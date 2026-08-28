@@ -1,0 +1,21 @@
+{
+  "version": "example-v1",
+  "budget": {
+    "max_steps": 10,
+    "max_tool_calls": 5,
+    "max_output_bytes": 65536
+  },
+  "approval_required_impacts": [
+    "high",
+    "destructive",
+    "external-payment",
+    "credentialed",
+    "data-exfiltration"
+  ],
+  "tools": {
+    "catalog.search": {
+      "impact": "low",
+      "constraints": {"max_limit": 5}
+    }
+  }
+}
