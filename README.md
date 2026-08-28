@@ -123,11 +123,24 @@ or:
 
 The runnable Node WebAssembly adapter uses the JSON-lowered WIT binding documented in [WASM_COMPONENTS.md](WASM_COMPONENTS.md). Strong migration is implemented as checkpoint-and-resume: native stacks, threads, sockets, and file descriptors never cross hosts.
 
-## Production work still required
+## Production status
 
-- Replace the in-memory demo trust registry with an externally managed production trust registry.
-- Replace the JSON-lowered WIT adapter with native Component Model runtime bindings when the selected Python runtime exposes them.
-- Replace the local SQLite storage backend with a production database for multi-host deployments.
-- Replace the local A2A 1.0 generated-style type subset with an official generated SDK when the Python package is selected.
-- Replace the reference mock attestation authority with the selected production TEE quote verifier.
-- Replace demo approval authorities with production approval service integration.
+The reference runtime is feature-complete. Signing and trust, transactional persistence,
+the A2A 1.0 surface, external policy with approval gates, WIT-shaped Wasm execution, and
+confidential-computing attestation are all implemented and covered by the regression suite.
+[PRODUCTION_TASKS.md](PRODUCTION_TASKS.md) holds the task-level record.
+
+## Deployment integration points
+
+Portmark is provider-neutral by design. The following are deliberate seams for the deploying
+environment to fill, not unfinished work. Each has a working reference implementation and a
+stable interface to substitute against.
+
+| Seam | Reference implementation | What a production deployment supplies |
+| --- | --- | --- |
+| Trust registry | JSON registry loaded from `PORTMARK_TRUST_REGISTRY_PATH`, with key IDs, issuers, audiences, validity windows, and revocation | PKI- or KMS-backed key distribution and rotation |
+| Storage | `SQLiteRuntimeStore` behind the `RuntimeStore` protocol | a shared database for multi-host deployments |
+| Wasm bindings | WIT contract executed through a JSON-lowered adapter on Node | native Component Model bindings once a Python runtime exposes them |
+| A2A types | generated-style A2A 1.0 subset isolated in `a2a_types.py` | the official generated SDK when a Python package is published |
+| Attestation | signed mock evidence verified by `AttestationPolicy` against RATS-style roles | the target platform's TEE quote verifier and sealed-storage backend |
+| Approvals | locally signed approval tokens bound to task, nonce, arguments, and policy hash | an approval service tied to operator identity and change management |
