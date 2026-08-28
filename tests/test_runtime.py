@@ -6,12 +6,14 @@ import logging
 import os
 import sys
 import tempfile
+import socket
 import threading
 import time
 import unittest
 import urllib.error
 import urllib.request
 from dataclasses import asdict
+from http.client import HTTPResponse
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -815,7 +817,6 @@ class RuntimeTests(unittest.TestCase):
                 (b"{", {"Content-Type": "application/json"}, 400, -32700),
                 (json.dumps({"jsonrpc": "2.0", "id": "bad-method", "method": "tasks/get", "params": {}}).encode(), {"Content-Type": "application/json"}, 400, -32601),
                 (b"{}", {"Content-Type": "text/plain"}, 415, -32600),
-                (b"x" * 1_000_001, {"Content-Type": "application/json"}, 413, -32600),
             ]
             for body, headers, status, code in cases:
                 request = urllib.request.Request(base + "/message:send", data=body, headers=headers)
@@ -826,9 +827,37 @@ class RuntimeTests(unittest.TestCase):
                     payload = json.load(raised.exception)
                     self.assertEqual(payload["jsonrpc"], "2.0")
                     self.assertEqual(payload["error"]["code"], code)
+            with self.subTest(status=413, code=-32600):
+                self.assertEqual(self._oversized_rejection(server.server_port), (413, -32600))
         finally:
             server.shutdown()
             server.server_close()
+
+    def _oversized_rejection(self, port):
+        """Declare an oversized body in the headers without sending one.
+
+        The server rejects on Content-Length alone and never reads the body,
+        which is the DoS property we want. Actually sending the body races that
+        response: the server closes first and the client sees a broken pipe
+        instead of the 413. Sending headers only makes the check deterministic.
+        """
+        sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+        try:
+            sock.sendall(
+                b"POST /message:send HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: 1000001\r\n"
+                b"Connection: close\r\n"
+                b"\r\n"
+            )
+            response = HTTPResponse(sock)
+            response.begin()
+            payload = json.loads(response.read())
+            self.assertEqual(payload["jsonrpc"], "2.0")
+            return response.status, payload["error"]["code"]
+        finally:
+            sock.close()
 
     def _a2a_request_body(self, host, text, envelope=None):
         return json.dumps({
