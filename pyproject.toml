@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "portable-agent"
+version = "0.1.0"
+description = "Provider-neutral, capability-secured portable agent reference runtime"
+requires-python = ">=3.11"
+dependencies = ["cryptography>=42"]
+
+[project.scripts]
+portable-agent = "portable_agent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+portable_agent = ["wasm_runner.mjs"]

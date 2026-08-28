@@ -1,0 +1,21 @@
+package portable:agent@1.0.0;
+
+interface decisions {
+  record tool-request {
+    name: string,
+    arguments-json: string,
+  }
+
+  variant outcome {
+    tool(tool-request),
+    completed(string),
+    suspended(string),
+    migrate(tuple<string, string>),
+    awaiting-input(string),
+    failed(string),
+  }
+}
+
+world portable-agent {
+  export resume: func(context-json: string, checkpoint-json: string) -> decisions.outcome;
+}
