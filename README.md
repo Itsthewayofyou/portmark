@@ -1,6 +1,6 @@
 # Portmark
 
-This is a provider-neutral reference implementation of the architecture discussed in the accompanying conversation: an agent carries a signed manifest, permit, state checkpoint, and component identity; the destination host independently verifies it, intersects its authority with local policy, and mediates every tool invocation.
+Portmark is a provider-neutral reference implementation of a portable agent runtime: an agent carries a signed manifest, permit, state checkpoint, and component identity; the destination host independently verifies it, intersects its authority with local policy, and mediates every tool invocation.
 
 It runs entirely offline by default. The deterministic provider is for demonstrations and tests. `GenericHttpProvider` can connect the same runtime to llama.cpp, Ollama through an adapter, a hosted model gateway, or another provider that implements the small decision contract below.
 
