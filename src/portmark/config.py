@@ -21,17 +21,17 @@ class RuntimeConfig:
     @classmethod
     def from_environment(cls) -> "RuntimeConfig":
         return cls(
-            host_id=os.environ.get("PORTABLE_AGENT_HOST_ID", "host:local-demo"),
-            provider_endpoint=os.environ.get("PORTABLE_AGENT_PROVIDER_ENDPOINT"),
-            wasm_component=os.environ.get("PORTABLE_AGENT_WASM_COMPONENT"),
-            store_path=os.environ.get("PORTABLE_AGENT_STORE_PATH"),
-            policy_path=os.environ.get("PORTABLE_AGENT_POLICY_PATH"),
-            trust_registry_path=os.environ.get("PORTABLE_AGENT_TRUST_REGISTRY_PATH"),
-            reload_policy=os.environ.get("PORTABLE_AGENT_RELOAD_POLICY") == "1",
-            a2a_token=os.environ.get("PORTABLE_AGENT_A2A_TOKEN"),
-            log_level=os.environ.get("PORTABLE_AGENT_LOG_LEVEL", "INFO"),
-            log_json=os.environ.get("PORTABLE_AGENT_LOG_JSON") == "1",
-            enable_hsts=os.environ.get("PORTABLE_AGENT_ENABLE_HSTS") == "1",
+            host_id=os.environ.get("PORTMARK_HOST_ID", "host:local-demo"),
+            provider_endpoint=os.environ.get("PORTMARK_PROVIDER_ENDPOINT"),
+            wasm_component=os.environ.get("PORTMARK_WASM_COMPONENT"),
+            store_path=os.environ.get("PORTMARK_STORE_PATH"),
+            policy_path=os.environ.get("PORTMARK_POLICY_PATH"),
+            trust_registry_path=os.environ.get("PORTMARK_TRUST_REGISTRY_PATH"),
+            reload_policy=os.environ.get("PORTMARK_RELOAD_POLICY") == "1",
+            a2a_token=os.environ.get("PORTMARK_A2A_TOKEN"),
+            log_level=os.environ.get("PORTMARK_LOG_LEVEL", "INFO"),
+            log_json=os.environ.get("PORTMARK_LOG_JSON") == "1",
+            enable_hsts=os.environ.get("PORTMARK_ENABLE_HSTS") == "1",
         )
 
     def merged_with_args(self, args) -> "RuntimeConfig":

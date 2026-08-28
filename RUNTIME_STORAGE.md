@@ -1,6 +1,6 @@
 # Runtime Storage
 
-Portable Agent Runtime persists replay nonces, checkpoints, audit events, and audit heads through the `RuntimeStore` interface in `src/portable_agent/storage.py`.
+Portmark persists replay nonces, checkpoints, audit events, and audit heads through the `RuntimeStore` interface in `src/portmark/storage.py`.
 
 ## Storage Implementations
 
@@ -10,14 +10,14 @@ Portable Agent Runtime persists replay nonces, checkpoints, audit events, and au
 Use SQLite from the CLI:
 
 ```bash
-PYTHONPATH=src python -m portable_agent.cli --store-path runtime.sqlite demo "research portable agents"
+PYTHONPATH=src python -m portmark.cli --store-path runtime.sqlite demo "research portable agents"
 ```
 
 Or through the environment:
 
 ```bash
-export PORTABLE_AGENT_STORE_PATH=runtime.sqlite
-PYTHONPATH=src python -m portable_agent.cli demo "research portable agents"
+export PORTMARK_STORE_PATH=runtime.sqlite
+PYTHONPATH=src python -m portmark.cli demo "research portable agents"
 ```
 
 ## Transactional Guarantees

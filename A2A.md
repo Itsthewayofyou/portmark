@@ -1,6 +1,6 @@
 # A2A 1.0 HTTP Boundary
 
-The HTTP adapter exposes a typed A2A-style JSON-RPC boundary for submitting signed portable-agent envelopes.
+The HTTP adapter exposes a typed A2A-style JSON-RPC boundary for submitting signed Portmark agent envelopes.
 
 ## Agent Card
 
@@ -9,7 +9,7 @@ The HTTP adapter exposes a typed A2A-style JSON-RPC boundary for submitting sign
 - `protocolVersion: "1.0"`
 - `supportedInterfaces` for JSON-RPC over HTTP
 - default JSON input and output modes
-- the `portable-agent` skill
+- the `portmark` skill
 - bearer security metadata when A2A auth is enabled
 
 The card remains public so clients can discover the endpoint and required auth scheme. Do not place secrets or deployment-private topology in the card.
@@ -30,7 +30,7 @@ Clients submit work to the card `url`, currently `/message:send`, using JSON-RPC
       "parts": [{"kind": "text", "text": "run this agent"}]
     },
     "metadata": {
-      "portable_agent_envelope": {
+      "portmark_envelope": {
         "manifest": {},
         "permit": {},
         "state": {},
@@ -47,7 +47,7 @@ The signed envelope remains the security boundary. The A2A message fields provid
 
 ## Authentication
 
-Set `PORTABLE_AGENT_A2A_TOKEN` or pass `--a2a-token` to require:
+Set `PORTMARK_A2A_TOKEN` or pass `--a2a-token` to require:
 
 ```http
 Authorization: Bearer <token>

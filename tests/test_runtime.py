@@ -17,14 +17,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from portable_agent.a2a import A2AAuthConfig, envelope_from_dict, make_handler
-from portable_agent.config import RuntimeConfig
-from portable_agent.factory import make_demo_envelope, make_host
-from portable_agent.logging_config import JsonLogFormatter
-from portable_agent.models import AgentEnvelope, AgentManifest, AgentState, Permit, ProviderDecision, ResourceBudget, ToolGrant
-from portable_agent.providers import GenericHttpProvider, ModelProvider
-from portable_agent.policy import load_host_policy
-from portable_agent.security import (
+from portmark.a2a import A2AAuthConfig, envelope_from_dict, make_handler
+from portmark.config import RuntimeConfig
+from portmark.factory import make_demo_envelope, make_host
+from portmark.logging_config import JsonLogFormatter
+from portmark.models import AgentEnvelope, AgentManifest, AgentState, Permit, ProviderDecision, ResourceBudget, ToolGrant
+from portmark.providers import GenericHttpProvider, ModelProvider
+from portmark.policy import load_host_policy
+from portmark.security import (
     ApprovalAuthority,
     AttestationAuthority,
     AttestationPolicy,
@@ -36,7 +36,7 @@ from portable_agent.security import (
     canonical_json,
     load_trust_registry,
 )
-from portable_agent.storage import SQLiteRuntimeStore
+from portmark.storage import SQLiteRuntimeStore
 
 
 WASM_TOOL_REQUEST = "AGFzbQEAAAABCQFgBH9/f38BfgMCAQAFAwEAAQcTAgZtZW1vcnkCAAZyZXN1bWUAAAoLAQkAQu+AgICAAgsLdQEAQRALb3sib3V0Y29tZSI6InRvb2wiLCJyZXF1ZXN0Ijp7Im5hbWUiOiJjYXRhbG9nLnNlYXJjaCIsImFyZ3VtZW50c19qc29uIjoie1wicXVlcnlcIjpcImZyb20gd2FzbVwiLFwibGltaXRcIjozfSJ9fQ=="
@@ -93,17 +93,17 @@ class RuntimeTests(unittest.TestCase):
 
     def test_runtime_config_merges_environment_and_cli_arguments(self):
         environment = {
-            "PORTABLE_AGENT_HOST_ID": "host:env",
-            "PORTABLE_AGENT_PROVIDER_ENDPOINT": "https://provider.example/run",
-            "PORTABLE_AGENT_STORE_PATH": "env.sqlite",
-            "PORTABLE_AGENT_POLICY_PATH": "env-policy.json",
-            "PORTABLE_AGENT_TRUST_REGISTRY_PATH": "env-trust.json",
-            "PORTABLE_AGENT_RELOAD_POLICY": "1",
-            "PORTABLE_AGENT_LOG_LEVEL": "DEBUG",
-            "PORTABLE_AGENT_LOG_JSON": "1",
-            "PORTABLE_AGENT_ENABLE_HSTS": "1",
+            "PORTMARK_HOST_ID": "host:env",
+            "PORTMARK_PROVIDER_ENDPOINT": "https://provider.example/run",
+            "PORTMARK_STORE_PATH": "env.sqlite",
+            "PORTMARK_POLICY_PATH": "env-policy.json",
+            "PORTMARK_TRUST_REGISTRY_PATH": "env-trust.json",
+            "PORTMARK_RELOAD_POLICY": "1",
+            "PORTMARK_LOG_LEVEL": "DEBUG",
+            "PORTMARK_LOG_JSON": "1",
+            "PORTMARK_ENABLE_HSTS": "1",
         }
-        environment["PORTABLE_AGENT_A2A_" + "TOKEN"] = "env-" + "token"
+        environment["PORTMARK_A2A_" + "TOKEN"] = "env-" + "token"
         with patch.dict(os.environ, environment, clear=True):
             config = RuntimeConfig.from_environment().merged_with_args(SimpleNamespace(
                 host_id="host:cli",
@@ -134,12 +134,12 @@ class RuntimeTests(unittest.TestCase):
         try:
             raise RuntimeError("internal failure")
         except RuntimeError:
-            record = logging.getLogger("portable_agent.test").makeRecord(
-                "portable_agent.test", logging.ERROR, __file__, 1, "operation failed", (), exc_info=sys.exc_info()
+            record = logging.getLogger("portmark.test").makeRecord(
+                "portmark.test", logging.ERROR, __file__, 1, "operation failed", (), exc_info=sys.exc_info()
             )
         payload = json.loads(formatter.format(record))
         self.assertEqual(payload["level"], "ERROR")
-        self.assertEqual(payload["logger"], "portable_agent.test")
+        self.assertEqual(payload["logger"], "portmark.test")
         self.assertEqual(payload["message"], "operation failed")
         self.assertIn("RuntimeError", payload["exception"])
 
@@ -599,7 +599,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(source_checkpoint["memory"]["migration"], {"from": "host:source", "to": "host:destination"})
             self.assertTrue(source_store.verify_audit_chain(first.task_id))
 
-            from portable_agent.a2a import envelope_from_dict
+            from portmark.a2a import envelope_from_dict
             second = destination.run(envelope_from_dict(first.migration_envelope))
             self.assertEqual(second.status, "completed")
             self.assertEqual(destination_store.load_checkpoint(second.task_id)["status"], "completed")
@@ -639,7 +639,7 @@ class RuntimeTests(unittest.TestCase):
         source.signer.seal(envelope)
         first = source.run(envelope)
         self.assertIsNotNone(first.migration_envelope)
-        from portable_agent.a2a import envelope_from_dict
+        from portmark.a2a import envelope_from_dict
         migrated = envelope_from_dict(first.migration_envelope)
         self.assertEqual(migrated.permit.audience, destination.host_id)
         self.assertFalse(migrated.permit.delegation_allowed)
@@ -711,7 +711,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(card["defaultInputModes"], ["application/json"])
             self.assertEqual(card["securitySchemes"]["bearer"]["scheme"], "bearer")
             self.assertEqual(card["securityRequirements"], [{"bearer": []}])
-            self.assertEqual(card["skills"][0]["id"], "portable-agent")
+            self.assertEqual(card["skills"][0]["id"], "portmark")
             body = self._a2a_request_body(host, "A2A task")
             request = urllib.request.Request(
                 base + "/message:send",
@@ -723,7 +723,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(result["jsonrpc"], "2.0")
             self.assertEqual(result["id"], "req-1")
             self.assertEqual(result["result"]["status"]["state"], "completed")
-            self.assertEqual(result["result"]["metadata"]["portable_agent_status"], "completed")
+            self.assertEqual(result["result"]["metadata"]["portmark_status"], "completed")
         finally:
             server.shutdown()
             server.server_close()
@@ -780,7 +780,7 @@ class RuntimeTests(unittest.TestCase):
                 "method": "message/send",
                 "params": {
                     "message": {"messageId": "msg-1", "role": "user", "parts": [{"kind": "text", "text": "run"}]},
-                    "metadata": {"portable_agent_envelope": {"signature": "broken"}},
+                    "metadata": {"portmark_envelope": {"signature": "broken"}},
                 },
             }).encode()
             request = urllib.request.Request(base + "/message:send", data=body, headers={"Content-Type": "application/json"})
@@ -837,7 +837,7 @@ class RuntimeTests(unittest.TestCase):
             "method": "message/send",
             "params": {
                 "message": {"messageId": "msg-1", "role": "user", "parts": [{"kind": "text", "text": text}]},
-                "metadata": {"portable_agent_envelope": asdict(envelope or make_demo_envelope(host, text))},
+                "metadata": {"portmark_envelope": asdict(envelope or make_demo_envelope(host, text))},
             },
         }).encode()
 
@@ -870,14 +870,14 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result.result["evidence"], [])
 
     def test_wasm_with_ambient_wasi_import_cannot_instantiate(self):
-        from portable_agent.providers import WasmDecisionProvider
+        from portmark.providers import WasmDecisionProvider
         hostile = base64.b64decode(WASM_FORBIDDEN_IMPORT)
         provider = WasmDecisionProvider(hostile)
         with self.assertRaisesRegex(RuntimeError, "ambient imports"):
             provider.decide(AgentState("task", "goal"), ())
 
     def test_wasm_component_tool_decision_uses_structured_wit_outcome(self):
-        from portable_agent.providers import WasmDecisionProvider
+        from portmark.providers import WasmDecisionProvider
         provider = WasmDecisionProvider(base64.b64decode(WASM_TOOL_REQUEST))
         decision = provider.decide(AgentState("task", "goal"), ("catalog.search",))
         self.assertEqual(decision.kind, "tool")
@@ -885,14 +885,14 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(decision.arguments, {"query": "from wasm", "limit": 3})
 
     def test_wasm_component_unavailable_capability_fails_closed(self):
-        from portable_agent.providers import WasmDecisionProvider
+        from portmark.providers import WasmDecisionProvider
         provider = WasmDecisionProvider(base64.b64decode(WASM_TOOL_REQUEST))
         decision = provider.decide(AgentState("task", "goal"), ())
         self.assertEqual(decision.kind, "fail")
         self.assertEqual(decision.content, {"error": "required capability unavailable"})
 
     def test_wasm_component_malformed_missing_timeout_and_oversized_outputs_are_rejected(self):
-        from portable_agent.providers import WasmDecisionProvider
+        from portmark.providers import WasmDecisionProvider
         cases = [
             (WASM_MALFORMED_JSON, {}, "malformed decision JSON"),
             (WASM_MISSING_RESUME, {}, "must export resume"),

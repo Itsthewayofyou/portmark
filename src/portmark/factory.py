@@ -19,21 +19,21 @@ HOST_ID = "host:local-demo"
 
 def signer_from_environment(host_id: str = HOST_ID, trust_registry_path: str | None = None) -> EnvelopeSigningIdentity:
     registry = load_trust_registry(trust_registry_path) if trust_registry_path else None
-    raw_private_key = os.environ.get("PORTABLE_AGENT_ED25519_PRIVATE_KEY_B64")
+    raw_private_key = os.environ.get("PORTMARK_ED25519_PRIVATE_KEY_B64")
     if raw_private_key:
         import base64
 
         padding = "=" * (-len(raw_private_key) % 4)
         private_key = base64.urlsafe_b64decode(raw_private_key + padding)
         return EnvelopeSigner.from_private_key_bytes(
-            os.environ.get("PORTABLE_AGENT_SIGNING_KEY_ID", "env-ed25519-key"),
-            os.environ.get("PORTABLE_AGENT_SIGNING_ISSUER", host_id),
+            os.environ.get("PORTMARK_SIGNING_KEY_ID", "env-ed25519-key"),
+            os.environ.get("PORTMARK_SIGNING_ISSUER", host_id),
             private_key,
-            tuple(os.environ.get("PORTABLE_AGENT_ALLOWED_AUDIENCES", host_id).split(",")),
+            tuple(os.environ.get("PORTMARK_ALLOWED_AUDIENCES", host_id).split(",")),
             registry,
         )
-    if os.environ.get("PORTABLE_AGENT_ALLOW_LEGACY_HMAC") == "1":
-        raw = os.environ.get("PORTABLE_AGENT_SIGNING_KEY", "development-only-signing-key-change-me")
+    if os.environ.get("PORTMARK_ALLOW_LEGACY_HMAC") == "1":
+        raw = os.environ.get("PORTMARK_SIGNING_KEY", "development-only-signing-key-change-me")
         return HmacEnvelopeSigner(hashlib.sha256(raw.encode()).digest())
     return EnvelopeSigner.generate(issuer=host_id, allowed_audiences=(host_id,))
 
@@ -54,8 +54,8 @@ def make_host(
         providers["http"] = GenericHttpProvider(provider_endpoint, os.environ.get("MODEL_PROVIDER_TOKEN"))
     if wasm_component:
         providers["wasm"] = WasmDecisionProvider.from_file(wasm_component)
-    configured_policy_path = policy_path or os.environ.get("PORTABLE_AGENT_POLICY_PATH")
-    configured_trust_registry_path = trust_registry_path or os.environ.get("PORTABLE_AGENT_TRUST_REGISTRY_PATH")
+    configured_policy_path = policy_path or os.environ.get("PORTMARK_POLICY_PATH")
+    configured_trust_registry_path = trust_registry_path or os.environ.get("PORTMARK_TRUST_REGISTRY_PATH")
     policy_loader = (lambda: load_host_policy(configured_policy_path, host_id)) if configured_policy_path else None
     policy = policy_loader() if policy_loader else HostPolicy(
         host_id,
@@ -64,8 +64,8 @@ def make_host(
         tool_impacts={"catalog.search": "low", "payments.reserve": "external-payment"},
     )
     configured_store = store
-    if configured_store is None and os.environ.get("PORTABLE_AGENT_STORE_PATH"):
-        configured_store = SQLiteRuntimeStore(os.environ["PORTABLE_AGENT_STORE_PATH"])
+    if configured_store is None and os.environ.get("PORTMARK_STORE_PATH"):
+        configured_store = SQLiteRuntimeStore(os.environ["PORTMARK_STORE_PATH"])
     return AgentHost(
         host_id,
         signer or signer_from_environment(host_id, configured_trust_registry_path),

@@ -6,20 +6,20 @@ This runbook covers production operations for the reference runtime.
 
 Runtime configuration can come from environment variables or CLI flags:
 
-- `PORTABLE_AGENT_HOST_ID` / `--host-id`
-- `PORTABLE_AGENT_ED25519_PRIVATE_KEY_B64`
-- `PORTABLE_AGENT_SIGNING_KEY_ID`
-- `PORTABLE_AGENT_SIGNING_ISSUER`
-- `PORTABLE_AGENT_ALLOWED_AUDIENCES`
-- `PORTABLE_AGENT_TRUST_REGISTRY_PATH` / `--trust-registry-path`
-- `PORTABLE_AGENT_POLICY_PATH` / `--policy-path`
-- `PORTABLE_AGENT_RELOAD_POLICY` / `--reload-policy`
-- `PORTABLE_AGENT_STORE_PATH` / `--store-path`
-- `PORTABLE_AGENT_PROVIDER_ENDPOINT` / `--provider-endpoint`
-- `PORTABLE_AGENT_A2A_TOKEN` / `--a2a-token`
-- `PORTABLE_AGENT_LOG_LEVEL` / `--log-level`
-- `PORTABLE_AGENT_LOG_JSON` / `--log-json`
-- `PORTABLE_AGENT_ENABLE_HSTS` / `--enable-hsts`
+- `PORTMARK_HOST_ID` / `--host-id`
+- `PORTMARK_ED25519_PRIVATE_KEY_B64`
+- `PORTMARK_SIGNING_KEY_ID`
+- `PORTMARK_SIGNING_ISSUER`
+- `PORTMARK_ALLOWED_AUDIENCES`
+- `PORTMARK_TRUST_REGISTRY_PATH` / `--trust-registry-path`
+- `PORTMARK_POLICY_PATH` / `--policy-path`
+- `PORTMARK_RELOAD_POLICY` / `--reload-policy`
+- `PORTMARK_STORE_PATH` / `--store-path`
+- `PORTMARK_PROVIDER_ENDPOINT` / `--provider-endpoint`
+- `PORTMARK_A2A_TOKEN` / `--a2a-token`
+- `PORTMARK_LOG_LEVEL` / `--log-level`
+- `PORTMARK_LOG_JSON` / `--log-json`
+- `PORTMARK_ENABLE_HSTS` / `--enable-hsts`
 
 ## Trust Registry
 

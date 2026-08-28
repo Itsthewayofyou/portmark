@@ -1,4 +1,4 @@
-package portable:agent@1.0.0;
+package portmark:agent@1.0.0;
 
 interface decisions {
   record tool-request {
@@ -16,6 +16,6 @@ interface decisions {
   }
 }
 
-world portable-agent {
+world portmark {
   export resume: func(context-json: string, checkpoint-json: string) -> decisions.outcome;
 }

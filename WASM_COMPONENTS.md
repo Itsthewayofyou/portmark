@@ -1,12 +1,12 @@
 # WebAssembly Component Binding Contract
 
-Portable Agent Runtime uses `wit/portable-agent.wit` as the source contract for Wasm decision providers. The current executable adapter uses a JSON-lowered binding for the WIT `resume(context-json, checkpoint-json)` export so the reference runtime can execute offline with Node's built-in WebAssembly engine.
+Portmark uses `wit/portmark.wit` as the source contract for Wasm decision providers. The current executable adapter uses a JSON-lowered binding for the WIT `resume(context-json, checkpoint-json)` export so the reference runtime can execute offline with Node's built-in WebAssembly engine.
 
 ## Toolchain
 
-- Contract: `wit/portable-agent.wit`
-- Host bindings: `src/portable_agent/component_bindings.py`
-- Runner: `src/portable_agent/wasm_runner.mjs`
+- Contract: `wit/portmark.wit`
+- Host bindings: `src/portmark/component_bindings.py`
+- Runner: `src/portmark/wasm_runner.mjs`
 - Example capsule source: `capsules/research-agent.wat`
 - Example capsule artifact: `capsules/research-agent.wasm.b64`
 
@@ -29,8 +29,8 @@ The host passes:
 {
   "wit": {
     "package": "portable:agent@1.0.0",
-    "world": "portable-agent",
-    "abi": "portable-agent-json-lowered-v1"
+    "world": "portmark",
+    "abi": "portmark-json-lowered-v1"
   },
   "state": {},
   "available_tools": ["catalog.search"]

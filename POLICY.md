@@ -47,10 +47,10 @@ Use a policy file:
 
 ```powershell
 $env:PYTHONPATH = "src"
-python -m portable_agent.cli --policy-path host-policy.json demo "research mobile agents"
+python -m portmark.cli --policy-path host-policy.json demo "research mobile agents"
 ```
 
-Or set `PORTABLE_AGENT_POLICY_PATH`.
+Or set `PORTMARK_POLICY_PATH`.
 
 By default the policy is loaded at startup and changes require restart. Pass `--reload-policy` to reload the file before each run. Approval tokens are bound to the policy hash, so a token issued for an older policy is rejected after reload.
 

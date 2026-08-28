@@ -1,6 +1,6 @@
 # Signing Keys And Trust Registry
 
-Portable Agent Runtime signs envelopes with Ed25519 by default. HMAC remains available only as an explicit legacy demo mode and should not be used for production trust domains.
+Portmark signs envelopes with Ed25519 by default. HMAC remains available only as an explicit legacy demo mode and should not be used for production trust domains.
 
 ## Signed Envelope Metadata
 
@@ -31,7 +31,7 @@ Generate an Ed25519 signer in Python:
 
 ```python
 # scripts/key_example.py
-from portable_agent.security import EnvelopeSigner
+from portmark.security import EnvelopeSigner
 
 signer = EnvelopeSigner.generate(
     key_id="host-prod-2026-08",
@@ -43,13 +43,13 @@ print(signer.private_key_b64())
 print(signer.public_key_bytes().hex())
 ```
 
-For local CLI use, provide the raw private key through `PORTABLE_AGENT_ED25519_PRIVATE_KEY_B64`:
+For local CLI use, provide the raw private key through `PORTMARK_ED25519_PRIVATE_KEY_B64`:
 
 ```bash
-export PORTABLE_AGENT_ED25519_PRIVATE_KEY_B64="..."
-export PORTABLE_AGENT_SIGNING_KEY_ID="host-prod-2026-08"
-export PORTABLE_AGENT_SIGNING_ISSUER="host:prod"
-export PORTABLE_AGENT_ALLOWED_AUDIENCES="host:prod"
+export PORTMARK_ED25519_PRIVATE_KEY_B64="..."
+export PORTMARK_SIGNING_KEY_ID="host-prod-2026-08"
+export PORTMARK_SIGNING_ISSUER="host:prod"
+export PORTMARK_ALLOWED_AUDIENCES="host:prod"
 ```
 
 Production deployments should load private keys from a secret manager, workload identity provider, HSM, or equivalent key custody system instead of shell environment variables.
@@ -85,4 +85,4 @@ Trust registry distribution is out of scope for the reference runtime, but produ
 
 ## Legacy HMAC Mode
 
-Set `PORTABLE_AGENT_ALLOW_LEGACY_HMAC=1` to use the dependency-free HMAC signer for demos. This mode uses shared secret verification and does not provide asymmetric workload identity. Do not enable it in production.
+Set `PORTMARK_ALLOW_LEGACY_HMAC=1` to use the dependency-free HMAC signer for demos. This mode uses shared secret verification and does not provide asymmetric workload identity. Do not enable it in production.

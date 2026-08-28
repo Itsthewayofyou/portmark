@@ -95,8 +95,8 @@ class MessageSendParams:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
-    def portable_agent_envelope(self) -> dict[str, Any]:
-        envelope = self.metadata.get("portable_agent_envelope")
+    def portmark_envelope(self) -> dict[str, Any]:
+        envelope = self.metadata.get("portmark_envelope")
         if not isinstance(envelope, dict):
             raise A2ARequestError(-32602, "invalid params")
         return envelope
@@ -141,7 +141,7 @@ def make_agent_card(base_url: str, require_bearer_auth: bool) -> dict[str, Any]:
         capabilities=AgentCapabilities(),
         defaultInputModes=("application/json",),
         defaultOutputModes=("application/json",),
-        skills=(AgentSkill("portable-agent", "Portable agent execution", "Execute a signed portable agent envelope"),),
+        skills=(AgentSkill("portmark", "Portmark agent execution", "Execute a signed Portmark agent envelope"),),
         securitySchemes=security_schemes,
         security=security,
         securityRequirements=security,
@@ -169,7 +169,7 @@ def parse_message_send_params(value: Any) -> MessageSendParams:
     message = _parse_message(value.get("message"))
     metadata = _optional_object(value.get("metadata"), "metadata")
     params = MessageSendParams(message, metadata)
-    params.portable_agent_envelope
+    params.portmark_envelope
     return params
 
 
@@ -178,7 +178,7 @@ def task_from_run_result(result: Any) -> dict[str, Any]:
         id=result.task_id,
         status=TaskStatus(_task_state(result.status)),
         artifacts=(asdict(result),),
-        metadata={"portable_agent_status": result.status},
+        metadata={"portmark_status": result.status},
     ).to_dict()
 
 

@@ -1,2 +1,0 @@
-[console_scripts]
-portable-agent = portable_agent.cli:main

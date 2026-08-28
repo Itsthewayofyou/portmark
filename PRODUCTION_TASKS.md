@@ -2,11 +2,11 @@
 
 This file expands the production work listed in `README.md` into concrete implementation tasks. It is grounded in the current runtime files:
 
-- `src/portable_agent/security.py`
-- `src/portable_agent/host.py`
-- `src/portable_agent/a2a.py`
-- `src/portable_agent/providers.py`
-- `wit/portable-agent.wit`
+- `src/portmark/security.py`
+- `src/portmark/host.py`
+- `src/portmark/a2a.py`
+- `src/portmark/providers.py`
+- `wit/portmark.wit`
 
 ## 1. Replace HMAC With Asymmetric Workload Identities
 
@@ -25,12 +25,12 @@ Tasks:
 
 ## 2. Replace Core-Wasm ABI With WIT Component Model Bindings
 
-Status: implemented for the reference runtime. `wit/portable-agent.wit` now defines structured provider decisions, `component_bindings.py` validates WIT-shaped outcomes, the runner calls `resume(context-json, checkpoint-json)`, and the example capsule has been regenerated for the new ABI.
+Status: implemented for the reference runtime. `wit/portmark.wit` now defines structured provider decisions, `component_bindings.py` validates WIT-shaped outcomes, the runner calls `resume(context-json, checkpoint-json)`, and the example capsule has been regenerated for the new ABI.
 
 Tasks:
 
 - [x] Choose the Component Model toolchain, likely `wit-bindgen` plus a runtime such as Wasmtime.
-- [x] Generate host bindings from `wit/portable-agent.wit`.
+- [x] Generate host bindings from `wit/portmark.wit`.
 - [x] Replace the `decide(step: i32) -> i64` ABI with checkpoint/resume calls defined by WIT.
 - [x] Pass structured state and available capabilities into the component.
 - [x] Return structured provider decisions instead of encoded integers.

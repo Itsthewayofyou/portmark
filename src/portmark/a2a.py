@@ -41,7 +41,7 @@ def envelope_from_dict(value: dict[str, Any]) -> AgentEnvelope:
 @dataclass(frozen=True)
 class A2AAuthConfig:
     bearer_token: str | None = None
-    realm: str = "portable-agent"
+    realm: str = "portmark"
 
     @property
     def required(self) -> bool:
@@ -105,7 +105,7 @@ def make_handler(host: AgentHost, auth: A2AAuthConfig | None = None, enable_hsts
                     raise A2ARequestError(-32700, "parse error", 400) from exc
                 request = parse_jsonrpc_request(payload)
                 request_id = request.id
-                envelope = envelope_from_dict(request.params.portable_agent_envelope)
+                envelope = envelope_from_dict(request.params.portmark_envelope)
                 result = host.run(envelope)
                 self._json(200, success_response(request.id, task_from_run_result(result)))
             except A2ARequestError as exc:
@@ -133,7 +133,7 @@ def make_handler(host: AgentHost, auth: A2AAuthConfig | None = None, enable_hsts
 
 
 def auth_from_environment() -> A2AAuthConfig:
-    return A2AAuthConfig(os.environ.get("PORTABLE_AGENT_A2A_TOKEN"))
+    return A2AAuthConfig(os.environ.get("PORTMARK_A2A_TOKEN"))
 
 
 def serve(host: AgentHost, bind: str, port: int, auth: A2AAuthConfig | None = None, enable_hsts: bool = False) -> None:

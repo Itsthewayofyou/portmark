@@ -1,4 +1,4 @@
-# Portable Agent Runtime
+# Portmark
 
 This is a provider-neutral reference implementation of the architecture discussed in the accompanying conversation: an agent carries a signed manifest, permit, state checkpoint, and component identity; the destination host independently verifies it, intersects its authority with local policy, and mediates every tool invocation.
 
@@ -34,21 +34,21 @@ No installation is required:
 
 ```powershell
 $env:PYTHONPATH = "src"
-python -m portable_agent.cli demo "research modern mobile agents"
+python -m portmark.cli demo "research modern mobile agents"
 ```
 
 For normal package usage without setting `PYTHONPATH`, install the project:
 
 ```powershell
 python -m pip install -e .
-portable-agent demo "research modern mobile agents"
+portmark demo "research modern mobile agents"
 ```
 
 Execute the included Wasm capsule using the WIT-shaped `resume(context-json, checkpoint-json)` binding:
 
 ```powershell
 $env:PYTHONPATH = "src"
-python -m portable_agent.cli --wasm-component capsules/research-agent.wasm.b64 demo "research modern mobile agents"
+python -m portmark.cli --wasm-component capsules/research-agent.wasm.b64 demo "research modern mobile agents"
 ```
 
 The host executes each capsule in a short-lived worker with a strict deadline and rejects every module declaring an import. The guest therefore has no filesystem, network, process, environment, clock, randomness, or credential access. Its signed SHA-256 digest is checked before execution. Tool actions returned by the capsule still pass through the same host permit and argument enforcement as model-provider proposals. See [WASM_COMPONENTS.md](WASM_COMPONENTS.md) for the WIT binding contract.
@@ -64,15 +64,15 @@ Run the A2A-facing HTTP service:
 
 ```powershell
 $env:PYTHONPATH = "src"
-python -m portable_agent.cli serve --port 8080
+python -m portmark.cli serve --port 8080
 ```
 
 Require bearer authentication for A2A message submission:
 
 ```powershell
 $env:PYTHONPATH = "src"
-$env:PORTABLE_AGENT_A2A_TOKEN = "change-me"
-python -m portable_agent.cli serve --port 8080
+$env:PORTMARK_A2A_TOKEN = "change-me"
+python -m portmark.cli serve --port 8080
 ```
 
 The Agent Card is available at `/.well-known/agent-card.json`; signed envelopes are submitted to `/message:send` with the A2A JSON-RPC `message/send` method. See [A2A.md](A2A.md) for the Agent Card fields, request shape, authentication profile, and error behavior.
@@ -81,7 +81,7 @@ Persist replay nonces, checkpoints, and audit heads with SQLite:
 
 ```powershell
 $env:PYTHONPATH = "src"
-python -m portable_agent.cli --store-path runtime.sqlite demo "research modern mobile agents"
+python -m portmark.cli --store-path runtime.sqlite demo "research modern mobile agents"
 ```
 
 See [RUNTIME_STORAGE.md](RUNTIME_STORAGE.md) for the storage schema, transaction guarantees, and recovery behavior.
@@ -90,7 +90,7 @@ Load policy from JSON:
 
 ```powershell
 $env:PYTHONPATH = "src"
-python -m portable_agent.cli --policy-path host-policy.json --reload-policy demo "research modern mobile agents"
+python -m portmark.cli --policy-path host-policy.json --reload-policy demo "research modern mobile agents"
 ```
 
 See [OPERATIONS.md](OPERATIONS.md) for runtime configuration, trust registry format, policy updates, audit verification, backup/restore, and incident response.
@@ -119,7 +119,7 @@ or:
 
 ## WebAssembly component boundary
 
-[`wit/portable-agent.wit`](wit/portable-agent.wit) defines the Wasm Component Model decision interface. The capsule exports a checkpoint-based `resume` operation that receives structured context and checkpoint JSON and returns a structured outcome. A compiled capsule therefore cannot directly acquire filesystem, network, process, database, or credential access; the host must explicitly validate and mediate every requested action.
+[`wit/portmark.wit`](wit/portmark.wit) defines the Wasm Component Model decision interface. The capsule exports a checkpoint-based `resume` operation that receives structured context and checkpoint JSON and returns a structured outcome. A compiled capsule therefore cannot directly acquire filesystem, network, process, database, or credential access; the host must explicitly validate and mediate every requested action.
 
 The runnable Node WebAssembly adapter uses the JSON-lowered WIT binding documented in [WASM_COMPONENTS.md](WASM_COMPONENTS.md). Strong migration is implemented as checkpoint-and-resume: native stacks, threads, sockets, and file descriptors never cross hosts.
 

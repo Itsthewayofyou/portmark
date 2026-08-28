@@ -7,9 +7,9 @@ from typing import Any
 from .models import AgentState, ProviderDecision
 
 
-WIT_PACKAGE = "portable:agent@1.0.0"
-WIT_WORLD = "portable-agent"
-WIT_ABI = "portable-agent-json-lowered-v1"
+WIT_PACKAGE = "portmark:agent@1.0.0"
+WIT_WORLD = "portmark"
+WIT_ABI = "portmark-json-lowered-v1"
 
 
 def component_context(state: AgentState, available_tools: tuple[str, ...]) -> dict[str, Any]:
