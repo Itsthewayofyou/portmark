@@ -59,7 +59,7 @@ Tasks:
 
 ## 4. Use Complete A2A 1.0 Generated Types And Authentication Profile
 
-Status: implemented for the reference runtime. `a2a_types.py` now provides generated-style A2A 1.0 JSON-RPC and Agent Card models, `a2a.py` enforces the `message/send` method and bearer authentication profile, and regression tests cover happy-path compatibility plus malformed, unauthenticated, oversized, unsupported-method, wrong-content-type, and generic-error cases.
+Status: implemented for the reference runtime. `a2a_types.py` now provides generated-style A2A 1.0 JSON-RPC and Agent Card models, `a2a.py` enforces the `message/send` method and bearer authentication profile, and regression tests cover happy-path compatibility plus malformed, unauthenticated, oversized, unsupported-method, wrong-content-type, rate-limited Agent Card GET, and generic-error cases. Public deployments must front the Python reference server with a production HTTP proxy; `portmark serve` refuses non-loopback binds unless direct exposure is explicitly enabled.
 
 Tasks:
 
@@ -73,6 +73,8 @@ Tasks:
 - [x] Replace current error response behavior that exposes exception types and messages to clients.
 - [x] Add compatibility tests using known-good A2A examples.
 - [x] Add negative tests for missing auth, invalid auth, malformed messages, oversized requests, unsupported methods, and wrong content type.
+- [x] Require loopback binding by default and document a production reverse-proxy front.
+- [x] Rate-limit public Agent Card GET separately from message submission.
 
 Implementation note: no official Python A2A SDK is pinned in this project, so the reference runtime uses a local generated-style subset based on the authoritative A2A proto and JSON-RPC specification. The boundary is isolated in `a2a_types.py` so it can be replaced cleanly by official generated bindings later.
 

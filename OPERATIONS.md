@@ -20,6 +20,10 @@ Runtime configuration can come from environment variables or CLI flags:
 - `PORTMARK_A2A_MAX_CONCURRENT_REQUESTS` / `--a2a-max-concurrent-requests`
 - `PORTMARK_A2A_RATE_LIMIT_PER_IP` / `--a2a-rate-limit-per-ip`
 - `PORTMARK_A2A_RATE_LIMIT_WINDOW_SECONDS` / `--a2a-rate-limit-window-seconds`
+- `PORTMARK_A2A_AGENT_CARD_RATE_LIMIT_PER_IP` /
+  `--a2a-agent-card-rate-limit-per-ip`
+- `PORTMARK_A2A_AGENT_CARD_RATE_LIMIT_WINDOW_SECONDS` /
+  `--a2a-agent-card-rate-limit-window-seconds`
 - `PORTMARK_LOG_LEVEL` / `--log-level`
 - `PORTMARK_LOG_JSON` / `--log-json`
 - `PORTMARK_ENABLE_HSTS` / `--enable-hsts`
@@ -52,11 +56,26 @@ Policy changes should be reviewed, versioned, and deployed with a rollback plan.
 
 ## Network Boundary
 
-Expose the A2A listener behind a production HTTP stack whenever possible. The
-reference server still enforces its own message-submission controls: concurrent
-`/message:send` requests are capped, accepted submissions are rate-limited per
-client IP, and oversized submissions are rejected from `Content-Length` without
-reading the request body.
+Expose the A2A listener behind a production HTTP stack for public deployments.
+Run the reference listener on loopback:
+
+```bash
+portmark serve --bind 127.0.0.1 --port 8080
+```
+
+Then front it with a production proxy. The repository includes an Nginx example
+at `deploy/nginx/portmark.conf` with TLS termination, HTTPS redirect,
+`client_max_body_size 1m`, security headers, and proxy-side rate/connection
+limits for `/.well-known/agent-card.json` and `/message:send`.
+
+By default `portmark serve` refuses non-loopback binds such as `0.0.0.0`.
+`--allow-direct-a2a` or `PORTMARK_ALLOW_DIRECT_A2A=1` is the explicit escape
+hatch for deployments that intentionally expose the Python reference server
+directly. Even when fronted, the reference server still enforces its own
+network controls: public Agent Card GETs are rate-limited separately from
+message submission, concurrent `/message:send` requests are capped, accepted
+submissions are rate-limited per client IP, and oversized submissions are
+rejected from `Content-Length` without reading the request body.
 
 ## Audit Verification
 

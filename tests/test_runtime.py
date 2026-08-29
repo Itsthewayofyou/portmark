@@ -23,7 +23,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from portmark.a2a import A2AAuthConfig, BoundedThreadingHTTPServer, envelope_from_dict, make_handler
+from portmark.a2a import A2AAuthConfig, BoundedThreadingHTTPServer, RateLimiter, envelope_from_dict, is_loopback_bind, make_handler, serve
 from portmark.config import RuntimeConfig
 from portmark.factory import make_demo_envelope, make_host
 from portmark.logging_config import JsonLogFormatter
@@ -161,9 +161,12 @@ class RuntimeTests(unittest.TestCase):
             "PORTMARK_LOG_LEVEL": "DEBUG",
             "PORTMARK_LOG_JSON": "1",
             "PORTMARK_ENABLE_HSTS": "1",
+            "PORTMARK_ALLOW_DIRECT_A2A": "1",
             "PORTMARK_A2A_MAX_CONCURRENT_REQUESTS": "12",
             "PORTMARK_A2A_RATE_LIMIT_PER_IP": "34",
             "PORTMARK_A2A_RATE_LIMIT_WINDOW_SECONDS": "56",
+            "PORTMARK_A2A_AGENT_CARD_RATE_LIMIT_PER_IP": "78",
+            "PORTMARK_A2A_AGENT_CARD_RATE_LIMIT_WINDOW_SECONDS": "90",
         }
         environment["PORTMARK_A2A_" + "TOKEN"] = "env-" + "token"
         with patch.dict(os.environ, environment, clear=True):
@@ -179,6 +182,9 @@ class RuntimeTests(unittest.TestCase):
                 log_level=None,
                 log_json=False,
                 enable_hsts=False,
+                allow_direct_a2a=False,
+                a2a_agent_card_rate_limit_per_ip=None,
+                a2a_agent_card_rate_limit_window_seconds=None,
             ))
         self.assertEqual(config.host_id, "host:cli")
         self.assertEqual(config.provider_endpoint, "https://provider.example/run")
@@ -190,9 +196,12 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(config.a2a_token, "env-token")
         self.assertTrue(config.log_json)
         self.assertTrue(config.enable_hsts)
+        self.assertTrue(config.allow_direct_a2a)
         self.assertEqual(config.a2a_max_concurrent_requests, 12)
         self.assertEqual(config.a2a_rate_limit_per_ip, 34)
         self.assertEqual(config.a2a_rate_limit_window_seconds, 56)
+        self.assertEqual(config.a2a_agent_card_rate_limit_per_ip, 78)
+        self.assertEqual(config.a2a_agent_card_rate_limit_window_seconds, 90)
 
     def test_json_log_formatter_emits_structured_internal_exception(self):
         formatter = JsonLogFormatter()
@@ -216,6 +225,14 @@ class RuntimeTests(unittest.TestCase):
         self.assertNotIn("token-secret", json.dumps(payload))
         self.assertNotIn("key-secret", json.dumps(payload))
         self.assertNotIn("sig-secret", json.dumps(payload))
+
+    def test_rate_limiter_bounds_tracked_client_state(self):
+        limiter = RateLimiter(limit_per_ip=10, window_seconds=60, max_tracked_clients=2)
+        self.assertTrue(limiter.admit("192.0.2.1"))
+        self.assertTrue(limiter.admit("192.0.2.2"))
+        self.assertTrue(limiter.admit("192.0.2.3"))
+        self.assertLessEqual(len(limiter._requests_by_ip), 2)
+        self.assertNotIn("192.0.2.1", limiter._requests_by_ip)
 
     def test_external_trust_registry_allows_configured_signing_key(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1386,6 +1403,42 @@ class RuntimeTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    def test_a2a_serve_requires_loopback_unless_direct_exposure_is_explicit(self):
+        public_bind = ".".join(("0", "0", "0", "0"))
+        self.assertTrue(is_loopback_bind("127.0.0.1"))
+        self.assertTrue(is_loopback_bind("::1"))
+        self.assertTrue(is_loopback_bind("localhost"))
+        self.assertFalse(is_loopback_bind(public_bind))
+        self.assertFalse(is_loopback_bind("192.0.2.10"))
+
+        host = make_host()
+        with patch("portmark.a2a.BoundedThreadingHTTPServer") as server_class:
+            with self.assertRaisesRegex(ValueError, "loopback"):
+                serve(host, public_bind, 8080)
+        server_class.assert_not_called()
+
+        with patch("portmark.a2a.BoundedThreadingHTTPServer") as server_class:
+            server = server_class.return_value
+            serve(host, public_bind, 8080, allow_direct_a2a=True)
+        server.serve_forever.assert_called_once()
+
+    def test_a2a_nginx_front_documents_required_controls(self):
+        config = (Path(__file__).parents[1] / "deploy" / "nginx" / "portmark.conf").read_text(encoding="utf-8")
+        for required in [
+            "proxy_pass http://127.0.0.1:8080",
+            "client_max_body_size 1m",
+            "Strict-Transport-Security",
+            "X-Content-Type-Options",
+            "limit_req_zone",
+            "limit_conn_zone",
+            "zone=portmark_agent_card_rate",
+            "location = /.well-known/agent-card.json",
+            "location = /message:send",
+            "return 308 https://$host$request_uri",
+        ]:
+            with self.subTest(required=required):
+                self.assertIn(required, config)
+
     def test_a2a_errors_do_not_expose_internal_exception_details(self):
         host = make_host()
         server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(host))
@@ -1510,6 +1563,29 @@ class RuntimeTests(unittest.TestCase):
             )
             with self.assertRaises(urllib.error.HTTPError) as raised:
                 urllib.request.urlopen(second)  # nosec B310
+            self.assertEqual(raised.exception.code, 429)
+            self.assertEqual(raised.exception.headers["Retry-After"], "60")
+            payload = json.load(raised.exception)
+            self.assertEqual(payload["error"], {"code": -32002, "message": "rate limit exceeded"})
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_a2a_rate_limits_agent_card_per_ip(self):
+        host = make_host()
+        server = ThreadingHTTPServer(
+            ("127.0.0.1", 0),
+            make_handler(host, agent_card_rate_limit_per_ip=1, agent_card_rate_limit_window_seconds=60),
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_port}"
+        try:
+            with urllib.request.urlopen(base + "/.well-known/agent-card.json") as response:  # nosec B310
+                self.assertEqual(json.load(response)["protocolVersion"], "1.0")
+
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                urllib.request.urlopen(base + "/.well-known/agent-card.json")  # nosec B310
             self.assertEqual(raised.exception.code, 429)
             self.assertEqual(raised.exception.headers["Retry-After"], "60")
             payload = json.load(raised.exception)

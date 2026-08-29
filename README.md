@@ -124,6 +124,12 @@ Require bearer authentication for A2A message submission:
 PORTMARK_A2A_TOKEN=change-me PYTHONPATH=src python -m portmark.cli serve --port 8080
 ```
 
+The reference A2A server is loopback-only by default for public deployments.
+Front it with a production HTTP proxy such as the Nginx example in
+[`deploy/nginx/portmark.conf`](deploy/nginx/portmark.conf). Binding directly to
+a public interface requires `--allow-direct-a2a` or `PORTMARK_ALLOW_DIRECT_A2A=1`.
+The public Agent Card route is rate-limited separately from `/message:send`.
+
 The Agent Card is available at `/.well-known/agent-card.json`; signed envelopes are submitted to
 `/message:send` with the A2A JSON-RPC `message/send` method. See [A2A.md](A2A.md) for the Agent
 Card fields, request shape, authentication profile, and error behavior.

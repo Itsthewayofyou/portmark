@@ -22,6 +22,7 @@ def main() -> None:
     parser.add_argument("--log-level", help="logging level")
     parser.add_argument("--log-json", action="store_true", help="emit structured JSON logs")
     parser.add_argument("--enable-hsts", action="store_true", help="emit HSTS header when served behind HTTPS")
+    parser.add_argument("--allow-direct-a2a", action="store_true", help="allow the reference A2A server to bind to non-loopback interfaces")
     subparsers = parser.add_subparsers(dest="command", required=True)
     demo = subparsers.add_parser("demo")
     demo.add_argument("goal", nargs="?", default="find portable agent architecture references")
@@ -32,6 +33,8 @@ def main() -> None:
     server.add_argument("--a2a-max-concurrent-requests", type=int, help="maximum concurrent A2A message/send requests")
     server.add_argument("--a2a-rate-limit-per-ip", type=int, help="maximum A2A message/send requests per client IP window")
     server.add_argument("--a2a-rate-limit-window-seconds", type=int, help="A2A per-IP rate limit window in seconds")
+    server.add_argument("--a2a-agent-card-rate-limit-per-ip", type=int, help="maximum Agent Card GET requests per client IP window")
+    server.add_argument("--a2a-agent-card-rate-limit-window-seconds", type=int, help="Agent Card GET per-IP rate limit window in seconds")
     verify_audit = subparsers.add_parser("verify-audit")
     verify_audit.add_argument("--task-id", required=True, help="task id whose SQLite audit chain should be verified")
     args = parser.parse_args()
@@ -65,14 +68,17 @@ def main() -> None:
         print(json.dumps(asdict(result), indent=2))
     else:
         serve(
-            host,
-            args.bind,
-            args.port,
-            A2AAuthConfig(config.a2a_token) if config.a2a_token else None,
-            config.enable_hsts,
-            config.a2a_max_concurrent_requests,
-            config.a2a_rate_limit_per_ip,
-            config.a2a_rate_limit_window_seconds,
+            host=host,
+            bind=args.bind,
+            port=args.port,
+            auth=A2AAuthConfig(config.a2a_token) if config.a2a_token else None,
+            enable_hsts=config.enable_hsts,
+            max_concurrent_requests=config.a2a_max_concurrent_requests,
+            rate_limit_per_ip=config.a2a_rate_limit_per_ip,
+            rate_limit_window_seconds=config.a2a_rate_limit_window_seconds,
+            agent_card_rate_limit_per_ip=config.a2a_agent_card_rate_limit_per_ip,
+            agent_card_rate_limit_window_seconds=config.a2a_agent_card_rate_limit_window_seconds,
+            allow_direct_a2a=config.allow_direct_a2a,
         )
 
 

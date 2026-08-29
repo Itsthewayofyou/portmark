@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -22,6 +23,9 @@ MAX_REQUEST_BYTES = 1_000_000
 DEFAULT_MAX_CONCURRENT_REQUESTS = 32
 DEFAULT_RATE_LIMIT_PER_IP = 120
 DEFAULT_RATE_LIMIT_WINDOW_SECONDS = 60
+DEFAULT_AGENT_CARD_RATE_LIMIT_PER_IP = 240
+DEFAULT_AGENT_CARD_RATE_LIMIT_WINDOW_SECONDS = 60
+DEFAULT_RATE_LIMIT_TRACKED_CLIENTS = 8192
 BUSY_RESPONSE = (
     b"HTTP/1.1 503 Service Unavailable\r\n"
     b"Content-Type: application/json\r\n"
@@ -74,6 +78,40 @@ class A2AAuthConfig:
         return bool(self.bearer_token)
 
 
+class RateLimiter:
+    def __init__(
+        self,
+        limit_per_ip: int,
+        window_seconds: int,
+        max_tracked_clients: int = DEFAULT_RATE_LIMIT_TRACKED_CLIENTS,
+    ):
+        if limit_per_ip < 1:
+            raise ValueError("limit_per_ip must be at least 1")
+        if window_seconds < 1:
+            raise ValueError("window_seconds must be at least 1")
+        if max_tracked_clients < 1:
+            raise ValueError("max_tracked_clients must be at least 1")
+        self._limit_per_ip = limit_per_ip
+        self._window_seconds = window_seconds
+        self._max_tracked_clients = max_tracked_clients
+        self._lock = threading.Lock()
+        self._requests_by_ip: dict[str, deque[float]] = {}
+
+    def admit(self, client_ip: str) -> bool:
+        now = time.monotonic()
+        cutoff = now - self._window_seconds
+        with self._lock:
+            if client_ip not in self._requests_by_ip and len(self._requests_by_ip) >= self._max_tracked_clients:
+                self._requests_by_ip.pop(next(iter(self._requests_by_ip)))
+            requests = self._requests_by_ip.setdefault(client_ip, deque())
+            while requests and requests[0] <= cutoff:
+                requests.popleft()
+            if len(requests) >= self._limit_per_ip:
+                return False
+            requests.append(now)
+            return True
+
+
 class NetworkGuard:
     def __init__(
         self,
@@ -83,15 +121,8 @@ class NetworkGuard:
     ):
         if max_concurrent_requests < 1:
             raise ValueError("max_concurrent_requests must be at least 1")
-        if rate_limit_per_ip < 1:
-            raise ValueError("rate_limit_per_ip must be at least 1")
-        if rate_limit_window_seconds < 1:
-            raise ValueError("rate_limit_window_seconds must be at least 1")
         self._concurrency = threading.BoundedSemaphore(max_concurrent_requests)
-        self._rate_limit_per_ip = rate_limit_per_ip
-        self._rate_limit_window_seconds = rate_limit_window_seconds
-        self._lock = threading.Lock()
-        self._requests_by_ip: dict[str, deque[float]] = {}
+        self._rate_limiter = RateLimiter(rate_limit_per_ip, rate_limit_window_seconds)
 
     @contextmanager
     def admit(self, client_ip: str) -> Iterator[tuple[int, int, str] | None]:
@@ -99,24 +130,12 @@ class NetworkGuard:
             yield (503, -32003, "server busy")
             return
         try:
-            if self._rate_limited(client_ip):
+            if not self._rate_limiter.admit(client_ip):
                 yield (429, -32002, "rate limit exceeded")
                 return
             yield None
         finally:
             self._concurrency.release()
-
-    def _rate_limited(self, client_ip: str) -> bool:
-        now = time.monotonic()
-        cutoff = now - self._rate_limit_window_seconds
-        with self._lock:
-            requests = self._requests_by_ip.setdefault(client_ip, deque())
-            while requests and requests[0] <= cutoff:
-                requests.popleft()
-            if len(requests) >= self._rate_limit_per_ip:
-                return True
-            requests.append(now)
-            return False
 
 
 class BoundedThreadingHTTPServer(ThreadingHTTPServer):
@@ -158,9 +177,12 @@ def make_handler(
     max_concurrent_requests: int = DEFAULT_MAX_CONCURRENT_REQUESTS,
     rate_limit_per_ip: int = DEFAULT_RATE_LIMIT_PER_IP,
     rate_limit_window_seconds: int = DEFAULT_RATE_LIMIT_WINDOW_SECONDS,
+    agent_card_rate_limit_per_ip: int = DEFAULT_AGENT_CARD_RATE_LIMIT_PER_IP,
+    agent_card_rate_limit_window_seconds: int = DEFAULT_AGENT_CARD_RATE_LIMIT_WINDOW_SECONDS,
 ):
     auth_config = auth or A2AAuthConfig()
     network_guard = NetworkGuard(max_concurrent_requests, rate_limit_per_ip, rate_limit_window_seconds)
+    agent_card_limiter = RateLimiter(agent_card_rate_limit_per_ip, agent_card_rate_limit_window_seconds)
 
     class A2AHandler(BaseHTTPRequestHandler):
         server_version = "PortableAgentA2A/1.0"
@@ -185,6 +207,13 @@ def make_handler(
 
         def do_GET(self) -> None:
             if self.path == "/.well-known/agent-card.json":
+                if not agent_card_limiter.admit(self._client_ip()):
+                    self._json(
+                        429,
+                        error_response(None, -32002, "rate limit exceeded"),
+                        {"Retry-After": str(agent_card_rate_limit_window_seconds)},
+                    )
+                    return
                 self._json(200, make_agent_card(self._base_url(), auth_config.required))
             else:
                 self._json(404, {"error": "not found"})
@@ -257,6 +286,15 @@ def auth_from_environment() -> A2AAuthConfig:
     return A2AAuthConfig(os.environ.get("PORTMARK_A2A_TOKEN"))
 
 
+def is_loopback_bind(bind: str) -> bool:
+    if bind == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(bind).is_loopback
+    except ValueError:
+        return False
+
+
 def serve(
     host: AgentHost,
     bind: str,
@@ -266,7 +304,14 @@ def serve(
     max_concurrent_requests: int = DEFAULT_MAX_CONCURRENT_REQUESTS,
     rate_limit_per_ip: int = DEFAULT_RATE_LIMIT_PER_IP,
     rate_limit_window_seconds: int = DEFAULT_RATE_LIMIT_WINDOW_SECONDS,
+    agent_card_rate_limit_per_ip: int = DEFAULT_AGENT_CARD_RATE_LIMIT_PER_IP,
+    agent_card_rate_limit_window_seconds: int = DEFAULT_AGENT_CARD_RATE_LIMIT_WINDOW_SECONDS,
+    allow_direct_a2a: bool = False,
 ) -> None:
+    if not allow_direct_a2a and not is_loopback_bind(bind):
+        raise ValueError(
+            "A2A reference server must bind to loopback unless explicitly fronted or --allow-direct-a2a is set"
+        )
     BoundedThreadingHTTPServer(
         (bind, port),
         make_handler(
@@ -276,6 +321,8 @@ def serve(
             max_concurrent_requests,
             rate_limit_per_ip,
             rate_limit_window_seconds,
+            agent_card_rate_limit_per_ip,
+            agent_card_rate_limit_window_seconds,
         ),
         max_connections=max_concurrent_requests,
     ).serve_forever()
