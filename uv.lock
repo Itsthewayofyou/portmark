@@ -165,7 +165,7 @@ dependencies = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "cryptography", specifier = ">=42" }]
+requires-dist = [{ name = "cryptography", specifier = "==50.0.1" }]
 
 [[package]]
 name = "pycparser"

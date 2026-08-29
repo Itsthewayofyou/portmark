@@ -7,6 +7,8 @@ Portmark persists replay nonces, checkpoints, audit events, and audit heads thro
 - `InMemoryRuntimeStore`: default for tests and dependency-free demos.
 - `SQLiteRuntimeStore`: durable local store for production-like runs.
 
+`RuntimeStore` is the supported extension point for production databases. A replacement store must provide the same transaction boundary and observable behavior as `SQLiteRuntimeStore`: nonce consumption, audit append, checkpoint save, and audit-head update commit or roll back together; nonce values and `(task_id, sequence)` audit positions must be unique; `audit_head(task_id)` must return the next expected sequence; and `verify_audit_chain(task_id)` must return `False` for missing, incomplete, reordered, relinked, or hash-tampered histories.
+
 Use SQLite from the CLI:
 
 ```bash
@@ -22,7 +24,7 @@ PYTHONPATH=src python -m portmark.cli demo "research portable agents"
 
 ## Transactional Guarantees
 
-The SQLite store uses `BEGIN IMMEDIATE` for each runtime transaction. The host commits or rolls back these operations together:
+The SQLite store uses `BEGIN IMMEDIATE` for each runtime transaction and configures `PRAGMA busy_timeout = 30000` on store-created connections so concurrent writers wait for the active writer instead of failing immediately with `database is locked`. The host commits or rolls back these operations together:
 
 - Nonce consumption
 - New audit events
@@ -32,6 +34,8 @@ The SQLite store uses `BEGIN IMMEDIATE` for each runtime transaction. The host c
 If any write fails, the transaction is rolled back. For example, a duplicate audit event cannot leave behind a consumed nonce without a matching checkpoint and audit head.
 
 ## Tables
+
+The current SQLite schema version is stored in `PRAGMA user_version`. Version `2` is the current schema below. Opening a version `0` store runs the baseline table migration, version `1` stores are rebuilt so audit hash uniqueness is scoped to `(task_id, hash)`, and newer unsupported versions fail closed so an older runtime does not write to an unknown schema.
 
 `consumed_nonces`
 
@@ -51,7 +55,8 @@ If any write fails, the transaction is rolled back. For example, a duplicate aud
 `audit_events`
 
 - `(task_id, sequence)`: primary key
-- `hash`: unique
+- `(task_id, hash)`: unique
+- `hash`
 - `host_id`
 - `event`
 - `details_json`

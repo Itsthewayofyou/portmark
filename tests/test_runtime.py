@@ -1,9 +1,11 @@
 import copy
 import base64
 import concurrent.futures
+import io
 import json
 import logging
 import os
+import sqlite3
 import sys
 import tempfile
 import socket
@@ -13,13 +15,14 @@ import unittest
 import urllib.error
 import urllib.request
 from dataclasses import asdict
+from contextlib import redirect_stdout
 from http.client import HTTPResponse
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from portmark.a2a import A2AAuthConfig, envelope_from_dict, make_handler
+from portmark.a2a import A2AAuthConfig, BoundedThreadingHTTPServer, envelope_from_dict, make_handler
 from portmark.config import RuntimeConfig
 from portmark.factory import make_demo_envelope, make_host
 from portmark.logging_config import JsonLogFormatter
@@ -38,7 +41,10 @@ from portmark.security import (
     canonical_json,
     load_trust_registry,
 )
-from portmark.storage import SQLiteRuntimeStore
+from portmark.storage import SQLITE_BUSY_TIMEOUT_MS, SQLITE_SCHEMA_VERSION, SQLiteRuntimeStore
+from portmark.cli import main as cli_main
+from portmark.tools import ToolRegistry
+from fuzz_a2a_parser import run_fuzz_cases
 
 
 WASM_TOOL_REQUEST = "AGFzbQEAAAABCQFgBH9/f38BfgMCAQAFAwEAAQcTAgZtZW1vcnkCAAZyZXN1bWUAAAoLAQkAQu+AgICAAgsLdQEAQRALb3sib3V0Y29tZSI6InRvb2wiLCJyZXF1ZXN0Ijp7Im5hbWUiOiJjYXRhbG9nLnNlYXJjaCIsImFyZ3VtZW50c19qc29uIjoie1wicXVlcnlcIjpcImZyb20gd2FzbVwiLFwibGltaXRcIjozfSJ9fQ=="
@@ -85,6 +91,46 @@ class PaymentProvider(ModelProvider):
         return ProviderDecision("complete", content={"payment": state.memory["payments_reserve"]})
 
 
+class BlockingProvider(ModelProvider):
+    def __init__(self, entered, release):
+        self.entered = entered
+        self.release = release
+
+    def decide(self, state, available_tools):
+        self.entered.set()
+        self.release.wait(10)
+        return ProviderDecision("complete", content={"blocked": True})
+
+
+class LargeToolProvider(ModelProvider):
+    def decide(self, state, available_tools):
+        if "large" not in state.memory:
+            return ProviderDecision("tool", "large.output", {})
+        return ProviderDecision("complete", content={"large": state.memory["large"]})
+
+
+class DigestProvider(FixedProvider):
+    component_digest = "wasm:expected"
+
+
+class FakeHttpResponse:
+    def __init__(self, body):
+        self.body = body
+        self.read_size = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return None
+
+    def read(self, size=-1):
+        self.read_size = size
+        if size < 0:
+            return self.body
+        return self.body[:size]
+
+
 class RuntimeTests(unittest.TestCase):
     def test_demo_completes_with_audited_tool_call(self):
         host = make_host()
@@ -104,6 +150,9 @@ class RuntimeTests(unittest.TestCase):
             "PORTMARK_LOG_LEVEL": "DEBUG",
             "PORTMARK_LOG_JSON": "1",
             "PORTMARK_ENABLE_HSTS": "1",
+            "PORTMARK_A2A_MAX_CONCURRENT_REQUESTS": "12",
+            "PORTMARK_A2A_RATE_LIMIT_PER_IP": "34",
+            "PORTMARK_A2A_RATE_LIMIT_WINDOW_SECONDS": "56",
         }
         environment["PORTMARK_A2A_" + "TOKEN"] = "env-" + "token"
         with patch.dict(os.environ, environment, clear=True):
@@ -130,20 +179,32 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(config.a2a_token, "env-token")
         self.assertTrue(config.log_json)
         self.assertTrue(config.enable_hsts)
+        self.assertEqual(config.a2a_max_concurrent_requests, 12)
+        self.assertEqual(config.a2a_rate_limit_per_ip, 34)
+        self.assertEqual(config.a2a_rate_limit_window_seconds, 56)
 
     def test_json_log_formatter_emits_structured_internal_exception(self):
         formatter = JsonLogFormatter()
         try:
-            raise RuntimeError("internal failure")
+            raise RuntimeError("internal failure with signature='sig-secret'")
         except RuntimeError:
             record = logging.getLogger("portmark.test").makeRecord(
-                "portmark.test", logging.ERROR, __file__, 1, "operation failed", (), exc_info=sys.exc_info()
+                "portmark.test",
+                logging.ERROR,
+                __file__,
+                1,
+                "operation failed Authorization: Bearer token-secret PORTMARK_ED25519_PRIVATE_KEY_B64=key-secret",
+                (),
+                exc_info=sys.exc_info(),
             )
         payload = json.loads(formatter.format(record))
         self.assertEqual(payload["level"], "ERROR")
         self.assertEqual(payload["logger"], "portmark.test")
-        self.assertEqual(payload["message"], "operation failed")
+        self.assertEqual(payload["message"], "operation failed Authorization: Bearer [REDACTED] PORTMARK_ED25519_PRIVATE_KEY_B64=[REDACTED]")
         self.assertIn("RuntimeError", payload["exception"])
+        self.assertNotIn("token-secret", json.dumps(payload))
+        self.assertNotIn("key-secret", json.dumps(payload))
+        self.assertNotIn("sig-secret", json.dumps(payload))
 
     def test_external_trust_registry_allows_configured_signing_key(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -354,12 +415,164 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "http or https"):
             GenericHttpProvider("file:///tmp/provider.json")
 
+    def test_http_provider_bounds_response_before_json_parsing(self):
+        response = FakeHttpResponse(b'{"kind":"complete","content":{"ok":true}}')
+        with patch("urllib.request.urlopen", return_value=response):
+            decision = GenericHttpProvider("https://provider.example/run", max_response_bytes=64).decide(AgentState("task", "goal"), ())
+        self.assertEqual(response.read_size, 65)
+        self.assertEqual(decision.kind, "complete")
+        self.assertEqual(decision.content, {"ok": True})
+
+        response = FakeHttpResponse(b"x" * 65)
+        with patch("urllib.request.urlopen", return_value=response):
+            with self.assertRaisesRegex(SecurityError, "provider response exceeds"):
+                GenericHttpProvider("https://provider.example/run", max_response_bytes=64).decide(AgentState("task", "goal"), ())
+
+    def test_http_provider_sends_minimal_state_payload(self):
+        state = AgentState(
+            "task-1",
+            "sensitive goal",
+            step=2,
+            tool_calls=1,
+            memory={"private_note": "do not send"},
+            messages=[{"role": "tool", "content": "do not send"}],
+            status="running",
+            result={"private_note": "do not send"},
+        )
+        captured = {}
+
+        def capture(request, timeout):
+            captured["body"] = json.loads(request.data)
+            captured["timeout"] = timeout
+            return FakeHttpResponse(b'{"kind":"complete","content":{"ok":true}}')
+
+        with patch("urllib.request.urlopen", side_effect=capture):
+            decision = GenericHttpProvider("https://provider.example/run", timeout=7).decide(state, ("catalog.search",))
+
+        self.assertEqual(decision.kind, "complete")
+        self.assertEqual(captured["timeout"], 7)
+        self.assertEqual(captured["body"], {
+            "state": {
+                "task_id": "task-1",
+                "goal": "sensitive goal",
+                "step": 2,
+                "tool_calls": 1,
+                "status": "running",
+            },
+            "available_tools": ["catalog.search"],
+        })
+        self.assertNotIn("memory", captured["body"]["state"])
+        self.assertNotIn("messages", captured["body"]["state"])
+        self.assertNotIn("result", captured["body"]["state"])
+
+    def test_http_provider_rejects_malformed_response_shapes(self):
+        cases = [
+            (b"{", "malformed JSON"),
+            (b"[]", "JSON object"),
+            (b"{}", "kind"),
+            (b'{"kind":"unknown"}', "kind"),
+            (b'{"kind":"tool","tool":"","arguments":{}}', "tool name"),
+            (b'{"kind":"tool","tool":"catalog.search","arguments":[]}', "arguments"),
+            (b'{"kind":"migrate","destination":""}', "destination"),
+            (b'{"kind":"migrate","destination":"host:other","content":[]}', "content"),
+        ]
+        for body, message in cases:
+            with self.subTest(message=message):
+                with patch("urllib.request.urlopen", return_value=FakeHttpResponse(body)):
+                    with self.assertRaisesRegex(SecurityError, message):
+                        GenericHttpProvider("https://provider.example/run").decide(AgentState("task", "goal"), ("catalog.search",))
+
     def test_host_restricts_permit_more_than_agent_requests(self):
         host = make_host()
         host.providers["evil"] = FixedProvider(ProviderDecision("tool", "catalog.search", {"query": "x", "limit": 4}))
         envelope = make_demo_envelope(host, "search", "evil")
         with self.assertRaisesRegex(SecurityError, "maximum"):
             host.run(envelope)
+
+    def test_tool_registry_bounds_timeout_exceptions_serialization_and_output(self):
+        registry = ToolRegistry(default_timeout=0.01, max_output_bytes=64)
+        registry.register("slow.tool", lambda arguments: time.sleep(0.1) or {"ok": True})
+        registry.register("bad.tool", lambda arguments: (_ for _ in ()).throw(RuntimeError("internal failure")))
+        registry.register("raw.tool", lambda arguments: object())
+        registry.register("large.tool", lambda arguments: {"value": "x" * 128})
+        permit = Permit(
+            issuer="issuer",
+            subject="agent",
+            audience="host",
+            expires_at=int(time.time()) + 60,
+            nonce="nonce",
+            grants=(
+                ToolGrant("slow.tool"),
+                ToolGrant("bad.tool"),
+                ToolGrant("raw.tool"),
+                ToolGrant("large.tool"),
+            ),
+        )
+
+        for tool, message in [
+            ("slow.tool", "deadline"),
+            ("bad.tool", "tool execution failed"),
+            ("raw.tool", "not JSON serializable"),
+            ("large.tool", "output budget"),
+        ]:
+            with self.subTest(tool=tool):
+                with self.assertRaisesRegex(SecurityError, message):
+                    registry.invoke(permit, tool, {})
+
+    def test_host_rejects_oversized_tool_output_before_checkpointing_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(path)
+            tools = ToolRegistry()
+            tools.register("large.output", lambda arguments: {"payload": "x" * 2048})
+            host = make_host(store=store)
+            host.tools = tools
+            host.policy = HostPolicy(host.host_id, (ToolGrant("large.output"),), ResourceBudget(max_steps=6, max_tool_calls=2, max_output_bytes=1024))
+            host.providers["large"] = LargeToolProvider()
+            envelope = make_demo_envelope(host, "large output", "large")
+            object.__setattr__(envelope.manifest, "requested_tools", ("large.output",))
+            object.__setattr__(envelope.permit, "grants", (ToolGrant("large.output"),))
+            object.__setattr__(envelope.permit, "budget", ResourceBudget(max_steps=6, max_tool_calls=2, max_output_bytes=1024))
+            host.signer.seal(envelope)
+
+            result = host.run(envelope)
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(result.result, {"error": "tool execution failed"})
+            failed_events = [event for event in result.audit if event["event"] == "tool.failed"]
+            self.assertEqual(len(failed_events), 1)
+            self.assertEqual(failed_events[0]["details"]["error"], "tool output exceeds output budget")
+            checkpoint = store.load_checkpoint(envelope.state.task_id)
+            self.assertIsNotNone(checkpoint)
+            self.assertNotIn("large", checkpoint["memory"])
+            self.assertEqual(checkpoint["messages"], [])
+
+    def test_host_audits_tool_timeout_and_exception_as_failed_steps(self):
+        cases = [
+            ("slow.output", lambda arguments: time.sleep(0.1) or {"ok": True}, "tool execution exceeded its deadline", "Empty"),
+            ("bad.output", lambda arguments: (_ for _ in ()).throw(RuntimeError("internal failure")), "tool execution failed", "RuntimeError"),
+        ]
+        for tool_name, tool, message, cause in cases:
+            with self.subTest(tool=tool_name):
+                with tempfile.TemporaryDirectory() as directory:
+                    store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+                    tools = ToolRegistry(default_timeout=0.01)
+                    tools.register(tool_name, tool)
+                    host = make_host(store=store)
+                    host.tools = tools
+                    host.policy = HostPolicy(host.host_id, (ToolGrant(tool_name),), ResourceBudget())
+                    host.providers["tool-failure"] = FixedProvider(ProviderDecision("tool", tool_name, {}))
+                    envelope = make_demo_envelope(host, f"{tool_name} failure", "tool-failure")
+                    object.__setattr__(envelope.manifest, "requested_tools", (tool_name,))
+                    object.__setattr__(envelope.permit, "grants", (ToolGrant(tool_name),))
+                    host.signer.seal(envelope)
+
+                    result = host.run(envelope)
+                    self.assertEqual(result.status, "failed")
+                    self.assertEqual(result.result, {"error": "tool execution failed"})
+                    failed = next(event for event in result.audit if event["event"] == "tool.failed")
+                    self.assertEqual(failed["details"]["error"], message)
+                    self.assertEqual(failed["details"]["cause"], cause)
+                    self.assertEqual(store.load_checkpoint(result.task_id)["status"], "failed")
 
     def test_json_policy_loads_grants_impacts_version_and_hash(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -559,6 +772,239 @@ class RuntimeTests(unittest.TestCase):
             self.assertTrue(store.verify_audit_chain(result.task_id))
             self.assertEqual(store.audit_head(result.task_id), (result.audit[-1]["hash"], result.audit[-1]["sequence"] + 1))
 
+    def test_sqlite_store_sets_schema_version_busy_timeout_and_rejects_future_schema(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(path)
+            with sqlite3.connect(path) as connection:
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SQLITE_SCHEMA_VERSION)
+                connection.execute("PRAGMA user_version = 999")
+            with store._connect() as connection:
+                self.assertEqual(connection.execute("PRAGMA busy_timeout").fetchone()[0], SQLITE_BUSY_TIMEOUT_MS)
+            with self.assertRaisesRegex(RuntimeError, "newer than supported"):
+                SQLiteRuntimeStore(path)
+
+    def test_sqlite_store_migrates_legacy_v0_database_without_losing_existing_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime.sqlite"
+            with sqlite3.connect(path) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE consumed_nonces (
+                        nonce TEXT PRIMARY KEY,
+                        subject TEXT NOT NULL,
+                        audience TEXT NOT NULL,
+                        task_id TEXT NOT NULL,
+                        consumed_at INTEGER NOT NULL
+                    );
+                    CREATE TABLE checkpoints (
+                        task_id TEXT PRIMARY KEY,
+                        status TEXT NOT NULL,
+                        checkpoint_json TEXT NOT NULL,
+                        updated_at INTEGER NOT NULL
+                    );
+                    CREATE TABLE audit_events (
+                        task_id TEXT NOT NULL,
+                        sequence INTEGER NOT NULL,
+                        host_id TEXT NOT NULL,
+                        event TEXT NOT NULL,
+                        details_json TEXT NOT NULL,
+                        previous_hash TEXT NOT NULL,
+                        hash TEXT NOT NULL UNIQUE,
+                        created_at INTEGER NOT NULL,
+                        PRIMARY KEY (task_id, sequence)
+                    );
+                    CREATE TABLE audit_heads (
+                        task_id TEXT PRIMARY KEY,
+                        head_hash TEXT NOT NULL,
+                        sequence INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL
+                    );
+                    INSERT INTO consumed_nonces VALUES ('legacy-nonce', 'agent:demo', 'host:local-demo', 'task-legacy', 1);
+                    """
+                )
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 0)
+
+            store = SQLiteRuntimeStore(path)
+            self.assertTrue(store.consumed_nonce_exists("legacy-nonce"))
+            with sqlite3.connect(path) as connection:
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SQLITE_SCHEMA_VERSION)
+
+    def test_sqlite_store_migrates_v1_global_audit_hash_uniqueness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime.sqlite"
+            with sqlite3.connect(path) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE consumed_nonces (
+                        nonce TEXT PRIMARY KEY,
+                        subject TEXT NOT NULL,
+                        audience TEXT NOT NULL,
+                        task_id TEXT NOT NULL,
+                        consumed_at INTEGER NOT NULL
+                    );
+                    CREATE TABLE checkpoints (
+                        task_id TEXT PRIMARY KEY,
+                        status TEXT NOT NULL,
+                        checkpoint_json TEXT NOT NULL,
+                        updated_at INTEGER NOT NULL
+                    );
+                    CREATE TABLE audit_events (
+                        task_id TEXT NOT NULL,
+                        sequence INTEGER NOT NULL,
+                        host_id TEXT NOT NULL,
+                        event TEXT NOT NULL,
+                        details_json TEXT NOT NULL,
+                        previous_hash TEXT NOT NULL,
+                        hash TEXT NOT NULL UNIQUE,
+                        created_at INTEGER NOT NULL,
+                        PRIMARY KEY (task_id, sequence)
+                    );
+                    CREATE TABLE audit_heads (
+                        task_id TEXT PRIMARY KEY,
+                        head_hash TEXT NOT NULL,
+                        sequence INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL
+                    );
+                    PRAGMA user_version = 1;
+                    """
+                )
+
+            signer = EnvelopeSigner.generate("v1-migration-key", "host:local-demo", ("host:local-demo",))
+            store = SQLiteRuntimeStore(path)
+            self.assertEqual(store.audit_head("missing"), None)
+            first = make_host(signer=signer, store=store)
+            second = make_host(signer=signer, store=SQLiteRuntimeStore(path))
+            self.assertEqual(first.run(make_demo_envelope(first, "first migrated task")).status, "completed")
+            self.assertEqual(second.run(make_demo_envelope(second, "second migrated task")).status, "completed")
+            with sqlite3.connect(path) as connection:
+                indexes = {
+                    row[1]: connection.execute(f"PRAGMA index_info({row[1]})").fetchall()
+                    for row in connection.execute("PRAGMA index_list(audit_events)").fetchall()
+                    if row[2]
+                }
+            self.assertTrue(any([column[2] for column in columns] == ["task_id", "hash"] for columns in indexes.values()))
+
+    def test_sqlite_audit_chain_verifier_rejects_tampering_and_missing_chains(self):
+        cases = {
+            "mutated payload": "UPDATE audit_events SET details_json = '{\"tampered\":true}' WHERE task_id = ? AND sequence = 1",
+            "broken previous hash": "UPDATE audit_events SET previous_hash = 'broken' WHERE task_id = ? AND sequence = 1",
+            "deleted middle event": "DELETE FROM audit_events WHERE task_id = ? AND sequence = 1",
+            "reordered sequence": "UPDATE audit_events SET sequence = 99 WHERE task_id = ? AND sequence = 1",
+            "stale head": "UPDATE audit_heads SET head_hash = 'stale' WHERE task_id = ?",
+        }
+        for name, statement in cases.items():
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "runtime.sqlite"
+                    store = SQLiteRuntimeStore(path)
+                    host = make_host(store=store)
+                    result = host.run(make_demo_envelope(host, f"audit tamper {name}"))
+                    self.assertTrue(store.verify_audit_chain(result.task_id))
+                    with sqlite3.connect(path) as connection:
+                        connection.execute(statement, (result.task_id,))
+                    self.assertFalse(store.verify_audit_chain(result.task_id))
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            self.assertFalse(store.verify_audit_chain("missing-task"))
+
+    def test_verify_audit_cli_reports_valid_invalid_and_missing_chains(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(path)
+            host = make_host(store=store)
+            result = host.run(make_demo_envelope(host, "operator audit"))
+
+            output = io.StringIO()
+            with patch.object(sys, "argv", ["portmark", "--store-path", str(path), "verify-audit", "--task-id", result.task_id]):
+                with redirect_stdout(output):
+                    cli_main()
+            self.assertEqual(json.loads(output.getvalue()), {"task_id": result.task_id, "valid": True})
+
+            with sqlite3.connect(path) as connection:
+                connection.execute("UPDATE audit_heads SET head_hash = 'tampered' WHERE task_id = ?", (result.task_id,))
+            output = io.StringIO()
+            with patch.object(sys, "argv", ["portmark", "--store-path", str(path), "verify-audit", "--task-id", result.task_id]):
+                with redirect_stdout(output):
+                    with self.assertRaises(SystemExit) as raised:
+                        cli_main()
+            self.assertEqual(raised.exception.code, 1)
+            self.assertEqual(json.loads(output.getvalue()), {"task_id": result.task_id, "valid": False})
+
+            output = io.StringIO()
+            with patch.object(sys, "argv", ["portmark", "--store-path", str(path), "verify-audit", "--task-id", "missing-task"]):
+                with redirect_stdout(output):
+                    with self.assertRaises(SystemExit) as raised:
+                        cli_main()
+            self.assertEqual(raised.exception.code, 1)
+            self.assertEqual(json.loads(output.getvalue()), {"task_id": "missing-task", "valid": False})
+
+    def test_host_security_guards_are_directly_reachable(self):
+        host = make_host()
+        envelope = make_demo_envelope(host, "missing provider", "deterministic")
+        object.__setattr__(envelope.manifest, "provider", "missing")
+        host.signer.seal(envelope)
+        with self.assertRaisesRegex(SecurityError, "not configured"):
+            host.run(envelope)
+
+        host = make_host()
+        host.providers["digest"] = DigestProvider(ProviderDecision("complete", content={}))
+        envelope = make_demo_envelope(host, "digest mismatch", "digest")
+        object.__setattr__(envelope.manifest, "component_digest", "wasm:tampered")
+        host.signer.seal(envelope)
+        with self.assertRaisesRegex(SecurityError, "digest"):
+            host.run(envelope)
+
+        for decision, message, mutate in [
+            (ProviderDecision("tool"), "without a tool name", None),
+            (ProviderDecision("tool", "catalog.search", {"query": "x", "limit": 1}), "tool-call budget", lambda e: object.__setattr__(e.permit, "budget", ResourceBudget(max_steps=6, max_tool_calls=0))),
+            (ProviderDecision("migrate"), "lacks a destination", lambda e: object.__setattr__(e.permit, "delegation_allowed", True)),
+            (ProviderDecision("migrate", destination="host:destination"), "does not allow migration", None),
+            (ProviderDecision("migrate", destination="host:destination", content={"attestation": "bad"}), "attestation has invalid shape", lambda e: object.__setattr__(e.permit, "delegation_allowed", True)),
+        ]:
+            with self.subTest(message=message):
+                host = make_host()
+                host.providers["guard"] = FixedProvider(decision)
+                envelope = make_demo_envelope(host, message, "guard")
+                if mutate is not None:
+                    mutate(envelope)
+                host.signer.seal(envelope)
+                with self.assertRaisesRegex(SecurityError, message):
+                    host.run(envelope)
+
+        authority = ApprovalAuthority.generate()
+        host = make_host()
+        host.policy = HostPolicy(
+            host.host_id,
+            (ToolGrant("payments.reserve", {"max_amount": 100, "currency": "USD"}),),
+            ResourceBudget(),
+            "policy-v1",
+            "policy-hash",
+            {"payments.reserve": "external-payment"},
+            (authority.trusted_approver(),),
+        )
+        host.providers["payer"] = PaymentProvider()
+        envelope = make_demo_envelope(host, "bad approval", "payer")
+        object.__setattr__(envelope.permit, "grants", (ToolGrant("payments.reserve", {"max_amount": 100, "currency": "USD"}),))
+        envelope.state.memory["approvals"] = {"payments.reserve": "bad-shape"}
+        host.signer.seal(envelope)
+        with self.assertRaisesRegex(SecurityError, "approval token has invalid shape"):
+            host.run(envelope)
+
+    def test_stored_audit_head_mismatch_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            signer = EnvelopeSigner.generate("audit-head-key", "host:local-demo", ("host:local-demo",))
+            host = make_host(signer=signer, store=store)
+            result = host.run(make_demo_envelope(host, "stored head"))
+            envelope = make_demo_envelope(host, "bad head")
+            envelope.state.task_id = result.task_id
+            envelope.previous_audit_hash = "wrong-head"
+            signer.seal(envelope)
+            with self.assertRaisesRegex(SecurityError, "audit head"):
+                host.run(envelope)
+
     def test_sqlite_transaction_rolls_back_partial_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
@@ -628,6 +1074,43 @@ class RuntimeTests(unittest.TestCase):
                         outcomes.append("rejected")
             self.assertEqual(outcomes.count("completed"), 1)
             self.assertEqual(outcomes.count("rejected"), 1)
+
+    def test_sqlite_store_parallel_writers_keep_nonce_and_audit_sequences_consistent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime.sqlite"
+            signer = EnvelopeSigner.generate("parallel-key", "host:local-demo", ("host:local-demo",))
+            envelopes = []
+            for index in range(8):
+                host = make_host(signer=signer, store=SQLiteRuntimeStore(path))
+                envelopes.append(copy.deepcopy(make_demo_envelope(host, f"parallel {index}")))
+
+            def run_envelope(envelope):
+                local_host = make_host(signer=signer, store=SQLiteRuntimeStore(path))
+                return local_host.run(envelope)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                results = list(executor.map(run_envelope, envelopes))
+
+            self.assertEqual([result.status for result in results], ["completed"] * len(envelopes))
+            store = SQLiteRuntimeStore(path)
+            nonces_by_task = {envelope.state.task_id: envelope.permit.nonce for envelope in envelopes}
+            for result in results:
+                self.assertTrue(store.verify_audit_chain(result.task_id))
+                self.assertTrue(store.consumed_nonce_exists(nonces_by_task[result.task_id]))
+            with sqlite3.connect(path) as connection:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM consumed_nonces").fetchone()[0], len(envelopes))
+                rows = connection.execute(
+                    """
+                    SELECT task_id, COUNT(*) AS count, MIN(sequence) AS first_sequence, MAX(sequence) AS last_sequence
+                    FROM audit_events
+                    GROUP BY task_id
+                    """
+                ).fetchall()
+            self.assertEqual(len(rows), len(envelopes))
+            for task_id, count, first_sequence, last_sequence in rows:
+                with self.subTest(task_id=task_id):
+                    self.assertEqual(first_sequence, 0)
+                    self.assertEqual(last_sequence, count - 1)
 
     def test_delegated_migration_resumes_on_destination(self):
         signer = EnvelopeSigner.generate("source-key", "host:source", ("host:source", "host:destination"))
@@ -816,6 +1299,20 @@ class RuntimeTests(unittest.TestCase):
             cases = [
                 (b"{", {"Content-Type": "application/json"}, 400, -32700),
                 (json.dumps({"jsonrpc": "2.0", "id": "bad-method", "method": "tasks/get", "params": {}}).encode(), {"Content-Type": "application/json"}, 400, -32601),
+                (
+                    json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": "bad-envelope",
+                        "method": "message/send",
+                        "params": {
+                            "message": {"messageId": "msg-1", "role": "user", "parts": [{"kind": "text", "text": "run"}]},
+                            "metadata": {"portmark_envelope": {"signature": "broken"}},
+                        },
+                    }).encode(),
+                    {"Content-Type": "application/json"},
+                    400,
+                    -32602,
+                ),
                 (b"{}", {"Content-Type": "text/plain"}, 415, -32600),
             ]
             for body, headers, status, code in cases:
@@ -832,6 +1329,82 @@ class RuntimeTests(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+    def test_a2a_parser_fuzz_target_fails_closed(self):
+        run_fuzz_cases(iterations=200)
+
+    def test_a2a_rate_limits_message_submissions_per_ip(self):
+        host = make_host()
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(host, rate_limit_per_ip=1, rate_limit_window_seconds=60))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_port}"
+        try:
+            first = urllib.request.Request(
+                base + "/message:send",
+                data=self._a2a_request_body(host, "first limited task"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(first) as response:  # nosec B310
+                self.assertEqual(json.load(response)["result"]["status"]["state"], "completed")
+
+            second = urllib.request.Request(
+                base + "/message:send",
+                data=self._a2a_request_body(host, "second limited task"),
+                headers={"Content-Type": "application/json"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                urllib.request.urlopen(second)  # nosec B310
+            self.assertEqual(raised.exception.code, 429)
+            self.assertEqual(raised.exception.headers["Retry-After"], "60")
+            payload = json.load(raised.exception)
+            self.assertEqual(payload["error"], {"code": -32002, "message": "rate limit exceeded"})
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_a2a_connection_cap_rejects_saturated_message_submissions(self):
+        host = make_host()
+        entered = threading.Event()
+        release = threading.Event()
+        host.providers["blocker"] = BlockingProvider(entered, release)
+        server = BoundedThreadingHTTPServer(
+            ("127.0.0.1", 0),
+            make_handler(host, max_concurrent_requests=100, rate_limit_per_ip=100),
+            max_connections=1,
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_port}"
+
+        def submit_blocking_request():
+            request = urllib.request.Request(
+                base + "/message:send",
+                data=self._a2a_request_body(host, "blocking task", make_demo_envelope(host, "blocking task", "blocker")),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(request) as response:  # nosec B310
+                return json.load(response)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(submit_blocking_request)
+            try:
+                self.assertTrue(entered.wait(5))
+                second = urllib.request.Request(
+                    base + "/message:send",
+                    data=self._a2a_request_body(host, "busy task"),
+                    headers={"Content-Type": "application/json"},
+                )
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(second)  # nosec B310
+                self.assertEqual(raised.exception.code, 503)
+                payload = json.load(raised.exception)
+                self.assertEqual(payload["error"], {"code": -32003, "message": "server busy"})
+            finally:
+                release.set()
+                server.shutdown()
+                server.server_close()
+            self.assertEqual(future.result(timeout=10)["result"]["status"]["state"], "completed")
 
     def _oversized_rejection(self, port):
         """Declare an oversized body in the headers without sending one.

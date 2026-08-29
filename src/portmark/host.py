@@ -7,9 +7,9 @@ from typing import Any
 
 from .models import AgentEnvelope, ApprovalToken, AttestationEvidence, ProviderDecision, RunResult
 from .providers import ModelProvider
-from .security import AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, SecurityError, arguments_hash
+from .security import AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, SecurityError, arguments_hash, canonical_json
 from .storage import InMemoryRuntimeStore, RuntimeStore
-from .tools import ToolRegistry
+from .tools import ToolExecutionError, ToolRegistry
 
 
 class AgentHost:
@@ -92,7 +92,23 @@ class AgentHost:
             approval_result = self._approval_gate(active_policy, effective, state, decision, audit)
             if approval_result is not None:
                 return approval_result
-            result = self.tools.invoke(effective, decision.tool, decision.arguments)
+            try:
+                result = self.tools.invoke(effective, decision.tool, decision.arguments, effective.budget.max_output_bytes)
+            except ToolExecutionError as error:
+                state.status = "failed"
+                state.result = {"error": "tool execution failed"}
+                audit.append(
+                    "tool.failed",
+                    {
+                        "tool": decision.tool,
+                        "arguments": decision.arguments,
+                        "error": str(error),
+                        "cause": type(error.__cause__).__name__ if error.__cause__ is not None else None,
+                        "cause_message": str(error.__cause__) if error.__cause__ is not None else "",
+                    },
+                )
+                audit.append("agent.failed", state.result)
+                return True, None
             state.tool_calls += 1
             state.memory[decision.tool.removesuffix(".search").replace(".", "_")] = result
             if decision.tool == "catalog.search":
@@ -217,7 +233,7 @@ class AgentHost:
 
     def _result(self, envelope, audit, migration=None):
         checkpoint = asdict(envelope.state)
-        encoded_size = len(str(checkpoint).encode())
+        encoded_size = len(canonical_json(checkpoint))
         if encoded_size > envelope.permit.budget.max_output_bytes:
             raise SecurityError("checkpoint exceeds output budget")
         return RunResult(envelope.state.status, envelope.state.task_id, envelope.state.result, checkpoint, audit.events, migration)
@@ -241,7 +257,7 @@ class AgentHost:
         consume_nonce: str | None = None,
     ) -> int:
         checkpoint = asdict(state)
-        encoded_size = len(str(checkpoint).encode())
+        encoded_size = len(canonical_json(checkpoint))
         if encoded_size > envelope.permit.budget.max_output_bytes:
             raise SecurityError("checkpoint exceeds output budget")
         with self.store.transaction() as transaction:

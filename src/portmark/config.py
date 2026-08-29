@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from .a2a import DEFAULT_MAX_CONCURRENT_REQUESTS, DEFAULT_RATE_LIMIT_PER_IP, DEFAULT_RATE_LIMIT_WINDOW_SECONDS
+
 
 @dataclass(frozen=True)
 class RuntimeConfig:
@@ -17,6 +19,9 @@ class RuntimeConfig:
     log_level: str = "INFO"
     log_json: bool = False
     enable_hsts: bool = False
+    a2a_max_concurrent_requests: int = DEFAULT_MAX_CONCURRENT_REQUESTS
+    a2a_rate_limit_per_ip: int = DEFAULT_RATE_LIMIT_PER_IP
+    a2a_rate_limit_window_seconds: int = DEFAULT_RATE_LIMIT_WINDOW_SECONDS
 
     @classmethod
     def from_environment(cls) -> "RuntimeConfig":
@@ -32,6 +37,9 @@ class RuntimeConfig:
             log_level=os.environ.get("PORTMARK_LOG_LEVEL", "INFO"),
             log_json=os.environ.get("PORTMARK_LOG_JSON") == "1",
             enable_hsts=os.environ.get("PORTMARK_ENABLE_HSTS") == "1",
+            a2a_max_concurrent_requests=int(os.environ.get("PORTMARK_A2A_MAX_CONCURRENT_REQUESTS", DEFAULT_MAX_CONCURRENT_REQUESTS)),
+            a2a_rate_limit_per_ip=int(os.environ.get("PORTMARK_A2A_RATE_LIMIT_PER_IP", DEFAULT_RATE_LIMIT_PER_IP)),
+            a2a_rate_limit_window_seconds=int(os.environ.get("PORTMARK_A2A_RATE_LIMIT_WINDOW_SECONDS", DEFAULT_RATE_LIMIT_WINDOW_SECONDS)),
         )
 
     def merged_with_args(self, args) -> "RuntimeConfig":
@@ -47,4 +55,7 @@ class RuntimeConfig:
             log_level=args.log_level or self.log_level,
             log_json=bool(args.log_json or self.log_json),
             enable_hsts=bool(args.enable_hsts or self.enable_hsts),
+            a2a_max_concurrent_requests=getattr(args, "a2a_max_concurrent_requests", None) or self.a2a_max_concurrent_requests,
+            a2a_rate_limit_per_ip=getattr(args, "a2a_rate_limit_per_ip", None) or self.a2a_rate_limit_per_ip,
+            a2a_rate_limit_window_seconds=getattr(args, "a2a_rate_limit_window_seconds", None) or self.a2a_rate_limit_window_seconds,
         )

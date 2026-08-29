@@ -55,11 +55,28 @@ Authorization: Bearer <token>
 
 Authentication is checked before JSON parsing, envelope deserialization, or host execution. Missing or invalid credentials receive a generic JSON-RPC error with HTTP 401.
 
+## Network Limits
+
+`POST /message:send` is bounded before envelope parsing and host execution:
+
+- `PORTMARK_A2A_MAX_CONCURRENT_REQUESTS` / `--a2a-max-concurrent-requests`
+  caps concurrent message submissions. Saturated servers return HTTP 503 with a
+  generic JSON-RPC error.
+- `PORTMARK_A2A_RATE_LIMIT_PER_IP` / `--a2a-rate-limit-per-ip` caps accepted
+  message submissions per client IP.
+- `PORTMARK_A2A_RATE_LIMIT_WINDOW_SECONDS` /
+  `--a2a-rate-limit-window-seconds` sets the per-IP rate-limit window.
+
+Oversized submissions are still rejected from `Content-Length` alone before the
+server reads the request body.
+
 ## Rejection Behavior
 
 The adapter fails closed for:
 
 - missing or invalid bearer auth
+- saturated concurrent request capacity
+- per-IP rate-limit exhaustion
 - wrong content type
 - malformed JSON
 - unsupported JSON-RPC methods

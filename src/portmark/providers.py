@@ -13,6 +13,7 @@ from typing import Any
 
 from .component_bindings import component_checkpoint, component_context, decode_component_decision, encode_component_input
 from .models import AgentState, ProviderDecision
+from .security import SecurityError
 
 
 class ModelProvider(ABC):
@@ -36,30 +37,66 @@ class DeterministicProvider(ModelProvider):
 class GenericHttpProvider(ModelProvider):
     """Provider-neutral JSON adapter for a local or remote model gateway."""
 
-    def __init__(self, endpoint: str, bearer_token: str | None = None, timeout: float = 30.0) -> None:
+    def __init__(self, endpoint: str, bearer_token: str | None = None, timeout: float = 30.0, max_response_bytes: int = 65_536) -> None:
         scheme = urlparse(endpoint).scheme
         if scheme not in {"http", "https"}:
             raise ValueError("provider endpoint must use http or https")
         self.endpoint = endpoint
         self.bearer_token = bearer_token
         self.timeout = timeout
+        self.max_response_bytes = max_response_bytes
 
     def decide(self, state: AgentState, available_tools: tuple[str, ...]) -> ProviderDecision:
-        body = json.dumps({"state": state.__dict__, "available_tools": available_tools}).encode()
+        body = json.dumps({"state": _provider_state(state), "available_tools": available_tools}).encode()
         headers = {"Content-Type": "application/json"}
         if self.bearer_token:
             headers["Authorization"] = f"Bearer {self.bearer_token}"
         request = urllib.request.Request(self.endpoint, data=body, headers=headers, method="POST")
         # Endpoint scheme is validated at initialization.
         with urllib.request.urlopen(request, timeout=self.timeout) as response:  # nosec B310
-            value: dict[str, Any] = json.load(response)
-        return ProviderDecision(
-            kind=value["kind"],
-            tool=value.get("tool"),
-            arguments=value.get("arguments", {}),
-            content=value.get("content"),
-            destination=value.get("destination"),
-        )
+            raw = response.read(self.max_response_bytes + 1)
+        if len(raw) > self.max_response_bytes:
+            raise SecurityError("provider response exceeds output limit")
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError as error:
+            raise SecurityError("provider response is malformed JSON") from error
+        return _provider_decision(value)
+
+
+def _provider_state(state: AgentState) -> dict[str, Any]:
+    return {
+        "task_id": state.task_id,
+        "goal": state.goal,
+        "step": state.step,
+        "tool_calls": state.tool_calls,
+        "status": state.status,
+    }
+
+
+def _provider_decision(value: Any) -> ProviderDecision:
+    if not isinstance(value, dict):
+        raise SecurityError("provider response must be a JSON object")
+    kind = value.get("kind")
+    if kind == "tool":
+        tool = value.get("tool")
+        if not isinstance(tool, str) or not tool:
+            raise SecurityError("provider tool decision has an invalid tool name")
+        arguments = value.get("arguments", {})
+        if not isinstance(arguments, dict):
+            raise SecurityError("provider tool decision arguments must be a JSON object")
+        return ProviderDecision("tool", tool=tool, arguments=arguments, content=value.get("content"), destination=value.get("destination"))
+    if kind in {"complete", "await_input", "fail"}:
+        return ProviderDecision(kind, content=value.get("content"))
+    if kind == "migrate":
+        destination = value.get("destination")
+        if not isinstance(destination, str) or not destination:
+            raise SecurityError("provider migration decision has an invalid destination")
+        content = value.get("content")
+        if content is not None and not isinstance(content, dict):
+            raise SecurityError("provider migration decision content must be a JSON object")
+        return ProviderDecision("migrate", content=content, destination=destination)
+    raise SecurityError("provider response kind is not supported")
 
 
 class WasmDecisionProvider(ModelProvider):

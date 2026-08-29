@@ -15,6 +15,10 @@ from .models import AgentState
 from .security import SecurityError, canonical_json
 
 
+SQLITE_SCHEMA_VERSION = 2
+SQLITE_BUSY_TIMEOUT_MS = 30_000
+
+
 class RuntimeTransaction(Protocol):
     def consume_nonce(self, nonce: str, subject: str, audience: str, task_id: str) -> None:
         ...
@@ -72,9 +76,11 @@ class InMemoryRuntimeStore:
     def verify_audit_chain(self, task_id: str) -> bool:
         with self._lock:
             events = self._audit_events.get(task_id, [])
-            previous = events[0]["previous"] if events else ""
-            for event in events:
-                if event["previous"] != previous:
+            if not events:
+                return False
+            previous = events[0]["previous"]
+            for expected_sequence, event in enumerate(events):
+                if event["sequence"] != expected_sequence or event["previous"] != previous:
                     return False
                 record = {
                     "sequence": event["sequence"],
@@ -145,46 +151,95 @@ class SQLiteRuntimeStore:
         connection = sqlite3.connect(self.path, timeout=30, isolation_level=None)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
         connection.execute("PRAGMA journal_mode = WAL")
         return connection
 
     def _initialize(self) -> None:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
-            connection.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS consumed_nonces (
-                    nonce TEXT PRIMARY KEY,
-                    subject TEXT NOT NULL,
-                    audience TEXT NOT NULL,
-                    task_id TEXT NOT NULL,
-                    consumed_at INTEGER NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS checkpoints (
-                    task_id TEXT PRIMARY KEY,
-                    status TEXT NOT NULL,
-                    checkpoint_json TEXT NOT NULL,
-                    updated_at INTEGER NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS audit_events (
-                    task_id TEXT NOT NULL,
-                    sequence INTEGER NOT NULL,
-                    host_id TEXT NOT NULL,
-                    event TEXT NOT NULL,
-                    details_json TEXT NOT NULL,
-                    previous_hash TEXT NOT NULL,
-                    hash TEXT NOT NULL UNIQUE,
-                    created_at INTEGER NOT NULL,
-                    PRIMARY KEY (task_id, sequence)
-                );
-                CREATE TABLE IF NOT EXISTS audit_heads (
-                    task_id TEXT PRIMARY KEY,
-                    head_hash TEXT NOT NULL,
-                    sequence INTEGER NOT NULL,
-                    updated_at INTEGER NOT NULL
-                );
-                """
-            )
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version > SQLITE_SCHEMA_VERSION:
+                raise RuntimeError(f"SQLite store schema version {version} is newer than supported version {SQLITE_SCHEMA_VERSION}")
+            if version == 0:
+                self._migrate_to_v1(connection)
+                version = 1
+            while version < SQLITE_SCHEMA_VERSION:
+                version = self._run_migration(connection, version)
+
+    def _run_migration(self, connection: sqlite3.Connection, version: int) -> int:
+        migrations = {
+            0: self._migrate_to_v1,
+            1: self._migrate_to_v2,
+        }
+        migration = migrations.get(version)
+        if migration is None:
+            raise RuntimeError(f"SQLite store has no migration from schema version {version}")
+        migration(connection)
+        return int(connection.execute("PRAGMA user_version").fetchone()[0])
+
+    def _migrate_to_v1(self, connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS consumed_nonces (
+                nonce TEXT PRIMARY KEY,
+                subject TEXT NOT NULL,
+                audience TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                consumed_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS checkpoints (
+                task_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                checkpoint_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS audit_events (
+                task_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                host_id TEXT NOT NULL,
+                event TEXT NOT NULL,
+                details_json TEXT NOT NULL,
+                previous_hash TEXT NOT NULL,
+                hash TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (task_id, sequence),
+                UNIQUE (task_id, hash)
+            );
+            CREATE TABLE IF NOT EXISTS audit_heads (
+                task_id TEXT PRIMARY KEY,
+                head_hash TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            PRAGMA user_version = 1;
+            """
+        )
+
+    def _migrate_to_v2(self, connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            """
+            CREATE TABLE audit_events_v2 (
+                task_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                host_id TEXT NOT NULL,
+                event TEXT NOT NULL,
+                details_json TEXT NOT NULL,
+                previous_hash TEXT NOT NULL,
+                hash TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (task_id, sequence),
+                UNIQUE (task_id, hash)
+            );
+            INSERT INTO audit_events_v2
+                (task_id, sequence, host_id, event, details_json, previous_hash, hash, created_at)
+            SELECT task_id, sequence, host_id, event, details_json, previous_hash, hash, created_at
+            FROM audit_events;
+            DROP TABLE audit_events;
+            ALTER TABLE audit_events_v2 RENAME TO audit_events;
+            PRAGMA user_version = 2;
+            """
+        )
 
     def transaction(self) -> AbstractContextManager[RuntimeTransaction]:
         return _SQLiteTransaction(self)
@@ -210,6 +265,12 @@ class SQLiteRuntimeStore:
                 "SELECT sequence, event, details_json, previous_hash, hash FROM audit_events WHERE task_id = ? ORDER BY sequence",
                 (task_id,),
             ).fetchall()
+            head = connection.execute(
+                "SELECT head_hash, sequence FROM audit_heads WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        if not rows or head is None:
+            return False
         previous = rows[0]["previous_hash"] if rows else ""
         for expected_sequence, row in enumerate(rows):
             if row["sequence"] != expected_sequence or row["previous_hash"] != previous:
@@ -223,7 +284,7 @@ class SQLiteRuntimeStore:
             if row["hash"] != _audit_hash(record):
                 return False
             previous = row["hash"]
-        return True
+        return head["head_hash"] == previous and int(head["sequence"]) == len(rows)
 
 
 class _SQLiteTransaction:

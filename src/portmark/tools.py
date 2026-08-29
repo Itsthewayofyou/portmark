@@ -1,26 +1,37 @@
 from __future__ import annotations
 
+import queue
+import threading
 from collections.abc import Callable
 from typing import Any
 
 from .models import Permit
-from .security import SecurityError, check_constraints
+from .security import SecurityError, canonical_json, check_constraints
 
 
 Tool = Callable[[dict[str, Any]], Any]
 
 
-class ToolRegistry:
-    def __init__(self) -> None:
-        self._tools: dict[str, Tool] = {}
+class ToolExecutionError(SecurityError):
+    pass
 
-    def register(self, name: str, tool: Tool) -> None:
+
+class ToolRegistry:
+    def __init__(self, default_timeout: float = 5.0, max_output_bytes: int = 65_536) -> None:
+        self._tools: dict[str, Tool] = {}
+        self._timeouts: dict[str, float] = {}
+        self.default_timeout = default_timeout
+        self.max_output_bytes = max_output_bytes
+
+    def register(self, name: str, tool: Tool, timeout: float | None = None) -> None:
         self._tools[name] = tool
+        if timeout is not None:
+            self._timeouts[name] = timeout
 
     def names(self) -> tuple[str, ...]:
         return tuple(sorted(self._tools))
 
-    def invoke(self, permit: Permit, name: str, arguments: dict[str, Any]) -> Any:
+    def invoke(self, permit: Permit, name: str, arguments: dict[str, Any], max_output_bytes: int | None = None) -> Any:
         grant = next((grant for grant in permit.grants if grant.name == name), None)
         if grant is None:
             raise SecurityError(f"tool {name!r} was not granted")
@@ -28,7 +39,31 @@ class ToolRegistry:
         if tool is None:
             raise SecurityError(f"tool {name!r} is not installed")
         check_constraints(grant.constraints, arguments)
-        return tool(arguments)
+        timeout = self._timeouts.get(name, self.default_timeout)
+        result_queue: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+        def run_tool() -> None:
+            try:
+                result_queue.put((True, tool(arguments)))
+            except Exception as error:
+                result_queue.put((False, error))
+
+        thread = threading.Thread(target=run_tool, daemon=True)
+        thread.start()
+        try:
+            succeeded, value = result_queue.get(timeout=timeout)
+        except queue.Empty as error:
+            raise ToolExecutionError("tool execution exceeded its deadline") from error
+        if not succeeded:
+            raise ToolExecutionError("tool execution failed") from value
+        result = value
+        try:
+            encoded_size = len(canonical_json(result))
+        except (TypeError, ValueError) as error:
+            raise ToolExecutionError("tool output is not JSON serializable") from error
+        if encoded_size > (max_output_bytes if max_output_bytes is not None else self.max_output_bytes):
+            raise ToolExecutionError("tool output exceeds output budget")
+        return result
 
 
 def demo_registry() -> ToolRegistry:
@@ -48,4 +83,3 @@ def demo_registry() -> ToolRegistry:
     registry.register("catalog.search", search)
     registry.register("payments.reserve", reserve)
     return registry
-
