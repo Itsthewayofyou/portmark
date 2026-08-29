@@ -65,7 +65,8 @@ def make_host(
     )
     configured_store = store
     if configured_store is None and os.environ.get("PORTMARK_STORE_PATH"):
-        configured_store = SQLiteRuntimeStore(os.environ["PORTMARK_STORE_PATH"])
+        audit_verifier = load_trust_registry(configured_trust_registry_path) if configured_trust_registry_path else None
+        configured_store = SQLiteRuntimeStore(os.environ["PORTMARK_STORE_PATH"], audit_verifier)
     return AgentHost(
         host_id,
         signer or signer_from_environment(host_id, configured_trust_registry_path),

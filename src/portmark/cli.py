@@ -35,11 +35,13 @@ def main() -> None:
     verify_audit = subparsers.add_parser("verify-audit")
     verify_audit.add_argument("--task-id", required=True, help="task id whose SQLite audit chain should be verified")
     args = parser.parse_args()
+    from .security import load_trust_registry
     from .storage import SQLiteRuntimeStore
 
     config = RuntimeConfig.from_environment().merged_with_args(args)
     configure_logging(config.log_level, config.log_json)
-    store = SQLiteRuntimeStore(config.store_path) if config.store_path else None
+    audit_verifier = load_trust_registry(config.trust_registry_path) if config.trust_registry_path else None
+    store = SQLiteRuntimeStore(config.store_path, audit_verifier) if config.store_path else None
     if args.command == "verify-audit":
         if store is None:
             parser.error("verify-audit requires --store-path or PORTMARK_STORE_PATH")

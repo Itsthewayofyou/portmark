@@ -32,12 +32,23 @@ The host passes:
     "world": "portmark",
     "abi": "portmark-json-lowered-v1"
   },
-  "state": {},
+  "state": {
+    "task_id": "...",
+    "goal": "...",
+    "step": 1,
+    "tool_calls": 1,
+    "status": "running",
+    "messages": [
+      {"role": "tool", "name": "catalog.search", "content": [{"id": "doc-1", "title": "..."}]}
+    ]
+  },
   "available_tools": ["catalog.search"]
 }
 ```
 
-`state` is the current `AgentState`. `available_tools` is already narrowed by the effective host permit.
+`state` is the same projected provider state used for remote HTTP providers. It includes scalar run
+metadata and host-policy-projected tool messages only. Raw checkpoint `memory` and `result` are not
+sent to the capsule. `available_tools` is already narrowed by the effective host permit.
 
 ## Checkpoint JSON
 
@@ -46,14 +57,16 @@ The host passes:
 ```json
 {
   "task_id": "...",
-  "step": 0,
-  "tool_calls": 0,
-  "memory": {},
-  "messages": []
+  "step": 1,
+  "tool_calls": 1,
+  "messages": [
+    {"role": "tool", "name": "catalog.search", "content": [{"id": "doc-1", "title": "..."}]}
+  ]
 }
 ```
 
-Native stacks, threads, sockets, file descriptors, and process state do not cross hosts. Capsules resume from explicit checkpoint data only.
+Native stacks, threads, sockets, file descriptors, full memory, and process state do not cross hosts.
+Capsules resume from explicit, projected checkpoint data only.
 
 ## Outcome JSON
 

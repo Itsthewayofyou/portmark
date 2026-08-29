@@ -9,21 +9,22 @@ from contextlib import AbstractContextManager
 from dataclasses import asdict
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from .models import AgentState
-from .security import SecurityError, canonical_json
+from .security import AuditHeadVerifier, SecurityError, audit_head_payload, canonical_json
 
 
-SQLITE_SCHEMA_VERSION = 2
+SQLITE_SCHEMA_VERSION = 3
 SQLITE_BUSY_TIMEOUT_MS = 30_000
+AuditHeadSigner = Callable[[str, int], tuple[str, str]]
 
 
 class RuntimeTransaction(Protocol):
     def consume_nonce(self, nonce: str, subject: str, audience: str, task_id: str) -> None:
         ...
 
-    def append_audit_events(self, task_id: str, host_id: str, events: tuple[dict[str, Any], ...]) -> None:
+    def append_audit_events(self, task_id: str, host_id: str, events: tuple[dict[str, Any], ...], sign_head: AuditHeadSigner | None = None) -> None:
         ...
 
     def save_checkpoint(self, task_id: str, state: AgentState) -> None:
@@ -53,6 +54,11 @@ class InMemoryRuntimeStore:
         self._nonces: dict[str, dict[str, Any]] = {}
         self._checkpoints: dict[str, dict[str, Any]] = {}
         self._audit_events: dict[str, list[dict[str, Any]]] = {}
+        self._audit_heads: dict[str, dict[str, Any]] = {}
+        self._audit_head_verifier: AuditHeadVerifier | None = None
+
+    def set_audit_head_verifier(self, verifier: AuditHeadVerifier) -> None:
+        self._audit_head_verifier = verifier
 
     def transaction(self) -> AbstractContextManager[RuntimeTransaction]:
         return _InMemoryTransaction(self)
@@ -69,14 +75,16 @@ class InMemoryRuntimeStore:
     def audit_head(self, task_id: str) -> tuple[str, int] | None:
         with self._lock:
             events = self._audit_events.get(task_id)
-            if not events:
+            head = self._audit_heads.get(task_id)
+            if not events or head is None:
                 return None
-            return events[-1]["hash"], events[-1]["sequence"] + 1
+            return head["head_hash"], head["sequence"]
 
     def verify_audit_chain(self, task_id: str) -> bool:
         with self._lock:
             events = self._audit_events.get(task_id, [])
-            if not events:
+            head = self._audit_heads.get(task_id)
+            if not events or head is None:
                 return False
             previous = events[0]["previous"]
             for expected_sequence, event in enumerate(events):
@@ -91,13 +99,15 @@ class InMemoryRuntimeStore:
                 if event["hash"] != _audit_hash(record):
                     return False
                 previous = event["hash"]
-            return True
+            if head["head_hash"] != previous or head["sequence"] != len(events):
+                return False
+            return _verify_head_signature(self._audit_head_verifier, task_id, head)
 
 
 class _InMemoryTransaction:
     def __init__(self, store: InMemoryRuntimeStore) -> None:
         self._store = store
-        self._snapshots: tuple[dict[str, Any], dict[str, Any], dict[str, list[dict[str, Any]]]] | None = None
+        self._snapshots: tuple[dict[str, Any], dict[str, Any], dict[str, list[dict[str, Any]]], dict[str, dict[str, Any]]] | None = None
 
     def __enter__(self) -> "_InMemoryTransaction":
         self._store._lock.acquire()
@@ -105,12 +115,13 @@ class _InMemoryTransaction:
             dict(self._store._nonces),
             json.loads(json.dumps(self._store._checkpoints)),
             json.loads(json.dumps(self._store._audit_events)),
+            json.loads(json.dumps(self._store._audit_heads)),
         )
         return self
 
     def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: TracebackType | None) -> None:
         if exc_type is not None and self._snapshots is not None:
-            self._store._nonces, self._store._checkpoints, self._store._audit_events = self._snapshots
+            self._store._nonces, self._store._checkpoints, self._store._audit_events, self._store._audit_heads = self._snapshots
         self._store._lock.release()
 
     def consume_nonce(self, nonce: str, subject: str, audience: str, task_id: str) -> None:
@@ -123,7 +134,7 @@ class _InMemoryTransaction:
             "consumed_at": int(time.time()),
         }
 
-    def append_audit_events(self, task_id: str, host_id: str, events: tuple[dict[str, Any], ...]) -> None:
+    def append_audit_events(self, task_id: str, host_id: str, events: tuple[dict[str, Any], ...], sign_head: AuditHeadSigner | None = None) -> None:
         current = self._store._audit_events.setdefault(task_id, [])
         hashes = {event["hash"] for event in current}
         for event in events:
@@ -136,16 +147,29 @@ class _InMemoryTransaction:
                 raise SecurityError("audit event hash already exists")
             current.append(json.loads(json.dumps({**event, "host_id": host_id})))
             hashes.add(event["hash"])
+            sequence = event["sequence"] + 1
+            signature_key_id, signature = sign_head(event["hash"], sequence) if sign_head is not None else ("", "")
+            self._store._audit_heads[task_id] = {
+                "head_hash": event["hash"],
+                "sequence": sequence,
+                "host_id": host_id,
+                "signature_key_id": signature_key_id,
+                "signature": signature,
+            }
 
     def save_checkpoint(self, task_id: str, state: AgentState) -> None:
         self._store._checkpoints[task_id] = asdict(state)
 
 
 class SQLiteRuntimeStore:
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, audit_head_verifier: AuditHeadVerifier | None = None) -> None:
         self.path = str(path)
         self._lock = threading.RLock()
+        self._audit_head_verifier = audit_head_verifier
         self._initialize()
+
+    def set_audit_head_verifier(self, verifier: AuditHeadVerifier) -> None:
+        self._audit_head_verifier = verifier
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30, isolation_level=None)
@@ -171,6 +195,7 @@ class SQLiteRuntimeStore:
         migrations = {
             0: self._migrate_to_v1,
             1: self._migrate_to_v2,
+            2: self._migrate_to_v3,
         }
         migration = migrations.get(version)
         if migration is None:
@@ -241,6 +266,16 @@ class SQLiteRuntimeStore:
             """
         )
 
+    def _migrate_to_v3(self, connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            """
+            ALTER TABLE audit_heads ADD COLUMN host_id TEXT NOT NULL DEFAULT '';
+            ALTER TABLE audit_heads ADD COLUMN signature_key_id TEXT NOT NULL DEFAULT '';
+            ALTER TABLE audit_heads ADD COLUMN signature TEXT NOT NULL DEFAULT '';
+            PRAGMA user_version = 3;
+            """
+        )
+
     def transaction(self) -> AbstractContextManager[RuntimeTransaction]:
         return _SQLiteTransaction(self)
 
@@ -266,7 +301,7 @@ class SQLiteRuntimeStore:
                 (task_id,),
             ).fetchall()
             head = connection.execute(
-                "SELECT head_hash, sequence FROM audit_heads WHERE task_id = ?",
+                "SELECT head_hash, sequence, host_id, signature_key_id, signature FROM audit_heads WHERE task_id = ?",
                 (task_id,),
             ).fetchone()
         if not rows or head is None:
@@ -284,7 +319,19 @@ class SQLiteRuntimeStore:
             if row["hash"] != _audit_hash(record):
                 return False
             previous = row["hash"]
-        return head["head_hash"] == previous and int(head["sequence"]) == len(rows)
+        if head["head_hash"] != previous or int(head["sequence"]) != len(rows):
+            return False
+        return _verify_head_signature(
+            self._audit_head_verifier,
+            task_id,
+            {
+                "head_hash": head["head_hash"],
+                "sequence": int(head["sequence"]),
+                "host_id": head["host_id"],
+                "signature_key_id": head["signature_key_id"],
+                "signature": head["signature"],
+            },
+        )
 
 
 class _SQLiteTransaction:
@@ -321,7 +368,7 @@ class _SQLiteTransaction:
         except sqlite3.IntegrityError as error:
             raise SecurityError("permit nonce has already been consumed") from error
 
-    def append_audit_events(self, task_id: str, host_id: str, events: tuple[dict[str, Any], ...]) -> None:
+    def append_audit_events(self, task_id: str, host_id: str, events: tuple[dict[str, Any], ...], sign_head: AuditHeadSigner | None = None) -> None:
         if self._connection is None:
             raise RuntimeError("SQLite transaction was not opened")
         for event in events:
@@ -355,16 +402,21 @@ class _SQLiteTransaction:
                 )
             except sqlite3.IntegrityError as error:
                 raise SecurityError("audit event already exists") from error
+            sequence = event["sequence"] + 1
+            signature_key_id, signature = sign_head(event["hash"], sequence) if sign_head is not None else ("", "")
             self._connection.execute(
                 """
-                INSERT INTO audit_heads (task_id, head_hash, sequence, updated_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO audit_heads (task_id, head_hash, sequence, host_id, signature_key_id, signature, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(task_id) DO UPDATE SET
                     head_hash = excluded.head_hash,
                     sequence = excluded.sequence,
+                    host_id = excluded.host_id,
+                    signature_key_id = excluded.signature_key_id,
+                    signature = excluded.signature,
                     updated_at = excluded.updated_at
                 """,
-                (task_id, event["hash"], event["sequence"] + 1, int(time.time())),
+                (task_id, event["hash"], sequence, host_id, signature_key_id, signature, int(time.time())),
             )
 
     def save_checkpoint(self, task_id: str, state: AgentState) -> None:
@@ -385,3 +437,17 @@ class _SQLiteTransaction:
 
 def _audit_hash(record: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_json(record)).hexdigest()
+
+
+def _verify_head_signature(verifier: AuditHeadVerifier | None, task_id: str, head: dict[str, Any]) -> bool:
+    if verifier is None or not head.get("signature_key_id") or not head.get("signature") or not head.get("host_id"):
+        return False
+    try:
+        verifier.verify_audit_head(
+            head["signature_key_id"],
+            audit_head_payload(task_id, head["host_id"], head["head_hash"], int(head["sequence"])),
+            head["signature"],
+        )
+    except SecurityError:
+        return False
+    return True

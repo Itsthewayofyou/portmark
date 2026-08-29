@@ -128,14 +128,14 @@ The Agent Card is available at `/.well-known/agent-card.json`; signed envelopes 
 `/message:send` with the A2A JSON-RPC `message/send` method. See [A2A.md](A2A.md) for the Agent
 Card fields, request shape, authentication profile, and error behavior.
 
-Persist replay nonces, checkpoints, and audit heads with SQLite:
+Persist replay nonces, checkpoints, and signed audit heads with SQLite:
 
 ```bash
 PYTHONPATH=src python -m portmark.cli --store-path runtime.sqlite demo "research modern mobile agents"
 ```
 
-See [RUNTIME_STORAGE.md](RUNTIME_STORAGE.md) for the storage schema, transaction guarantees, and
-recovery behavior.
+See [RUNTIME_STORAGE.md](RUNTIME_STORAGE.md) for the storage schema, transaction guarantees,
+signed-head audit verification, and recovery behavior.
 
 Load policy from JSON:
 
@@ -151,8 +151,26 @@ updates, audit verification, backup/restore, and incident response.
 Start the CLI with `--provider-endpoint URL`. The runtime sends:
 
 ```json
-{"state": {"goal": "..."}, "available_tools": ["catalog.search"]}
+{
+  "state": {
+    "task_id": "...",
+    "goal": "...",
+    "step": 1,
+    "tool_calls": 1,
+    "status": "running",
+    "messages": [
+      {"role": "tool", "name": "catalog.search", "content": [{"id": "doc-1", "title": "..."}]}
+    ]
+  },
+  "available_tools": ["catalog.search"]
+}
 ```
+
+`state.messages` contains only host-policy-projected tool output from prior steps. The host never
+sends raw checkpoint `memory` or `result` fields to remote providers. Configure per-tool sharing
+with `output_projection` in host policy; omit it or set `[]` to share no output, use top-level
+field names such as `["id", "title"]` for dict outputs or lists of dicts, and use `["*"]` only
+for tools whose full output may be sent to the provider.
 
 The provider responds with one decision:
 

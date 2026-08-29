@@ -15,7 +15,8 @@
   "tools": {
     "catalog.search": {
       "impact": "low",
-      "constraints": {"max_limit": 5}
+      "constraints": {"max_limit": 5},
+      "output_projection": ["title"]
     }
   }
 }

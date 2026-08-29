@@ -53,6 +53,10 @@ def envelope_from_dict(value: dict[str, Any]) -> AgentEnvelope:
             permit=permit,
             state=AgentState(**value["state"]),
             previous_audit_hash=value.get("previous_audit_hash", ""),
+            previous_audit_sequence=int(value.get("previous_audit_sequence", 0)),
+            previous_audit_host_id=value.get("previous_audit_host_id", ""),
+            previous_audit_signature_key_id=value.get("previous_audit_signature_key_id", ""),
+            previous_audit_signature=value.get("previous_audit_signature", ""),
             signature_key_id=value.get("signature_key_id", ""),
             signature=value["signature"],
         )

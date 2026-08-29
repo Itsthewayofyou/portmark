@@ -63,10 +63,10 @@ reading the request body.
 For SQLite-backed hosts, run:
 
 ```bash
-portmark --store-path runtime.sqlite verify-audit --task-id TASK_ID
+portmark --store-path runtime.sqlite --trust-registry-path trust.json verify-audit --task-id TASK_ID
 ```
 
-The command prints `{"valid": true}` and exits 0 for an intact chain. It prints `{"valid": false}` and exits 1 when the task is missing or when event sequence, previous hash, event hash, or stored audit-head validation fails. Treat any false result as tampered or corrupted task history.
+The command prints `{"valid": true}` and exits 0 for an intact chain whose stored audit head is signed by a trusted host key. It prints `{"valid": false}` and exits 1 when the task is missing or when event sequence, previous hash, event hash, stored audit-head validation, trust-registry lookup, or audit-head signature validation fails. Unsigned legacy heads are reported as invalid. Treat any false result as tampered or corrupted task history.
 
 ## Backup And Restore
 

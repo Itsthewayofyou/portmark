@@ -12,20 +12,21 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 from .component_bindings import component_checkpoint, component_context, decode_component_decision, encode_component_input
-from .models import AgentState, ProviderDecision
+from .models import AgentState, ProviderDecision, ToolGrant
+from .projection import provider_state
 from .security import SecurityError
 
 
 class ModelProvider(ABC):
     @abstractmethod
-    def decide(self, state: AgentState, available_tools: tuple[str, ...]) -> ProviderDecision:
+    def decide(self, state: AgentState, available_tools: tuple[str, ...], grants: tuple[ToolGrant, ...] = ()) -> ProviderDecision:
         """Return a proposal. The host remains responsible for authorization and execution."""
 
 
 class DeterministicProvider(ModelProvider):
     """Offline provider used for tests and the demo."""
 
-    def decide(self, state: AgentState, available_tools: tuple[str, ...]) -> ProviderDecision:
+    def decide(self, state: AgentState, available_tools: tuple[str, ...], grants: tuple[ToolGrant, ...] = ()) -> ProviderDecision:
         if not state.memory.get("catalog") and "catalog.search" in available_tools:
             return ProviderDecision("tool", "catalog.search", {"query": state.goal, "limit": 3})
         return ProviderDecision(
@@ -46,8 +47,8 @@ class GenericHttpProvider(ModelProvider):
         self.timeout = timeout
         self.max_response_bytes = max_response_bytes
 
-    def decide(self, state: AgentState, available_tools: tuple[str, ...]) -> ProviderDecision:
-        body = json.dumps({"state": _provider_state(state), "available_tools": available_tools}).encode()
+    def decide(self, state: AgentState, available_tools: tuple[str, ...], grants: tuple[ToolGrant, ...] = ()) -> ProviderDecision:
+        body = json.dumps({"state": provider_state(state, grants), "available_tools": available_tools}).encode()
         headers = {"Content-Type": "application/json"}
         if self.bearer_token:
             headers["Authorization"] = f"Bearer {self.bearer_token}"
@@ -62,16 +63,6 @@ class GenericHttpProvider(ModelProvider):
         except json.JSONDecodeError as error:
             raise SecurityError("provider response is malformed JSON") from error
         return _provider_decision(value)
-
-
-def _provider_state(state: AgentState) -> dict[str, Any]:
-    return {
-        "task_id": state.task_id,
-        "goal": state.goal,
-        "step": state.step,
-        "tool_calls": state.tool_calls,
-        "status": state.status,
-    }
 
 
 def _provider_decision(value: Any) -> ProviderDecision:
@@ -121,10 +112,10 @@ class WasmDecisionProvider(ModelProvider):
             component = base64.b64decode(component.strip(), validate=True)
         return cls(component, timeout, max_output_bytes)
 
-    def decide(self, state: AgentState, available_tools: tuple[str, ...]) -> ProviderDecision:
+    def decide(self, state: AgentState, available_tools: tuple[str, ...], grants: tuple[ToolGrant, ...] = ()) -> ProviderDecision:
         encoded_component = base64.b64encode(self._component).decode("ascii")
-        context_json = encode_component_input(component_context(state, available_tools))
-        checkpoint_json = encode_component_input(component_checkpoint(state))
+        context_json = encode_component_input(component_context(state, available_tools, grants))
+        checkpoint_json = encode_component_input(component_checkpoint(state, grants))
         try:
             # Shell is disabled and the executable/runner paths are host-controlled.
             process = subprocess.run(  # nosec B603

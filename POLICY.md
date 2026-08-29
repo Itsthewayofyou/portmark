@@ -29,7 +29,8 @@ Host policy can be loaded from a JSON file instead of being hard-coded in proces
   "tools": {
     "catalog.search": {
       "impact": "low",
-      "constraints": {"max_limit": 5}
+      "constraints": {"max_limit": 5},
+      "output_projection": ["id", "title"]
     },
     "payments.reserve": {
       "impact": "external-payment",
@@ -39,7 +40,9 @@ Host policy can be loaded from a JSON file instead of being hard-coded in proces
 }
 ```
 
-The loader validates the root object, policy version, tool entries, impact levels, constraints, budget fields, and approval public keys before constructing `HostPolicy`.
+The loader validates the root object, policy version, tool entries, impact levels, constraints, output projections, budget fields, and approval public keys before constructing `HostPolicy`.
+
+`output_projection` controls what tool output, if any, is sent back to a model provider on later steps. Omit it or set it to `[]` to share no tool output. Use a list of top-level JSON object fields, such as `["id", "title"]`, to share only those fields from dict outputs or lists of dicts. Use `["*"]` only when the provider is allowed to see the full output for that tool. Projection is intersected across the manifest request, incoming permit, and local host policy; the effective projection can only narrow.
 
 ## Loading And Reloading
 

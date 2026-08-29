@@ -43,7 +43,7 @@ Implementation note: the available Python Wasm runtime did not expose native Com
 
 ## 3. Persist Nonces, Checkpoints, And Audit Heads Transactionally
 
-Status: implemented for the reference runtime. `RuntimeStore` now supports transactional nonce consumption, checkpoint persistence, audit event insertion, and audit head updates, with a durable SQLite implementation and regression tests for restart replay, rollback, migration recovery, audit verification, and concurrency.
+Status: implemented for the reference runtime. `RuntimeStore` now supports transactional nonce consumption, checkpoint persistence, audit event insertion, and signed audit head updates, with a durable SQLite implementation and regression tests for restart replay, rollback, migration recovery, audit verification, forgery rejection, and concurrency.
 
 Tasks:
 

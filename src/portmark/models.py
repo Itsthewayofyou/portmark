@@ -11,6 +11,11 @@ Json = dict[str, Any]
 class ToolGrant:
     name: str
     constraints: Json = field(default_factory=dict)
+    output_projection: tuple[str, ...] | None = None
+
+    def __post_init__(self) -> None:
+        if self.output_projection is not None:
+            object.__setattr__(self, "output_projection", tuple(self.output_projection))
 
 
 @dataclass(frozen=True)
@@ -108,6 +113,10 @@ class AgentEnvelope:
     permit: Permit
     state: AgentState
     previous_audit_hash: str = ""
+    previous_audit_sequence: int = 0
+    previous_audit_host_id: str = ""
+    previous_audit_signature_key_id: str = ""
+    previous_audit_signature: str = ""
     signature_key_id: str = ""
     signature: str = ""
 

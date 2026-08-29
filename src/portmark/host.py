@@ -7,7 +7,7 @@ from typing import Any
 
 from .models import AgentEnvelope, ApprovalToken, AttestationEvidence, ProviderDecision, RunResult
 from .providers import ModelProvider
-from .security import AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, SecurityError, arguments_hash, canonical_json
+from .security import AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, SecurityError, arguments_hash, audit_head_payload, canonical_json
 from .storage import InMemoryRuntimeStore, RuntimeStore
 from .tools import ToolExecutionError, ToolRegistry
 
@@ -33,6 +33,8 @@ class AgentHost:
         self.tools = tools
         self.providers = providers
         self.store = store or InMemoryRuntimeStore()
+        if hasattr(self.store, "set_audit_head_verifier"):
+            self.store.set_audit_head_verifier(self.signer)
         self.attestation_policy = attestation_policy or AttestationPolicy()
         self._policy_loader = policy_loader
         self._reload_policy = reload_policy
@@ -67,7 +69,7 @@ class AgentHost:
         tool_names = tuple(grant.name for grant in effective.grants)
 
         while state.step < effective.budget.max_steps:
-            decision = provider.decide(state, tool_names)
+            decision = provider.decide(state, tool_names, effective.grants)
             audit.append("provider.proposed", {"kind": decision.kind, "tool": decision.tool})
             finished, migration = self._apply_decision(decision, state, effective, audit, envelope, active_policy)
             state.step += 1
@@ -150,7 +152,17 @@ class AgentHost:
                 delegation_allowed=False,
                 attestation=destination_attestation,
             )
-            migrated = AgentEnvelope(envelope.manifest, delegated, state, audit.head)
+            previous_sequence = audit.events[-1]["sequence"] + 1
+            migrated = AgentEnvelope(
+                envelope.manifest,
+                delegated,
+                state,
+                previous_audit_hash=audit.head,
+                previous_audit_sequence=previous_sequence,
+                previous_audit_host_id=self.host_id,
+                previous_audit_signature_key_id=self.signer.key_id,
+                previous_audit_signature=self.signer.sign_audit_head(state.task_id, self.host_id, audit.head, previous_sequence),
+            )
             self.signer.seal(migrated)
             return True, asdict(migrated)
         state.status = "failed"
@@ -243,10 +255,31 @@ class AgentHost:
         if envelope.previous_audit_hash:
             if stored is not None and stored[0] != envelope.previous_audit_hash:
                 raise SecurityError("envelope audit head does not match stored audit head")
+            if stored is None:
+                self._verify_previous_audit_head(envelope)
             return envelope.previous_audit_hash, stored[1] if stored is not None else 0
         if stored is not None:
             return stored
         return "", 0
+
+    def _verify_previous_audit_head(self, envelope: AgentEnvelope) -> None:
+        if (
+            not envelope.previous_audit_host_id
+            or not envelope.previous_audit_signature_key_id
+            or not envelope.previous_audit_signature
+            or envelope.previous_audit_sequence <= 0
+        ):
+            raise SecurityError("previous audit head signature is missing")
+        self.signer.verify_audit_head(
+            envelope.previous_audit_signature_key_id,
+            audit_head_payload(
+                envelope.state.task_id,
+                envelope.previous_audit_host_id,
+                envelope.previous_audit_hash,
+                envelope.previous_audit_sequence,
+            ),
+            envelope.previous_audit_signature,
+        )
 
     def _persist(
         self,
@@ -263,6 +296,11 @@ class AgentHost:
         with self.store.transaction() as transaction:
             if consume_nonce is not None:
                 transaction.consume_nonce(consume_nonce, envelope.permit.subject, envelope.permit.audience, state.task_id)
-            transaction.append_audit_events(state.task_id, self.host_id, audit.events[persisted_events:])
+            transaction.append_audit_events(
+                state.task_id,
+                self.host_id,
+                audit.events[persisted_events:],
+                lambda head_hash, sequence: (self.signer.key_id, self.signer.sign_audit_head(state.task_id, self.host_id, head_hash, sequence)),
+            )
             transaction.save_checkpoint(state.task_id, state)
         return len(audit.events)

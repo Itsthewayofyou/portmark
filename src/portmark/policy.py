@@ -35,7 +35,7 @@ def policy_from_dict(value: dict[str, Any], audience: str) -> HostPolicy:
         constraints = config.get("constraints", {})
         if not isinstance(constraints, dict):
             raise ValueError(f"policy tool {name!r} constraints must be an object")
-        grants.append(ToolGrant(name, constraints))
+        grants.append(ToolGrant(name, constraints, _output_projection(config.get("output_projection"), name)))
         impacts[name] = impact
     if not grants:
         raise ValueError("policy must grant at least one tool")
@@ -103,6 +103,18 @@ def _approval_required_impacts(value: Any) -> tuple[str, ...]:
     if not all(isinstance(impact, str) and impact in VALID_IMPACTS for impact in impacts):
         raise ValueError("approval_required_impacts contains an invalid impact")
     return impacts
+
+
+def _output_projection(value: Any, tool: str) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError(f"policy tool {tool!r} output_projection must be a list")
+    if not all(isinstance(item, str) and item for item in value):
+        raise ValueError(f"policy tool {tool!r} output_projection entries must be non-empty strings")
+    if "*" in value and len(value) > 1:
+        raise ValueError(f"policy tool {tool!r} output_projection cannot mix '*' with field names")
+    return tuple(value)
 
 
 def _required_string(value: dict[str, Any], name: str) -> str:

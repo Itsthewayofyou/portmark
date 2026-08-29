@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
 from typing import Any
 
-from .models import AgentState, ProviderDecision
+from .models import AgentState, ProviderDecision, ToolGrant
+from .projection import provider_state, project_tool_messages
 
 
 WIT_PACKAGE = "portmark:agent@1.0.0"
@@ -12,21 +12,20 @@ WIT_WORLD = "portmark"
 WIT_ABI = "portmark-json-lowered-v1"
 
 
-def component_context(state: AgentState, available_tools: tuple[str, ...]) -> dict[str, Any]:
+def component_context(state: AgentState, available_tools: tuple[str, ...], grants: tuple[ToolGrant, ...] = ()) -> dict[str, Any]:
     return {
         "wit": {"package": WIT_PACKAGE, "world": WIT_WORLD, "abi": WIT_ABI},
-        "state": asdict(state),
+        "state": provider_state(state, grants),
         "available_tools": list(available_tools),
     }
 
 
-def component_checkpoint(state: AgentState) -> dict[str, Any]:
+def component_checkpoint(state: AgentState, grants: tuple[ToolGrant, ...] = ()) -> dict[str, Any]:
     return {
         "task_id": state.task_id,
         "step": state.step,
         "tool_calls": state.tool_calls,
-        "memory": state.memory,
-        "messages": state.messages,
+        "messages": project_tool_messages(state.messages, grants),
     }
 
 

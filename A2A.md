@@ -35,6 +35,10 @@ Clients submit work to the card `url`, currently `/message:send`, using JSON-RPC
         "permit": {},
         "state": {},
         "previous_audit_hash": "",
+        "previous_audit_sequence": 0,
+        "previous_audit_host_id": "",
+        "previous_audit_signature_key_id": "",
+        "previous_audit_signature": "",
         "signature_key_id": "key-id",
         "signature": "base64url-signature"
       }

@@ -32,6 +32,27 @@ class EnvelopeSigningIdentity(EnvelopeVerifier, Protocol):
     def seal(self, envelope: AgentEnvelope) -> AgentEnvelope:
         ...
 
+    def sign_audit_head(self, task_id: str, host_id: str, head_hash: str, sequence: int) -> str:
+        ...
+
+    def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str) -> None:
+        ...
+
+
+class AuditHeadVerifier(Protocol):
+    def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str) -> None:
+        ...
+
+
+def audit_head_payload(task_id: str, host_id: str, head_hash: str, sequence: int) -> dict[str, Any]:
+    return {
+        "type": "portmark.audit-head.v1",
+        "task_id": task_id,
+        "host_id": host_id,
+        "head_hash": head_hash,
+        "sequence": sequence,
+    }
+
 
 def canonical_json(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
@@ -90,6 +111,27 @@ class TrustRegistry:
 
     def has_key(self, key_id: str) -> bool:
         return key_id in self._identities
+
+    def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None) -> None:
+        identity = self._identities.get(key_id)
+        if identity is None:
+            raise SecurityError("audit head signing key is not trusted")
+        current_time = int(time.time()) if now is None else now
+        if identity.revoked:
+            raise SecurityError("audit head signing key has been revoked")
+        if identity.not_before > current_time:
+            raise SecurityError("audit head signing key is not active yet")
+        if identity.expires_at is not None and identity.expires_at <= current_time:
+            raise SecurityError("audit head signing key has expired")
+        if payload.get("host_id") != identity.issuer:
+            raise SecurityError("audit head signer identity does not match host")
+        try:
+            Ed25519PublicKey.from_public_bytes(identity.public_key).verify(
+                _b64url_decode(signature),
+                canonical_json(payload),
+            )
+        except (InvalidSignature, ValueError) as error:
+            raise SecurityError("audit head signature is invalid") from error
 
     def require_identity(self, envelope: AgentEnvelope, now: int | None = None) -> TrustedIdentity:
         if not envelope.signature_key_id:
@@ -414,6 +456,14 @@ class EnvelopeSigner:
     def public_key_bytes(self) -> bytes:
         return self._private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
 
+    def sign_audit_head(self, task_id: str, host_id: str, head_hash: str, sequence: int) -> str:
+        if host_id != self.issuer:
+            raise SecurityError("audit head host does not match signing identity")
+        return _b64url_encode(self._private_key.sign(canonical_json(audit_head_payload(task_id, host_id, head_hash, sequence))))
+
+    def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str) -> None:
+        self.registry.verify_audit_head(key_id, payload, signature)
+
 
 class HmacEnvelopeSigner:
     """Legacy dependency-free demo signer. Do not use for production trust domains."""
@@ -443,6 +493,16 @@ class HmacEnvelopeSigner:
         if not hmac.compare_digest(expected, envelope.signature):
             raise SecurityError("agent envelope signature is invalid")
 
+    def sign_audit_head(self, task_id: str, host_id: str, head_hash: str, sequence: int) -> str:
+        return hmac.new(self._key, canonical_json(audit_head_payload(task_id, host_id, head_hash, sequence)), hashlib.sha256).hexdigest()
+
+    def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str) -> None:
+        if key_id != self.key_id:
+            raise SecurityError("audit head signing key is not trusted")
+        expected = hmac.new(self._key, canonical_json(payload), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, signature):
+            raise SecurityError("audit head signature is invalid")
+
 
 def _constraint_intersection(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any] | None:
     result: dict[str, Any] = {}
@@ -468,16 +528,34 @@ def _constraint_intersection(left: dict[str, Any], right: dict[str, Any]) -> dic
 def intersect_grants(*grant_sets: tuple[ToolGrant, ...]) -> tuple[ToolGrant, ...]:
     if not grant_sets:
         return ()
-    current = {grant.name: grant.constraints for grant in grant_sets[0]}
+    current = {grant.name: grant for grant in grant_sets[0]}
     for grants in grant_sets[1:]:
-        incoming = {grant.name: grant.constraints for grant in grants}
-        next_current: dict[str, dict[str, Any]] = {}
+        incoming = {grant.name: grant for grant in grants}
+        next_current: dict[str, ToolGrant] = {}
         for name in current.keys() & incoming.keys():
-            constraints = _constraint_intersection(current[name], incoming[name])
+            constraints = _constraint_intersection(current[name].constraints, incoming[name].constraints)
             if constraints is not None:
-                next_current[name] = constraints
+                next_current[name] = ToolGrant(
+                    name,
+                    constraints,
+                    _projection_intersection(current[name].output_projection, incoming[name].output_projection),
+                )
         current = next_current
-    return tuple(ToolGrant(name, constraints) for name, constraints in sorted(current.items()))
+    return tuple(current[name] for name in sorted(current))
+
+
+def _projection_intersection(left: tuple[str, ...] | None, right: tuple[str, ...] | None) -> tuple[str, ...] | None:
+    if left is None:
+        return right
+    if right is None:
+        return left
+    if not left or not right:
+        return ()
+    if "*" in left:
+        return right
+    if "*" in right:
+        return left
+    return tuple(item for item in left if item in set(right))
 
 
 class HostPolicy:

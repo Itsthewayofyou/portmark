@@ -1,6 +1,7 @@
 import copy
 import base64
 import concurrent.futures
+import hashlib
 import io
 import json
 import logging
@@ -56,12 +57,12 @@ WASM_MISSING_RESUME = "AGFzbQEAAAAFAwEAAQcKAQZtZW1vcnkCAA=="
 
 class FixedProvider(ModelProvider):
     def __init__(self, decision): self.decision = decision
-    def decide(self, state, available_tools): return self.decision
+    def decide(self, state, available_tools, grants=()): return self.decision
 
 
 class MigrateThenCompleteProvider(ModelProvider):
     def __init__(self, destination): self.destination = destination
-    def decide(self, state, available_tools):
+    def decide(self, state, available_tools, grants=()):
         if "migration" not in state.memory:
             return ProviderDecision("migrate", destination=self.destination)
         return ProviderDecision("complete", content={"resumed_on": self.destination})
@@ -71,21 +72,21 @@ class AttestedMigrateThenCompleteProvider(ModelProvider):
     def __init__(self, destination, attestation):
         self.destination = destination
         self.attestation = attestation
-    def decide(self, state, available_tools):
+    def decide(self, state, available_tools, grants=()):
         if "migration" not in state.memory:
             return ProviderDecision("migrate", destination=self.destination, content={"attestation": asdict(self.attestation)})
         return ProviderDecision("complete", content={"resumed_on": self.destination})
 
 
 class ExplodingProvider(ModelProvider):
-    def decide(self, state, available_tools):
+    def decide(self, state, available_tools, grants=()):
         raise RuntimeError("provider crashed")
 
 
 class PaymentProvider(ModelProvider):
     def __init__(self, amount=50):
         self.amount = amount
-    def decide(self, state, available_tools):
+    def decide(self, state, available_tools, grants=()):
         if "payments_reserve" not in state.memory:
             return ProviderDecision("tool", "payments.reserve", {"amount": self.amount, "currency": "USD"})
         return ProviderDecision("complete", content={"payment": state.memory["payments_reserve"]})
@@ -96,14 +97,14 @@ class BlockingProvider(ModelProvider):
         self.entered = entered
         self.release = release
 
-    def decide(self, state, available_tools):
+    def decide(self, state, available_tools, grants=()):
         self.entered.set()
         self.release.wait(10)
         return ProviderDecision("complete", content={"blocked": True})
 
 
 class LargeToolProvider(ModelProvider):
-    def decide(self, state, available_tools):
+    def decide(self, state, available_tools, grants=()):
         if "large" not in state.memory:
             return ProviderDecision("tool", "large.output", {})
         return ProviderDecision("complete", content={"large": state.memory["large"]})
@@ -111,6 +112,16 @@ class LargeToolProvider(ModelProvider):
 
 class DigestProvider(FixedProvider):
     component_digest = "wasm:expected"
+
+
+def trusted_identity_for(signer: EnvelopeSigner, allowed_audiences=("*",)):
+    return TrustedIdentity(signer.key_id, signer.issuer, signer.public_key_bytes(), tuple(allowed_audiences))
+
+
+def trust_signer(verifier: EnvelopeSigner, signer: EnvelopeSigner) -> EnvelopeSigner:
+    if not verifier.registry.has_key(signer.key_id):
+        verifier.registry.add(trusted_identity_for(signer))
+    return verifier
 
 
 class FakeHttpResponse:
@@ -434,10 +445,10 @@ class RuntimeTests(unittest.TestCase):
             "sensitive goal",
             step=2,
             tool_calls=1,
-            memory={"private_note": "do not send"},
-            messages=[{"role": "tool", "content": "do not send"}],
+            memory={"private_note": "blocked-content"},
+            messages=[{"role": "tool", "name": "catalog.search", "content": {"id": "public", "internal_note": "blocked-content"}}],
             status="running",
-            result={"private_note": "do not send"},
+            result={"private_note": "blocked-content"},
         )
         captured = {}
 
@@ -447,7 +458,11 @@ class RuntimeTests(unittest.TestCase):
             return FakeHttpResponse(b'{"kind":"complete","content":{"ok":true}}')
 
         with patch("urllib.request.urlopen", side_effect=capture):
-            decision = GenericHttpProvider("https://provider.example/run", timeout=7).decide(state, ("catalog.search",))
+            decision = GenericHttpProvider("https://provider.example/run", timeout=7).decide(
+                state,
+                ("catalog.search",),
+                (ToolGrant("catalog.search"),),
+            )
 
         self.assertEqual(decision.kind, "complete")
         self.assertEqual(captured["timeout"], 7)
@@ -458,12 +473,74 @@ class RuntimeTests(unittest.TestCase):
                 "step": 2,
                 "tool_calls": 1,
                 "status": "running",
+                "messages": [{"role": "tool", "name": "catalog.search"}],
             },
             "available_tools": ["catalog.search"],
         })
         self.assertNotIn("memory", captured["body"]["state"])
-        self.assertNotIn("messages", captured["body"]["state"])
         self.assertNotIn("result", captured["body"]["state"])
+        self.assertNotIn("internal_note", json.dumps(captured["body"]))
+
+    def test_http_provider_projects_allowed_tool_output_fields(self):
+        state = AgentState(
+            "task-1",
+            "goal",
+            messages=[
+                {"role": "tool", "name": "catalog.search", "content": [{"id": "doc-1", "title": "Visible", "internal_note": "blocked-content"}]},
+                {"role": "tool", "name": "payments.reserve", "content": {"receipt": "blocked-content"}},
+            ],
+        )
+        captured = {}
+
+        def capture(request, timeout):
+            captured["body"] = json.loads(request.data)
+            return FakeHttpResponse(b'{"kind":"complete","content":{"ok":true}}')
+
+        with patch("urllib.request.urlopen", side_effect=capture):
+            GenericHttpProvider("https://provider.example/run").decide(
+                state,
+                ("catalog.search",),
+                (ToolGrant("catalog.search", output_projection=("id", "title")),),
+            )
+
+        self.assertEqual(
+            captured["body"]["state"]["messages"],
+            [{"role": "tool", "name": "catalog.search", "content": [{"id": "doc-1", "title": "Visible"}]}],
+        )
+        self.assertNotIn("internal_note", json.dumps(captured["body"]))
+        self.assertNotIn("receipt", json.dumps(captured["body"]))
+
+    def test_remote_provider_loop_sees_projected_tool_result_on_second_call(self):
+        host = make_host(provider_endpoint="https://provider.example/run")
+        host.policy = HostPolicy(
+            host.host_id,
+            (ToolGrant("catalog.search", {"max_limit": 3}, ("*",)),),
+            ResourceBudget(max_steps=6, max_tool_calls=2, max_output_bytes=32_768),
+        )
+        envelope = make_demo_envelope(host, "portable agents", "http")
+        bodies = []
+        responses = [
+            FakeHttpResponse(b'{"kind":"tool","tool":"catalog.search","arguments":{"query":"portable agents","limit":3}}'),
+            FakeHttpResponse(b'{"kind":"complete","content":{"ok":true}}'),
+        ]
+
+        def capture(request, timeout):
+            bodies.append(json.loads(request.data))
+            return responses.pop(0)
+
+        with patch("urllib.request.urlopen", side_effect=capture):
+            result = host.run(envelope)
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(len(bodies), 2)
+        self.assertEqual(bodies[0]["state"]["messages"], [])
+        self.assertIn("catalog.search", bodies[1]["available_tools"])
+        self.assertEqual(bodies[1]["state"]["messages"][0]["role"], "tool")
+        self.assertEqual(bodies[1]["state"]["messages"][0]["name"], "catalog.search")
+        self.assertEqual(len(bodies[1]["state"]["messages"][0]["content"]), 3)
+        self.assertIn("title", bodies[1]["state"]["messages"][0]["content"][0])
+        self.assertNotIn("memory", bodies[1]["state"])
+        self.assertNotIn("result", bodies[1]["state"])
 
     def test_http_provider_rejects_malformed_response_shapes(self):
         cases = [
@@ -584,6 +661,8 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(policy.impact_for_tool("payments.reserve"), "external-payment")
             self.assertTrue(policy.requires_approval("payments.reserve"))
             self.assertFalse(policy.requires_approval("catalog.search"))
+            catalog = next(grant for grant in policy.grants if grant.name == "catalog.search")
+            self.assertEqual(catalog.output_projection, ("id", "title"))
 
     def test_external_policy_denies_unlisted_tool_and_narrows_grant(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -892,6 +971,7 @@ class RuntimeTests(unittest.TestCase):
             "deleted middle event": "DELETE FROM audit_events WHERE task_id = ? AND sequence = 1",
             "reordered sequence": "UPDATE audit_events SET sequence = 99 WHERE task_id = ? AND sequence = 1",
             "stale head": "UPDATE audit_heads SET head_hash = 'stale' WHERE task_id = ?",
+            "tampered signature": "UPDATE audit_heads SET signature = 'tampered' WHERE task_id = ?",
         }
         for name, statement in cases.items():
             with self.subTest(name=name):
@@ -909,15 +989,75 @@ class RuntimeTests(unittest.TestCase):
             store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
             self.assertFalse(store.verify_audit_chain("missing-task"))
 
+    def test_sqlite_audit_chain_rejects_fabricated_consistent_history(self):
+        def event(sequence, name, details, previous):
+            record = {"sequence": sequence, "event": name, "details": details, "previous": previous}
+            return {**record, "hash": hashlib.sha256(canonical_json(record)).hexdigest()}
+
+        signer = EnvelopeSigner.generate("audit-forgery-key", "host:local-demo", ("host:local-demo",))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(path, signer)
+            fabricated = []
+            previous = ""
+            for sequence, name, details in [
+                (0, "agent.accepted", {"agent": "agent:demo", "host": "host:local-demo"}),
+                (1, "provider.proposed", {"kind": "tool", "tool": "payments.reserve"}),
+                (2, "tool.executed", {"tool": "payments.reserve", "arguments": {"amount": 250000, "currency": "USD"}}),
+                (3, "agent.completed", {"result": {"payment": "reserved"}}),
+            ]:
+                row = event(sequence, name, details, previous)
+                fabricated.append(row)
+                previous = row["hash"]
+
+            with sqlite3.connect(path) as connection:
+                for row in fabricated:
+                    connection.execute(
+                        """
+                        INSERT INTO audit_events
+                            (task_id, sequence, host_id, event, details_json, previous_hash, hash, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            "task-forged",
+                            row["sequence"],
+                            "host:local-demo",
+                            row["event"],
+                            json.dumps(row["details"], sort_keys=True, separators=(",", ":")),
+                            row["previous"],
+                            row["hash"],
+                            int(time.time()),
+                        ),
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO audit_heads
+                        (task_id, head_hash, sequence, host_id, signature_key_id, signature, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("task-forged", previous, len(fabricated), "host:local-demo", "", "", int(time.time())),
+                )
+
+            self.assertFalse(store.verify_audit_chain("task-forged"))
+
+            host = make_host(signer=signer, store=store)
+            result = host.run(make_demo_envelope(host, "signed history"))
+            self.assertTrue(store.verify_audit_chain(result.task_id))
+            with sqlite3.connect(path) as connection:
+                connection.execute("UPDATE audit_heads SET signature = 'tampered' WHERE task_id = ?", (result.task_id,))
+            self.assertFalse(store.verify_audit_chain(result.task_id))
+
     def test_verify_audit_cli_reports_valid_invalid_and_missing_chains(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runtime.sqlite"
+            signer = EnvelopeSigner.generate("cli-audit-key", "host:local-demo", ("host:local-demo",))
+            registry_path = self._write_trust_registry(directory, signer)
             store = SQLiteRuntimeStore(path)
-            host = make_host(store=store)
+            host = make_host(signer=signer, store=store)
             result = host.run(make_demo_envelope(host, "operator audit"))
 
             output = io.StringIO()
-            with patch.object(sys, "argv", ["portmark", "--store-path", str(path), "verify-audit", "--task-id", result.task_id]):
+            with patch.object(sys, "argv", ["portmark", "--store-path", str(path), "--trust-registry-path", str(registry_path), "verify-audit", "--task-id", result.task_id]):
                 with redirect_stdout(output):
                     cli_main()
             self.assertEqual(json.loads(output.getvalue()), {"task_id": result.task_id, "valid": True})
@@ -925,7 +1065,7 @@ class RuntimeTests(unittest.TestCase):
             with sqlite3.connect(path) as connection:
                 connection.execute("UPDATE audit_heads SET head_hash = 'tampered' WHERE task_id = ?", (result.task_id,))
             output = io.StringIO()
-            with patch.object(sys, "argv", ["portmark", "--store-path", str(path), "verify-audit", "--task-id", result.task_id]):
+            with patch.object(sys, "argv", ["portmark", "--store-path", str(path), "--trust-registry-path", str(registry_path), "verify-audit", "--task-id", result.task_id]):
                 with redirect_stdout(output):
                     with self.assertRaises(SystemExit) as raised:
                         cli_main()
@@ -933,7 +1073,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(json.loads(output.getvalue()), {"task_id": result.task_id, "valid": False})
 
             output = io.StringIO()
-            with patch.object(sys, "argv", ["portmark", "--store-path", str(path), "verify-audit", "--task-id", "missing-task"]):
+            with patch.object(sys, "argv", ["portmark", "--store-path", str(path), "--trust-registry-path", str(registry_path), "verify-audit", "--task-id", "missing-task"]):
                 with redirect_stdout(output):
                     with self.assertRaises(SystemExit) as raised:
                         cli_main()
@@ -1029,23 +1169,27 @@ class RuntimeTests(unittest.TestCase):
 
     def test_sqlite_migration_checkpoint_and_audit_are_recoverable(self):
         with tempfile.TemporaryDirectory() as directory:
-            signer = EnvelopeSigner.generate("source-key", "host:source", ("host:source", "host:destination"))
+            source_signer = EnvelopeSigner.generate("source-key", "host:source", ("host:source", "host:destination"))
+            destination_signer = trust_signer(EnvelopeSigner.generate("destination-key", "host:destination", ("host:destination",)), source_signer)
             source_store = SQLiteRuntimeStore(Path(directory) / "source.sqlite")
             destination_store = SQLiteRuntimeStore(Path(directory) / "destination.sqlite")
-            source = make_host(host_id="host:source", signer=signer, store=source_store)
-            destination = make_host(host_id="host:destination", signer=signer, store=destination_store)
+            source = make_host(host_id="host:source", signer=source_signer, store=source_store)
+            destination = make_host(host_id="host:destination", signer=destination_signer, store=destination_store)
             provider = MigrateThenCompleteProvider(destination.host_id)
             source.providers["migrator"] = provider
             destination.providers["migrator"] = provider
             envelope = make_demo_envelope(source, "move durably", "migrator")
             object.__setattr__(envelope.permit, "delegation_allowed", True)
-            signer.seal(envelope)
+            source_signer.seal(envelope)
 
             first = source.run(envelope)
             source_checkpoint = source_store.load_checkpoint(first.task_id)
             self.assertEqual(source_checkpoint["status"], "ready")
             self.assertEqual(source_checkpoint["memory"]["migration"], {"from": "host:source", "to": "host:destination"})
             self.assertTrue(source_store.verify_audit_chain(first.task_id))
+            self.assertEqual(first.migration_envelope["previous_audit_host_id"], "host:source")
+            self.assertEqual(first.migration_envelope["previous_audit_signature_key_id"], source_signer.key_id)
+            self.assertTrue(first.migration_envelope["previous_audit_signature"])
 
             from portmark.a2a import envelope_from_dict
             second = destination.run(envelope_from_dict(first.migration_envelope))
@@ -1092,7 +1236,7 @@ class RuntimeTests(unittest.TestCase):
                 results = list(executor.map(run_envelope, envelopes))
 
             self.assertEqual([result.status for result in results], ["completed"] * len(envelopes))
-            store = SQLiteRuntimeStore(path)
+            store = SQLiteRuntimeStore(path, signer)
             nonces_by_task = {envelope.state.task_id: envelope.permit.nonce for envelope in envelopes}
             for result in results:
                 self.assertTrue(store.verify_audit_chain(result.task_id))
@@ -1113,9 +1257,10 @@ class RuntimeTests(unittest.TestCase):
                     self.assertEqual(last_sequence, count - 1)
 
     def test_delegated_migration_resumes_on_destination(self):
-        signer = EnvelopeSigner.generate("source-key", "host:source", ("host:source", "host:destination"))
-        source = make_host(host_id="host:source", signer=signer)
-        destination = make_host(host_id="host:destination", signer=source.signer)
+        source_signer = EnvelopeSigner.generate("source-key", "host:source", ("host:source", "host:destination"))
+        destination_signer = trust_signer(EnvelopeSigner.generate("destination-key", "host:destination", ("host:destination",)), source_signer)
+        source = make_host(host_id="host:source", signer=source_signer)
+        destination = make_host(host_id="host:destination", signer=destination_signer)
         provider = MigrateThenCompleteProvider(destination.host_id)
         source.providers["migrator"] = provider
         destination.providers["migrator"] = provider
@@ -1128,6 +1273,15 @@ class RuntimeTests(unittest.TestCase):
         migrated = envelope_from_dict(first.migration_envelope)
         self.assertEqual(migrated.permit.audience, destination.host_id)
         self.assertFalse(migrated.permit.delegation_allowed)
+
+        forged = envelope_from_dict(first.migration_envelope)
+        forged.previous_audit_signature = "tampered"
+        source.signer.seal(forged)
+        fresh_destination = make_host(host_id="host:destination", signer=destination_signer)
+        fresh_destination.providers["migrator"] = provider
+        with self.assertRaisesRegex(SecurityError, "audit head signature"):
+            fresh_destination.run(forged)
+
         second = destination.run(migrated)
         self.assertEqual(second.status, "completed")
         self.assertEqual(second.result["resumed_on"], destination.host_id)
@@ -1140,9 +1294,10 @@ class RuntimeTests(unittest.TestCase):
             required_for_execution=True,
             required_for_migration=True,
         )
-        signer = EnvelopeSigner.generate("source-key", "host:source", ("host:source", "host:destination"))
-        source = make_host(host_id="host:source", signer=signer, attestation_policy=policy)
-        destination = make_host(host_id="host:destination", signer=signer, attestation_policy=policy)
+        source_signer = EnvelopeSigner.generate("source-key", "host:source", ("host:source", "host:destination"))
+        destination_signer = trust_signer(EnvelopeSigner.generate("destination-key", "host:destination", ("host:destination",)), source_signer)
+        source = make_host(host_id="host:source", signer=source_signer, attestation_policy=policy)
+        destination = make_host(host_id="host:destination", signer=destination_signer, attestation_policy=policy)
         destination_evidence = authority.issue(
             subject=destination.host_id,
             audience=source.host_id,
@@ -1159,7 +1314,7 @@ class RuntimeTests(unittest.TestCase):
             "attestation",
             authority.issue(source.host_id, envelope.permit.issuer, "measurement:destination", int(time.time()) + 60, nonce=envelope.permit.nonce),
         )
-        signer.seal(envelope)
+        source_signer.seal(envelope)
 
         first = source.run(envelope)
         self.assertEqual(first.checkpoint["memory"]["migration"]["attested_measurement"], "measurement:destination")
@@ -1457,9 +1612,21 @@ class RuntimeTests(unittest.TestCase):
             "budget": {"max_steps": 10, "max_tool_calls": 5, "max_output_bytes": 65536},
             "approval_authorities": authorities,
             "tools": tools or {
-                "catalog.search": {"impact": "low", "constraints": {"max_limit": 5}},
+                "catalog.search": {"impact": "low", "constraints": {"max_limit": 5}, "output_projection": ["id", "title"]},
                 "payments.reserve": {"impact": "external-payment", "constraints": {"max_amount": 100, "currency": "USD"}},
             },
+        }), encoding="utf-8")
+        return path
+
+    def _write_trust_registry(self, directory, signer):
+        path = Path(directory) / "trust.json"
+        path.write_text(json.dumps({
+            "identities": [{
+                "key_id": signer.key_id,
+                "issuer": signer.issuer,
+                "public_key_b64": base64.urlsafe_b64encode(signer.public_key_bytes()).decode("ascii").rstrip("="),
+                "allowed_audiences": ["*"],
+            }]
         }), encoding="utf-8")
         return path
 
@@ -1470,6 +1637,28 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result.status, "completed")
         self.assertEqual(result.result["summary"], "Wasm completed through WIT resume")
         self.assertEqual(result.result["evidence"], [])
+
+    def test_wasm_component_inputs_use_projected_provider_state(self):
+        from portmark.component_bindings import component_checkpoint, component_context
+
+        state = AgentState(
+            "task-1",
+            "goal",
+            memory={"internal_note": "blocked-content"},
+            messages=[{"role": "tool", "name": "catalog.search", "content": {"id": "doc-1", "title": "Visible", "internal_note": "blocked-content"}}],
+            result={"internal_note": "blocked-content"},
+        )
+        grants = (ToolGrant("catalog.search", output_projection=("title",)),)
+        context = component_context(state, ("catalog.search",), grants)
+        checkpoint = component_checkpoint(state, grants)
+
+        self.assertEqual(context["state"]["messages"], [{"role": "tool", "name": "catalog.search", "content": {"title": "Visible"}}])
+        self.assertEqual(checkpoint["messages"], [{"role": "tool", "name": "catalog.search", "content": {"title": "Visible"}}])
+        self.assertNotIn("memory", context["state"])
+        self.assertNotIn("result", context["state"])
+        self.assertNotIn("memory", checkpoint)
+        self.assertNotIn("internal_note", json.dumps(context))
+        self.assertNotIn("internal_note", json.dumps(checkpoint))
 
     def test_wasm_with_ambient_wasi_import_cannot_instantiate(self):
         from portmark.providers import WasmDecisionProvider
