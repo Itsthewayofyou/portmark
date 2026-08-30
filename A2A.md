@@ -86,6 +86,11 @@ do not permit public direct binds.
   `--a2a-agent-card-rate-limit-window-seconds` sets the Agent Card per-IP
   rate-limit window.
 
+`GET /metrics` returns the in-process `RuntimeMetrics.snapshot()` JSON for
+operators. It is never public discovery metadata: the endpoint returns HTTP 401
+unless `PORTMARK_A2A_TOKEN` or `--a2a-token` is configured and the request
+includes the matching `Authorization: Bearer <token>` header.
+
 `POST /message:send` is bounded before envelope parsing and host execution:
 
 - `PORTMARK_A2A_MAX_CONCURRENT_REQUESTS` / `--a2a-max-concurrent-requests`

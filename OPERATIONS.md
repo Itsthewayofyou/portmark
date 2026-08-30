@@ -102,7 +102,7 @@ portmark serve --bind 127.0.0.1 --port 8080
 Then front it with a production proxy. The repository includes an Nginx example
 at `deploy/nginx/portmark.conf` with TLS termination, HTTPS redirect,
 `client_max_body_size 1m`, security headers, and proxy-side rate/connection
-limits for `/.well-known/agent-card.json` and `/message:send`.
+limits for `/.well-known/agent-card.json`, `/message:send`, and `/metrics`.
 
 `portmark serve` refuses non-loopback binds such as `0.0.0.0`; public exposure
 must go through the production proxy boundary. The legacy `--allow-direct-a2a`
@@ -133,8 +133,11 @@ The command prints `{"status": "valid"}` and exits 0 for an intact chain whose s
 
 `AgentHost` owns an in-process `RuntimeMetrics` instance. Embedders can pass
 their own metrics object and export `metrics.snapshot()` through the deployment
-telemetry pipeline. The reference A2A server does not publish a metrics
-endpoint, so enabling metrics does not widen the network surface.
+telemetry pipeline. The reference A2A server publishes the same snapshot at
+`GET /metrics` only when `PORTMARK_A2A_TOKEN` or `--a2a-token` is configured;
+requests must include `Authorization: Bearer <token>`. The endpoint is still
+served only from the loopback origin and should be exposed publicly only
+through the same authenticated production proxy boundary as `/message:send`.
 
 ## Backup And Restore
 

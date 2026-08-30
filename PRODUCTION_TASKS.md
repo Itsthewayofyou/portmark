@@ -130,15 +130,16 @@ Tasks:
 Status: implemented for the reference runtime. `AgentHost` owns an in-process
 `RuntimeMetrics` object that records run starts, terminal statuses, provider
 decisions, tool executions, tool failures, and security rejections. The
-reference A2A server does not publish a metrics endpoint, so deployments can
-export the snapshot through their existing telemetry path without widening the
-network surface.
+reference A2A server exposes the snapshot at authenticated loopback `GET
+/metrics` when a bearer token is configured, so operators can read counters
+without making metrics public discovery metadata.
 
 Tasks:
 
 - [x] Add a dependency-free metrics collector suitable for tests and embedders.
 - [x] Wire metrics through `AgentHost` without changing the provider/tool API.
 - [x] Count successful runs, failed runs, provider decisions, tool executions, tool failures, and security rejections.
+- [x] Expose metrics through an authenticated loopback endpoint without making them public.
 - [x] Add regression tests for metrics increments.
 
 Implementation note: the reference runtime uses local signed approval tokens and file-backed JSON policy. Production deployments should replace the demo approval authority with an approval service or workflow tied to operator identity and change management.

@@ -154,7 +154,7 @@ public Agent Card route is rate-limited separately from `/message:send`.
 
 The Agent Card is available at `/.well-known/agent-card.json`; signed envelopes are submitted to
 `/message:send` with the A2A JSON-RPC `message/send` method. See [A2A.md](A2A.md) for the Agent
-Card fields, request shape, authentication profile, and error behavior.
+Card fields, request shape, authentication profile, metrics endpoint, and error behavior.
 
 To validate the Agent Card and request shape through the official SDK types,
 install `portmark[a2a]` and run `serve --a2a-adapter sdk`. The local adapter
@@ -257,7 +257,7 @@ stable interface to substitute against.
 | A2A types | generated-style A2A 1.0 subset isolated in `a2a_types.py`, with optional `a2a-sdk` validation | deployment-selected official SDK/server integration |
 | Attestation | signed mock evidence and optional external verifier command checked by `AttestationPolicy` against RATS-style roles | the target platform's TEE quote verifier and sealed-storage backend |
 | Approvals | locally signed approval tokens bound to task, nonce, arguments, and policy hash | an approval service tied to operator identity and change management |
-| Metrics | in-process `RuntimeMetrics` counters attached to `AgentHost` | deployment metrics/export pipeline |
+| Metrics | in-process `RuntimeMetrics` counters attached to `AgentHost`, exposed on authenticated loopback `GET /metrics` | deployment metrics/export pipeline and authenticated proxy policy |
 
 ## License
 

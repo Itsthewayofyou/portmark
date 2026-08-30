@@ -1651,6 +1651,87 @@ class RuntimeTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    def test_a2a_metrics_endpoint_requires_bearer_auth_and_returns_snapshot(self):
+        host = make_host()
+        server = ThreadingHTTPServer(
+            ("127.0.0.1", 0),
+            make_handler(host, A2AAuthConfig("metrics-secret"), rate_limit_per_ip=100),
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_port}"
+        try:
+            body = self._a2a_request_body(host, "metrics endpoint")
+            submit = urllib.request.Request(
+                base + "/message:send",
+                data=body,
+                headers={"Content-Type": "application/json", "Authorization": "Bearer metrics-secret"},
+            )
+            with urllib.request.urlopen(submit) as response:  # nosec B310
+                self.assertEqual(json.load(response)["result"]["status"]["state"], "completed")
+
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                urllib.request.urlopen(base + "/metrics")  # nosec B310
+            self.assertEqual(raised.exception.code, 401)
+            self.assertEqual(json.load(raised.exception)["error"]["message"], "unauthorized")
+
+            wrong = urllib.request.Request(base + "/metrics", headers={"Authorization": "Bearer wrong"})
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                urllib.request.urlopen(wrong)  # nosec B310
+            self.assertEqual(raised.exception.code, 401)
+
+            request = urllib.request.Request(base + "/metrics", headers={"Authorization": "Bearer metrics-secret"})
+            with urllib.request.urlopen(request) as response:  # nosec B310
+                metrics = json.load(response)
+            self.assertEqual(metrics["counters"]["runs.completed"], 1)
+            self.assertEqual(metrics["counters"]["runs.started"], 1)
+            self.assertEqual(metrics["counters"]["provider.decisions"], 2)
+            self.assertEqual(metrics["counters"]["tools.executed"], 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_a2a_metrics_endpoint_is_rate_limited_separately(self):
+        host = make_host()
+        server = ThreadingHTTPServer(
+            ("127.0.0.1", 0),
+            make_handler(host, A2AAuthConfig("metrics-secret"), rate_limit_per_ip=1, rate_limit_window_seconds=60),
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_port}"
+        try:
+            request = urllib.request.Request(base + "/metrics", headers={"Authorization": "Bearer metrics-secret"})
+            with urllib.request.urlopen(request) as response:  # nosec B310
+                self.assertEqual(json.load(response), {"counters": {}})
+
+            request = urllib.request.Request(base + "/metrics", headers={"Authorization": "Bearer metrics-secret"})
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                urllib.request.urlopen(request)  # nosec B310
+            self.assertEqual(raised.exception.code, 429)
+            self.assertEqual(raised.exception.headers["Retry-After"], "60")
+            self.assertEqual(json.load(raised.exception)["error"], {"code": -32002, "message": "rate limit exceeded"})
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_a2a_metrics_endpoint_is_not_open_when_message_auth_is_disabled(self):
+        host = make_host()
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(host))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_port}"
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                urllib.request.urlopen(base + "/metrics")  # nosec B310
+            self.assertEqual(raised.exception.code, 401)
+            payload = json.load(raised.exception)
+            self.assertEqual(payload["error"], {"code": -32001, "message": "unauthorized"})
+            self.assertEqual(raised.exception.headers["WWW-Authenticate"], 'Bearer realm="portmark"')
+        finally:
+            server.shutdown()
+            server.server_close()
+
     def test_a2a_serve_requires_loopback_even_when_direct_exposure_flag_is_set(self):
         public_bind = ".".join(("0", "0", "0", "0"))
         self.assertTrue(is_loopback_bind("127.0.0.1"))
@@ -1698,8 +1779,11 @@ class RuntimeTests(unittest.TestCase):
             "limit_req_zone",
             "limit_conn_zone",
             "zone=portmark_agent_card_rate",
+            "zone=portmark_metrics_rate",
             "location = /.well-known/agent-card.json",
             "location = /message:send",
+            "location = /metrics",
+            "proxy_set_header Authorization $http_authorization",
             "return 308 https://$host$request_uri",
         ]:
             with self.subTest(required=required):

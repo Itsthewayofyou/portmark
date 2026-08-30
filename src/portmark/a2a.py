@@ -193,6 +193,7 @@ def make_handler(
     auth_config = auth or A2AAuthConfig()
     network_guard = NetworkGuard(max_concurrent_requests, rate_limit_per_ip, rate_limit_window_seconds)
     agent_card_limiter = RateLimiter(agent_card_rate_limit_per_ip, agent_card_rate_limit_window_seconds)
+    metrics_limiter = RateLimiter(rate_limit_per_ip, rate_limit_window_seconds)
 
     class A2AHandler(BaseHTTPRequestHandler):
         server_version = "PortableAgentA2A/1.0"
@@ -228,6 +229,22 @@ def make_handler(
                     self._json(200, make_sdk_agent_card(self._base_url(), auth_config.required))
                     return
                 self._json(200, make_agent_card(self._base_url(), auth_config.required))
+            elif self.path == "/metrics":
+                if not metrics_limiter.admit(self._client_ip()):
+                    self._json(
+                        429,
+                        error_response(None, -32002, "rate limit exceeded"),
+                        {"Retry-After": str(rate_limit_window_seconds)},
+                    )
+                    return
+                if not auth_config.required or not self._authorized(auth_config):
+                    self._json(
+                        401,
+                        error_response(None, -32001, "unauthorized"),
+                        {"WWW-Authenticate": f'Bearer realm="{auth_config.realm}"'},
+                    )
+                    return
+                self._json(200, host.metrics.snapshot())
             else:
                 self._json(404, {"error": "not found"})
 
