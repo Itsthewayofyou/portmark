@@ -2011,8 +2011,6 @@ class RuntimeTests(unittest.TestCase):
         capsule = Path(__file__).parents[1] / "capsules" / "research-agent.wasm.b64"
         host = make_host(wasm_component=str(capsule))
         envelope = make_demo_envelope(host, "portable execution", "wasm")
-        object.__setattr__(envelope.permit, "grants", (ToolGrant("catalog.search", {"max_limit": 3}, ("id", "title")),))
-        host.signer.seal(envelope)
         result = host.run(envelope)
         self.assertEqual(result.status, "completed")
         self.assertEqual(result.result["summary"], "Wasm resumed from checkpointed tool result")

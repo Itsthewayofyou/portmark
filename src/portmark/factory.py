@@ -115,7 +115,7 @@ def make_demo_envelope(host: AgentHost, goal: str, provider: str = "deterministi
     permit = Permit(
         issuer=getattr(host.signer, "issuer", host.host_id), subject=manifest.agent_id, audience=host.host_id,
         expires_at=int(time.time()) + 3600, nonce=secrets.token_hex(16),
-        grants=(ToolGrant("catalog.search", {"max_limit": 3}),),
+        grants=(ToolGrant("catalog.search", {"max_limit": 3}, ("id", "title")),),
         budget=ResourceBudget(max_steps=6, max_tool_calls=2, max_output_bytes=32_768),
     )
     return host.signer.seal(AgentEnvelope(manifest, permit, AgentState(secrets.token_hex(8), goal)))
