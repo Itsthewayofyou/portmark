@@ -85,10 +85,11 @@ portmark --attestation-verifier-command "/opt/portmark/verify-quote --json" \
 
 The verifier command receives canonical JSON on stdin containing the unsigned
 attestation evidence, expected subject, relying party, expected nonce, and host
-time. It must exit 0 and return `{"valid": true}` on stdout. Non-zero exits,
-timeouts, malformed JSON, oversized stdout, and any response other than
-`{"valid": true}` reject the run. Keep the verifier executable and trust roots
-owned by the deployment control plane.
+time. Attestation evidence must include a non-empty `quote` when an external
+verifier is configured. The verifier must exit 0 and return `{"valid": true}`
+on stdout. Non-zero exits, timeouts, malformed JSON, oversized stdout, and any
+response other than `{"valid": true}` reject the run. Keep the verifier
+executable and trust roots owned by the deployment control plane.
 
 ## Network Boundary
 

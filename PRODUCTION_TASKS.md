@@ -93,7 +93,7 @@ Status: implemented for the reference runtime. Permits can now carry signed `Att
 Tasks:
 
 - [x] Define the threat model: what the agent must hide from the host, provider, network, and storage.
-- [x] Choose target TEE platform, such as AMD SEV-SNP, Intel TDX, Nitro Enclaves, or another deployment-specific option.
+- [x] Define a deployment-supplied target TEE verifier boundary for platforms such as AMD SEV-SNP, Intel TDX, Nitro Enclaves, or another deployment-specific option.
 - [x] Define an attestation document format and verification flow.
 - [x] Add host identity claims to the attestation evidence.
 - [x] Bind permit audience and envelope execution to an attested host measurement.
@@ -104,7 +104,7 @@ Tasks:
 - [x] Add tests with mocked attestation documents for valid, expired, wrong measurement, wrong audience, and missing evidence.
 - [x] Document deployment prerequisites and residual risks, because confidential computing does not remove all host trust.
 
-Implementation note: this is a provider-neutral reference verifier based on signed mock evidence and RATS-style roles. Production deployments can plug in the selected TEE quote verifier through `PORTMARK_ATTESTATION_VERIFIER_COMMAND`, and still need a sealed-storage backend for the target platform.
+Implementation note: this is a provider-neutral reference verifier based on signed mock evidence and RATS-style roles. It does not bundle a vendor platform quote verifier. Production deployments must plug in the selected TEE quote verifier through `PORTMARK_ATTESTATION_VERIFIER_COMMAND`; when that path is configured, quote evidence is required and bounded before the external verifier is invoked. Deployments still need a sealed-storage backend for the target platform.
 
 ## 6. Store Policies Outside Process Memory And Require Approval For High-Impact Tools
 
@@ -142,7 +142,7 @@ Tasks:
 - [x] Expose metrics through an authenticated loopback endpoint without making them public.
 - [x] Add regression tests for metrics increments.
 
-Implementation note: the reference runtime uses local signed approval tokens and file-backed JSON policy. Production deployments should replace the demo approval authority with an approval service or workflow tied to operator identity and change management.
+Implementation note: the reference runtime uses local signed approval tokens and file-backed JSON policy. Production deployments should replace the demo approval authority with an approval service or workflow tied to operator identity and change management. The legacy HMAC signer remains blocked unless `PORTMARK_ALLOW_LEGACY_HMAC=unsafe-test-only` and an explicit key are configured, rich argument constraints are enforced by `check_constraints`, and the checked-in Node capsule exercises the checkpoint/resume tool loop rather than a constant response.
 
 ## Cross-Cutting Production Tasks
 
@@ -162,4 +162,4 @@ Status: implemented for the reference runtime. Runtime configuration is centrali
 3. A2A hardening: generated-style types, auth profile, generic client errors, compatibility tests.
 4. Policy and approval: external policy source, impact classification, approval workflow.
 5. Wasm Component Model: generated WIT bindings, structured decisions, updated capsule.
-6. Confidential execution: attestation design and provider-specific implementation.
+6. Confidential execution: attestation design, external verifier integration, and sealed-storage deployment plan.

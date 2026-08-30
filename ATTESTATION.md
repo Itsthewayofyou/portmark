@@ -6,7 +6,7 @@ This runtime models confidential-computing attestation as a signed authorization
 
 Attestation reduces trust in the destination host before an agent releases sensitive state or migrates work. The relying party needs evidence that a host identity is bound to an approved workload measurement and that the evidence is fresh.
 
-This reference implementation does not encrypt memory against the local Python process. The built-in authority is a signed test double, and production deployments can configure a bounded external verifier for the selected TEE, such as a verifier for SEV-SNP, TDX, Nitro Enclaves, or the deployment's equivalent confidential-computing evidence format.
+This reference implementation does not encrypt memory against the local Python process. The built-in authority is a signed test double, not a platform quote verifier. Production deployments must select the target TEE and configure a bounded external verifier for that platform, such as a verifier for SEV-SNP, TDX, Nitro Enclaves, or the deployment's equivalent confidential-computing evidence format.
 
 ## Evidence Format
 
@@ -28,7 +28,7 @@ This reference implementation does not encrypt memory against the local Python p
 }
 ```
 
-The built-in verifier signs the canonical JSON form of every field except `signature`. When an external verifier is configured, `quote` carries the deployment-specific attestation document and `claims` can carry parsed, non-secret quote metadata.
+The built-in verifier signs the canonical JSON form of every field except `signature`. When an external verifier is configured, `quote` is required and carries the deployment-specific attestation document; `claims` can carry parsed, non-secret quote metadata.
 
 ## Verification Flow
 
@@ -75,7 +75,10 @@ executed without a shell. It receives canonical JSON on stdin:
 The command must exit 0 and return `{"valid": true}` on stdout. Non-zero exits,
 timeouts, malformed JSON, oversized stdout, and any other response reject the
 evidence. Local signed evidence and external verification can be combined by
-configuring both trusted authorities and an external verifier.
+configuring both trusted authorities and an external verifier. The reference
+runtime does not ship SEV-SNP, TDX, Nitro, or vendor-specific quote validation
+logic; that verifier is deployment-supplied and must own its platform trust
+roots.
 
 ## Sealed Storage Decision
 

@@ -507,7 +507,7 @@ class RuntimeTests(unittest.TestCase):
             host.signer.seal(accepted)
             self.assertEqual(host.run(accepted).status, "completed")
 
-            for quote, message in [("bad", "rejected"), ("large", "output limit")]:
+            for quote, message in [("", "quote is required"), ("bad", "rejected"), ("large", "output limit")]:
                 with self.subTest(quote=quote):
                     rejected = make_demo_envelope(host, "external rejection")
                     object.__setattr__(

@@ -327,6 +327,8 @@ class AttestationPolicy:
             raise SecurityError("attestation measurement is not approved")
         if expected_nonce is not None and evidence.nonce and not hmac.compare_digest(evidence.nonce, expected_nonce):
             raise SecurityError("attestation nonce does not match permit")
+        if self.external_verifier is not None and not evidence.quote:
+            raise SecurityError("attestation quote is required for external verification")
         if authority is not None:
             try:
                 Ed25519PublicKey.from_public_bytes(authority.public_key).verify(
