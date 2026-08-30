@@ -93,8 +93,14 @@ executable and trust roots owned by the deployment control plane.
 
 ## Network Boundary
 
+`portmark serve` runs the A2A boundary on **uvicorn**, an ASGI server, so a slow
+or stalled client costs a suspended coroutine rather than a blocked OS thread.
+Connection concurrency is bounded by `--max-concurrent-requests`, which is passed
+to uvicorn as `limit_concurrency`.
+
 Expose the A2A listener behind a production HTTP stack for public deployments.
-Run the reference listener on loopback:
+TLS termination remains the proxy's responsibility. Run the reference listener on
+loopback:
 
 ```bash
 portmark serve --bind 127.0.0.1 --port 8080

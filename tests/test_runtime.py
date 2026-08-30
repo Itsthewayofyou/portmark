@@ -1,4 +1,5 @@
 import copy
+import asyncio
 import base64
 import concurrent.futures
 import hashlib
@@ -24,7 +25,7 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
-from portmark.a2a import A2AAuthConfig, BoundedReferenceHTTPServer, RateLimiter, envelope_from_dict, is_loopback_bind, make_handler, serve
+from portmark.a2a import MAX_REQUEST_BYTES, DEFAULT_MAX_CONCURRENT_REQUESTS, A2AAuthConfig, BoundedReferenceHTTPServer, RateLimiter, envelope_from_dict, is_loopback_bind, make_asgi_app, make_handler, serve
 from portmark.config import RuntimeConfig
 from portmark.factory import make_demo_envelope, make_host, signer_from_environment
 from portmark.metrics import RuntimeMetrics
@@ -1742,20 +1743,94 @@ class RuntimeTests(unittest.TestCase):
         self.assertFalse(issubclass(BoundedReferenceHTTPServer, ThreadingHTTPServer))
 
         host = make_host()
-        with patch("portmark.a2a.BoundedReferenceHTTPServer") as server_class:
+        with patch("uvicorn.run") as run:
             with self.assertRaisesRegex(ValueError, "loopback"):
                 serve(host, public_bind, 8080)
-        server_class.assert_not_called()
+        run.assert_not_called()
 
-        with patch("portmark.a2a.BoundedReferenceHTTPServer") as server_class:
+        with patch("uvicorn.run") as run:
             with self.assertRaisesRegex(ValueError, "reverse proxy"):
                 serve(host, public_bind, 8080, allow_direct_a2a=True)
-        server_class.assert_not_called()
+        run.assert_not_called()
 
-        with patch("portmark.a2a.BoundedReferenceHTTPServer") as server_class:
-            server = server_class.return_value
+        with patch("uvicorn.run") as run:
             serve(host, "127.0.0.1", 8080)
-        server.serve_forever.assert_called_once()
+        run.assert_called_once()
+        self.assertEqual(run.call_args.kwargs["host"], "127.0.0.1")
+        self.assertEqual(run.call_args.kwargs["limit_concurrency"], DEFAULT_MAX_CONCURRENT_REQUESTS)
+
+    def _asgi_call(self, app, method, path, headers=None, body=b"", client=("203.0.113.9", 5555)):
+        """Drive an ASGI app directly and collect the response."""
+        scope = {
+            "type": "http",
+            "method": method,
+            "path": path,
+            "client": client,
+            "headers": [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()],
+        }
+        sent = []
+
+        async def receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        async def send(message):
+            sent.append(message)
+
+        asyncio.run(app(scope, receive, send))
+        status = sent[0]["status"]
+        response_headers = {k.decode(): v.decode() for k, v in sent[0]["headers"]}
+        payload = b"".join(m.get("body", b"") for m in sent[1:])
+        return status, response_headers, payload
+
+    def test_asgi_app_serves_agent_card_with_security_headers(self):
+        app = make_asgi_app(make_host())
+        status, headers, payload = self._asgi_call(app, "GET", "/.well-known/agent-card.json", {"Host": "127.0.0.1"})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["protocolVersion"], "1.0")
+        for header in ("x-content-type-options", "x-frame-options", "content-security-policy", "referrer-policy"):
+            self.assertIn(header, headers)
+
+    def test_asgi_app_rejects_oversized_content_length_without_reading_body(self):
+        app = make_asgi_app(make_host())
+        read = []
+
+        async def receive():
+            read.append(True)
+            return {"type": "http.request", "body": b"x", "more_body": False}
+
+        sent = []
+
+        async def send(message):
+            sent.append(message)
+
+        scope = {
+            "type": "http", "method": "POST", "path": "/message:send", "client": ("203.0.113.9", 1),
+            "headers": [(b"content-type", b"application/json"), (b"content-length", str(MAX_REQUEST_BYTES + 1).encode())],
+        }
+        asyncio.run(app(scope, receive, send))
+        self.assertEqual(sent[0]["status"], 413)
+        self.assertEqual(read, [], "oversized request must be rejected before the body is read")
+
+    def test_asgi_app_requires_auth_for_metrics_and_shares_rate_limit_state(self):
+        host = make_host()
+        app = make_asgi_app(host, A2AAuthConfig("secret"), rate_limit_per_ip=2)
+        status, headers, _ = self._asgi_call(app, "GET", "/metrics")
+        self.assertEqual(status, 401)
+        self.assertIn("www-authenticate", headers)  # ASGI header names are lowercase
+        status, _, payload = self._asgi_call(app, "GET", "/metrics", {"Authorization": "Bearer secret"})
+        self.assertEqual(status, 200)
+        self.assertIn("counters", json.loads(payload))
+        # The limiter lives on the router, not the request: a third call must be refused.
+        status, _, _ = self._asgi_call(app, "GET", "/metrics", {"Authorization": "Bearer secret"})
+        self.assertEqual(status, 429)
+
+    def test_asgi_app_handles_missing_client_and_unknown_paths(self):
+        app = make_asgi_app(make_host())
+        status, _, _ = self._asgi_call(app, "GET", "/nope")
+        self.assertEqual(status, 404)
+        # scope["client"] is None under some deployments; the limiter must still key deterministically.
+        status, _, _ = self._asgi_call(app, "GET", "/.well-known/agent-card.json", {"Host": "h"}, client=None)
+        self.assertEqual(status, 200)
 
     def test_a2a_cli_rejects_public_bind_without_traceback(self):
         error = io.StringIO()

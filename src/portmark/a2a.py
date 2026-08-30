@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import json
 import logging
@@ -12,6 +13,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
+from collections.abc import Callable
 from typing import Any, Iterator
 
 from .a2a_types import A2ARequestError, error_response, make_agent_card, parse_jsonrpc_request, success_response, task_from_run_result
@@ -175,146 +177,220 @@ class BoundedReferenceHTTPServer(ThreadingMixIn, HTTPServer):
             logger.debug("failed to write busy response", exc_info=True)
 
 
-def make_handler(
-    host: AgentHost,
-    auth: A2AAuthConfig | None = None,
-    enable_hsts: bool = False,
-    max_concurrent_requests: int = DEFAULT_MAX_CONCURRENT_REQUESTS,
-    rate_limit_per_ip: int = DEFAULT_RATE_LIMIT_PER_IP,
-    rate_limit_window_seconds: int = DEFAULT_RATE_LIMIT_WINDOW_SECONDS,
-    agent_card_rate_limit_per_ip: int = DEFAULT_AGENT_CARD_RATE_LIMIT_PER_IP,
-    agent_card_rate_limit_window_seconds: int = DEFAULT_AGENT_CARD_RATE_LIMIT_WINDOW_SECONDS,
-    a2a_adapter: str = "local",
-):
-    if a2a_adapter not in A2A_ADAPTERS:
-        raise ValueError("a2a_adapter must be 'local' or 'sdk'")
-    if a2a_adapter == "sdk":
-        make_sdk_agent_card("http://127.0.0.1", False)
-    auth_config = auth or A2AAuthConfig()
-    network_guard = NetworkGuard(max_concurrent_requests, rate_limit_per_ip, rate_limit_window_seconds)
-    agent_card_limiter = RateLimiter(agent_card_rate_limit_per_ip, agent_card_rate_limit_window_seconds)
-    metrics_limiter = RateLimiter(rate_limit_per_ip, rate_limit_window_seconds)
+
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": "geolocation=(), microphone=(), camera=()",
+    "X-Frame-Options": "DENY",
+    "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'; base-uri 'none'",
+}
+
+
+def parse_content_length(raw: str) -> int:
+    """Bounds-check Content-Length before any body is read.
+
+    Rejecting on the header alone is the DoS property: an oversized request must
+    never cause the body to be read. Shared by every transport so the check
+    cannot drift between them.
+    """
+    try:
+        size = int(raw or "0")
+    except ValueError as exc:
+        raise A2ARequestError(-32600, "invalid request", 400) from exc
+    if size <= 0 or size > MAX_REQUEST_BYTES:
+        raise A2ARequestError(-32600, "invalid request", 413)
+    return size
+
+
+@dataclass(frozen=True)
+class HttpResponse:
+    status: int
+    payload: bytes
+    headers: dict[str, str]
+
+
+class A2ARouter:
+    """Transport-neutral A2A request handling.
+
+    Owns the mutable limiter state. One router per server; every transport that
+    wraps it shares these instances, so limits apply across the whole server
+    rather than per request.
+    """
+
+    def __init__(
+        self,
+        host: AgentHost,
+        auth: A2AAuthConfig | None = None,
+        enable_hsts: bool = False,
+        max_concurrent_requests: int = DEFAULT_MAX_CONCURRENT_REQUESTS,
+        rate_limit_per_ip: int = DEFAULT_RATE_LIMIT_PER_IP,
+        rate_limit_window_seconds: int = DEFAULT_RATE_LIMIT_WINDOW_SECONDS,
+        agent_card_rate_limit_per_ip: int = DEFAULT_AGENT_CARD_RATE_LIMIT_PER_IP,
+        agent_card_rate_limit_window_seconds: int = DEFAULT_AGENT_CARD_RATE_LIMIT_WINDOW_SECONDS,
+        a2a_adapter: str = "local",
+    ) -> None:
+        if a2a_adapter not in A2A_ADAPTERS:
+            raise ValueError("a2a_adapter must be 'local' or 'sdk'")
+        if a2a_adapter == "sdk":
+            make_sdk_agent_card("http://127.0.0.1", False)
+        self.host = host
+        self.auth_config = auth or A2AAuthConfig()
+        self.enable_hsts = enable_hsts
+        self.a2a_adapter = a2a_adapter
+        self.rate_limit_window_seconds = rate_limit_window_seconds
+        self.agent_card_rate_limit_window_seconds = agent_card_rate_limit_window_seconds
+        self.network_guard = NetworkGuard(max_concurrent_requests, rate_limit_per_ip, rate_limit_window_seconds)
+        self.agent_card_limiter = RateLimiter(agent_card_rate_limit_per_ip, agent_card_rate_limit_window_seconds)
+        self.metrics_limiter = RateLimiter(rate_limit_per_ip, rate_limit_window_seconds)
+
+    def response(self, status: int, value: Any, headers: dict[str, str] | None = None) -> HttpResponse:
+        payload = json.dumps(value).encode()
+        out = {
+            "Content-Type": "application/json",
+            "Content-Length": str(len(payload)),
+            **SECURITY_HEADERS,
+        }
+        if self.enable_hsts:
+            out["Strict-Transport-Security"] = "max-age=31536000"
+        if headers:
+            out.update(headers)
+        return HttpResponse(status, payload, out)
+
+    def authorized(self, authorization: str) -> bool:
+        if not self.auth_config.bearer_token:
+            return True
+        prefix = "Bearer "
+        if not authorization.startswith(prefix):
+            return False
+        return secrets.compare_digest(authorization[len(prefix):], self.auth_config.bearer_token)
+
+    def _unauthorized(self) -> HttpResponse:
+        return self.response(
+            401,
+            error_response(None, -32001, "unauthorized"),
+            {"WWW-Authenticate": f'Bearer realm="{self.auth_config.realm}"'},
+        )
+
+    def handle_get(self, path: str, host_header: str, client_ip: str, authorization: str = "") -> HttpResponse:
+        base_url = f"http://{host_header or '127.0.0.1'}"
+        if path == "/.well-known/agent-card.json":
+            if not self.agent_card_limiter.admit(client_ip):
+                return self.response(
+                    429,
+                    error_response(None, -32002, "rate limit exceeded"),
+                    {"Retry-After": str(self.agent_card_rate_limit_window_seconds)},
+                )
+            if self.a2a_adapter == "sdk":
+                return self.response(200, make_sdk_agent_card(base_url, self.auth_config.required))
+            return self.response(200, make_agent_card(base_url, self.auth_config.required))
+        if path == "/metrics":
+            if not self.metrics_limiter.admit(client_ip):
+                return self.response(
+                    429,
+                    error_response(None, -32002, "rate limit exceeded"),
+                    {"Retry-After": str(self.rate_limit_window_seconds)},
+                )
+            if not self.auth_config.required or not self.authorized(authorization):
+                return self._unauthorized()
+            return self.response(200, self.host.metrics.snapshot())
+        return self.response(404, {"error": "not found"})
+
+    def handle_post(
+        self,
+        path: str,
+        content_type: str,
+        content_length: str,
+        authorization: str,
+        client_ip: str,
+        read_body: Callable[[int], bytes],
+    ) -> HttpResponse:
+        if path != "/message:send":
+            return self.response(404, error_response(None, -32601, "method not found"))
+        request_id: str | int | None = None
+        try:
+            if content_type.split(";", 1)[0].strip().lower() != "application/json":
+                raise A2ARequestError(-32600, "invalid request", 415)
+            size = parse_content_length(content_length)
+            with self.network_guard.admit(client_ip) as rejection:
+                if rejection is not None:
+                    status, code, message = rejection
+                    return self.response(
+                        status,
+                        error_response(None, code, message),
+                        {"Retry-After": str(self.rate_limit_window_seconds)},
+                    )
+                if not self.authorized(authorization):
+                    return self._unauthorized()
+                try:
+                    payload = json.loads(read_body(size))
+                except json.JSONDecodeError as exc:
+                    raise A2ARequestError(-32700, "parse error", 400) from exc
+                if self.a2a_adapter == "sdk":
+                    try:
+                        validate_sdk_message_send_params(payload.get("params"))
+                    except Exception as exc:
+                        raise A2ARequestError(-32602, "invalid params") from exc
+                request = parse_jsonrpc_request(payload)
+                request_id = request.id
+                envelope = envelope_from_dict(request.params.portmark_envelope)
+                result = self.host.run(envelope)
+                return self.response(200, success_response(request.id, task_from_run_result(result)))
+        except A2ARequestError as exc:
+            return self.response(exc.http_status, error_response(exc.request_id, exc.code, exc.message))
+        except Exception:
+            logger.exception("A2A message submission failed")
+            return self.response(400, error_response(request_id, -32000, "message submission failed"))
+
+
+def make_handler(host: AgentHost, auth: A2AAuthConfig | None = None, enable_hsts: bool = False, **kwargs: Any):
+    """BaseHTTPRequestHandler transport over A2ARouter.
+
+    Retained for tests and local development. Production serving uses the ASGI
+    application; both share the router above, so the security logic has one
+    implementation.
+    """
+    router = A2ARouter(host, auth, enable_hsts, **kwargs)
 
     class A2AHandler(BaseHTTPRequestHandler):
         server_version = "PortableAgentA2A/1.0"
+        a2a_router = router
 
-        def _json(self, status: int, value: Any, headers: dict[str, str] | None = None) -> None:
-            payload = json.dumps(value).encode()
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(payload)))
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("Referrer-Policy", "no-referrer")
-            self.send_header("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
-            self.send_header("X-Frame-Options", "DENY")
-            self.send_header("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'")
-            if enable_hsts:
-                self.send_header("Strict-Transport-Security", "max-age=31536000")
-            if headers:
-                for key, value in headers.items():
-                    self.send_header(key, value)
+        def _send(self, response: HttpResponse) -> None:
+            self.send_response(response.status)
+            for key, value in response.headers.items():
+                self.send_header(key, value)
             self.end_headers()
-            self.wfile.write(payload)
-
-        def do_GET(self) -> None:
-            if self.path == "/.well-known/agent-card.json":
-                if not agent_card_limiter.admit(self._client_ip()):
-                    self._json(
-                        429,
-                        error_response(None, -32002, "rate limit exceeded"),
-                        {"Retry-After": str(agent_card_rate_limit_window_seconds)},
-                    )
-                    return
-                if a2a_adapter == "sdk":
-                    self._json(200, make_sdk_agent_card(self._base_url(), auth_config.required))
-                    return
-                self._json(200, make_agent_card(self._base_url(), auth_config.required))
-            elif self.path == "/metrics":
-                if not metrics_limiter.admit(self._client_ip()):
-                    self._json(
-                        429,
-                        error_response(None, -32002, "rate limit exceeded"),
-                        {"Retry-After": str(rate_limit_window_seconds)},
-                    )
-                    return
-                if not auth_config.required or not self._authorized(auth_config):
-                    self._json(
-                        401,
-                        error_response(None, -32001, "unauthorized"),
-                        {"WWW-Authenticate": f'Bearer realm="{auth_config.realm}"'},
-                    )
-                    return
-                self._json(200, host.metrics.snapshot())
-            else:
-                self._json(404, {"error": "not found"})
-
-        def do_POST(self) -> None:
-            if self.path != "/message:send":
-                self._json(404, error_response(None, -32601, "method not found"))
-                return
-            request_id: str | int | None = None
-            try:
-                if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
-                    raise A2ARequestError(-32600, "invalid request", 415)
-                try:
-                    size = int(self.headers.get("Content-Length", "0"))
-                except ValueError as exc:
-                    raise A2ARequestError(-32600, "invalid request", 400) from exc
-                if size <= 0 or size > MAX_REQUEST_BYTES:
-                    raise A2ARequestError(-32600, "invalid request", 413)
-                with network_guard.admit(self._client_ip()) as rejection:
-                    if rejection is not None:
-                        status, code, message = rejection
-                        self._json(status, error_response(None, code, message), {"Retry-After": str(rate_limit_window_seconds)})
-                        return
-                    if not self._authorized(auth_config):
-                        self._json(
-                            401,
-                            error_response(None, -32001, "unauthorized"),
-                            {"WWW-Authenticate": f'Bearer realm="{auth_config.realm}"'},
-                        )
-                        return
-                    try:
-                        payload = json.loads(self.rfile.read(size))
-                    except json.JSONDecodeError as exc:
-                        raise A2ARequestError(-32700, "parse error", 400) from exc
-                    if a2a_adapter == "sdk":
-                        try:
-                            validate_sdk_message_send_params(payload.get("params"))
-                        except Exception as exc:
-                            raise A2ARequestError(-32602, "invalid params") from exc
-                    request = parse_jsonrpc_request(payload)
-                    request_id = request.id
-                    envelope = envelope_from_dict(request.params.portmark_envelope)
-                    result = host.run(envelope)
-                    self._json(200, success_response(request.id, task_from_run_result(result)))
-            except A2ARequestError as exc:
-                self._json(exc.http_status, error_response(exc.request_id, exc.code, exc.message))
-            except Exception:
-                logger.exception("A2A message submission failed")
-                self._json(400, error_response(request_id, -32000, "message submission failed"))
-
-        def _base_url(self) -> str:
-            return f"http://{self.headers.get('Host', '127.0.0.1')}"
-
-        def _authorized(self, config: A2AAuthConfig) -> bool:
-            if not config.bearer_token:
-                return True
-            header = self.headers.get("Authorization", "")
-            prefix = "Bearer "
-            if not header.startswith(prefix):
-                return False
-            return secrets.compare_digest(header[len(prefix):], config.bearer_token)
+            self.wfile.write(response.payload)
 
         def _client_ip(self) -> str:
             if isinstance(self.client_address, tuple) and self.client_address:
                 return str(self.client_address[0])
             return "unknown"
 
+        def do_GET(self) -> None:
+            self._send(router.handle_get(
+                self.path,
+                self.headers.get("Host", "127.0.0.1"),
+                self._client_ip(),
+                self.headers.get("Authorization", ""),
+            ))
+
+        def do_POST(self) -> None:
+            self._send(router.handle_post(
+                self.path,
+                self.headers.get("Content-Type", ""),
+                self.headers.get("Content-Length", "0"),
+                self.headers.get("Authorization", ""),
+                self._client_ip(),
+                lambda size: self.rfile.read(size),
+            ))
+
         def log_message(self, format: str, *args: Any) -> None:
             return
 
     return A2AHandler
+
 
 
 def auth_from_environment() -> A2AAuthConfig:
@@ -328,6 +404,104 @@ def is_loopback_bind(bind: str) -> bool:
         return ipaddress.ip_address(bind).is_loopback
     except ValueError:
         return False
+
+
+def make_asgi_app(host: AgentHost, auth: A2AAuthConfig | None = None, enable_hsts: bool = False, **kwargs: Any):
+    """ASGI application over A2ARouter.
+
+    Shares one router instance across every request, so the rate limiters and the
+    concurrency guard are server-wide rather than per request.
+
+    Transport note: ASGI delivers the body through `receive()`, so the body is
+    buffered after the Content-Length bounds check and before the router runs.
+    An oversized request is still rejected without its body being read, which is
+    the DoS property. A request within the limit has at most MAX_REQUEST_BYTES
+    buffered before per-IP rate limiting applies; uvicorn's own concurrency limit
+    is the outer bound.
+    """
+    router = A2ARouter(host, auth, enable_hsts, **kwargs)
+
+    def _header(scope: dict[str, Any], name: bytes) -> str:
+        for key, value in scope.get("headers", ()):
+            if key.lower() == name:
+                return value.decode("latin-1")
+        return ""
+
+    def _client_ip(scope: dict[str, Any]) -> str:
+        client = scope.get("client")
+        if isinstance(client, (tuple, list)) and client:
+            return str(client[0])
+        return "unknown"
+
+    async def _send(send, response: HttpResponse) -> None:
+        await send({
+            "type": "http.response.start",
+            "status": response.status,
+            "headers": [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in response.headers.items()],
+        })
+        await send({"type": "http.response.body", "body": response.payload})
+
+    async def app(scope, receive, send) -> None:
+        if scope["type"] == "lifespan":
+            while True:
+                message = await receive()
+                if message["type"] == "lifespan.startup":
+                    await send({"type": "lifespan.startup.complete"})
+                elif message["type"] == "lifespan.shutdown":
+                    await send({"type": "lifespan.shutdown.complete"})
+                    return
+            return
+        if scope["type"] != "http":
+            return
+        path, method = scope.get("path", ""), scope.get("method", "GET").upper()
+        client_ip = _client_ip(scope)
+        if method == "GET":
+            response = await asyncio.to_thread(
+                router.handle_get, path, _header(scope, b"host"), client_ip, _header(scope, b"authorization")
+            )
+            await _send(send, response)
+            return
+        if method != "POST":
+            await _send(send, router.response(404, {"error": "not found"}))
+            return
+
+        raw_length = _header(scope, b"content-length")
+        content_type = _header(scope, b"content-type")
+        if path == "/message:send" and content_type.split(";", 1)[0].strip().lower() == "application/json":
+            # Bounds-check before touching receive(): an oversized body is never read.
+            try:
+                size = parse_content_length(raw_length)
+            except A2ARequestError as exc:
+                await _send(send, router.response(exc.http_status, error_response(None, exc.code, exc.message)))
+                return
+            body = bytearray()
+            while len(body) < size:
+                message = await receive()
+                if message["type"] == "http.disconnect":
+                    return
+                body.extend(message.get("body", b""))
+                if len(body) > MAX_REQUEST_BYTES:
+                    await _send(send, router.response(413, error_response(None, -32600, "invalid request")))
+                    return
+                if not message.get("more_body", False):
+                    break
+            payload = bytes(body)
+        else:
+            payload = b""
+
+        response = await asyncio.to_thread(
+            router.handle_post,
+            path,
+            content_type,
+            raw_length,
+            _header(scope, b"authorization"),
+            client_ip,
+            lambda n: payload[:n],
+        )
+        await _send(send, response)
+
+    app.a2a_router = router  # type: ignore[attr-defined]
+    return app
 
 
 def serve(
@@ -344,22 +518,39 @@ def serve(
     allow_direct_a2a: bool = False,
     a2a_adapter: str = "local",
 ) -> None:
+    """Serve the A2A boundary on uvicorn.
+
+    The loopback restriction is retained deliberately and is not overridable by
+    `allow_direct_a2a`. Moving to a production ASGI server removes the
+    slow-client thread exhaustion of http.server; it is not on its own a
+    decision to expose the reference host publicly.
+    """
     if not is_loopback_bind(bind):
         raise ValueError(
             "A2A reference server must bind to loopback and be fronted by a production reverse proxy for public exposure"
         )
-    BoundedReferenceHTTPServer(
-        (bind, port),
-        make_handler(
-            host,
-            auth or auth_from_environment(),
-            enable_hsts,
-            max_concurrent_requests,
-            rate_limit_per_ip,
-            rate_limit_window_seconds,
-            agent_card_rate_limit_per_ip,
-            agent_card_rate_limit_window_seconds,
-            a2a_adapter,
-        ),
-        max_connections=max_concurrent_requests,
-    ).serve_forever()
+    try:
+        import uvicorn
+    except ImportError as exc:  # pragma: no cover - exercised by packaging, not unit tests
+        raise RuntimeError("serving the A2A boundary requires uvicorn; install portmark with its default dependencies") from exc
+
+    app = make_asgi_app(
+        host,
+        auth or auth_from_environment(),
+        enable_hsts,
+        max_concurrent_requests=max_concurrent_requests,
+        rate_limit_per_ip=rate_limit_per_ip,
+        rate_limit_window_seconds=rate_limit_window_seconds,
+        agent_card_rate_limit_per_ip=agent_card_rate_limit_per_ip,
+        agent_card_rate_limit_window_seconds=agent_card_rate_limit_window_seconds,
+        a2a_adapter=a2a_adapter,
+    )
+    uvicorn.run(
+        app,
+        host=bind,
+        port=port,
+        log_level="warning",
+        limit_concurrency=max_concurrent_requests,
+        timeout_keep_alive=5,
+        access_log=False,
+    )
