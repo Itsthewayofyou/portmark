@@ -25,7 +25,7 @@ def main() -> None:
     parser.add_argument("--log-level", help="logging level")
     parser.add_argument("--log-json", action="store_true", help="emit structured JSON logs")
     parser.add_argument("--enable-hsts", action="store_true", help="emit HSTS header when served behind HTTPS")
-    parser.add_argument("--allow-direct-a2a", action="store_true", help="allow the reference A2A server to bind to non-loopback interfaces")
+    parser.add_argument("--allow-direct-a2a", action="store_true", help="deprecated; non-loopback A2A binds are refused")
     subparsers = parser.add_subparsers(dest="command", required=True)
     demo = subparsers.add_parser("demo")
     demo.add_argument("goal", nargs="?", default="find portable agent architecture references")
@@ -76,20 +76,23 @@ def main() -> None:
         result = host.run(make_demo_envelope(host, args.goal, provider))
         print(json.dumps(asdict(result), indent=2))
     else:
-        serve(
-            host=host,
-            bind=args.bind,
-            port=args.port,
-            auth=A2AAuthConfig(config.a2a_token) if config.a2a_token else None,
-            enable_hsts=config.enable_hsts,
-            max_concurrent_requests=config.a2a_max_concurrent_requests,
-            rate_limit_per_ip=config.a2a_rate_limit_per_ip,
-            rate_limit_window_seconds=config.a2a_rate_limit_window_seconds,
-            agent_card_rate_limit_per_ip=config.a2a_agent_card_rate_limit_per_ip,
-            agent_card_rate_limit_window_seconds=config.a2a_agent_card_rate_limit_window_seconds,
-            allow_direct_a2a=config.allow_direct_a2a,
-            a2a_adapter=config.a2a_adapter,
-        )
+        try:
+            serve(
+                host=host,
+                bind=args.bind,
+                port=args.port,
+                auth=A2AAuthConfig(config.a2a_token) if config.a2a_token else None,
+                enable_hsts=config.enable_hsts,
+                max_concurrent_requests=config.a2a_max_concurrent_requests,
+                rate_limit_per_ip=config.a2a_rate_limit_per_ip,
+                rate_limit_window_seconds=config.a2a_rate_limit_window_seconds,
+                agent_card_rate_limit_per_ip=config.a2a_agent_card_rate_limit_per_ip,
+                agent_card_rate_limit_window_seconds=config.a2a_agent_card_rate_limit_window_seconds,
+                allow_direct_a2a=config.allow_direct_a2a,
+                a2a_adapter=config.a2a_adapter,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
 
 
 if __name__ == "__main__":

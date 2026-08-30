@@ -29,6 +29,8 @@ Runtime configuration can come from environment variables or CLI flags:
   `--a2a-agent-card-rate-limit-per-ip`
 - `PORTMARK_A2A_AGENT_CARD_RATE_LIMIT_WINDOW_SECONDS` /
   `--a2a-agent-card-rate-limit-window-seconds`
+- `PORTMARK_ALLOW_DIRECT_A2A` / `--allow-direct-a2a` (deprecated no-op;
+  non-loopback binds are refused)
 - `PORTMARK_LOG_LEVEL` / `--log-level`
 - `PORTMARK_LOG_JSON` / `--log-json`
 - `PORTMARK_ENABLE_HSTS` / `--enable-hsts`
@@ -102,10 +104,11 @@ at `deploy/nginx/portmark.conf` with TLS termination, HTTPS redirect,
 `client_max_body_size 1m`, security headers, and proxy-side rate/connection
 limits for `/.well-known/agent-card.json` and `/message:send`.
 
-By default `portmark serve` refuses non-loopback binds such as `0.0.0.0`.
-`--allow-direct-a2a` or `PORTMARK_ALLOW_DIRECT_A2A=1` is the explicit escape
-hatch for deployments that intentionally expose the Python reference server
-directly. Even when fronted, the reference server still enforces its own
+`portmark serve` refuses non-loopback binds such as `0.0.0.0`; public exposure
+must go through the production proxy boundary. The legacy `--allow-direct-a2a`
+flag and `PORTMARK_ALLOW_DIRECT_A2A=1` environment variable are retained only
+for configuration compatibility and do not bypass the loopback requirement.
+Even when fronted, the reference server still enforces its own
 network controls: public Agent Card GETs are rate-limited separately from
 message submission, concurrent `/message:send` requests are capped, accepted
 submissions are rate-limited per client IP, and oversized submissions are

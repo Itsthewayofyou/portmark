@@ -17,14 +17,14 @@ import unittest
 import urllib.error
 import urllib.request
 from dataclasses import asdict
-from contextlib import contextmanager, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from http.client import HTTPResponse
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
-from portmark.a2a import A2AAuthConfig, BoundedThreadingHTTPServer, RateLimiter, envelope_from_dict, is_loopback_bind, make_handler, serve
+from portmark.a2a import A2AAuthConfig, BoundedReferenceHTTPServer, RateLimiter, envelope_from_dict, is_loopback_bind, make_handler, serve
 from portmark.config import RuntimeConfig
 from portmark.factory import make_demo_envelope, make_host, signer_from_environment
 from portmark.metrics import RuntimeMetrics
@@ -1651,24 +1651,42 @@ class RuntimeTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
-    def test_a2a_serve_requires_loopback_unless_direct_exposure_is_explicit(self):
+    def test_a2a_serve_requires_loopback_even_when_direct_exposure_flag_is_set(self):
         public_bind = ".".join(("0", "0", "0", "0"))
         self.assertTrue(is_loopback_bind("127.0.0.1"))
         self.assertTrue(is_loopback_bind("::1"))
         self.assertTrue(is_loopback_bind("localhost"))
         self.assertFalse(is_loopback_bind(public_bind))
         self.assertFalse(is_loopback_bind("192.0.2.10"))
+        self.assertFalse(issubclass(BoundedReferenceHTTPServer, ThreadingHTTPServer))
 
         host = make_host()
-        with patch("portmark.a2a.BoundedThreadingHTTPServer") as server_class:
+        with patch("portmark.a2a.BoundedReferenceHTTPServer") as server_class:
             with self.assertRaisesRegex(ValueError, "loopback"):
                 serve(host, public_bind, 8080)
         server_class.assert_not_called()
 
-        with patch("portmark.a2a.BoundedThreadingHTTPServer") as server_class:
+        with patch("portmark.a2a.BoundedReferenceHTTPServer") as server_class:
+            with self.assertRaisesRegex(ValueError, "reverse proxy"):
+                serve(host, public_bind, 8080, allow_direct_a2a=True)
+        server_class.assert_not_called()
+
+        with patch("portmark.a2a.BoundedReferenceHTTPServer") as server_class:
             server = server_class.return_value
-            serve(host, public_bind, 8080, allow_direct_a2a=True)
+            serve(host, "127.0.0.1", 8080)
         server.serve_forever.assert_called_once()
+
+    def test_a2a_cli_rejects_public_bind_without_traceback(self):
+        error = io.StringIO()
+        public_bind = ".".join(("0", "0", "0", "0"))
+        with patch.object(sys, "argv", ["portmark", "--allow-direct-a2a", "serve", "--bind", public_bind, "--port", "8080"]):
+            with redirect_stderr(error):
+                with self.assertRaises(SystemExit) as raised:
+                    cli_main()
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("must bind to loopback", error.getvalue())
+        self.assertNotIn("Traceback", error.getvalue())
+        self.assertNotIn("ValueError", error.getvalue())
 
     def test_a2a_nginx_front_documents_required_controls(self):
         config = (Path(__file__).parents[1] / "deploy" / "nginx" / "portmark.conf").read_text(encoding="utf-8")
@@ -1842,12 +1860,49 @@ class RuntimeTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    def test_a2a_bounded_reference_server_handles_concurrent_loopback_load(self):
+        host = make_host()
+        server = BoundedReferenceHTTPServer(
+            ("127.0.0.1", 0),
+            make_handler(
+                host,
+                max_concurrent_requests=8,
+                rate_limit_per_ip=100,
+                agent_card_rate_limit_per_ip=100,
+            ),
+            max_connections=8,
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_port}"
+
+        def submit(index):
+            body = self._a2a_request_body(host, f"load task {index}")
+            request = urllib.request.Request(base + "/message:send", data=body, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(request, timeout=10) as response:  # nosec B310
+                payload = json.load(response)
+            return payload["result"]["status"]["state"]
+
+        def get_card(_):
+            with urllib.request.urlopen(base + "/.well-known/agent-card.json", timeout=10) as response:  # nosec B310
+                return json.load(response)["protocolVersion"]
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                message_states = list(executor.map(submit, range(12)))
+                card_versions = list(executor.map(get_card, range(12)))
+            self.assertEqual(message_states, ["completed"] * 12)
+            self.assertEqual(card_versions, ["1.0"] * 12)
+        finally:
+            server.shutdown()
+            server.server_close()
+
     def test_a2a_connection_cap_rejects_saturated_message_submissions(self):
         host = make_host()
         entered = threading.Event()
         release = threading.Event()
         host.providers["blocker"] = BlockingProvider(entered, release)
-        server = BoundedThreadingHTTPServer(
+        server = BoundedReferenceHTTPServer(
             ("127.0.0.1", 0),
             make_handler(host, max_concurrent_requests=100, rate_limit_per_ip=100),
             max_connections=1,

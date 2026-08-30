@@ -10,7 +10,8 @@ import time
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
 from typing import Any, Iterator
 
 from .a2a_types import A2ARequestError, error_response, make_agent_card, parse_jsonrpc_request, success_response, task_from_run_result
@@ -140,7 +141,9 @@ class NetworkGuard:
             self._concurrency.release()
 
 
-class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+class BoundedReferenceHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
     def __init__(self, server_address, RequestHandlerClass, max_connections: int = DEFAULT_MAX_CONCURRENT_REQUESTS):
         if max_connections < 1:
             raise ValueError("max_connections must be at least 1")
@@ -324,11 +327,11 @@ def serve(
     allow_direct_a2a: bool = False,
     a2a_adapter: str = "local",
 ) -> None:
-    if not allow_direct_a2a and not is_loopback_bind(bind):
+    if not is_loopback_bind(bind):
         raise ValueError(
-            "A2A reference server must bind to loopback unless explicitly fronted or --allow-direct-a2a is set"
+            "A2A reference server must bind to loopback and be fronted by a production reverse proxy for public exposure"
         )
-    BoundedThreadingHTTPServer(
+    BoundedReferenceHTTPServer(
         (bind, port),
         make_handler(
             host,

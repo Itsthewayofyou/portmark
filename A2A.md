@@ -67,16 +67,16 @@ Authentication is checked before JSON parsing, envelope deserialization, or host
 
 ## Network Limits
 
-The Python `ThreadingHTTPServer` adapter is a loopback origin, not a production
-edge server. By default `portmark serve` refuses non-loopback binds such as
-`0.0.0.0`; expose it publicly through a production HTTP front end such as
-Nginx. See `deploy/nginx/portmark.conf` for a TLS-terminating reference front
-that preserves the A2A routes, caps request body size, and adds proxy-side
+The Python reference server is a loopback origin, not a production edge server.
+`portmark serve` refuses non-loopback binds such as `0.0.0.0`; expose it
+publicly through a production HTTP front end such as Nginx. See
+`deploy/nginx/portmark.conf` for a TLS-terminating reference front that
+preserves the A2A routes, caps request body size, and adds proxy-side
 rate/connection limits. The Agent Card is public discovery metadata, but it is
 still rate-limited separately from message submission so anonymous GET traffic
-cannot be left unbounded. Use `--allow-direct-a2a` or
-`PORTMARK_ALLOW_DIRECT_A2A=1` only for an explicitly accepted direct-exposure
-deployment.
+cannot be left unbounded. The legacy `--allow-direct-a2a` flag and
+`PORTMARK_ALLOW_DIRECT_A2A=1` environment variable are compatibility no-ops and
+do not permit public direct binds.
 
 `GET /.well-known/agent-card.json` is bounded independently:
 
