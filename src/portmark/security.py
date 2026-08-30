@@ -4,6 +4,8 @@ import hashlib
 import hmac
 import json
 import secrets
+import subprocess  # nosec B404
+import tempfile
 import time
 import base64
 from dataclasses import dataclass
@@ -41,6 +43,18 @@ class EnvelopeSigningIdentity(EnvelopeVerifier, Protocol):
 
 class AuditHeadVerifier(Protocol):
     def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str) -> None:
+        ...
+
+
+class ExternalAttestationVerifierProtocol(Protocol):
+    def verify(
+        self,
+        evidence: AttestationEvidence,
+        expected_subject: str,
+        relying_party: str,
+        expected_nonce: str | None,
+        now: int,
+    ) -> None:
         ...
 
 
@@ -254,11 +268,13 @@ class AttestationPolicy:
         allowed_measurements: tuple[str, ...] = (),
         required_for_execution: bool = False,
         required_for_migration: bool = False,
+        external_verifier: ExternalAttestationVerifierProtocol | None = None,
     ) -> None:
         self._authorities = {authority.key_id: authority for authority in authorities}
         self.allowed_measurements = allowed_measurements
         self.required_for_execution = required_for_execution
         self.required_for_migration = required_for_migration
+        self.external_verifier = external_verifier
 
     def verify_execution(self, permit: Permit, host_id: str, now: int | None = None) -> None:
         if not self.required_for_execution and permit.attestation is None:
@@ -286,18 +302,19 @@ class AttestationPolicy:
     ) -> None:
         if evidence is None:
             raise SecurityError("attestation evidence is required")
-        authority = self._authorities.get(evidence.signature_key_id)
-        if authority is None:
+        authority = self._authorities.get(evidence.signature_key_id) if evidence.signature_key_id else None
+        if authority is None and self.external_verifier is None:
             raise SecurityError("attestation verifier key is not trusted")
         current_time = int(time.time()) if now is None else now
-        if authority.revoked:
-            raise SecurityError("attestation verifier key has been revoked")
-        if authority.not_before > current_time:
-            raise SecurityError("attestation verifier key is not active yet")
-        if authority.expires_at is not None and authority.expires_at <= current_time:
-            raise SecurityError("attestation verifier key has expired")
-        if evidence.verifier != authority.verifier:
-            raise SecurityError("attestation verifier identity does not match key")
+        if authority is not None:
+            if authority.revoked:
+                raise SecurityError("attestation verifier key has been revoked")
+            if authority.not_before > current_time:
+                raise SecurityError("attestation verifier key is not active yet")
+            if authority.expires_at is not None and authority.expires_at <= current_time:
+                raise SecurityError("attestation verifier key has expired")
+            if evidence.verifier != authority.verifier:
+                raise SecurityError("attestation verifier identity does not match key")
         if evidence.subject != expected_subject:
             raise SecurityError("attestation subject does not match expected host")
         if evidence.audience not in {relying_party, "*"}:
@@ -310,13 +327,75 @@ class AttestationPolicy:
             raise SecurityError("attestation measurement is not approved")
         if expected_nonce is not None and evidence.nonce and not hmac.compare_digest(evidence.nonce, expected_nonce):
             raise SecurityError("attestation nonce does not match permit")
+        if authority is not None:
+            try:
+                Ed25519PublicKey.from_public_bytes(authority.public_key).verify(
+                    _b64url_decode(evidence.signature),
+                    canonical_json(evidence.unsigned_dict()),
+                )
+            except (InvalidSignature, ValueError) as error:
+                raise SecurityError("attestation signature is invalid") from error
+        if self.external_verifier is not None:
+            self.external_verifier.verify(evidence, expected_subject, relying_party, expected_nonce, current_time)
+
+
+class ExternalAttestationVerifier:
+    """Shell-free adapter for deployment-specific quote verification."""
+
+    def __init__(self, command: tuple[str, ...], timeout: float = 2.0, max_response_bytes: int = 4096) -> None:
+        if not command or not all(isinstance(item, str) and item for item in command):
+            raise ValueError("attestation verifier command must be a non-empty argv tuple")
+        if timeout <= 0:
+            raise ValueError("attestation verifier timeout must be positive")
+        if max_response_bytes < 2:
+            raise ValueError("attestation verifier response limit must be at least 2 bytes")
+        self.command = command
+        self.timeout = timeout
+        self.max_response_bytes = max_response_bytes
+
+    def verify(
+        self,
+        evidence: AttestationEvidence,
+        expected_subject: str,
+        relying_party: str,
+        expected_nonce: str | None,
+        now: int,
+    ) -> None:
+        payload = canonical_json({
+            "evidence": evidence.unsigned_dict(),
+            "expected_subject": expected_subject,
+            "relying_party": relying_party,
+            "expected_nonce": expected_nonce,
+            "now": now,
+        })
         try:
-            Ed25519PublicKey.from_public_bytes(authority.public_key).verify(
-                _b64url_decode(evidence.signature),
-                canonical_json(evidence.unsigned_dict()),
-            )
-        except (InvalidSignature, ValueError) as error:
-            raise SecurityError("attestation signature is invalid") from error
+            with tempfile.TemporaryFile() as stdout:
+                # The command is an operator-provided argv tuple and shell execution is disabled.
+                process = subprocess.run(  # nosec B603
+                    list(self.command),
+                    input=payload,
+                    stdout=stdout,
+                    stderr=subprocess.DEVNULL,
+                    timeout=self.timeout,
+                    check=False,
+                    env={},
+                )
+                stdout.seek(0, 2)
+                response_size = stdout.tell()
+                if response_size > self.max_response_bytes:
+                    raise SecurityError("external attestation verifier response exceeds output limit")
+                stdout.seek(0)
+                response = stdout.read(self.max_response_bytes + 1)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise SecurityError("external attestation verifier failed") from error
+        if process.returncode != 0:
+            raise SecurityError("external attestation verifier rejected evidence")
+        try:
+            value = json.loads(response or b"{}")
+        except json.JSONDecodeError as error:
+            raise SecurityError("external attestation verifier returned malformed JSON") from error
+        if not isinstance(value, dict) or value.get("valid") is not True:
+            raise SecurityError("external attestation verifier rejected evidence")
 
 
 def arguments_hash(arguments: dict[str, Any]) -> str:
@@ -680,7 +759,32 @@ class AuditLog:
 
 
 def check_constraints(constraints: dict[str, Any], arguments: dict[str, Any]) -> None:
+    schema = constraints.get("arguments")
+    required = _required_arguments(constraints.get("required", ()))
+    additional = constraints.get("additional_arguments", True)
+    if schema is not None:
+        if not isinstance(schema, dict):
+            raise SecurityError("argument constraints must be an object")
+        for name in required:
+            if name not in arguments:
+                raise SecurityError(f"argument {name!r} is required")
+        for argument, spec in schema.items():
+            if not isinstance(argument, str) or not argument:
+                raise SecurityError("argument constraint names must be non-empty strings")
+            if not isinstance(spec, dict):
+                raise SecurityError(f"argument {argument!r} constraint must be an object")
+            if spec.get("required") is True and argument not in arguments:
+                raise SecurityError(f"argument {argument!r} is required")
+            if argument in arguments:
+                _check_argument_schema(argument, arguments[argument], spec)
+        if additional is False:
+            known = set(schema) | set(required) | _legacy_constrained_arguments(constraints)
+            unexpected = set(arguments) - known
+            if unexpected:
+                raise SecurityError("tool arguments contain unsupported fields")
     for name, expected in constraints.items():
+        if name in {"arguments", "required", "additional_arguments"}:
+            continue
         if name.startswith("max_"):
             argument = name[4:]
             actual = arguments.get(argument)
@@ -692,3 +796,93 @@ def check_constraints(constraints: dict[str, Any], arguments: dict[str, Any]) ->
                 raise SecurityError(f"argument {argument!r} is outside its allowed set")
         elif arguments.get(name) != expected:
             raise SecurityError(f"argument {name!r} does not match its required value")
+
+
+def _required_arguments(value: Any) -> tuple[str, ...]:
+    if value in (None, ()):
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise SecurityError("required argument constraints must be a list")
+    if not all(isinstance(item, str) and item for item in value):
+        raise SecurityError("required argument constraints must be non-empty strings")
+    return tuple(value)
+
+
+def _legacy_constrained_arguments(constraints: dict[str, Any]) -> set[str]:
+    result = set()
+    for name in constraints:
+        if name.startswith("max_"):
+            result.add(name[4:])
+        elif name.startswith("allowed_"):
+            result.add(name[8:])
+        elif name not in {"arguments", "required", "additional_arguments"}:
+            result.add(name)
+    return result
+
+
+def _check_argument_schema(name: str, value: Any, spec: dict[str, Any]) -> None:
+    expected_type = spec.get("type")
+    if expected_type is not None and not _matches_type(value, expected_type):
+        raise SecurityError(f"argument {name!r} has invalid type")
+    if "const" in spec and value != spec["const"]:
+        raise SecurityError(f"argument {name!r} does not match its required value")
+    enum = spec.get("enum")
+    if enum is not None:
+        if not isinstance(enum, list) or not enum:
+            raise SecurityError(f"argument {name!r} enum constraint must be a non-empty list")
+        if value not in enum:
+            raise SecurityError(f"argument {name!r} is outside its allowed set")
+    if "minimum" in spec:
+        if not isinstance(spec["minimum"], (int, float)) or isinstance(spec["minimum"], bool):
+            raise SecurityError(f"argument {name!r} minimum constraint must be numeric")
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or value < spec["minimum"]:
+            raise SecurityError(f"argument {name!r} is below its permitted minimum")
+    if "maximum" in spec:
+        if not isinstance(spec["maximum"], (int, float)) or isinstance(spec["maximum"], bool):
+            raise SecurityError(f"argument {name!r} maximum constraint must be numeric")
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or value > spec["maximum"]:
+            raise SecurityError(f"argument {name!r} exceeds its permitted maximum")
+    if "min_length" in spec:
+        if not isinstance(spec["min_length"], int) or isinstance(spec["min_length"], bool) or spec["min_length"] < 0:
+            raise SecurityError(f"argument {name!r} min_length constraint must be a non-negative integer")
+        if not isinstance(value, str) or len(value) < spec["min_length"]:
+            raise SecurityError(f"argument {name!r} is shorter than its permitted minimum length")
+    if "max_length" in spec:
+        if not isinstance(spec["max_length"], int) or isinstance(spec["max_length"], bool) or spec["max_length"] < 0:
+            raise SecurityError(f"argument {name!r} max_length constraint must be a non-negative integer")
+        if not isinstance(value, str) or len(value) > spec["max_length"]:
+            raise SecurityError(f"argument {name!r} exceeds its permitted maximum length")
+    pattern = spec.get("pattern")
+    if pattern is not None:
+        import re
+
+        if not isinstance(pattern, str):
+            raise SecurityError(f"argument {name!r} pattern constraint must be a string")
+        try:
+            matched = re.fullmatch(pattern, value) if isinstance(value, str) else None
+        except re.error as error:
+            raise SecurityError(f"argument {name!r} pattern constraint is invalid") from error
+        if matched is None:
+            raise SecurityError(f"argument {name!r} does not match its required pattern")
+
+
+def _matches_type(value: Any, expected_type: Any) -> bool:
+    types = expected_type if isinstance(expected_type, list) else [expected_type]
+    if not all(isinstance(item, str) for item in types):
+        raise SecurityError("argument type constraints must be strings")
+    for item in types:
+        if item == "string" and isinstance(value, str):
+            return True
+        if item == "integer" and isinstance(value, int) and not isinstance(value, bool):
+            return True
+        if item == "number" and isinstance(value, (int, float)) and not isinstance(value, bool):
+            return True
+        if item == "boolean" and isinstance(value, bool):
+            return True
+        if item == "object" and isinstance(value, dict):
+            return True
+        if item == "array" and isinstance(value, list):
+            return True
+        if item == "null" and value is None:
+            return True
+    return False

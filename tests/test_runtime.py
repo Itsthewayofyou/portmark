@@ -16,25 +16,28 @@ import unittest
 import urllib.error
 import urllib.request
 from dataclasses import asdict
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 from http.client import HTTPResponse
 from http.server import ThreadingHTTPServer
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 from portmark.a2a import A2AAuthConfig, BoundedThreadingHTTPServer, RateLimiter, envelope_from_dict, is_loopback_bind, make_handler, serve
 from portmark.config import RuntimeConfig
-from portmark.factory import make_demo_envelope, make_host
+from portmark.factory import make_demo_envelope, make_host, signer_from_environment
+from portmark.metrics import RuntimeMetrics
 from portmark.logging_config import JsonLogFormatter
-from portmark.models import AgentEnvelope, AgentManifest, AgentState, Permit, ProviderDecision, ResourceBudget, ToolGrant
-from portmark.providers import GenericHttpProvider, ModelProvider
+from portmark.models import AgentEnvelope, AgentManifest, AgentState, AttestationEvidence, Permit, ProviderDecision, ResourceBudget, ToolGrant
+from portmark.providers import GenericHttpProvider, ModelProvider, NativeWasmtimeComponentProvider
 from portmark.policy import load_host_policy
 from portmark.security import (
     ApprovalAuthority,
     AttestationAuthority,
     AttestationPolicy,
     EnvelopeSigner,
+    ExternalAttestationVerifier,
+    HmacEnvelopeSigner,
     HostPolicy,
     SecurityError,
     TrustRegistry,
@@ -150,14 +153,36 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual([e["event"] for e in result.audit].count("tool.executed"), 1)
         self.assertEqual(len(result.result["evidence"]), 3)
 
+    def test_runtime_metrics_record_run_provider_tool_and_security_outcomes(self):
+        metrics = RuntimeMetrics()
+        host = make_host(metrics=metrics)
+        self.assertEqual(host.run(make_demo_envelope(host, "metrics")).status, "completed")
+        snapshot = metrics.snapshot()["counters"]
+        self.assertEqual(snapshot["runs.started"], 1)
+        self.assertEqual(snapshot["runs.completed"], 1)
+        self.assertEqual(snapshot["provider.decisions"], 2)
+        self.assertEqual(snapshot["tools.executed"], 1)
+
+        tampered = make_demo_envelope(host, "metrics reject")
+        tampered.state.goal = "tampered"
+        with self.assertRaises(SecurityError):
+            host.run(tampered)
+        snapshot = metrics.snapshot()["counters"]
+        self.assertEqual(snapshot["runs.failed"], 1)
+        self.assertEqual(snapshot["security.rejections"], 1)
+
     def test_runtime_config_merges_environment_and_cli_arguments(self):
         environment = {
             "PORTMARK_HOST_ID": "host:env",
             "PORTMARK_PROVIDER_ENDPOINT": "https://provider.example/run",
             "PORTMARK_STORE_PATH": "env.sqlite",
+            "PORTMARK_WASM_ENGINE": "wasmtime",
             "PORTMARK_POLICY_PATH": "env-policy.json",
             "PORTMARK_TRUST_REGISTRY_PATH": "env-trust.json",
             "PORTMARK_RELOAD_POLICY": "1",
+            "PORTMARK_ATTESTATION_VERIFIER_COMMAND": "/bin/verify-attestation --json",
+            "PORTMARK_REQUIRE_ATTESTATION": "1",
+            "PORTMARK_A2A_ADAPTER": "sdk",
             "PORTMARK_LOG_LEVEL": "DEBUG",
             "PORTMARK_LOG_JSON": "1",
             "PORTMARK_ENABLE_HSTS": "1",
@@ -174,10 +199,14 @@ class RuntimeTests(unittest.TestCase):
                 host_id="host:cli",
                 provider_endpoint=None,
                 wasm_component="capsule.wasm",
+                wasm_engine=None,
                 store_path=None,
                 policy_path="cli-policy.json",
                 trust_registry_path=None,
                 reload_policy=False,
+                attestation_verifier_command=None,
+                require_attestation=False,
+                a2a_adapter=None,
                 a2a_token=None,
                 log_level=None,
                 log_json=False,
@@ -189,10 +218,14 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(config.host_id, "host:cli")
         self.assertEqual(config.provider_endpoint, "https://provider.example/run")
         self.assertEqual(config.wasm_component, "capsule.wasm")
+        self.assertEqual(config.wasm_engine, "wasmtime")
         self.assertEqual(config.store_path, "env.sqlite")
         self.assertEqual(config.policy_path, "cli-policy.json")
         self.assertEqual(config.trust_registry_path, "env-trust.json")
         self.assertTrue(config.reload_policy)
+        self.assertEqual(config.attestation_verifier_command, ("/bin/verify-attestation", "--json"))
+        self.assertTrue(config.require_attestation)
+        self.assertEqual(config.a2a_adapter, "sdk")
         self.assertEqual(config.a2a_token, "env-token")
         self.assertTrue(config.log_json)
         self.assertTrue(config.enable_hsts)
@@ -299,6 +332,20 @@ class RuntimeTests(unittest.TestCase):
         missing_key_id.signature_key_id = ""
         with self.assertRaisesRegex(SecurityError, "key id is missing"):
             host.run(missing_key_id)
+
+    def test_legacy_hmac_signer_requires_explicit_unsafe_test_opt_in_and_key(self):
+        with patch.dict(os.environ, {"PORTMARK_ALLOW_LEGACY_HMAC": "1"}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "unsafe-test-only"):
+                signer_from_environment()
+        with patch.dict(os.environ, {"PORTMARK_ALLOW_LEGACY_HMAC": "unsafe-test-only"}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "PORTMARK_SIGNING_KEY"):
+                signer_from_environment()
+        with patch.dict(os.environ, {
+            "PORTMARK_ALLOW_LEGACY_HMAC": "unsafe-test-only",
+            "PORTMARK_SIGNING_KEY": "explicit legacy integration test key",
+        }, clear=True):
+            signer = signer_from_environment()
+        self.assertIsInstance(signer, HmacEnvelopeSigner)
 
     def test_canonical_signature_is_stable(self):
         private_key = bytes(range(32))
@@ -415,6 +462,69 @@ class RuntimeTests(unittest.TestCase):
         host.signer.seal(tampered)
         with self.assertRaisesRegex(SecurityError, "signature"):
             host.run(tampered)
+
+    def test_external_attestation_verifier_accepts_rejects_and_bounds_responses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            verifier = Path(directory) / "verifier.py"
+            verifier.write_text(
+                "\n".join((
+                    "import json, sys",
+                    "payload = json.loads(sys.stdin.buffer.read())",
+                    "quote = payload['evidence'].get('quote')",
+                    "if quote == 'large':",
+                    "    sys.stdout.write('x' * 8192)",
+                    "elif quote == 'ok' and payload['expected_subject'] == payload['evidence']['subject']:",
+                    "    sys.stdout.write(json.dumps({'valid': True}))",
+                    "else:",
+                    "    sys.stdout.write(json.dumps({'valid': False}))",
+                    "",
+                )),
+                encoding="utf-8",
+            )
+            policy = AttestationPolicy(
+                required_for_execution=True,
+                external_verifier=ExternalAttestationVerifier((sys.executable, str(verifier)), max_response_bytes=128),
+            )
+            host = make_host(attestation_policy=policy)
+
+            accepted = make_demo_envelope(host, "external attestation")
+            object.__setattr__(
+                accepted.permit,
+                "attestation",
+                AttestationEvidence(
+                    verifier="verifier:external",
+                    subject=host.host_id,
+                    audience=accepted.permit.issuer,
+                    measurement="measurement:external",
+                    issued_at=int(time.time()) - 1,
+                    expires_at=int(time.time()) + 60,
+                    nonce=accepted.permit.nonce,
+                    quote="ok",
+                ),
+            )
+            host.signer.seal(accepted)
+            self.assertEqual(host.run(accepted).status, "completed")
+
+            for quote, message in [("bad", "rejected"), ("large", "output limit")]:
+                with self.subTest(quote=quote):
+                    rejected = make_demo_envelope(host, "external rejection")
+                    object.__setattr__(
+                        rejected.permit,
+                        "attestation",
+                        AttestationEvidence(
+                            verifier="verifier:external",
+                            subject=host.host_id,
+                            audience=rejected.permit.issuer,
+                            measurement="measurement:external",
+                            issued_at=int(time.time()) - 1,
+                            expires_at=int(time.time()) + 60,
+                            nonce=rejected.permit.nonce,
+                            quote=quote,
+                        ),
+                    )
+                    host.signer.seal(rejected)
+                    with self.assertRaisesRegex(SecurityError, message):
+                        host.run(rejected)
 
     def test_signing_identity_must_match_issuer_and_audience(self):
         signer = EnvelopeSigner.generate("scoped-key", "host:local-demo", ("host:local-demo",))
@@ -582,6 +692,42 @@ class RuntimeTests(unittest.TestCase):
         envelope = make_demo_envelope(host, "search", "evil")
         with self.assertRaisesRegex(SecurityError, "maximum"):
             host.run(envelope)
+
+    def test_rich_argument_constraints_enforce_required_type_range_enum_pattern_and_extras(self):
+        registry = ToolRegistry()
+        registry.register("catalog.search", lambda arguments: {"ok": True})
+        permit = Permit(
+            issuer="issuer",
+            subject="agent",
+            audience="host",
+            expires_at=int(time.time()) + 60,
+            nonce="nonce",
+            grants=(ToolGrant("catalog.search", {
+                "arguments": {
+                    "query": {"type": "string", "min_length": 3, "max_length": 20, "pattern": "[a-z ]+"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 3},
+                    "source": {"enum": ["catalog", "archive"]},
+                },
+                "required": ["query", "limit", "source"],
+                "additional_arguments": False,
+            }),),
+        )
+        self.assertEqual(
+            registry.invoke(permit, "catalog.search", {"query": "portable agents", "limit": 2, "source": "catalog"}),
+            {"ok": True},
+        )
+        cases = [
+            ({"limit": 2, "source": "catalog"}, "required"),
+            ({"query": "portable agents", "limit": 2.5, "source": "catalog"}, "type"),
+            ({"query": "portable agents", "limit": 4, "source": "catalog"}, "maximum"),
+            ({"query": "portable agents", "limit": 2, "source": "web"}, "allowed set"),
+            ({"query": "Portable Agents", "limit": 2, "source": "catalog"}, "pattern"),
+            ({"query": "portable agents", "limit": 2, "source": "catalog", "debug": True}, "unsupported fields"),
+        ]
+        for arguments, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(SecurityError, message):
+                    registry.invoke(permit, "catalog.search", arguments)
 
     def test_tool_registry_bounds_timeout_exceptions_serialization_and_output(self):
         registry = ToolRegistry(default_timeout=0.01, max_output_bytes=64)
@@ -1385,6 +1531,63 @@ class RuntimeTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    def test_a2a_sdk_adapter_emits_official_agent_card_shape(self):
+        with self._fake_official_a2a_sdk():
+            host = make_host()
+            server = ThreadingHTTPServer(
+                ("127.0.0.1", 0),
+                make_handler(host, A2AAuthConfig("a2a-secret"), a2a_adapter="sdk"),
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base = f"http://127.0.0.1:{server.server_port}"
+            try:
+                with urllib.request.urlopen(base + "/.well-known/agent-card.json") as response:  # nosec B310
+                    card = json.load(response)
+                self.assertEqual(card["securitySchemes"]["bearer"]["httpAuthSecurityScheme"]["scheme"], "bearer")
+                self.assertEqual(card["securityRequirements"], [{"schemes": {"bearer": {}}}])
+                self.assertEqual(card["supportedInterfaces"][0]["protocolBinding"], "JSONRPC")
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_a2a_sdk_adapter_rejects_request_parts_before_host_execution(self):
+        with self._fake_official_a2a_sdk():
+            host = make_host()
+            server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(host, a2a_adapter="sdk"))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base = f"http://127.0.0.1:{server.server_port}"
+            try:
+                body = json.loads(self._a2a_request_body(host, "sdk invalid part").decode())
+                body["params"]["message"]["parts"] = [{"kind": "unknown", "payload": "locally accepted"}]
+                request = urllib.request.Request(
+                    base + "/message:send",
+                    data=json.dumps(body).encode(),
+                    headers={"Content-Type": "application/json"},
+                )
+                with patch.object(host, "run", wraps=host.run) as run:
+                    with self.assertRaises(urllib.error.HTTPError) as raised:
+                        urllib.request.urlopen(request)  # nosec B310
+                self.assertEqual(raised.exception.code, 400)
+                self.assertEqual(json.load(raised.exception)["error"]["code"], -32602)
+                run.assert_not_called()
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_a2a_sdk_adapter_requires_optional_dependency(self):
+        original_import = __import__
+
+        def blocked_import(name, *args, **kwargs):
+            if name == "a2a.types":
+                raise ImportError("blocked a2a-sdk")
+            return original_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=blocked_import):
+            with self.assertRaisesRegex(RuntimeError, "portmark\\[a2a\\]"):
+                make_handler(make_host(), a2a_adapter="sdk")
+
     def test_a2a_security_headers_are_set_with_opt_in_hsts(self):
         host = make_host()
         server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(host, enable_hsts=True))
@@ -1706,13 +1909,165 @@ class RuntimeTests(unittest.TestCase):
         }), encoding="utf-8")
         return path
 
+    @contextmanager
+    def _fake_official_a2a_sdk(self):
+        a2a = ModuleType("a2a")
+        a2a_types = ModuleType("a2a.types")
+        google = ModuleType("google")
+        protobuf = ModuleType("google.protobuf")
+        json_format = ModuleType("google.protobuf.json_format")
+
+        class AgentCard:
+            pass
+
+        class SendMessageRequest:
+            pass
+
+        def parse_dict(payload, target):
+            if isinstance(target, SendMessageRequest):
+                message = payload.get("message")
+                if not isinstance(message, dict) or message.get("role") not in {"ROLE_USER", "ROLE_AGENT"}:
+                    raise ValueError("invalid SDK message")
+                for part in message.get("parts", []):
+                    if not any(key in part for key in ("text", "raw", "url", "data")):
+                        raise ValueError("invalid SDK message part")
+            target.payload = payload
+            return target
+
+        def message_to_dict(value, preserving_proto_field_name=False):
+            return value.payload
+
+        a2a_types.AgentCard = AgentCard
+        a2a_types.SendMessageRequest = SendMessageRequest
+        json_format.ParseDict = parse_dict
+        json_format.MessageToDict = message_to_dict
+        with patch.dict(sys.modules, {
+            "a2a": a2a,
+            "a2a.types": a2a_types,
+            "google": google,
+            "google.protobuf": protobuf,
+            "google.protobuf.json_format": json_format,
+        }):
+            yield
+
+    @contextmanager
+    def _fake_wasmtime_runtime(self, sleep_seconds=0, content=None):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "wasmtime"
+            package.mkdir()
+            (package / "__init__.py").write_text(
+                "class Engine:\n"
+                "    pass\n"
+                "class Store:\n"
+                "    def __init__(self, engine=None):\n"
+                "        self.engine = engine\n",
+                encoding="utf-8",
+            )
+            response = content
+            if response is None:
+                response = json.dumps({
+                    "outcome": "tool",
+                    "request": {
+                        "name": "catalog.search",
+                        "arguments_json": json.dumps({"query": "from native wasmtime", "limit": 2}),
+                    },
+                })
+            (package / "component.py").write_text(
+                "\n".join((
+                    "import time",
+                    "class Component:",
+                    "    def __init__(self, engine, wasm):",
+                    "        if wasm == b'import':",
+                    "            raise RuntimeError('imports are not linked')",
+                    "        self.wasm = wasm",
+                    "class Linker:",
+                    "    def __init__(self, engine):",
+                    "        self.engine = engine",
+                    "    def instantiate(self, store, component):",
+                    "        return Instance(component.wasm)",
+                    "class Instance:",
+                    "    def __init__(self, wasm):",
+                    "        self.wasm = wasm",
+                    "    def get_func(self, store, name):",
+                    "        if self.wasm == b'missing-resume' or name != 'resume':",
+                    "            return None",
+                    "        return Func()",
+                    "class Func:",
+                    "    def __call__(self, store, context_json, checkpoint_json):",
+                    f"        time.sleep({sleep_seconds!r})",
+                    f"        return {response!r}",
+                    "    def post_return(self, store):",
+                    "        pass",
+                    "",
+                )),
+                encoding="utf-8",
+            )
+            python_path = os.pathsep.join(filter(None, (directory, os.environ.get("PYTHONPATH", ""))))
+            with patch.dict(os.environ, {"PYTHONPATH": python_path}):
+                yield
+
     def test_real_wasm_capsule_completes_inside_deadline_limited_sandbox(self):
         capsule = Path(__file__).parents[1] / "capsules" / "research-agent.wasm.b64"
         host = make_host(wasm_component=str(capsule))
-        result = host.run(make_demo_envelope(host, "portable execution", "wasm"))
+        envelope = make_demo_envelope(host, "portable execution", "wasm")
+        object.__setattr__(envelope.permit, "grants", (ToolGrant("catalog.search", {"max_limit": 3}, ("id", "title")),))
+        host.signer.seal(envelope)
+        result = host.run(envelope)
         self.assertEqual(result.status, "completed")
-        self.assertEqual(result.result["summary"], "Wasm completed through WIT resume")
-        self.assertEqual(result.result["evidence"], [])
+        self.assertEqual(result.result["summary"], "Wasm resumed from checkpointed tool result")
+        self.assertEqual(result.result["evidence"], ["checkpoint-observed"])
+        self.assertEqual([event["event"] for event in result.audit].count("tool.executed"), 1)
+        self.assertEqual(result.checkpoint["messages"][0]["content"][0]["title"], "Result 1 for from capsule checkpoint")
+
+    def test_native_wasmtime_provider_uses_component_api_in_isolated_worker(self):
+        component = b"native-component"
+        with self._fake_wasmtime_runtime():
+            provider = NativeWasmtimeComponentProvider(component)
+            decision = provider.decide(AgentState("task", "goal"), ("catalog.search",))
+        self.assertEqual(decision.kind, "tool")
+        self.assertEqual(decision.tool, "catalog.search")
+        self.assertEqual(decision.arguments, {"query": "from native wasmtime", "limit": 2})
+
+    def test_native_wasmtime_provider_rejects_unlinkable_or_missing_resume_components(self):
+        with self._fake_wasmtime_runtime():
+            provider = NativeWasmtimeComponentProvider(b"import")
+            with self.assertRaisesRegex(RuntimeError, "native Wasmtime component rejected"):
+                provider.decide(AgentState("task", "goal"), ("catalog.search",))
+
+        with self._fake_wasmtime_runtime():
+            provider = NativeWasmtimeComponentProvider(b"missing-resume")
+            with self.assertRaisesRegex(RuntimeError, "native Wasmtime component rejected"):
+                provider.decide(AgentState("task", "goal"), ("catalog.search",))
+
+    def test_native_wasmtime_provider_enforces_timeout_and_output_limit(self):
+        with self._fake_wasmtime_runtime(sleep_seconds=2):
+            provider = NativeWasmtimeComponentProvider(b"slow", timeout=0.1)
+            with self.assertRaisesRegex(RuntimeError, "execution deadline"):
+                provider.decide(AgentState("task", "goal"), ("catalog.search",))
+
+        with self._fake_wasmtime_runtime(content="x" * 1024):
+            provider = NativeWasmtimeComponentProvider(b"large", max_output_bytes=128)
+            with self.assertRaisesRegex(RuntimeError, "output limit|rejected"):
+                provider.decide(AgentState("task", "goal"), ("catalog.search",))
+
+    def test_native_wasmtime_provider_rejects_oversized_component_files(self):
+        with tempfile.NamedTemporaryFile() as capsule:
+            capsule.write(b"x" * 5)
+            capsule.flush()
+            with self.assertRaisesRegex(RuntimeError, "input limit"):
+                NativeWasmtimeComponentProvider.from_file(capsule.name, max_component_bytes=4)
+
+    def test_factory_selects_optional_native_wasmtime_provider(self):
+        with self._fake_wasmtime_runtime():
+            with tempfile.NamedTemporaryFile() as capsule:
+                capsule.write(b"native-component")
+                capsule.flush()
+                host = make_host(
+                    wasm_component=capsule.name,
+                    wasm_engine="wasmtime",
+                )
+        self.assertIsInstance(host.providers["wasm"], NativeWasmtimeComponentProvider)
 
     def test_wasm_component_inputs_use_projected_provider_state(self):
         from portmark.component_bindings import component_checkpoint, component_context

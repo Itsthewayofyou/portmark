@@ -51,6 +51,7 @@ class AttestationEvidence:
     expires_at: int
     nonce: str = ""
     claims: Json = field(default_factory=dict)
+    quote: str = ""
     signature_key_id: str = ""
     signature: str = ""
 

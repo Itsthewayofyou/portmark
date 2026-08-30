@@ -2,6 +2,12 @@
 
 The HTTP adapter exposes a typed A2A-style JSON-RPC boundary for submitting signed Portmark agent envelopes.
 
+The default adapter uses the local generated-style A2A subset in `a2a_types.py`.
+Install `portmark[a2a]` and run `portmark serve --a2a-adapter sdk` to validate
+Agent Card and `message/send` request shapes through the official `a2a-sdk` 1.0
+protobuf types while retaining Portmark's hardened HTTP boundary, envelope
+verification, rate limits, and audit checks.
+
 ## Agent Card
 
 `GET /.well-known/agent-card.json` returns an Agent Card with:

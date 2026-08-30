@@ -29,7 +29,14 @@ Host policy can be loaded from a JSON file instead of being hard-coded in proces
   "tools": {
     "catalog.search": {
       "impact": "low",
-      "constraints": {"max_limit": 5},
+      "constraints": {
+        "arguments": {
+          "query": {"type": "string", "min_length": 1, "max_length": 200},
+          "limit": {"type": "integer", "minimum": 1, "maximum": 5}
+        },
+        "required": ["query", "limit"],
+        "additional_arguments": false
+      },
       "output_projection": ["id", "title"]
     },
     "payments.reserve": {
@@ -41,6 +48,16 @@ Host policy can be loaded from a JSON file instead of being hard-coded in proces
 ```
 
 The loader validates the root object, policy version, tool entries, impact levels, constraints, output projections, budget fields, and approval public keys before constructing `HostPolicy`.
+
+Constraints are enforced immediately before tool invocation. Legacy constraints
+remain supported: `max_limit` means argument `limit` must be numeric and no
+larger than the configured value, `allowed_currency` means argument `currency`
+must be in the allowed list, and a plain key such as `currency: "USD"` requires
+exact equality. Rich constraints can be placed under `constraints.arguments`
+with `type`, `const`, `enum`, `minimum`, `maximum`, `min_length`, `max_length`,
+and `pattern`. Use top-level `required` or per-argument `required: true` for
+mandatory arguments, and `additional_arguments: false` to reject undeclared
+fields.
 
 `output_projection` controls what tool output, if any, is sent back to a model provider on later steps. Omit it or set it to `[]` to share no tool output. Use a list of top-level JSON object fields, such as `["id", "title"]`, to share only those fields from dict outputs or lists of dicts. Use `["*"]` only when the provider is allowed to see the full output for that tool. Projection is intersected across the manifest request, incoming permit, and local host policy; the effective projection can only narrow.
 

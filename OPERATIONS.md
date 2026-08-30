@@ -14,8 +14,13 @@ Runtime configuration can come from environment variables or CLI flags:
 - `PORTMARK_TRUST_REGISTRY_PATH` / `--trust-registry-path`
 - `PORTMARK_POLICY_PATH` / `--policy-path`
 - `PORTMARK_RELOAD_POLICY` / `--reload-policy`
+- `PORTMARK_ATTESTATION_VERIFIER_COMMAND` / `--attestation-verifier-command`
+- `PORTMARK_REQUIRE_ATTESTATION` / `--require-attestation`
 - `PORTMARK_STORE_PATH` / `--store-path`
 - `PORTMARK_PROVIDER_ENDPOINT` / `--provider-endpoint`
+- `PORTMARK_WASM_COMPONENT` / `--wasm-component`
+- `PORTMARK_WASM_ENGINE` / `--wasm-engine`
+- `PORTMARK_A2A_ADAPTER` / `--a2a-adapter`
 - `PORTMARK_A2A_TOKEN` / `--a2a-token`
 - `PORTMARK_A2A_MAX_CONCURRENT_REQUESTS` / `--a2a-max-concurrent-requests`
 - `PORTMARK_A2A_RATE_LIMIT_PER_IP` / `--a2a-rate-limit-per-ip`
@@ -50,9 +55,38 @@ Trust registries are JSON files:
 
 Use unique key IDs, short key lifetimes, and explicit `allowed_audiences` where possible. For emergency revocation, set `revoked: true`, deploy the trust registry, and restart hosts or use the deployment's config reload mechanism.
 
+Ed25519 is the default signer. The legacy HMAC signer is blocked unless
+`PORTMARK_ALLOW_LEGACY_HMAC=unsafe-test-only` and a non-empty
+`PORTMARK_SIGNING_KEY` are both set. Treat that path as a dependency-free test
+fixture only; do not use it for a production trust domain.
+
 ## Policy Updates
 
 Policy changes should be reviewed, versioned, and deployed with a rollback plan. Approval tokens are bound to policy hashes, so tokens issued before a policy update will be rejected once hosts reload the new policy.
+
+Tool argument constraints can use legacy exact/`max_`/`allowed_` keys or the
+schema subset under `constraints.arguments`. Supported schema checks are
+`type`, `const`, `enum`, `minimum`, `maximum`, `min_length`, `max_length`,
+`pattern`, per-argument `required`, top-level `required`, and
+`additional_arguments: false`.
+
+## Attestation Verifier
+
+Production deployments can attach a platform quote verifier without using a
+shell:
+
+```bash
+portmark --attestation-verifier-command "/opt/portmark/verify-quote --json" \
+  --require-attestation \
+  serve --port 8080
+```
+
+The verifier command receives canonical JSON on stdin containing the unsigned
+attestation evidence, expected subject, relying party, expected nonce, and host
+time. It must exit 0 and return `{"valid": true}` on stdout. Non-zero exits,
+timeouts, malformed JSON, oversized stdout, and any response other than
+`{"valid": true}` reject the run. Keep the verifier executable and trust roots
+owned by the deployment control plane.
 
 ## Network Boundary
 
@@ -77,6 +111,11 @@ message submission, concurrent `/message:send` requests are capped, accepted
 submissions are rate-limited per client IP, and oversized submissions are
 rejected from `Content-Length` without reading the request body.
 
+The default A2A adapter is `local`. Use `--a2a-adapter sdk` or
+`PORTMARK_A2A_ADAPTER=sdk` only when `portmark[a2a]` is installed and you want
+Agent Card plus `message/send` request validation through the official
+`a2a-sdk` 1.0 protobuf types.
+
 ## Audit Verification
 
 For SQLite-backed hosts, run:
@@ -86,6 +125,13 @@ portmark --store-path runtime.sqlite --trust-registry-path trust.json verify-aud
 ```
 
 The command prints `{"valid": true}` and exits 0 for an intact chain whose stored audit head is signed by a trusted host key. It prints `{"valid": false}` and exits 1 when the task is missing or when event sequence, previous hash, event hash, stored audit-head validation, trust-registry lookup, or audit-head signature validation fails. Unsigned legacy heads are reported as invalid. Treat any false result as tampered or corrupted task history.
+
+## Metrics
+
+`AgentHost` owns an in-process `RuntimeMetrics` instance. Embedders can pass
+their own metrics object and export `metrics.snapshot()` through the deployment
+telemetry pipeline. The reference A2A server does not publish a metrics
+endpoint, so enabling metrics does not widen the network surface.
 
 ## Backup And Restore
 
@@ -133,3 +179,18 @@ CI runs the regression suite across Python 3.11, 3.12, and 3.13, executes the A2
 parser fuzz target, runs Bandit, and audits installed dependencies with
 `pip-audit --strict`. Runtime package dependencies should stay pinned in
 `pyproject.toml` and refreshed in `uv.lock` together.
+
+## Native Wasmtime Components
+
+The default Wasm engine is the Node JSON-lowered runner. Native Wasmtime is
+optional and requires `portmark[wasmtime]` plus a Component Model artifact:
+
+```bash
+portmark --wasm-component path/to/component.wasm \
+  --wasm-engine wasmtime \
+  demo "goal"
+```
+
+The runtime instantiates the signed component bytes through an empty
+`wasmtime.component.Linker`, runs them in a short-lived Python worker with a
+deadline, and passes only projected context and checkpoint JSON.

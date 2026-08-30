@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shlex
 import secrets
 import time
 
 from .host import AgentHost
+from .metrics import RuntimeMetrics
 from .models import AgentEnvelope, AgentManifest, AgentState, Permit, ResourceBudget, ToolGrant
 from .policy import load_host_policy
-from .providers import DeterministicProvider, GenericHttpProvider, WasmDecisionProvider
-from .security import AttestationPolicy, EnvelopeSigner, EnvelopeSigningIdentity, HmacEnvelopeSigner, HostPolicy, load_trust_registry
+from .providers import DeterministicProvider, GenericHttpProvider, NativeWasmtimeComponentProvider, WasmDecisionProvider
+from .security import AttestationPolicy, EnvelopeSigner, EnvelopeSigningIdentity, ExternalAttestationVerifier, HmacEnvelopeSigner, HostPolicy, load_trust_registry
 from .storage import RuntimeStore, SQLiteRuntimeStore
 from .tools import demo_registry
 
@@ -32,9 +34,13 @@ def signer_from_environment(host_id: str = HOST_ID, trust_registry_path: str | N
             tuple(os.environ.get("PORTMARK_ALLOWED_AUDIENCES", host_id).split(",")),
             registry,
         )
-    if os.environ.get("PORTMARK_ALLOW_LEGACY_HMAC") == "1":
-        raw = os.environ.get("PORTMARK_SIGNING_KEY", "development-only-signing-key-change-me")
+    if os.environ.get("PORTMARK_ALLOW_LEGACY_HMAC") == "unsafe-test-only":
+        raw = os.environ.get("PORTMARK_SIGNING_KEY")
+        if not raw:
+            raise RuntimeError("legacy HMAC signing requires PORTMARK_SIGNING_KEY")
         return HmacEnvelopeSigner(hashlib.sha256(raw.encode()).digest())
+    if os.environ.get("PORTMARK_ALLOW_LEGACY_HMAC"):
+        raise RuntimeError("legacy HMAC signing requires PORTMARK_ALLOW_LEGACY_HMAC=unsafe-test-only")
     return EnvelopeSigner.generate(issuer=host_id, allowed_audiences=(host_id,))
 
 
@@ -43,8 +49,12 @@ def make_host(
     host_id: str = HOST_ID,
     signer: EnvelopeSigningIdentity | None = None,
     wasm_component: str | None = None,
+    wasm_engine: str = "node",
     store: RuntimeStore | None = None,
     attestation_policy: AttestationPolicy | None = None,
+    attestation_verifier_command: tuple[str, ...] | str | None = None,
+    require_attestation: bool | None = None,
+    metrics: RuntimeMetrics | None = None,
     policy_path: str | None = None,
     trust_registry_path: str | None = None,
     reload_policy: bool = False,
@@ -53,7 +63,12 @@ def make_host(
     if provider_endpoint:
         providers["http"] = GenericHttpProvider(provider_endpoint, os.environ.get("MODEL_PROVIDER_TOKEN"))
     if wasm_component:
-        providers["wasm"] = WasmDecisionProvider.from_file(wasm_component)
+        if wasm_engine == "wasmtime":
+            providers["wasm"] = NativeWasmtimeComponentProvider.from_file(wasm_component)
+        elif wasm_engine == "node":
+            providers["wasm"] = WasmDecisionProvider.from_file(wasm_component)
+        else:
+            raise ValueError("wasm_engine must be 'node' or 'wasmtime'")
     configured_policy_path = policy_path or os.environ.get("PORTMARK_POLICY_PATH")
     configured_trust_registry_path = trust_registry_path or os.environ.get("PORTMARK_TRUST_REGISTRY_PATH")
     policy_loader = (lambda: load_host_policy(configured_policy_path, host_id)) if configured_policy_path else None
@@ -67,6 +82,18 @@ def make_host(
     if configured_store is None and os.environ.get("PORTMARK_STORE_PATH"):
         audit_verifier = load_trust_registry(configured_trust_registry_path) if configured_trust_registry_path else None
         configured_store = SQLiteRuntimeStore(os.environ["PORTMARK_STORE_PATH"], audit_verifier)
+    configured_attestation_policy = attestation_policy
+    if configured_attestation_policy is None:
+        command = attestation_verifier_command or os.environ.get("PORTMARK_ATTESTATION_VERIFIER_COMMAND")
+        required = (os.environ.get("PORTMARK_REQUIRE_ATTESTATION") == "1") if require_attestation is None else require_attestation
+        if command or required:
+            argv = tuple(shlex.split(command)) if isinstance(command, str) else command
+            verifier = ExternalAttestationVerifier(argv) if argv else None
+            configured_attestation_policy = AttestationPolicy(
+                required_for_execution=required,
+                required_for_migration=required,
+                external_verifier=verifier,
+            )
     return AgentHost(
         host_id,
         signer or signer_from_environment(host_id, configured_trust_registry_path),
@@ -74,9 +101,10 @@ def make_host(
         demo_registry(),
         providers,
         configured_store,
-        attestation_policy,
+        configured_attestation_policy,
         policy_loader,
         reload_policy,
+        metrics,
     )
 
 

@@ -11,6 +11,10 @@ license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = ["cryptography==50.0.1"]
 
+[project.optional-dependencies]
+a2a = ["a2a-sdk==1.1.2"]
+wasmtime = ["wasmtime==48.0.0"]
+
 [project.scripts]
 portmark = "portmark.cli:main"
 
@@ -18,4 +22,4 @@ portmark = "portmark.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-portmark = ["wasm_runner.mjs"]
+portmark = ["wasm_runner.mjs", "wasmtime_component_runner.py"]

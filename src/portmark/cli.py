@@ -15,10 +15,13 @@ def main() -> None:
     parser.add_argument("--host-id", help="host identity used for permit audience and signing issuer")
     parser.add_argument("--provider-endpoint", help="generic HTTP model-provider endpoint")
     parser.add_argument("--wasm-component", help="Wasm capsule (.wasm or .wat) implementing the WIT resume ABI")
+    parser.add_argument("--wasm-engine", choices=("node", "wasmtime"), help="Wasm provider engine")
     parser.add_argument("--store-path", help="SQLite path for durable nonces, checkpoints, and audit heads")
     parser.add_argument("--policy-path", help="JSON host policy path")
     parser.add_argument("--trust-registry-path", help="JSON trust registry path for envelope signing keys")
     parser.add_argument("--reload-policy", action="store_true", help="reload the JSON host policy before each run")
+    parser.add_argument("--attestation-verifier-command", help="shell-free argv string for an external attestation verifier")
+    parser.add_argument("--require-attestation", action="store_true", help="require attestation before execution and migration")
     parser.add_argument("--log-level", help="logging level")
     parser.add_argument("--log-json", action="store_true", help="emit structured JSON logs")
     parser.add_argument("--enable-hsts", action="store_true", help="emit HSTS header when served behind HTTPS")
@@ -29,6 +32,7 @@ def main() -> None:
     server = subparsers.add_parser("serve")
     server.add_argument("--bind", default="127.0.0.1")
     server.add_argument("--port", type=int, default=8080)
+    server.add_argument("--a2a-adapter", choices=("local", "sdk"), help="A2A type adapter for Agent Card and request validation")
     server.add_argument("--a2a-token", help="require this bearer token for A2A message/send requests")
     server.add_argument("--a2a-max-concurrent-requests", type=int, help="maximum concurrent A2A message/send requests")
     server.add_argument("--a2a-rate-limit-per-ip", type=int, help="maximum A2A message/send requests per client IP window")
@@ -57,10 +61,13 @@ def main() -> None:
         config.provider_endpoint,
         host_id=config.host_id,
         wasm_component=config.wasm_component,
+        wasm_engine=config.wasm_engine,
         store=store,
         policy_path=config.policy_path,
         trust_registry_path=config.trust_registry_path,
         reload_policy=config.reload_policy,
+        attestation_verifier_command=config.attestation_verifier_command,
+        require_attestation=config.require_attestation,
     )
     if args.command == "demo":
         provider = "wasm" if config.wasm_component else ("http" if config.provider_endpoint else "deterministic")
@@ -79,6 +86,7 @@ def main() -> None:
             agent_card_rate_limit_per_ip=config.a2a_agent_card_rate_limit_per_ip,
             agent_card_rate_limit_window_seconds=config.a2a_agent_card_rate_limit_window_seconds,
             allow_direct_a2a=config.allow_direct_a2a,
+            a2a_adapter=config.a2a_adapter,
         )
 
 

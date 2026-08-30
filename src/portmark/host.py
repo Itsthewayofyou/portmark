@@ -5,6 +5,7 @@ from dataclasses import asdict
 from collections.abc import Callable
 from typing import Any
 
+from .metrics import RuntimeMetrics
 from .models import AgentEnvelope, ApprovalToken, AttestationEvidence, ProviderDecision, RunResult
 from .providers import ModelProvider
 from .security import AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, SecurityError, arguments_hash, audit_head_payload, canonical_json
@@ -24,6 +25,7 @@ class AgentHost:
         attestation_policy: AttestationPolicy | None = None,
         policy_loader: Callable[[], HostPolicy] | None = None,
         reload_policy: bool = False,
+        metrics: RuntimeMetrics | None = None,
     ) -> None:
         if policy.audience != host_id:
             raise ValueError("policy audience must equal host id")
@@ -38,8 +40,21 @@ class AgentHost:
         self.attestation_policy = attestation_policy or AttestationPolicy()
         self._policy_loader = policy_loader
         self._reload_policy = reload_policy
+        self.metrics = metrics or RuntimeMetrics()
 
     def run(self, envelope: AgentEnvelope) -> RunResult:
+        self.metrics.increment("runs.started")
+        try:
+            return self._run(envelope)
+        except SecurityError:
+            self.metrics.increment("runs.failed")
+            self.metrics.increment("security.rejections")
+            raise
+        except Exception:
+            self.metrics.increment("runs.failed")
+            raise
+
+    def _run(self, envelope: AgentEnvelope) -> RunResult:
         active_policy = self._active_policy()
         self.signer.verify(envelope)
         effective = active_policy.effective_permit(envelope.manifest, envelope.permit)
@@ -70,18 +85,23 @@ class AgentHost:
 
         while state.step < effective.budget.max_steps:
             decision = provider.decide(state, tool_names, effective.grants)
+            self.metrics.increment("provider.decisions")
             audit.append("provider.proposed", {"kind": decision.kind, "tool": decision.tool})
             finished, migration = self._apply_decision(decision, state, effective, audit, envelope, active_policy)
             state.step += 1
             persisted_events = self._persist(envelope, state, audit, persisted_events)
             if finished:
-                return self._result(envelope, audit, migration)
+                result = self._result(envelope, audit, migration)
+                self._record_run_status(result.status)
+                return result
 
         state.status = "failed"
         state.result = {"error": "step budget exhausted"}
         audit.append("agent.failed", state.result)
         self._persist(envelope, state, audit, persisted_events)
-        return self._result(envelope, audit)
+        result = self._result(envelope, audit)
+        self._record_run_status(result.status)
+        return result
 
     def _apply_decision(self, decision, state, effective, audit, envelope, active_policy):
         if decision.kind == "tool":
@@ -97,6 +117,7 @@ class AgentHost:
             try:
                 result = self.tools.invoke(effective, decision.tool, decision.arguments, effective.budget.max_output_bytes)
             except ToolExecutionError as error:
+                self.metrics.increment("tools.failed")
                 state.status = "failed"
                 state.result = {"error": "tool execution failed"}
                 audit.append(
@@ -112,6 +133,7 @@ class AgentHost:
                 audit.append("agent.failed", state.result)
                 return True, None
             state.tool_calls += 1
+            self.metrics.increment("tools.executed")
             state.memory[decision.tool.removesuffix(".search").replace(".", "_")] = result
             if decision.tool == "catalog.search":
                 state.memory["catalog"] = result
@@ -249,6 +271,11 @@ class AgentHost:
         if encoded_size > envelope.permit.budget.max_output_bytes:
             raise SecurityError("checkpoint exceeds output budget")
         return RunResult(envelope.state.status, envelope.state.task_id, envelope.state.result, checkpoint, audit.events, migration)
+
+    def _record_run_status(self, status: str) -> None:
+        self.metrics.increment(f"runs.{status}")
+        if status == "failed":
+            self.metrics.increment("runs.failed")
 
     def _audit_start(self, envelope: AgentEnvelope) -> tuple[str, int]:
         stored = self.store.audit_head(envelope.state.task_id)

@@ -16,6 +16,7 @@ from typing import Any, Iterator
 from .a2a_types import A2ARequestError, error_response, make_agent_card, parse_jsonrpc_request, success_response, task_from_run_result
 from .host import AgentHost
 from .models import AgentEnvelope, AgentManifest, AgentState, AttestationEvidence, Permit, ResourceBudget, ToolGrant
+from .official_a2a import make_sdk_agent_card, validate_sdk_message_send_params
 
 
 logger = logging.getLogger(__name__)
@@ -26,6 +27,7 @@ DEFAULT_RATE_LIMIT_WINDOW_SECONDS = 60
 DEFAULT_AGENT_CARD_RATE_LIMIT_PER_IP = 240
 DEFAULT_AGENT_CARD_RATE_LIMIT_WINDOW_SECONDS = 60
 DEFAULT_RATE_LIMIT_TRACKED_CLIENTS = 8192
+A2A_ADAPTERS = ("local", "sdk")
 BUSY_RESPONSE = (
     b"HTTP/1.1 503 Service Unavailable\r\n"
     b"Content-Type: application/json\r\n"
@@ -179,7 +181,12 @@ def make_handler(
     rate_limit_window_seconds: int = DEFAULT_RATE_LIMIT_WINDOW_SECONDS,
     agent_card_rate_limit_per_ip: int = DEFAULT_AGENT_CARD_RATE_LIMIT_PER_IP,
     agent_card_rate_limit_window_seconds: int = DEFAULT_AGENT_CARD_RATE_LIMIT_WINDOW_SECONDS,
+    a2a_adapter: str = "local",
 ):
+    if a2a_adapter not in A2A_ADAPTERS:
+        raise ValueError("a2a_adapter must be 'local' or 'sdk'")
+    if a2a_adapter == "sdk":
+        make_sdk_agent_card("http://127.0.0.1", False)
     auth_config = auth or A2AAuthConfig()
     network_guard = NetworkGuard(max_concurrent_requests, rate_limit_per_ip, rate_limit_window_seconds)
     agent_card_limiter = RateLimiter(agent_card_rate_limit_per_ip, agent_card_rate_limit_window_seconds)
@@ -213,6 +220,9 @@ def make_handler(
                         error_response(None, -32002, "rate limit exceeded"),
                         {"Retry-After": str(agent_card_rate_limit_window_seconds)},
                     )
+                    return
+                if a2a_adapter == "sdk":
+                    self._json(200, make_sdk_agent_card(self._base_url(), auth_config.required))
                     return
                 self._json(200, make_agent_card(self._base_url(), auth_config.required))
             else:
@@ -248,6 +258,11 @@ def make_handler(
                         payload = json.loads(self.rfile.read(size))
                     except json.JSONDecodeError as exc:
                         raise A2ARequestError(-32700, "parse error", 400) from exc
+                    if a2a_adapter == "sdk":
+                        try:
+                            validate_sdk_message_send_params(payload.get("params"))
+                        except Exception as exc:
+                            raise A2ARequestError(-32602, "invalid params") from exc
                     request = parse_jsonrpc_request(payload)
                     request_id = request.id
                     envelope = envelope_from_dict(request.params.portmark_envelope)
@@ -307,6 +322,7 @@ def serve(
     agent_card_rate_limit_per_ip: int = DEFAULT_AGENT_CARD_RATE_LIMIT_PER_IP,
     agent_card_rate_limit_window_seconds: int = DEFAULT_AGENT_CARD_RATE_LIMIT_WINDOW_SECONDS,
     allow_direct_a2a: bool = False,
+    a2a_adapter: str = "local",
 ) -> None:
     if not allow_direct_a2a and not is_loopback_bind(bind):
         raise ValueError(
@@ -323,6 +339,7 @@ def serve(
             rate_limit_window_seconds,
             agent_card_rate_limit_per_ip,
             agent_card_rate_limit_window_seconds,
+            a2a_adapter,
         ),
         max_connections=max_concurrent_requests,
     ).serve_forever()

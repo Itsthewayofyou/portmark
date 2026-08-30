@@ -77,12 +77,15 @@ this reference implementation.
 Hosts can require signed confidential-computing attestation evidence before sensitive execution
 or delegated migration. The reference verifier binds the attested host identity, relying-party
 audience, approved measurement, freshness window, optional nonce, and verifier signature before
-the host runs the agent or emits a migration envelope. See [ATTESTATION.md](ATTESTATION.md) for
-the evidence format, verification flow, sealed-storage decision, and residual risks.
+the host runs the agent or emits a migration envelope. Deployments can also configure a bounded,
+shell-free external verifier command for platform quotes. See [ATTESTATION.md](ATTESTATION.md) for
+the evidence format, verification flow, external-verifier contract, sealed-storage decision, and
+residual risks.
 
 Envelopes are signed with Ed25519 by default and verified through a key-ID-based trust registry.
 See [SIGNING_KEYS.md](SIGNING_KEYS.md) for key generation, rotation, revocation, and trust
-bootstrap guidance. The legacy HMAC signer is retained only for explicit dependency-free demos.
+bootstrap guidance. The legacy HMAC signer is retained only behind
+`PORTMARK_ALLOW_LEGACY_HMAC=unsafe-test-only` plus an explicit `PORTMARK_SIGNING_KEY`.
 
 ## Run it
 
@@ -100,11 +103,16 @@ binding:
 PYTHONPATH=src python -m portmark.cli --wasm-component capsules/research-agent.wasm.b64 demo "research modern mobile agents"
 ```
 
+Deployments that install the optional native Wasmtime extra can select
+`--wasm-engine wasmtime` to instantiate the signed component bytes through
+`wasmtime.component` instead of the default Node runner.
+
 The host executes each capsule in a short-lived worker with a strict deadline and rejects every
 module declaring an import. Its signed SHA-256 digest is checked before execution. Tool actions
 returned by the capsule still pass through the same host permit and argument enforcement as
 model-provider proposals. See [WASM_COMPONENTS.md](WASM_COMPONENTS.md) for the WIT binding
-contract.
+contract. The included example capsule performs a projected `catalog.search` step and then
+completes from checkpointed tool output.
 
 Run tests:
 
@@ -133,6 +141,10 @@ The public Agent Card route is rate-limited separately from `/message:send`.
 The Agent Card is available at `/.well-known/agent-card.json`; signed envelopes are submitted to
 `/message:send` with the A2A JSON-RPC `message/send` method. See [A2A.md](A2A.md) for the Agent
 Card fields, request shape, authentication profile, and error behavior.
+
+To validate the Agent Card and request shape through the official SDK types,
+install `portmark[a2a]` and run `serve --a2a-adapter sdk`. The local adapter
+remains the default so base installs do not pull the SDK dependency tree.
 
 Persist replay nonces, checkpoints, and signed audit heads with SQLite:
 
@@ -201,9 +213,11 @@ checkpoint JSON and returns a structured outcome. A compiled capsule therefore c
 acquire filesystem, network, process, database, or credential access; the host must explicitly
 validate and mediate every requested action.
 
-The runnable Node WebAssembly adapter uses the JSON-lowered WIT binding documented in
-[WASM_COMPONENTS.md](WASM_COMPONENTS.md). Strong migration is implemented as
-checkpoint-and-resume: native stacks, threads, sockets, and file descriptors never cross hosts.
+The default runnable Node WebAssembly adapter uses the JSON-lowered WIT binding documented in
+[WASM_COMPONENTS.md](WASM_COMPONENTS.md). An optional native Wasmtime provider can execute
+the signed Component Model artifact in a short-lived Python worker when `portmark[wasmtime]` is
+installed. Strong migration is implemented as checkpoint-and-resume: native stacks, threads,
+sockets, and file descriptors never cross hosts.
 
 ## Production status
 
@@ -225,10 +239,11 @@ stable interface to substitute against.
 | --- | --- | --- |
 | Trust registry | JSON registry loaded from `PORTMARK_TRUST_REGISTRY_PATH`, with key IDs, issuers, audiences, validity windows, and revocation | PKI- or KMS-backed key distribution and rotation |
 | Storage | `SQLiteRuntimeStore` behind the `RuntimeStore` protocol | a shared database for multi-host deployments |
-| Wasm bindings | WIT contract executed through a JSON-lowered adapter on Node | native Component Model bindings once a Python runtime exposes them |
-| A2A types | generated-style A2A 1.0 subset isolated in `a2a_types.py` | the official generated SDK when a Python package is published |
-| Attestation | signed mock evidence verified by `AttestationPolicy` against RATS-style roles | the target platform's TEE quote verifier and sealed-storage backend |
+| Wasm bindings | WIT contract executed through a JSON-lowered adapter on Node, with optional native Wasmtime Component Model execution | deployment-selected Wasmtime version and component build pipeline |
+| A2A types | generated-style A2A 1.0 subset isolated in `a2a_types.py`, with optional `a2a-sdk` validation | deployment-selected official SDK/server integration |
+| Attestation | signed mock evidence and optional external verifier command checked by `AttestationPolicy` against RATS-style roles | the target platform's TEE quote verifier and sealed-storage backend |
 | Approvals | locally signed approval tokens bound to task, nonce, arguments, and policy hash | an approval service tied to operator identity and change management |
+| Metrics | in-process `RuntimeMetrics` counters attached to `AgentHost` | deployment metrics/export pipeline |
 
 ## License
 

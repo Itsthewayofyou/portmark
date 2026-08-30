@@ -1,25 +1,52 @@
 # WebAssembly Component Binding Contract
 
-Portmark uses `wit/portmark.wit` as the source contract for Wasm decision providers. The current executable adapter uses a JSON-lowered binding for the WIT `resume(context-json, checkpoint-json)` export so the reference runtime can execute offline with Node's built-in WebAssembly engine.
+Portmark uses `wit/portmark.wit` as the source contract for Wasm decision providers. The default executable adapter uses a JSON-lowered binding for the WIT `resume(context-json, checkpoint-json)` export so the reference runtime can execute offline with Node's built-in WebAssembly engine. Deployments can also opt into native Wasmtime Component Model bindings with `--wasm-engine wasmtime`.
 
 ## Toolchain
 
 - Contract: `wit/portmark.wit`
 - Host bindings: `src/portmark/component_bindings.py`
 - Runner: `src/portmark/wasm_runner.mjs`
+- Optional native runner: `src/portmark/wasmtime_component_runner.py`
 - Example capsule source: `capsules/research-agent.wat`
 - Example capsule artifact: `capsules/research-agent.wasm.b64`
 
 The Python host constructs structured context and checkpoint JSON from runtime state, sends it to the runner over stdin, and validates the returned WIT outcome before converting it into `ProviderDecision`.
 
-## Capsule ABI
+## Native Wasmtime Provider
 
-A capsule must export:
+Install the optional dependency:
+
+```bash
+python -m pip install -e '.[wasmtime]'
+```
+
+Run the provider with:
+
+```bash
+portmark --wasm-component path/to/component.wasm \
+  --wasm-engine wasmtime \
+  demo "research modern mobile agents"
+```
+
+The native provider still runs in a short-lived Python worker with a deadline,
+minimal environment, output cap, and generic client-facing failures. It
+instantiates the same component bytes whose SHA-256 digest is recorded in the
+signed manifest, so provider selection does not introduce a second artifact that
+can drift from the signature.
+
+## Default JSON-Lowered Capsule ABI
+
+The default Node adapter expects a core Wasm module that exports:
 
 - `memory`: WebAssembly memory used for string exchange.
 - `resume(context_ptr: i32, context_len: i32, checkpoint_ptr: i32, checkpoint_len: i32) -> i64`
 
 The returned `i64` is `(result_ptr << 32) | result_len`. The pointed-to bytes must be UTF-8 JSON matching one of the WIT outcomes.
+
+The native Wasmtime provider expects a Component Model artifact for
+`wit/portmark.wit` and calls the exported `resume(context-json, checkpoint-json)`
+function through `wasmtime.component`.
 
 ## Context JSON
 
@@ -68,6 +95,11 @@ The host passes:
 Native stacks, threads, sockets, file descriptors, full memory, and process state do not cross hosts.
 Capsules resume from explicit, projected checkpoint data only.
 
+The checked-in research capsule demonstrates that resume model: on the first
+call it requests `catalog.search`; once the checkpoint includes projected
+catalog output, it completes. If no output projection is granted, the capsule
+cannot inspect raw tool results and must continue from metadata only.
+
 ## Outcome JSON
 
 Tool request:
@@ -102,6 +134,6 @@ The host rejects malformed JSON, unknown outcomes, missing `resume`, missing `me
 
 ## Security Boundary
 
-The runner rejects every Wasm module declaring imports. Capsules therefore have no ambient filesystem, network, process, environment, clock, randomness, or credential access. Tool requests returned by the capsule still pass through the same host permit, argument constraints, budgets, and audit log as any model-provider proposal.
+The default Node runner rejects every Wasm module declaring imports. Capsules therefore have no ambient filesystem, network, process, environment, clock, randomness, or credential access. Native Wasmtime deployments instantiate components through an empty `wasmtime.component.Linker`, so components requiring imports fail to instantiate. Tool requests returned by either capsule path still pass through the same host permit, argument constraints, budgets, and audit log as any model-provider proposal.
 
 The host sends component input through stdin rather than process arguments to avoid command-line exposure and argument-length limits.

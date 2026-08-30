@@ -85,4 +85,7 @@ Trust registry distribution is out of scope for the reference runtime, but produ
 
 ## Legacy HMAC Mode
 
-Set `PORTMARK_ALLOW_LEGACY_HMAC=1` to use the dependency-free HMAC signer for demos. This mode uses shared secret verification and does not provide asymmetric workload identity. Do not enable it in production.
+Set `PORTMARK_ALLOW_LEGACY_HMAC=unsafe-test-only` and a non-empty
+`PORTMARK_SIGNING_KEY` to use the dependency-free HMAC signer for tests or
+demos. This mode uses shared secret verification and does not provide
+asymmetric workload identity. Do not enable it in production.

@@ -1,0 +1,101 @@
+from __future__ import annotations
+
+import base64
+import io
+import json
+import sys
+from contextlib import redirect_stdout
+from typing import Any
+
+
+def main() -> None:
+    try:
+        request = json.load(sys.stdin)
+        component = base64.b64decode(_string(request, "component"), validate=True)
+        context_json = _string(request, "context_json")
+        checkpoint_json = _string(request, "checkpoint_json")
+        max_output_bytes = int(request["max_output_bytes"])
+        if max_output_bytes < 1:
+            raise RuntimeError("max_output_bytes must be positive")
+
+        from wasmtime import Engine, Store
+        from wasmtime.component import Component, Linker
+
+        captured_stdout = _CappedTextIO(max_output_bytes)
+        with redirect_stdout(captured_stdout):
+            engine = Engine()
+            store = Store(engine)
+            instance = Linker(engine).instantiate(store, Component(engine, component))
+            resume = instance.get_func(store, "resume")
+            if resume is None:
+                raise RuntimeError("component does not export resume")
+            result = resume(store, context_json, checkpoint_json)
+            resume.post_return(store)
+        outcome = json.dumps(_normalize_outcome(result))
+        if len(outcome.encode()) > max_output_bytes:
+            raise RuntimeError("component outcome exceeds output limit")
+        print(outcome, end="")
+    except Exception:
+        print("native Wasmtime component failed", file=sys.stderr)
+        raise SystemExit(1)
+
+
+def _string(value: dict[str, Any], key: str) -> str:
+    item = value[key]
+    if not isinstance(item, str):
+        raise RuntimeError(f"{key} must be a string")
+    return item
+
+
+def _normalize_outcome(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        parsed = json.loads(value)
+        if not isinstance(parsed, dict):
+            raise RuntimeError("component outcome string must decode to a JSON object")
+        return parsed
+    tag = getattr(value, "tag", None) or getattr(value, "case", None)
+    payload = getattr(value, "value", None)
+    if isinstance(tag, str):
+        return _outcome_from_tag(tag, payload)
+    if isinstance(value, tuple) and len(value) == 2 and isinstance(value[0], str):
+        return _outcome_from_tag(value[0], value[1])
+    raise RuntimeError("component outcome has an unsupported shape")
+
+
+def _outcome_from_tag(tag: str, payload: Any) -> dict[str, Any]:
+    normalized = tag.replace("_", "-")
+    if normalized == "tool":
+        if not isinstance(payload, dict):
+            name = getattr(payload, "name", None)
+            arguments_json = getattr(payload, "arguments_json", None) or getattr(payload, "arguments-json", None)
+            payload = {"name": name, "arguments_json": arguments_json}
+        return {"outcome": "tool", "request": payload}
+    if normalized in {"completed", "suspended", "awaiting-input", "failed"}:
+        return {"outcome": normalized, "content_json": payload}
+    if normalized == "migrate":
+        if isinstance(payload, tuple) and len(payload) == 2:
+            destination, content_json = payload
+        else:
+            destination = getattr(payload, "destination", None)
+            content_json = getattr(payload, "content_json", None) or getattr(payload, "content-json", None)
+        return {"outcome": "migrate", "destination": destination, "content_json": content_json}
+    raise RuntimeError("component outcome tag is not supported")
+
+
+class _CappedTextIO(io.StringIO):
+    def __init__(self, max_bytes: int):
+        super().__init__()
+        self._max_bytes = max_bytes
+        self._bytes_written = 0
+
+    def write(self, value: str) -> int:
+        self._bytes_written += len(value.encode())
+        if self._bytes_written > self._max_bytes:
+            raise RuntimeError("component wrote too much stdout")
+        return len(value)
+
+
+if __name__ == "__main__":
+    main()

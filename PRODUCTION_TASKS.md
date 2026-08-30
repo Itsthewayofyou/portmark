@@ -10,7 +10,7 @@ This file expands the production work listed in `README.md` into concrete implem
 
 ## 1. Replace HMAC With Asymmetric Workload Identities
 
-Status: implemented for the reference runtime. `EnvelopeSigner` now uses Ed25519 by default, envelopes carry `signature_key_id`, verification uses `TrustRegistry`, and `HmacEnvelopeSigner` remains only for explicit legacy demos.
+Status: implemented for the reference runtime. `EnvelopeSigner` now uses Ed25519 by default, envelopes carry `signature_key_id`, verification uses `TrustRegistry`, and `HmacEnvelopeSigner` remains only behind the explicit `PORTMARK_ALLOW_LEGACY_HMAC=unsafe-test-only` test fixture path with a caller-supplied key.
 
 Tasks:
 
@@ -20,12 +20,12 @@ Tasks:
 - [x] Implement a trust registry mapping issuer/host IDs to public keys and allowed audiences.
 - [x] Update envelope canonicalization tests to ensure signatures are stable.
 - [x] Add tests for valid signature, wrong key, unknown key ID, tampered payload, expired key, and revoked key.
-- [x] Keep HMAC only as a demo/test signer, clearly marked non-production.
+- [x] Keep HMAC only as a demo/test signer, clearly marked non-production, and fail closed unless the unsafe test opt-in plus explicit key are present.
 - [x] Document key generation, rotation, revocation, and trust bootstrap.
 
 ## 2. Replace Core-Wasm ABI With WIT Component Model Bindings
 
-Status: implemented for the reference runtime. `wit/portmark.wit` now defines structured provider decisions, `component_bindings.py` validates WIT-shaped outcomes, the runner calls `resume(context-json, checkpoint-json)`, and the example capsule has been regenerated for the new ABI.
+Status: implemented for the reference runtime. `wit/portmark.wit` now defines structured provider decisions, `component_bindings.py` validates WIT-shaped outcomes, the default Node runner calls `resume(context-json, checkpoint-json)`, the optional native Wasmtime provider instantiates signed Component Model artifacts directly, and the example capsule has been regenerated for the new ABI and now completes from projected checkpointed tool output.
 
 Tasks:
 
@@ -38,8 +38,11 @@ Tasks:
 - [x] Add tests for valid component execution, malformed component, forbidden imports, timeout, oversized result, and unavailable capability.
 - [x] Update `capsules/research-agent.*` to the new ABI.
 - [x] Keep the old ABI behind a compatibility flag only if needed for migration.
+- [x] Add optional native Wasmtime Component Model provider behind an explicit engine flag.
+- [x] Add regressions for native import rejection, missing export, timeout, output cap, and factory wiring.
+- [x] Make the example capsule exercise a real multi-step tool/checkpoint loop instead of returning a static completion.
 
-Implementation note: the available Python Wasm runtime did not expose native Component Model bindings in this environment, so the selected reference toolchain is WIT plus a JSON-lowered binding layer executed through Node's built-in WebAssembly engine. No legacy integer ABI compatibility path was kept.
+Implementation note: the default toolchain remains WIT plus a JSON-lowered binding layer executed through Node's built-in WebAssembly engine for offline reference use. Native Wasmtime is optional because it requires the deploying package to install `portmark[wasmtime]` and provide a Component Model artifact accepted by `wasmtime.component`. No legacy integer ABI compatibility path was kept.
 
 ## 3. Persist Nonces, Checkpoints, And Audit Heads Transactionally
 
@@ -59,7 +62,7 @@ Tasks:
 
 ## 4. Use Complete A2A 1.0 Generated Types And Authentication Profile
 
-Status: implemented for the reference runtime. `a2a_types.py` now provides generated-style A2A 1.0 JSON-RPC and Agent Card models, `a2a.py` enforces the `message/send` method and bearer authentication profile, and regression tests cover happy-path compatibility plus malformed, unauthenticated, oversized, unsupported-method, wrong-content-type, rate-limited Agent Card GET, and generic-error cases. Public deployments must front the Python reference server with a production HTTP proxy; `portmark serve` refuses non-loopback binds unless direct exposure is explicitly enabled.
+Status: implemented for the reference runtime. `a2a_types.py` now provides generated-style A2A 1.0 JSON-RPC and Agent Card models, `a2a.py` enforces the `message/send` method and bearer authentication profile, and `--a2a-adapter sdk` optionally validates Agent Card plus request shapes through the official `a2a-sdk` 1.0 protobuf types. Regression tests cover happy-path compatibility plus malformed, unauthenticated, oversized, unsupported-method, wrong-content-type, rate-limited Agent Card GET, optional SDK validation, and generic-error cases. Public deployments must front the Python reference server with a production HTTP proxy; `portmark serve` refuses non-loopback binds unless direct exposure is explicitly enabled.
 
 Tasks:
 
@@ -75,12 +78,13 @@ Tasks:
 - [x] Add negative tests for missing auth, invalid auth, malformed messages, oversized requests, unsupported methods, and wrong content type.
 - [x] Require loopback binding by default and document a production reverse-proxy front.
 - [x] Rate-limit public Agent Card GET separately from message submission.
+- [x] Add optional official `a2a-sdk` adapter behind an explicit dependency and serve flag.
 
-Implementation note: no official Python A2A SDK is pinned in this project, so the reference runtime uses a local generated-style subset based on the authoritative A2A proto and JSON-RPC specification. The boundary is isolated in `a2a_types.py` so it can be replaced cleanly by official generated bindings later.
+Implementation note: the default boundary remains the local generated-style subset for a small offline install. Official SDK adoption is available through the optional `portmark[a2a]` extra and `--a2a-adapter sdk`, which keeps the existing hardened HTTP server and Portmark envelope security boundary.
 
 ## 5. Add Confidential-Computing Attestation
 
-Status: implemented for the reference runtime. Permits can now carry signed `AttestationEvidence`, `AttestationPolicy` verifies trusted verifier keys, host identity, relying-party audience, freshness, approved measurements, optional nonce binding, and signatures, and `AgentHost` can require attestation before execution or migration. Regression tests cover valid evidence, missing evidence, expired evidence, wrong measurement, wrong audience, nonce mismatch, unknown verifier, tampered evidence, valid attested migration, and missing destination evidence.
+Status: implemented for the reference runtime. Permits can now carry signed `AttestationEvidence` with an explicit quote field, `AttestationPolicy` verifies trusted verifier keys, host identity, relying-party audience, freshness, approved measurements, optional nonce binding, and signatures, and `AgentHost` can require attestation before execution or migration. Deployments can also configure a bounded shell-free external verifier command for platform quotes. Regression tests cover valid evidence, missing evidence, expired evidence, wrong measurement, wrong audience, nonce mismatch, unknown verifier, tampered evidence, external verifier accept/reject/oversize behavior, valid attested migration, and missing destination evidence.
 
 Tasks:
 
@@ -90,12 +94,13 @@ Tasks:
 - [x] Add host identity claims to the attestation evidence.
 - [x] Bind permit audience and envelope execution to an attested host measurement.
 - [x] Add remote attestation verification before migration or sensitive execution.
+- [x] Add a bounded external verifier command path for real platform quote verification.
 - [x] Decide which secrets, checkpoints, or model inputs require sealed storage.
 - [x] Add policy controls for rejecting untrusted measurements.
 - [x] Add tests with mocked attestation documents for valid, expired, wrong measurement, wrong audience, and missing evidence.
 - [x] Document deployment prerequisites and residual risks, because confidential computing does not remove all host trust.
 
-Implementation note: this is a provider-neutral reference verifier based on signed mock evidence and RATS-style roles. Production deployments still need to plug in the selected TEE quote verifier and sealed-storage backend for the target platform.
+Implementation note: this is a provider-neutral reference verifier based on signed mock evidence and RATS-style roles. Production deployments can plug in the selected TEE quote verifier through `PORTMARK_ATTESTATION_VERIFIER_COMMAND`, and still need a sealed-storage backend for the target platform.
 
 ## 6. Store Policies Outside Process Memory And Require Approval For High-Impact Tools
 
@@ -114,6 +119,23 @@ Tasks:
 - [x] Add audit events for approval requested, approved, denied, expired, and used.
 - [x] Add tests for policy denial, grant narrowing, high-impact approval required, approval expiry, replayed approval rejection, and policy reload behavior.
 - [x] Ensure API clients receive generic denial messages while detailed causes go to logs/audit.
+- [x] Add richer tool argument constraints for required fields, JSON-like types, numeric ranges, string lengths, enums, constants, regex patterns, and rejection of undeclared arguments.
+
+## 7. Add Runtime Metrics
+
+Status: implemented for the reference runtime. `AgentHost` owns an in-process
+`RuntimeMetrics` object that records run starts, terminal statuses, provider
+decisions, tool executions, tool failures, and security rejections. The
+reference A2A server does not publish a metrics endpoint, so deployments can
+export the snapshot through their existing telemetry path without widening the
+network surface.
+
+Tasks:
+
+- [x] Add a dependency-free metrics collector suitable for tests and embedders.
+- [x] Wire metrics through `AgentHost` without changing the provider/tool API.
+- [x] Count successful runs, failed runs, provider decisions, tool executions, tool failures, and security rejections.
+- [x] Add regression tests for metrics increments.
 
 Implementation note: the reference runtime uses local signed approval tokens and file-backed JSON policy. Production deployments should replace the demo approval authority with an approval service or workflow tied to operator identity and change management.
 
