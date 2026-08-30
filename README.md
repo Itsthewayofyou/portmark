@@ -133,7 +133,7 @@ Run tests:
 PYTHONPATH=src python -m unittest discover -s tests -v
 ```
 
-Run the A2A-facing HTTP service:
+Run the A2A-facing HTTP service (served by uvicorn on loopback; front it with a reverse proxy for TLS):
 
 ```bash
 PYTHONPATH=src python -m portmark.cli serve --port 8080
