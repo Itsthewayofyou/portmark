@@ -296,46 +296,65 @@ class A2ARouter:
             return self.response(200, self.host.metrics.snapshot())
         return self.response(404, {"error": "not found"})
 
-    def handle_post(
+    @contextmanager
+    def admit_post(
         self,
         path: str,
         content_type: str,
         content_length: str,
         authorization: str,
         client_ip: str,
-        read_body: Callable[[int], bytes],
-    ) -> HttpResponse:
-        if path != "/message:send":
-            return self.response(404, error_response(None, -32601, "method not found"))
-        request_id: str | int | None = None
+    ) -> Iterator[tuple[HttpResponse | None, int]]:
+        """Validate and admit a submission *before* its body is read.
+
+        Yields (rejection, size). When rejection is None the caller may read
+        exactly `size` bytes and pass them to dispatch_post. The concurrency slot
+        is held for the whole block, so the body read happens inside the guard on
+        every transport — a rate-limited or over-capacity client never causes a
+        body to be buffered.
+        """
         try:
+            if path != "/message:send":
+                yield self.response(404, error_response(None, -32601, "method not found")), 0
+                return
             if content_type.split(";", 1)[0].strip().lower() != "application/json":
                 raise A2ARequestError(-32600, "invalid request", 415)
             size = parse_content_length(content_length)
-            with self.network_guard.admit(client_ip) as rejection:
-                if rejection is not None:
-                    status, code, message = rejection
-                    return self.response(
-                        status,
-                        error_response(None, code, message),
-                        {"Retry-After": str(self.rate_limit_window_seconds)},
-                    )
-                if not self.authorized(authorization):
-                    return self._unauthorized()
+        except A2ARequestError as exc:
+            yield self.response(exc.http_status, error_response(None, exc.code, exc.message)), 0
+            return
+        with self.network_guard.admit(client_ip) as rejection:
+            if rejection is not None:
+                status, code, message = rejection
+                yield self.response(
+                    status,
+                    error_response(None, code, message),
+                    {"Retry-After": str(self.rate_limit_window_seconds)},
+                ), 0
+                return
+            if not self.authorized(authorization):
+                yield self._unauthorized(), 0
+                return
+            yield None, size
+
+    def dispatch_post(self, body: bytes) -> HttpResponse:
+        """Parse an admitted submission and run it. Called inside admit_post."""
+        request_id: str | int | None = None
+        try:
+            try:
+                payload = json.loads(body)
+            except json.JSONDecodeError as exc:
+                raise A2ARequestError(-32700, "parse error", 400) from exc
+            if self.a2a_adapter == "sdk":
                 try:
-                    payload = json.loads(read_body(size))
-                except json.JSONDecodeError as exc:
-                    raise A2ARequestError(-32700, "parse error", 400) from exc
-                if self.a2a_adapter == "sdk":
-                    try:
-                        validate_sdk_message_send_params(payload.get("params"))
-                    except Exception as exc:
-                        raise A2ARequestError(-32602, "invalid params") from exc
-                request = parse_jsonrpc_request(payload)
-                request_id = request.id
-                envelope = envelope_from_dict(request.params.portmark_envelope)
-                result = self.host.run(envelope)
-                return self.response(200, success_response(request.id, task_from_run_result(result)))
+                    validate_sdk_message_send_params(payload.get("params"))
+                except Exception as exc:
+                    raise A2ARequestError(-32602, "invalid params") from exc
+            request = parse_jsonrpc_request(payload)
+            request_id = request.id
+            envelope = envelope_from_dict(request.params.portmark_envelope)
+            result = self.host.run(envelope)
+            return self.response(200, success_response(request.id, task_from_run_result(result)))
         except A2ARequestError as exc:
             return self.response(exc.http_status, error_response(exc.request_id, exc.code, exc.message))
         except Exception:
@@ -377,14 +396,17 @@ def make_handler(host: AgentHost, auth: A2AAuthConfig | None = None, enable_hsts
             ))
 
         def do_POST(self) -> None:
-            self._send(router.handle_post(
+            with router.admit_post(
                 self.path,
                 self.headers.get("Content-Type", ""),
                 self.headers.get("Content-Length", "0"),
                 self.headers.get("Authorization", ""),
                 self._client_ip(),
-                lambda size: self.rfile.read(size),
-            ))
+            ) as (rejection, size):
+                if rejection is not None:
+                    self._send(rejection)
+                    return
+                self._send(router.dispatch_post(self.rfile.read(size)))
 
         def log_message(self, format: str, *args: Any) -> None:
             return
@@ -467,12 +489,12 @@ def make_asgi_app(host: AgentHost, auth: A2AAuthConfig | None = None, enable_hst
 
         raw_length = _header(scope, b"content-length")
         content_type = _header(scope, b"content-type")
-        if path == "/message:send" and content_type.split(";", 1)[0].strip().lower() == "application/json":
-            # Bounds-check before touching receive(): an oversized body is never read.
-            try:
-                size = parse_content_length(raw_length)
-            except A2ARequestError as exc:
-                await _send(send, router.response(exc.http_status, error_response(None, exc.code, exc.message)))
+        with router.admit_post(path, content_type, raw_length, _header(scope, b"authorization"), client_ip) as (
+            rejection,
+            size,
+        ):
+            if rejection is not None:
+                await _send(send, rejection)
                 return
             body = bytearray()
             while len(body) < size:
@@ -485,19 +507,7 @@ def make_asgi_app(host: AgentHost, auth: A2AAuthConfig | None = None, enable_hst
                     return
                 if not message.get("more_body", False):
                     break
-            payload = bytes(body)
-        else:
-            payload = b""
-
-        response = await asyncio.to_thread(
-            router.handle_post,
-            path,
-            content_type,
-            raw_length,
-            _header(scope, b"authorization"),
-            client_ip,
-            lambda n: payload[:n],
-        )
+            response = await asyncio.to_thread(router.dispatch_post, bytes(body))
         await _send(send, response)
 
     app.a2a_router = router  # type: ignore[attr-defined]

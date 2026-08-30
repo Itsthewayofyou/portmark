@@ -1824,6 +1824,37 @@ class RuntimeTests(unittest.TestCase):
         status, _, _ = self._asgi_call(app, "GET", "/metrics", {"Authorization": "Bearer secret"})
         self.assertEqual(status, 429)
 
+    def test_asgi_app_rate_limits_before_reading_the_body(self):
+        """A refused submission must not cause its body to be buffered.
+
+        The guard has to wrap the body read, not follow it, or a flood costs one
+        buffered body per rejected request.
+        """
+        app = make_asgi_app(make_host(), rate_limit_per_ip=1)
+        body = b'{"jsonrpc":"2.0","id":"1","method":"message/send","params":{}}'
+        headers = [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]
+        reads = []
+
+        def run_once():
+            async def receive():
+                reads.append(True)
+                return {"type": "http.request", "body": body, "more_body": False}
+
+            sent = []
+
+            async def send(message):
+                sent.append(message)
+
+            scope = {"type": "http", "method": "POST", "path": "/message:send",
+                     "client": ("203.0.113.9", 1), "headers": headers}
+            asyncio.run(app(scope, receive, send))
+            return sent[0]["status"]
+
+        self.assertEqual(run_once(), 400)
+        self.assertEqual(len(reads), 1)
+        self.assertEqual(run_once(), 429)
+        self.assertEqual(len(reads), 1, "rate-limited request must not read its body")
+
     def test_asgi_app_handles_missing_client_and_unknown_paths(self):
         app = make_asgi_app(make_host())
         status, _, _ = self._asgi_call(app, "GET", "/nope")
