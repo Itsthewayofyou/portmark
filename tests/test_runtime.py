@@ -2,6 +2,7 @@ import copy
 import base64
 import concurrent.futures
 import hashlib
+import importlib.util
 import io
 import json
 import logging
@@ -56,6 +57,7 @@ WASM_MALFORMED_JSON = "AGFzbQEAAAABCQFgBH9/f38BfgMCAQAFAwEAAQcTAgZtZW1vcnkCAAZyZ
 WASM_TIMEOUT = "AGFzbQEAAAABCQFgBH9/f38BfgMCAQAFAwEAAQcTAgZtZW1vcnkCAAZyZXN1bWUAAAoLAQkAA0AMAAtCAAs="
 WASM_FORBIDDEN_IMPORT = "AGFzbQEAAAABDAJgAABgBH9/f38BfgIJAQNlbnYBeAAAAwIBAQUDAQABBxMCBm1lbW9yeQIABnJlc3VtZQABCgYBBABCAAs="
 WASM_MISSING_RESUME = "AGFzbQEAAAAFAwEAAQcKAQZtZW1vcnkCAA=="
+HAS_REAL_WASMTIME = importlib.util.find_spec("wasmtime") is not None
 
 
 class FixedProvider(ModelProvider):
@@ -1133,7 +1135,9 @@ class RuntimeTests(unittest.TestCase):
             "broken previous hash": "UPDATE audit_events SET previous_hash = 'broken' WHERE task_id = ? AND sequence = 1",
             "deleted middle event": "DELETE FROM audit_events WHERE task_id = ? AND sequence = 1",
             "reordered sequence": "UPDATE audit_events SET sequence = 99 WHERE task_id = ? AND sequence = 1",
+            "malformed details": "UPDATE audit_events SET details_json = '{' WHERE task_id = ? AND sequence = 1",
             "stale head": "UPDATE audit_heads SET head_hash = 'stale' WHERE task_id = ?",
+            "malformed head sequence": "UPDATE audit_heads SET sequence = 'wrong' WHERE task_id = ?",
             "tampered signature": "UPDATE audit_heads SET signature = 'tampered' WHERE task_id = ?",
         }
         for name, statement in cases.items():
@@ -1146,10 +1150,12 @@ class RuntimeTests(unittest.TestCase):
                     self.assertTrue(store.verify_audit_chain(result.task_id))
                     with sqlite3.connect(path) as connection:
                         connection.execute(statement, (result.task_id,))
+                    self.assertEqual(store.verify_audit_chain_status(result.task_id).status, "invalid")
                     self.assertFalse(store.verify_audit_chain(result.task_id))
 
         with tempfile.TemporaryDirectory() as directory:
             store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            self.assertEqual(store.verify_audit_chain_status("missing-task").status, "invalid")
             self.assertFalse(store.verify_audit_chain("missing-task"))
 
     def test_sqlite_audit_chain_rejects_fabricated_consistent_history(self):
@@ -1208,9 +1214,28 @@ class RuntimeTests(unittest.TestCase):
             self.assertTrue(store.verify_audit_chain(result.task_id))
             with sqlite3.connect(path) as connection:
                 connection.execute("UPDATE audit_heads SET signature = 'tampered' WHERE task_id = ?", (result.task_id,))
+            self.assertEqual(store.verify_audit_chain_status(result.task_id).status, "invalid")
             self.assertFalse(store.verify_audit_chain(result.task_id))
 
-    def test_verify_audit_cli_reports_valid_invalid_and_missing_chains(self):
+    def test_sqlite_audit_chain_status_reports_unverifiable_without_trust_registry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime.sqlite"
+            signer = EnvelopeSigner.generate("audit-status-key", "host:local-demo", ("host:local-demo",))
+            signing_store = SQLiteRuntimeStore(path, signer)
+            host = make_host(signer=signer, store=signing_store)
+            result = host.run(make_demo_envelope(host, "operator audit without registry"))
+
+            verified = SQLiteRuntimeStore(path, signer).verify_audit_chain_status(result.task_id)
+            self.assertEqual(verified.status, "valid")
+            self.assertTrue(verified.valid)
+
+            unverifiable = SQLiteRuntimeStore(path).verify_audit_chain_status(result.task_id)
+            self.assertEqual(unverifiable.status, "unverifiable")
+            self.assertIn("trust registry", unverifiable.reason)
+            self.assertFalse(unverifiable.valid)
+            self.assertFalse(SQLiteRuntimeStore(path).verify_audit_chain(result.task_id))
+
+    def test_verify_audit_cli_reports_valid_invalid_unverifiable_and_missing_chains(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runtime.sqlite"
             signer = EnvelopeSigner.generate("cli-audit-key", "host:local-demo", ("host:local-demo",))
@@ -1223,7 +1248,21 @@ class RuntimeTests(unittest.TestCase):
             with patch.object(sys, "argv", ["portmark", "--store-path", str(path), "--trust-registry-path", str(registry_path), "verify-audit", "--task-id", result.task_id]):
                 with redirect_stdout(output):
                     cli_main()
-            self.assertEqual(json.loads(output.getvalue()), {"task_id": result.task_id, "valid": True})
+            self.assertEqual(
+                json.loads(output.getvalue()),
+                {"task_id": result.task_id, "status": "valid", "reason": "audit chain and signed head verified"},
+            )
+
+            output = io.StringIO()
+            with patch.object(sys, "argv", ["portmark", "--store-path", str(path), "verify-audit", "--task-id", result.task_id]):
+                with redirect_stdout(output):
+                    with self.assertRaises(SystemExit) as raised:
+                        cli_main()
+            self.assertEqual(raised.exception.code, 2)
+            self.assertEqual(
+                json.loads(output.getvalue()),
+                {"task_id": result.task_id, "status": "unverifiable", "reason": "trust registry is not configured"},
+            )
 
             with sqlite3.connect(path) as connection:
                 connection.execute("UPDATE audit_heads SET head_hash = 'tampered' WHERE task_id = ?", (result.task_id,))
@@ -1233,7 +1272,10 @@ class RuntimeTests(unittest.TestCase):
                     with self.assertRaises(SystemExit) as raised:
                         cli_main()
             self.assertEqual(raised.exception.code, 1)
-            self.assertEqual(json.loads(output.getvalue()), {"task_id": result.task_id, "valid": False})
+            self.assertEqual(
+                json.loads(output.getvalue()),
+                {"task_id": result.task_id, "status": "invalid", "reason": "stored audit head does not match audit events"},
+            )
 
             output = io.StringIO()
             with patch.object(sys, "argv", ["portmark", "--store-path", str(path), "--trust-registry-path", str(registry_path), "verify-audit", "--task-id", "missing-task"]):
@@ -1241,7 +1283,10 @@ class RuntimeTests(unittest.TestCase):
                     with self.assertRaises(SystemExit) as raised:
                         cli_main()
             self.assertEqual(raised.exception.code, 1)
-            self.assertEqual(json.loads(output.getvalue()), {"task_id": "missing-task", "valid": False})
+            self.assertEqual(
+                json.loads(output.getvalue()),
+                {"task_id": "missing-task", "status": "invalid", "reason": "audit chain is missing"},
+            )
 
     def test_host_security_guards_are_directly_reachable(self):
         host = make_host()
@@ -2026,6 +2071,46 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(decision.kind, "tool")
         self.assertEqual(decision.tool, "catalog.search")
         self.assertEqual(decision.arguments, {"query": "from native wasmtime", "limit": 2})
+
+    @unittest.skipUnless(HAS_REAL_WASMTIME, "requires portmark[wasmtime]")
+    def test_real_native_wasmtime_component_runs_and_resumes_from_projected_checkpoint(self):
+        capsule = Path(__file__).parents[1] / "capsules" / "research-agent.component.wasm.b64"
+        host = make_host(wasm_component=str(capsule), wasm_engine="wasmtime")
+        result = host.run(make_demo_envelope(host, "portable native component", "wasm"))
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.result["summary"], "Native Wasmtime component resumed from checkpoint")
+        self.assertEqual(result.result["evidence"], ["native-checkpoint-observed"])
+        self.assertEqual([event["event"] for event in result.audit].count("tool.executed"), 1)
+        self.assertEqual(result.checkpoint["messages"][0]["content"][0]["title"], "Result 1 for from native component checkpoint")
+
+    @unittest.skipUnless(HAS_REAL_WASMTIME, "requires portmark[wasmtime]")
+    def test_real_native_wasmtime_component_artifact_matches_source(self):
+        from wasmtime import wat2wasm
+
+        root = Path(__file__).parents[1]
+        source = (root / "capsules" / "research-agent.component.wat").read_text(encoding="utf-8")
+        artifact = base64.b64decode((root / "capsules" / "research-agent.component.wasm.b64").read_bytes().strip(), validate=True)
+        self.assertEqual(bytes(wat2wasm(source)), artifact)
+
+    @unittest.skipUnless(HAS_REAL_WASMTIME, "requires portmark[wasmtime]")
+    def test_real_native_wasmtime_rejects_importing_component_after_component_parse(self):
+        from wasmtime import wat2wasm
+
+        importing_component = bytes(wat2wasm("""
+        (component
+          (import "host-resume" (func $resume
+            (param "context-json" string)
+            (param "checkpoint-json" string)
+            (result string)))
+          (export "resume" (func $resume)))
+        """))
+        provider = NativeWasmtimeComponentProvider(importing_component)
+        with self.assertRaisesRegex(RuntimeError, "unknown import|import"):
+            provider.decide(AgentState("task", "goal"), ("catalog.search",))
+
+        core_provider = NativeWasmtimeComponentProvider(base64.b64decode(WASM_TOOL_REQUEST))
+        with self.assertRaisesRegex(RuntimeError, "component parser|parse a wasm module"):
+            core_provider.decide(AgentState("task", "goal"), ("catalog.search",))
 
     def test_native_wasmtime_provider_rejects_unlinkable_or_missing_resume_components(self):
         with self._fake_wasmtime_runtime():

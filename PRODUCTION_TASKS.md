@@ -25,7 +25,7 @@ Tasks:
 
 ## 2. Replace Core-Wasm ABI With WIT Component Model Bindings
 
-Status: implemented for the reference runtime. `wit/portmark.wit` now defines structured provider decisions, `component_bindings.py` validates WIT-shaped outcomes, the default Node runner calls `resume(context-json, checkpoint-json)`, the optional native Wasmtime provider instantiates signed Component Model artifacts directly, and the example capsule has been regenerated for the new ABI and now completes from projected checkpointed tool output.
+Status: implemented for the reference runtime. `wit/portmark.wit` now defines structured provider decisions, `component_bindings.py` validates WIT-shaped outcomes, the default Node runner calls `resume(context-json, checkpoint-json)` for the core artifact, the optional native Wasmtime provider instantiates a separate Component Model artifact directly, and both checked-in examples complete from projected checkpointed tool output.
 
 Tasks:
 
@@ -41,12 +41,14 @@ Tasks:
 - [x] Add optional native Wasmtime Component Model provider behind an explicit engine flag.
 - [x] Add regressions for native import rejection, missing export, timeout, output cap, and factory wiring.
 - [x] Make the example capsule exercise a real multi-step tool/checkpoint loop instead of returning a static completion.
+- [x] Ship a real Component Model artifact for native Wasmtime and prove it executes successfully.
+- [x] Prove native import rejection with a component that parses but requires an unlinked host import.
 
-Implementation note: the default toolchain remains WIT plus a JSON-lowered binding layer executed through Node's built-in WebAssembly engine for offline reference use. Native Wasmtime is optional because it requires the deploying package to install `portmark[wasmtime]` and provide a Component Model artifact accepted by `wasmtime.component`. No legacy integer ABI compatibility path was kept.
+Implementation note: the default toolchain remains WIT plus a JSON-lowered binding layer executed through Node's built-in WebAssembly engine for offline reference use. Native Wasmtime is optional because it requires the deploying package to install `portmark[wasmtime]` and provide a Component Model artifact accepted by `wasmtime.component`. The checked-in core module and Component Model artifact are intentionally separate files. No legacy integer ABI compatibility path was kept.
 
 ## 3. Persist Nonces, Checkpoints, And Audit Heads Transactionally
 
-Status: implemented for the reference runtime. `RuntimeStore` now supports transactional nonce consumption, checkpoint persistence, audit event insertion, and signed audit head updates, with a durable SQLite implementation and regression tests for restart replay, rollback, migration recovery, audit verification, forgery rejection, and concurrency.
+Status: implemented for the reference runtime. `RuntimeStore` now supports transactional nonce consumption, checkpoint persistence, audit event insertion, signed audit head updates, and three-state audit verification (`valid`, `invalid`, `unverifiable`), with a durable SQLite implementation and regression tests for restart replay, rollback, migration recovery, audit verification, forgery rejection, and concurrency.
 
 Tasks:
 
@@ -58,6 +60,7 @@ Tasks:
 - [x] Enforce uniqueness on nonce, task/audit sequence, and audit hash.
 - [x] Add transaction boundaries so nonce consumption, checkpoint update, and audit append cannot diverge.
 - [x] Add recovery logic for resuming from the last committed checkpoint.
+- [x] Report unverifiable audit chains separately from invalid chains when trust material is missing.
 - [x] Add tests for process restart replay rejection, migration recovery, partial failure rollback, audit-chain verification, and concurrent submissions.
 
 ## 4. Use Complete A2A 1.0 Generated Types And Authentication Profile

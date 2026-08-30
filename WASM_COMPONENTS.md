@@ -8,8 +8,10 @@ Portmark uses `wit/portmark.wit` as the source contract for Wasm decision provid
 - Host bindings: `src/portmark/component_bindings.py`
 - Runner: `src/portmark/wasm_runner.mjs`
 - Optional native runner: `src/portmark/wasmtime_component_runner.py`
-- Example capsule source: `capsules/research-agent.wat`
-- Example capsule artifact: `capsules/research-agent.wasm.b64`
+- Example core capsule source: `capsules/research-agent.wat`
+- Example core capsule artifact for the Node runner: `capsules/research-agent.wasm.b64`
+- Example Component Model capsule source: `capsules/research-agent.component.wat`
+- Example Component Model artifact for native Wasmtime: `capsules/research-agent.component.wasm.b64`
 
 The Python host constructs structured context and checkpoint JSON from runtime state, sends it to the runner over stdin, and validates the returned WIT outcome before converting it into `ProviderDecision`.
 
@@ -31,9 +33,11 @@ portmark --wasm-component path/to/component.wasm \
 
 The native provider still runs in a short-lived Python worker with a deadline,
 minimal environment, output cap, and generic client-facing failures. It
-instantiates the same component bytes whose SHA-256 digest is recorded in the
-signed manifest, so provider selection does not introduce a second artifact that
-can drift from the signature.
+instantiates the component bytes whose SHA-256 digest is recorded in the signed
+manifest. Use `capsules/research-agent.component.wasm.b64` for the checked-in
+example. The default `capsules/research-agent.wasm.b64` file is a core Wasm
+module for the Node runner and native Wasmtime rejects it with a component
+parser error.
 
 ## Default JSON-Lowered Capsule ABI
 
@@ -44,9 +48,11 @@ The default Node adapter expects a core Wasm module that exports:
 
 The returned `i64` is `(result_ptr << 32) | result_len`. The pointed-to bytes must be UTF-8 JSON matching one of the WIT outcomes.
 
-The native Wasmtime provider expects a Component Model artifact for
-`wit/portmark.wit` and calls the exported `resume(context-json, checkpoint-json)`
-function through `wasmtime.component`.
+The native Wasmtime provider expects a Component Model artifact and calls the
+exported `resume(context-json, checkpoint-json)` function through
+`wasmtime.component`. The checked-in component exports a lifted string-returning
+`resume` function whose JSON output uses the same outcome decoder as the Node
+path.
 
 ## Context JSON
 
@@ -134,6 +140,6 @@ The host rejects malformed JSON, unknown outcomes, missing `resume`, missing `me
 
 ## Security Boundary
 
-The default Node runner rejects every Wasm module declaring imports. Capsules therefore have no ambient filesystem, network, process, environment, clock, randomness, or credential access. Native Wasmtime deployments instantiate components through an empty `wasmtime.component.Linker`, so components requiring imports fail to instantiate. Tool requests returned by either capsule path still pass through the same host permit, argument constraints, budgets, and audit log as any model-provider proposal.
+The default Node runner rejects every Wasm module declaring imports. Capsules therefore have no ambient filesystem, network, process, environment, clock, randomness, or credential access. Native Wasmtime deployments instantiate components through an empty `wasmtime.component.Linker`, so components requiring imports fail to instantiate. The regression suite proves both sides separately: the native component artifact runs successfully, and a different valid component that imports a host function is rejected after component parsing. Tool requests returned by either capsule path still pass through the same host permit, argument constraints, budgets, and audit log as any model-provider proposal.
 
 The host sends component input through stdin rather than process arguments to avoid command-line exposure and argument-length limits.

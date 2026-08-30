@@ -52,10 +52,12 @@ def main() -> None:
     if args.command == "verify-audit":
         if store is None:
             parser.error("verify-audit requires --store-path or PORTMARK_STORE_PATH")
-        valid = store.verify_audit_chain(args.task_id)
-        print(json.dumps({"task_id": args.task_id, "valid": valid}, indent=2))
-        if not valid:
+        verification = store.verify_audit_chain_status(args.task_id)
+        print(json.dumps({"task_id": args.task_id, "status": verification.status, "reason": verification.reason}, indent=2))
+        if verification.status == "invalid":
             raise SystemExit(1)
+        if verification.status == "unverifiable":
+            raise SystemExit(2)
         return
     host = make_host(
         config.provider_endpoint,

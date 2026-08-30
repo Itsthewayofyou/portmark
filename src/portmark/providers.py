@@ -224,7 +224,10 @@ class NativeWasmtimeComponentProvider(ModelProvider):
         except subprocess.TimeoutExpired as error:
             raise RuntimeError("native Wasmtime component exceeded its execution deadline") from error
         if process.returncode != 0:
-            raise RuntimeError("native Wasmtime component rejected")
+            error_text = process.stderr.strip()
+            if len(error_text.encode()) > 4096:
+                error_text = error_text.encode()[:4096].decode("utf-8", "replace")
+            raise RuntimeError("native Wasmtime component rejected: " + error_text)
         if len(process.stdout.encode()) > self._max_output_bytes:
             raise RuntimeError("native Wasmtime component decision exceeded output limit")
         return decode_component_decision(process.stdout, available_tools)

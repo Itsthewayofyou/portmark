@@ -6,10 +6,10 @@ import sqlite3
 import threading
 import time
 from contextlib import AbstractContextManager
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Literal, Protocol
 
 from .models import AgentState
 from .security import AuditHeadVerifier, SecurityError, audit_head_payload, canonical_json
@@ -18,6 +18,17 @@ from .security import AuditHeadVerifier, SecurityError, audit_head_payload, cano
 SQLITE_SCHEMA_VERSION = 3
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 AuditHeadSigner = Callable[[str, int], tuple[str, str]]
+AuditVerificationStatus = Literal["valid", "invalid", "unverifiable"]
+
+
+@dataclass(frozen=True)
+class AuditVerificationResult:
+    status: AuditVerificationStatus
+    reason: str
+
+    @property
+    def valid(self) -> bool:
+        return self.status == "valid"
 
 
 class RuntimeTransaction(Protocol):
@@ -42,6 +53,9 @@ class RuntimeStore(Protocol):
         ...
 
     def audit_head(self, task_id: str) -> tuple[str, int] | None:
+        ...
+
+    def verify_audit_chain_status(self, task_id: str) -> AuditVerificationResult:
         ...
 
     def verify_audit_chain(self, task_id: str) -> bool:
@@ -80,16 +94,16 @@ class InMemoryRuntimeStore:
                 return None
             return head["head_hash"], head["sequence"]
 
-    def verify_audit_chain(self, task_id: str) -> bool:
+    def verify_audit_chain_status(self, task_id: str) -> AuditVerificationResult:
         with self._lock:
             events = self._audit_events.get(task_id, [])
             head = self._audit_heads.get(task_id)
             if not events or head is None:
-                return False
+                return AuditVerificationResult("invalid", "audit chain is missing")
             previous = events[0]["previous"]
             for expected_sequence, event in enumerate(events):
                 if event["sequence"] != expected_sequence or event["previous"] != previous:
-                    return False
+                    return AuditVerificationResult("invalid", "audit chain sequence or previous hash is inconsistent")
                 record = {
                     "sequence": event["sequence"],
                     "event": event["event"],
@@ -97,11 +111,14 @@ class InMemoryRuntimeStore:
                     "previous": event["previous"],
                 }
                 if event["hash"] != _audit_hash(record):
-                    return False
+                    return AuditVerificationResult("invalid", "audit event hash is invalid")
                 previous = event["hash"]
             if head["head_hash"] != previous or head["sequence"] != len(events):
-                return False
+                return AuditVerificationResult("invalid", "stored audit head does not match audit events")
             return _verify_head_signature(self._audit_head_verifier, task_id, head)
+
+    def verify_audit_chain(self, task_id: str) -> bool:
+        return self.verify_audit_chain_status(task_id).valid
 
 
 class _InMemoryTransaction:
@@ -294,7 +311,7 @@ class SQLiteRuntimeStore:
             row = connection.execute("SELECT head_hash, sequence FROM audit_heads WHERE task_id = ?", (task_id,)).fetchone()
             return (row["head_hash"], int(row["sequence"])) if row is not None else None
 
-    def verify_audit_chain(self, task_id: str) -> bool:
+    def verify_audit_chain_status(self, task_id: str) -> AuditVerificationResult:
         with self._connect() as connection:
             rows = connection.execute(
                 "SELECT sequence, event, details_json, previous_hash, hash FROM audit_events WHERE task_id = ? ORDER BY sequence",
@@ -305,33 +322,44 @@ class SQLiteRuntimeStore:
                 (task_id,),
             ).fetchone()
         if not rows or head is None:
-            return False
+            return AuditVerificationResult("invalid", "audit chain is missing")
         previous = rows[0]["previous_hash"] if rows else ""
         for expected_sequence, row in enumerate(rows):
             if row["sequence"] != expected_sequence or row["previous_hash"] != previous:
-                return False
+                return AuditVerificationResult("invalid", "audit chain sequence or previous hash is inconsistent")
+            try:
+                details = json.loads(row["details_json"])
+            except json.JSONDecodeError:
+                return AuditVerificationResult("invalid", "audit event details are malformed")
             record = {
                 "sequence": row["sequence"],
                 "event": row["event"],
-                "details": json.loads(row["details_json"]),
+                "details": details,
                 "previous": row["previous_hash"],
             }
             if row["hash"] != _audit_hash(record):
-                return False
+                return AuditVerificationResult("invalid", "audit event hash is invalid")
             previous = row["hash"]
-        if head["head_hash"] != previous or int(head["sequence"]) != len(rows):
-            return False
+        try:
+            head_sequence = int(head["sequence"])
+        except (TypeError, ValueError):
+            return AuditVerificationResult("invalid", "signed audit head sequence is malformed")
+        if head["head_hash"] != previous or head_sequence != len(rows):
+            return AuditVerificationResult("invalid", "stored audit head does not match audit events")
         return _verify_head_signature(
             self._audit_head_verifier,
             task_id,
             {
                 "head_hash": head["head_hash"],
-                "sequence": int(head["sequence"]),
+                "sequence": head_sequence,
                 "host_id": head["host_id"],
                 "signature_key_id": head["signature_key_id"],
                 "signature": head["signature"],
             },
         )
+
+    def verify_audit_chain(self, task_id: str) -> bool:
+        return self.verify_audit_chain_status(task_id).valid
 
 
 class _SQLiteTransaction:
@@ -439,15 +467,21 @@ def _audit_hash(record: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_json(record)).hexdigest()
 
 
-def _verify_head_signature(verifier: AuditHeadVerifier | None, task_id: str, head: dict[str, Any]) -> bool:
-    if verifier is None or not head.get("signature_key_id") or not head.get("signature") or not head.get("host_id"):
-        return False
+def _verify_head_signature(verifier: AuditHeadVerifier | None, task_id: str, head: dict[str, Any]) -> AuditVerificationResult:
+    if verifier is None:
+        return AuditVerificationResult("unverifiable", "trust registry is not configured")
+    if not head.get("signature_key_id") or not head.get("signature") or not head.get("host_id"):
+        return AuditVerificationResult("invalid", "signed audit head is missing")
+    try:
+        sequence = int(head["sequence"])
+    except (TypeError, ValueError):
+        return AuditVerificationResult("invalid", "signed audit head sequence is malformed")
     try:
         verifier.verify_audit_head(
             head["signature_key_id"],
-            audit_head_payload(task_id, head["host_id"], head["head_hash"], int(head["sequence"])),
+            audit_head_payload(task_id, head["host_id"], head["head_hash"], sequence),
             head["signature"],
         )
     except SecurityError:
-        return False
-    return True
+        return AuditVerificationResult("invalid", "audit head signature is invalid or untrusted")
+    return AuditVerificationResult("valid", "audit chain and signed head verified")

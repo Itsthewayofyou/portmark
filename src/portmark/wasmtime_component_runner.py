@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import io
 import json
 import sys
@@ -17,10 +18,22 @@ def main() -> None:
         max_output_bytes = int(request["max_output_bytes"])
         if max_output_bytes < 1:
             raise RuntimeError("max_output_bytes must be positive")
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError, binascii.Error) as error:
+        _fail(error)
+        raise SystemExit(1)
 
+    try:
         from wasmtime import Engine, Store
+        try:
+            from wasmtime import WasmtimeError
+        except ImportError:
+            WasmtimeError = RuntimeError
         from wasmtime.component import Component, Linker
+    except ImportError as error:
+        _fail(error)
+        raise SystemExit(1)
 
+    try:
         captured_stdout = _CappedTextIO(max_output_bytes)
         with redirect_stdout(captured_stdout):
             engine = Engine()
@@ -35,8 +48,8 @@ def main() -> None:
         if len(outcome.encode()) > max_output_bytes:
             raise RuntimeError("component outcome exceeds output limit")
         print(outcome, end="")
-    except Exception:
-        print("native Wasmtime component failed", file=sys.stderr)
+    except (WasmtimeError, RuntimeError, TypeError, ValueError, json.JSONDecodeError) as error:
+        _fail(error)
         raise SystemExit(1)
 
 
@@ -45,6 +58,10 @@ def _string(value: dict[str, Any], key: str) -> str:
     if not isinstance(item, str):
         raise RuntimeError(f"{key} must be a string")
     return item
+
+
+def _fail(error: BaseException) -> None:
+    print(f"native Wasmtime component failed: {type(error).__name__}: {error}", file=sys.stderr)
 
 
 def _normalize_outcome(value: Any) -> dict[str, Any]:

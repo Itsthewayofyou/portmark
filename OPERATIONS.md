@@ -124,7 +124,7 @@ For SQLite-backed hosts, run:
 portmark --store-path runtime.sqlite --trust-registry-path trust.json verify-audit --task-id TASK_ID
 ```
 
-The command prints `{"valid": true}` and exits 0 for an intact chain whose stored audit head is signed by a trusted host key. It prints `{"valid": false}` and exits 1 when the task is missing or when event sequence, previous hash, event hash, stored audit-head validation, trust-registry lookup, or audit-head signature validation fails. Unsigned legacy heads are reported as invalid. Treat any false result as tampered or corrupted task history.
+The command prints `{"status": "valid"}` and exits 0 for an intact chain whose stored audit head is signed by a trusted host key. It prints `{"status": "invalid"}` and exits 1 when the task is missing or when event sequence, previous hash, event hash, stored audit-head validation, missing signature material, trust-registry rejection, or audit-head signature validation fails. It prints `{"status": "unverifiable"}` and exits 2 when the local verifier cannot prove the signed head because no trust registry is configured. Treat invalid results as tampered or corrupted task history; treat unverifiable results as an operator configuration failure and re-run with `--trust-registry-path`.
 
 ## Metrics
 
@@ -186,10 +186,15 @@ The default Wasm engine is the Node JSON-lowered runner. Native Wasmtime is
 optional and requires `portmark[wasmtime]` plus a Component Model artifact:
 
 ```bash
-portmark --wasm-component path/to/component.wasm \
+portmark --wasm-component capsules/research-agent.component.wasm.b64 \
   --wasm-engine wasmtime \
   demo "goal"
 ```
+
+Use `capsules/research-agent.wasm.b64` only with the default Node runner; it is
+a core Wasm module and native Wasmtime rejects it with a component parser
+diagnostic. Use `capsules/research-agent.component.wasm.b64` for the checked-in
+native Component Model example.
 
 The runtime instantiates the signed component bytes through an empty
 `wasmtime.component.Linker`, runs them in a short-lived Python worker with a

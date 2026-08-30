@@ -105,7 +105,20 @@ PYTHONPATH=src python -m portmark.cli --wasm-component capsules/research-agent.w
 
 Deployments that install the optional native Wasmtime extra can select
 `--wasm-engine wasmtime` to instantiate the signed component bytes through
-`wasmtime.component` instead of the default Node runner.
+`wasmtime.component` instead of the default Node runner:
+
+```bash
+python -m pip install -e '.[wasmtime]'
+PYTHONPATH=src python -m portmark.cli \
+  --wasm-component capsules/research-agent.component.wasm.b64 \
+  --wasm-engine wasmtime \
+  demo "research modern mobile agents"
+```
+
+The Node runner consumes `capsules/research-agent.wasm.b64`, which is a core
+Wasm module. Native Wasmtime consumes
+`capsules/research-agent.component.wasm.b64`, which is a Component Model
+artifact.
 
 The host executes each capsule in a short-lived worker with a strict deadline and rejects every
 module declaring an import. Its signed SHA-256 digest is checked before execution. Tool actions
