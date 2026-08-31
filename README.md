@@ -137,8 +137,8 @@ the evidence format, verification flow, external-verifier contract, sealed-stora
 residual risks.
 
 Envelopes are signed with Ed25519 by default and verified through a key-ID-based trust registry.
-See [SIGNING_KEYS.md](SIGNING_KEYS.md) for key generation, rotation, revocation, and trust
-bootstrap guidance. The legacy HMAC signer is retained only behind
+See [SIGNING_KEYS.md](SIGNING_KEYS.md) for key generation, rotation, revocation, trust
+bootstrap guidance, and why SPIFFE is a planned opt-in rather than the trust root. The legacy HMAC signer is retained only behind
 `PORTMARK_ALLOW_LEGACY_HMAC=unsafe-test-only` plus an explicit `PORTMARK_SIGNING_KEY`.
 
 ## Run it
