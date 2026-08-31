@@ -2086,16 +2086,26 @@ class RuntimeTests(unittest.TestCase):
             server.server_close()
 
     def test_a2a_bounded_reference_server_handles_concurrent_loopback_load(self):
+        """Concurrent requests all complete and none are cross-contaminated.
+
+        The caps are deliberately double the worker count. With them equal, a
+        connection slot the server has not finished releasing can reject the next
+        request with 503 and fail this test for a reason it does not test --
+        observed once on CI, green on a re-run of the same commit. Saturation
+        behaviour has its own deterministic test below, which blocks a provider
+        rather than racing the cap, so widening the margin here loses no coverage.
+        """
+        workers = 8
         host = make_host()
         server = BoundedReferenceHTTPServer(
             ("127.0.0.1", 0),
             make_handler(
                 host,
-                max_concurrent_requests=8,
+                max_concurrent_requests=workers * 2,
                 rate_limit_per_ip=100,
                 agent_card_rate_limit_per_ip=100,
             ),
-            max_connections=8,
+            max_connections=workers * 2,
         )
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -2113,7 +2123,7 @@ class RuntimeTests(unittest.TestCase):
                 return json.load(response)["supportedInterfaces"][0]["protocolVersion"]
 
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
                 message_states = list(executor.map(submit, range(12)))
                 card_versions = list(executor.map(get_card, range(12)))
             self.assertEqual(message_states, ["completed"] * 12)
