@@ -96,6 +96,46 @@ Trust registry distribution is out of scope for the reference runtime, but produ
 - Require operator review for new issuers or broader audiences.
 - Test rollback before emergency revocation is needed.
 
+## Why Not SPIFFE
+
+SPIFFE/SPIRE is the consensus workload-identity standard, and Portmark deliberately does not use it
+as its trust root. The reason is a lifetime mismatch, not a disagreement about the standard.
+
+SPIFFE issues **short-lived credentials for a live workload**, rotated automatically — SPIRE's
+defaults are `default_x509_svid_ttl = 6h` and `default_jwt_svid_ttl = 5m`, renewed at roughly half
+of their lifetime. That is the correct design for authenticating a running process across a
+connection.
+
+Portmark verifies two things, and only one of them is a live connection:
+
+| What | When it is verified | Credential lifetime needed |
+| --- | --- | --- |
+| Envelope signature | once, on arrival | short is fine |
+| **Signed audit head** | **potentially months later, via `portmark verify-audit`** | **must outlive the run** |
+
+The audit head is the constraint. EU AI Act Article 12 record-keeping, enforceable since
+2 August 2026, expects tamper-evident logs of agent *actions* retained for at least six months.
+Today `verify-audit` resolves a six-month-old signature from a single JSON file. Under rotating
+SVIDs the same check requires archiving the exact signing certificate and the trust bundle current
+at signing time — signatures made before expiry stay valid, but the material needed to verify them
+must be kept, and SPIRE rotates and replaces rather than archiving. That is solvable, and it is
+machinery this runtime does not currently need.
+
+The second reason is bootstrap cost. Adopting SPIFFE makes step zero "deploy a SPIRE Server with a
+datastore, an Agent on every node, a node attestor, and clock sync," and cross-organisation trust
+additionally requires SPIFFE Federation, where adding or removing a trust domain means a
+configuration change and restart on every participating deployment. Portmark's premise is a
+stranger's agent arriving at your host, which the registry serves with a JSON file and no shared
+infrastructure.
+
+**This is an opt-in gap, not a rejection.** The intended design when it is needed: accept a SPIFFE
+SVID as an additional identity source for **envelope** verification, while audit heads continue to
+use a registry-backed host key. The envelope format does not have to change. The trigger to build
+it is a deployment that already runs SPIRE, a need for sub-hour revocation, or more trusted agent
+keys than a JSON file can sensibly carry.
+
+Comparison performed 2026-08-31 against spiffe.io documentation of that date.
+
 ## Legacy HMAC Mode
 
 Set `PORTMARK_ALLOW_LEGACY_HMAC=unsafe-test-only` and a non-empty
