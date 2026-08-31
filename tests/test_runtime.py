@@ -28,7 +28,7 @@ from unittest.mock import patch
 from portmark.a2a import MAX_REQUEST_BYTES, DEFAULT_MAX_CONCURRENT_REQUESTS, A2AAuthConfig, BoundedReferenceHTTPServer, RateLimiter, envelope_from_dict, is_loopback_bind, make_asgi_app, make_handler, serve
 from portmark.a2a_types import make_agent_card
 from portmark.config import RuntimeConfig
-from portmark.factory import make_demo_envelope, make_host, signer_from_environment
+from portmark.factory import build_envelope, make_demo_envelope, make_host, signer_from_environment
 from portmark.metrics import RuntimeMetrics
 from portmark.logging_config import JsonLogFormatter
 from portmark.models import AgentEnvelope, AgentManifest, AgentState, AttestationEvidence, Permit, ProviderDecision, ResourceBudget, ToolGrant
@@ -46,6 +46,7 @@ from portmark.security import (
     TrustRegistry,
     TrustedIdentity,
     canonical_json,
+    generate_signing_material,
     load_trust_registry,
 )
 from portmark.storage import SQLITE_BUSY_TIMEOUT_MS, SQLITE_SCHEMA_VERSION, SQLiteRuntimeStore
@@ -2488,6 +2489,137 @@ class RuntimeTests(unittest.TestCase):
             with self.subTest(message=message):
                 with self.assertRaisesRegex(RuntimeError, message):
                     provider.decide(AgentState("task", "goal"), ("catalog.search",))
+
+
+
+class AgentSideToolingTests(unittest.TestCase):
+    """The agent-side half: mint a key, build an envelope, have a separate host accept it."""
+
+    def _keygen(self, directory, key_id="portmark-agent-key", issuer="user:alice"):
+        material = generate_signing_material(key_id, issuer)
+        registry_path = Path(directory) / f"{key_id}.trust.json"
+        registry_path.write_text(json.dumps(material["trust_registry"]), encoding="utf-8")
+        return material, registry_path
+
+    def _agent_env(self, material):
+        return {
+            "PORTMARK_ED25519_PRIVATE_KEY_B64": material["private_key_b64"],
+            "PORTMARK_SIGNING_KEY_ID": material["key_id"],
+            "PORTMARK_SIGNING_ISSUER": material["issuer"],
+        }
+
+    def _run_cli(self, argv, env):
+        output = io.StringIO()
+        with patch.dict(os.environ, env, clear=False):
+            with patch.object(sys, "argv", argv):
+                with redirect_stdout(output), redirect_stderr(io.StringIO()):
+                    cli_main()
+        return json.loads(output.getvalue())
+
+    def test_trust_registry_path_is_honoured_without_an_operator_private_key(self):
+        """A host given only a registry file must trust the keys inside it.
+
+        Regression: the no-private-key branch built a fresh registry and silently
+        discarded the configured one, so an explicit trust anchor did nothing.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            _, registry_path = self._keygen(directory)
+            with patch.dict(os.environ, {}, clear=True):
+                signer = signer_from_environment("host:local-demo", str(registry_path))
+            self.assertTrue(signer.registry.has_key("portmark-agent-key"))
+            self.assertTrue(signer.registry.has_key(signer.key_id))
+
+    def test_signer_refuses_a_registry_entry_holding_a_different_public_key(self):
+        """Same key id, different key: fail at construction, not at some later signature."""
+        registry = TrustRegistry()
+        registry.add(
+            TrustedIdentity(
+                key_id="collide",
+                issuer="user:alice",
+                public_key=b"\x01" * 32,
+                allowed_audiences=("*",),
+            )
+        )
+        with self.assertRaisesRegex(SecurityError, "different public key"):
+            EnvelopeSigner.generate("collide", "user:alice", ("*",), registry=registry)
+        with self.assertRaisesRegex(SecurityError, "different public key"):
+            EnvelopeSigner.from_private_key_bytes("collide", "user:alice", b"\x02" * 32, ("*",), registry)
+
+    def test_build_envelope_rejects_unknown_and_incomplete_specs(self):
+        signer = EnvelopeSigner.generate("spec-key", "user:alice", ("*",))
+        cases = [
+            ({"goal": "g", "grants": [{"name": "catalog.search"}], "typo": 1}, "unknown envelope spec fields: typo"),
+            ({"grants": [{"name": "catalog.search"}]}, "non-empty 'goal'"),
+            ({"goal": "g", "grants": []}, "non-empty 'grants'"),
+            ({"goal": "g", "grants": [{"nmae": "x"}]}, "unknown grant fields: nmae"),
+            ({"goal": "g", "grants": [{"name": "x"}], "budget": {"max_step": 1}}, "unknown budget fields: max_step"),
+        ]
+        for spec, message in cases:
+            with self.subTest(spec=spec):
+                with self.assertRaisesRegex(ValueError, message):
+                    build_envelope(spec, signer)
+
+    def test_build_envelope_mints_a_fresh_nonce_and_task_id_per_call(self):
+        """A saved spec must not become a replayable envelope."""
+        signer = EnvelopeSigner.generate("nonce-key", "user:alice", ("*",))
+        spec = {"goal": "same goal", "grants": [{"name": "catalog.search"}]}
+        first = build_envelope(spec, signer)
+        second = build_envelope(spec, signer)
+        self.assertNotEqual(first.permit.nonce, second.permit.nonce)
+        self.assertNotEqual(first.state.task_id, second.state.task_id)
+
+    def test_envelope_cli_output_is_accepted_by_a_host_that_only_loaded_the_registry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            material, registry_path = self._keygen(directory)
+            request = self._run_cli(
+                ["portmark", "envelope", "--goal", "find a red widget", "--tool", "catalog.search"],
+                self._agent_env(material),
+            )
+            self.assertEqual(request["method"], "message/send")
+
+            with patch.dict(os.environ, {}, clear=True):
+                host = make_host(trust_registry_path=str(registry_path))
+            envelope = envelope_from_dict(request["params"]["metadata"]["portmark_envelope"])
+            self.assertEqual(host.run(envelope).status, "completed")
+
+    def test_envelope_signed_by_an_untrusted_key_is_refused_by_that_host(self):
+        """Control for the test above: without it, a passing run proves nothing about trust."""
+        with tempfile.TemporaryDirectory() as directory:
+            _, registry_path = self._keygen(directory)
+            stranger, _ = self._keygen(directory, key_id="stranger-key")
+            request = self._run_cli(
+                ["portmark", "envelope", "--goal", "find a red widget", "--tool", "catalog.search"],
+                self._agent_env(stranger),
+            )
+            with patch.dict(os.environ, {}, clear=True):
+                host = make_host(trust_registry_path=str(registry_path))
+            envelope = envelope_from_dict(request["params"]["metadata"]["portmark_envelope"])
+            with self.assertRaisesRegex(SecurityError, "not trusted"):
+                host.run(envelope)
+
+    def test_envelope_cli_refuses_to_sign_with_an_ephemeral_key(self):
+        """No soft fallback: a key no host has seen would fail far from its cause."""
+        with patch.dict(os.environ, {}, clear=True):
+            with patch.object(sys, "argv", ["portmark", "envelope", "--goal", "g", "--tool", "catalog.search"]):
+                stderr = io.StringIO()
+                with redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit):
+                        cli_main()
+        self.assertIn("PORTMARK_ED25519_PRIVATE_KEY_B64", stderr.getvalue())
+
+    def test_keygen_cli_writes_a_registry_and_refuses_to_clobber_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trust.json"
+            material = self._run_cli(["portmark", "keygen", "--issuer", "user:alice", "--out-registry", str(path)], {})
+            self.assertEqual(json.loads(path.read_text())["identities"][0]["issuer"], "user:alice")
+            self.assertEqual(material["issuer"], "user:alice")
+
+            before = path.read_text()
+            with patch.object(sys, "argv", ["portmark", "keygen", "--out-registry", str(path)]):
+                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        cli_main()
+            self.assertEqual(path.read_text(), before, "existing trust registry must survive")
 
 
 if __name__ == "__main__":

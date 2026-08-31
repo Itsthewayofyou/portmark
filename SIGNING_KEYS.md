@@ -27,7 +27,20 @@ Verification fails if the key ID is unknown, revoked, inactive, expired, used fo
 
 ## Generate A Key
 
-Generate an Ed25519 signer in Python:
+`portmark keygen` mints the private key and the matching trust registry together, so the
+public half a host must load is never hand-assembled:
+
+```bash
+eval "$(portmark keygen --issuer user:alice --out-registry trust.json --format env)"
+```
+
+That writes `trust.json` (public only, hand this to the host) and exports
+`PORTMARK_ED25519_PRIVATE_KEY_B64`, `PORTMARK_SIGNING_KEY_ID`, and `PORTMARK_SIGNING_ISSUER`
+as one consistent set. Drop `--format env` to get the same material as JSON on stdout.
+`--out-registry` refuses to overwrite an existing file unless `--force` is passed. Restrict
+which hosts a key may target with one or more `--audience` flags; the default is any.
+
+To generate a signer programmatically instead:
 
 ```python
 # scripts/key_example.py

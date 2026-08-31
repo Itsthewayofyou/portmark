@@ -44,6 +44,60 @@ PYTHONPATH=src python -m portmark.cli demo "research modern mobile agents"
 No installation and no network access required. Examples below use bash; on PowerShell, write
 `$env:PYTHONPATH = "src"` on its own line instead of the inline prefix.
 
+## Send an agent to a running host
+
+Portmark has no user interface, because the client is another program rather than a person at a
+screen. Sending an agent takes three commands and no Python:
+
+```bash
+# 1. mint a signing key and the public trust registry the host will load
+eval "$(portmark keygen --issuer user:alice --out-registry trust.json --format env)"
+
+# 2. start a host that trusts that registry
+portmark --trust-registry-path trust.json serve --port 8080 &
+
+# 3. build a signed request and post it
+portmark envelope --goal "find a red widget" --tool catalog.search > request.json
+curl -X POST http://127.0.0.1:8080/message:send \
+  -H 'Content-Type: application/json' --data @request.json
+```
+
+Steps 1 and 2 run once. Only step 3 repeats.
+
+`portmark envelope` prints a ready-to-POST `message/send` request by default, or the bare signed
+envelope with `--format envelope`. For anything past a single tool, pass a spec file:
+
+```bash
+portmark envelope --spec agent.json > request.json
+```
+
+```json
+{
+  "agent_id": "agent:shopper",
+  "goal": "find a red widget under $20",
+  "audience": "host:local-demo",
+  "ttl_seconds": 900,
+  "grants": [
+    {"name": "catalog.search", "constraints": {"max_limit": 3}, "output_projection": ["id", "title"]}
+  ],
+  "budget": {"max_steps": 6, "max_tool_calls": 2, "max_output_bytes": 32768}
+}
+```
+
+Unknown fields are rejected rather than ignored, so a typo fails loudly instead of silently
+dropping a constraint. Three things are worth knowing before the first run:
+
+- **`audience` must equal the host's `--host-id`** (default `host:local-demo`). A host will not
+  run an envelope addressed to somebody else.
+- **Each envelope carries a fresh nonce.** A saved `request.json` is single-use by design;
+  re-posting it is a replay and the host refuses it. Rebuild it from the spec each time.
+- **Host policy is a ceiling, not a suggestion.** A tool granted here that the host policy does
+  not allow is dropped from the effective permit; the agent runs without it rather than failing.
+
+The tools behind that boundary — `catalog.search` and `payments.reserve` — are deterministic
+stubs. The enforcement around them is real and tested; the things being enforced against are
+placeholders for your own.
+
 ## Security boundary
 
 ```text
