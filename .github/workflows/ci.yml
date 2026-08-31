@@ -1,8 +1,17 @@
 name: CI
 
 on:
+  # Unfiltered `push` plus `pull_request` ran the whole matrix twice for every
+  # push to a branch with an open PR, doubling load on the runner. Branch pushes
+  # are now covered by the pull_request event alone.
   push:
+    branches: [main]
   pull_request:
+
+concurrency:
+  # Supersede in-flight runs for the same PR; never cancel a run for main.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
