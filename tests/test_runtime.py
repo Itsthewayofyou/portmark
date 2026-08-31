@@ -26,6 +26,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 from portmark.a2a import MAX_REQUEST_BYTES, DEFAULT_MAX_CONCURRENT_REQUESTS, A2AAuthConfig, BoundedReferenceHTTPServer, RateLimiter, envelope_from_dict, is_loopback_bind, make_asgi_app, make_handler, serve
+from portmark.a2a_types import make_agent_card
 from portmark.config import RuntimeConfig
 from portmark.factory import make_demo_envelope, make_host, signer_from_environment
 from portmark.metrics import RuntimeMetrics
@@ -59,6 +60,7 @@ WASM_TIMEOUT = "AGFzbQEAAAABCQFgBH9/f38BfgMCAQAFAwEAAQcTAgZtZW1vcnkCAAZyZXN1bWUA
 WASM_FORBIDDEN_IMPORT = "AGFzbQEAAAABDAJgAABgBH9/f38BfgIJAQNlbnYBeAAAAwIBAQUDAQABBxMCBm1lbW9yeQIABnJlc3VtZQABCgYBBABCAAs="
 WASM_MISSING_RESUME = "AGFzbQEAAAAFAwEAAQcKAQZtZW1vcnkCAA=="
 HAS_REAL_WASMTIME = importlib.util.find_spec("wasmtime") is not None
+HAS_REAL_A2A_SDK = importlib.util.find_spec("a2a") is not None
 
 
 class FixedProvider(ModelProvider):
@@ -1554,12 +1556,13 @@ class RuntimeTests(unittest.TestCase):
         try:
             with urllib.request.urlopen(base + "/.well-known/agent-card.json") as response:  # nosec B310
                 card = json.load(response)
-            self.assertEqual(card["protocolVersion"], "1.0")
+            self.assertNotIn("protocolVersion", card)  # not an AgentCard field
+            self.assertNotIn("url", card)              # lives in supportedInterfaces
             self.assertEqual(card["supportedInterfaces"][0]["protocolBinding"], "JSONRPC")
             self.assertEqual(card["supportedInterfaces"][0]["protocolVersion"], "1.0")
             self.assertEqual(card["defaultInputModes"], ["application/json"])
-            self.assertEqual(card["securitySchemes"]["bearer"]["scheme"], "bearer")
-            self.assertEqual(card["securityRequirements"], [{"bearer": []}])
+            self.assertEqual(card["securitySchemes"]["bearer"]["httpAuthSecurityScheme"]["scheme"], "bearer")
+            self.assertEqual(card["securityRequirements"], [{"schemes": {"bearer": {}}}])
             self.assertEqual(card["skills"][0]["id"], "portmark")
             body = self._a2a_request_body(host, "A2A task")
             request = urllib.request.Request(
@@ -1786,7 +1789,7 @@ class RuntimeTests(unittest.TestCase):
         app = make_asgi_app(make_host())
         status, headers, payload = self._asgi_call(app, "GET", "/.well-known/agent-card.json", {"Host": "127.0.0.1"})
         self.assertEqual(status, 200)
-        self.assertEqual(json.loads(payload)["protocolVersion"], "1.0")
+        self.assertEqual(json.loads(payload)["supportedInterfaces"][0]["protocolVersion"], "1.0")
         for header in ("x-content-type-options", "x-frame-options", "content-security-policy", "referrer-policy"):
             self.assertIn(header, headers)
 
@@ -1862,6 +1865,37 @@ class RuntimeTests(unittest.TestCase):
         # scope["client"] is None under some deployments; the limiter must still key deterministically.
         status, _, _ = self._asgi_call(app, "GET", "/.well-known/agent-card.json", {"Host": "h"}, client=None)
         self.assertEqual(status, 200)
+
+    @unittest.skipUnless(HAS_REAL_A2A_SDK, "requires portmark[a2a]")
+    def test_local_agent_card_parses_under_strict_official_schema(self):
+        """The card must parse WITHOUT ignore_unknown_fields.
+
+        Unknown fields are an error to a strict A2A client, not something it
+        skips, so a card carrying non-schema fields is undiscoverable. This is
+        the check that fails when the card drifts; the rest of the suite does
+        not notice, because it only asserts fields it already knows about.
+        """
+        from google.protobuf.json_format import ParseDict
+        import a2a.types as sdk_types
+
+        for require_auth in (True, False):
+            with self.subTest(require_auth=require_auth):
+                card = json.loads(json.dumps(make_agent_card("http://h", require_auth)))
+                ParseDict(card, sdk_types.AgentCard())
+
+    @unittest.skipUnless(HAS_REAL_A2A_SDK, "requires portmark[a2a]")
+    def test_local_and_sdk_agent_cards_are_identical(self):
+        """Both adapters must serve the same card.
+
+        The card is swapped rather than stacked when --a2a-adapter changes, so
+        without this the two modes can silently diverge.
+        """
+        for require_auth in (True, False):
+            with self.subTest(require_auth=require_auth):
+                local = json.loads(json.dumps(make_agent_card("http://h", require_auth)))
+                from portmark.official_a2a import make_sdk_agent_card
+
+                self.assertEqual(local, make_sdk_agent_card("http://h", require_auth))
 
     def test_a2a_cli_rejects_public_bind_without_traceback(self):
         error = io.StringIO()
@@ -2038,7 +2072,7 @@ class RuntimeTests(unittest.TestCase):
         base = f"http://127.0.0.1:{server.server_port}"
         try:
             with urllib.request.urlopen(base + "/.well-known/agent-card.json") as response:  # nosec B310
-                self.assertEqual(json.load(response)["protocolVersion"], "1.0")
+                self.assertEqual(json.load(response)["supportedInterfaces"][0]["protocolVersion"], "1.0")
 
             with self.assertRaises(urllib.error.HTTPError) as raised:
                 urllib.request.urlopen(base + "/.well-known/agent-card.json")  # nosec B310
@@ -2075,7 +2109,7 @@ class RuntimeTests(unittest.TestCase):
 
         def get_card(_):
             with urllib.request.urlopen(base + "/.well-known/agent-card.json", timeout=10) as response:  # nosec B310
-                return json.load(response)["protocolVersion"]
+                return json.load(response)["supportedInterfaces"][0]["protocolVersion"]
 
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
