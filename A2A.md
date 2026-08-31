@@ -12,11 +12,23 @@ verification, rate limits, and audit checks.
 
 `GET /.well-known/agent-card.json` returns an Agent Card with:
 
-- `protocolVersion: "1.0"`
-- `supportedInterfaces` for JSON-RPC over HTTP
+- `supportedInterfaces` for JSON-RPC over HTTP, carrying the endpoint `url`,
+  `protocolBinding` and `protocolVersion`
 - default JSON input and output modes
 - the `portmark` skill
-- bearer security metadata when A2A auth is enabled
+- bearer security metadata when A2A auth is enabled, as a
+  `httpAuthSecurityScheme` variant of the `SecurityScheme` oneof
+
+The card contains only fields defined by the canonical `AgentCard` message in
+`specification/a2a.proto`. In particular there is no top-level `url`,
+`protocolVersion` or `security` field: the endpoint URL and protocol version
+live inside `supportedInterfaces`. This matters because unknown fields are an
+error to a strict client rather than something it skips, so a card carrying
+extra fields fails to parse and the host becomes undiscoverable.
+
+Both `--a2a-adapter local` and `--a2a-adapter sdk` serve a byte-identical card,
+asserted by `test_local_and_sdk_agent_cards_are_identical` whenever the
+`portmark[a2a]` extra is installed.
 
 The card remains public so clients can discover the endpoint and required auth scheme. Do not place secrets or deployment-private topology in the card.
 

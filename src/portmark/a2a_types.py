@@ -27,9 +27,14 @@ class AgentInterface:
 
 @dataclass(frozen=True)
 class AgentCapabilities:
+    """Mirrors the canonical AgentCapabilities message.
+
+    The proto defines streaming, push_notifications, extensions and
+    extended_agent_card. There is no state_transition_history field.
+    """
+
     streaming: bool = False
     pushNotifications: bool = False
-    stateTransitionHistory: bool = False
 
 
 @dataclass(frozen=True)
@@ -43,37 +48,54 @@ class AgentSkill:
 
 @dataclass(frozen=True)
 class SecurityScheme:
-    type: str
+    """Mirrors the canonical SecurityScheme oneof.
+
+    The proto models this as a oneof over apiKeySecurityScheme,
+    httpAuthSecurityScheme, oauth2SecurityScheme, openIdConnectSecurityScheme
+    and mtlsSecurityScheme. There is no flat "type" discriminator, so the
+    variant name is the wrapping key.
+    """
+
+    variant: str
     scheme: str | None = None
     bearerFormat: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {key: value for key, value in asdict(self).items() if value is not None}
+        inner = {key: value for key, value in asdict(self).items() if key != "variant" and value is not None}
+        return {self.variant: inner}
 
 
 @dataclass(frozen=True)
 class AgentCard:
+    """Mirrors the canonical AgentCard message.
+
+    The proto has no top-level url, protocolVersion or security field. The
+    endpoint URL and protocol version live in supportedInterfaces, which is
+    where a client is required to look for them. Emitting them at the top level
+    as well makes the card unparseable by a strict client, because unknown
+    fields are an error rather than something to ignore.
+    """
+
     name: str
     description: str
-    url: str
     version: str
     supportedInterfaces: tuple[AgentInterface, ...]
     capabilities: AgentCapabilities
     defaultInputModes: tuple[str, ...]
     defaultOutputModes: tuple[str, ...]
     skills: tuple[AgentSkill, ...]
-    protocolVersion: str = A2A_PROTOCOL_VERSION
     securitySchemes: dict[str, SecurityScheme] = field(default_factory=dict)
-    security: tuple[dict[str, tuple[str, ...]], ...] = ()
-    securityRequirements: tuple[dict[str, tuple[str, ...]], ...] = ()
+    securityRequirements: tuple[dict[str, dict[str, Any]], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
+        # proto3 cannot distinguish false from unset, so a canonical round-trip
+        # omits false capabilities. Match that, or the card differs from the
+        # SDK-generated one for no semantic reason.
+        payload["capabilities"] = {key: value for key, value in payload["capabilities"].items() if value}
         payload["securitySchemes"] = {key: scheme.to_dict() for key, scheme in self.securitySchemes.items()}
         if not payload["securitySchemes"]:
             payload.pop("securitySchemes")
-        if not payload["security"]:
-            payload.pop("security")
         if not payload["securityRequirements"]:
             payload.pop("securityRequirements")
         return payload
@@ -128,14 +150,13 @@ class Task:
 
 def make_agent_card(base_url: str, require_bearer_auth: bool) -> dict[str, Any]:
     security_schemes: dict[str, SecurityScheme] = {}
-    security: tuple[dict[str, tuple[str, ...]], ...] = ()
+    security_requirements: tuple[dict[str, dict[str, Any]], ...] = ()
     if require_bearer_auth:
-        security_schemes = {"bearer": SecurityScheme("http", "bearer", "opaque")}
-        security = ({"bearer": ()},)
+        security_schemes = {"bearer": SecurityScheme("httpAuthSecurityScheme", "bearer", "opaque")}
+        security_requirements = ({"schemes": {"bearer": {}}},)
     card = AgentCard(
         name="Portable Wasm Agent Host",
         description="Runs signed, capability-limited portable agents",
-        url=f"{base_url}/message:send",
         version="0.1.0",
         supportedInterfaces=(AgentInterface(f"{base_url}/message:send"),),
         capabilities=AgentCapabilities(),
@@ -143,8 +164,7 @@ def make_agent_card(base_url: str, require_bearer_auth: bool) -> dict[str, Any]:
         defaultOutputModes=("application/json",),
         skills=(AgentSkill("portmark", "Portmark agent execution", "Execute a signed Portmark agent envelope"),),
         securitySchemes=security_schemes,
-        security=security,
-        securityRequirements=security,
+        securityRequirements=security_requirements,
     )
     return card.to_dict()
 
