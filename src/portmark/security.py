@@ -126,6 +126,9 @@ class TrustRegistry:
     def has_key(self, key_id: str) -> bool:
         return key_id in self._identities
 
+    def identity(self, key_id: str) -> TrustedIdentity | None:
+        return self._identities.get(key_id)
+
     def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None) -> None:
         identity = self._identities.get(key_id)
         if identity is None:
@@ -455,6 +458,68 @@ class ApprovalAuthority:
         return _b64url_encode(self._private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw))
 
 
+def generate_signing_material(
+    key_id: str,
+    issuer: str,
+    allowed_audiences: tuple[str, ...] = ("*",),
+) -> dict[str, Any]:
+    """Mint a signing key together with the trust registry entry that accepts it.
+
+    The two halves are emitted at once on purpose: a private key whose public half
+    was never published to a host is unusable, and hand-assembling that registry
+    JSON is the step this exists to remove.
+    """
+    private_key = Ed25519PrivateKey.generate()
+    return {
+        "key_id": key_id,
+        "issuer": issuer,
+        "private_key_b64": _b64url_encode(
+            private_key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
+        ),
+        "trust_registry": {
+            "identities": [
+                {
+                    "key_id": key_id,
+                    "issuer": issuer,
+                    "public_key_b64": _b64url_encode(
+                        private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+                    ),
+                    "allowed_audiences": list(allowed_audiences),
+                }
+            ]
+        },
+    }
+
+
+def _register_own_identity(
+    registry: TrustRegistry,
+    key_id: str,
+    issuer: str,
+    public_key: bytes,
+    allowed_audiences: tuple[str, ...],
+) -> None:
+    """Publish this signer's own public key into the registry it verifies against.
+
+    An operator-supplied registry may already carry the entry, which is the normal
+    case. An entry under the same key id holding a *different* public key is a
+    misconfiguration that would otherwise surface much later as an unexplained
+    signature failure, so it fails closed here.
+    """
+    existing = registry.identity(key_id)
+    if existing is None:
+        registry.add(
+            TrustedIdentity(
+                key_id=key_id,
+                issuer=issuer,
+                public_key=public_key,
+                allowed_audiences=allowed_audiences,
+            )
+        )
+        return
+    if existing.public_key != public_key:
+        raise SecurityError(f"trust registry key id {key_id!r} holds a different public key")
+
+
 class EnvelopeSigner:
     """Ed25519 envelope signer and verifier backed by a trust registry."""
 
@@ -470,18 +535,18 @@ class EnvelopeSigner:
         key_id: str = "demo-ed25519-key",
         issuer: str = "user:demo",
         allowed_audiences: tuple[str, ...] = ("*",),
+        registry: TrustRegistry | None = None,
     ) -> "EnvelopeSigner":
         private_key = Ed25519PrivateKey.generate()
-        registry = TrustRegistry()
-        registry.add(
-            TrustedIdentity(
-                key_id=key_id,
-                issuer=issuer,
-                public_key=private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw),
-                allowed_audiences=allowed_audiences,
-            )
+        trust = registry if registry is not None else TrustRegistry()
+        _register_own_identity(
+            trust,
+            key_id,
+            issuer,
+            private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw),
+            allowed_audiences,
         )
-        return cls(key_id, issuer, private_key, registry)
+        return cls(key_id, issuer, private_key, trust)
 
     @classmethod
     def from_private_key_bytes(
@@ -495,16 +560,14 @@ class EnvelopeSigner:
         if len(private_key_bytes) != 32:
             raise ValueError("Ed25519 private keys must be 32 raw bytes")
         private_key = Ed25519PrivateKey.from_private_bytes(private_key_bytes)
-        trust = registry or TrustRegistry()
-        if not trust.has_key(key_id):
-            trust.add(
-                TrustedIdentity(
-                    key_id=key_id,
-                    issuer=issuer,
-                    public_key=private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw),
-                    allowed_audiences=allowed_audiences,
-                )
-            )
+        trust = registry if registry is not None else TrustRegistry()
+        _register_own_identity(
+            trust,
+            key_id,
+            issuer,
+            private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw),
+            allowed_audiences,
+        )
         return cls(key_id, issuer, private_key, trust)
 
     def sign(self, envelope: AgentEnvelope) -> str:

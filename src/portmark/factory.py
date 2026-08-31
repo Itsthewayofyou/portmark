@@ -41,7 +41,7 @@ def signer_from_environment(host_id: str = HOST_ID, trust_registry_path: str | N
         return HmacEnvelopeSigner(hashlib.sha256(raw.encode()).digest())
     if os.environ.get("PORTMARK_ALLOW_LEGACY_HMAC"):
         raise RuntimeError("legacy HMAC signing requires PORTMARK_ALLOW_LEGACY_HMAC=unsafe-test-only")
-    return EnvelopeSigner.generate(issuer=host_id, allowed_audiences=(host_id,))
+    return EnvelopeSigner.generate(issuer=host_id, allowed_audiences=(host_id,), registry=registry)
 
 
 def make_host(
@@ -106,6 +106,86 @@ def make_host(
         reload_policy,
         metrics,
     )
+
+
+SPEC_FIELDS = frozenset(
+    {"agent_id", "version", "provider", "component_digest", "goal", "issuer", "audience", "ttl_seconds", "grants", "budget", "requested_tools"}
+)
+GRANT_FIELDS = frozenset({"name", "constraints", "output_projection"})
+BUDGET_FIELDS = frozenset({"max_steps", "max_tool_calls", "max_output_bytes"})
+
+
+def _reject_unknown(value: dict, allowed: frozenset[str], label: str) -> None:
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise ValueError(f"unknown {label} fields: {', '.join(unknown)}")
+
+
+def _grant_from_spec(value: object) -> ToolGrant:
+    if not isinstance(value, dict):
+        raise ValueError("each entry in 'grants' must be an object")
+    _reject_unknown(value, GRANT_FIELDS, "grant")
+    name = value.get("name")
+    if not isinstance(name, str) or not name:
+        raise ValueError("each grant requires a non-empty 'name'")
+    constraints = value.get("constraints") or {}
+    if not isinstance(constraints, dict):
+        raise ValueError(f"grant {name!r} constraints must be an object")
+    projection = value.get("output_projection")
+    if projection is not None and not isinstance(projection, list):
+        raise ValueError(f"grant {name!r} output_projection must be a list")
+    return ToolGrant(name, dict(constraints), tuple(projection) if projection else None)
+
+
+def build_envelope(spec: dict, signer: EnvelopeSigningIdentity) -> AgentEnvelope:
+    """Build and sign an envelope from a plain JSON spec, without constructing a host.
+
+    The signing key belongs to whoever sends the agent; the host that runs it only
+    ever verifies. Keeping this host-free is what makes an envelope portable, so
+    the spec carries `component_digest` rather than reading it off a live provider.
+    """
+    if not isinstance(spec, dict):
+        raise ValueError("envelope spec must be a JSON object")
+    _reject_unknown(spec, SPEC_FIELDS, "envelope spec")
+    goal = spec.get("goal")
+    if not isinstance(goal, str) or not goal.strip():
+        raise ValueError("envelope spec requires a non-empty 'goal'")
+    raw_grants = spec.get("grants")
+    if not isinstance(raw_grants, list) or not raw_grants:
+        raise ValueError("envelope spec requires a non-empty 'grants' list")
+    grants = tuple(_grant_from_spec(entry) for entry in raw_grants)
+    requested = spec.get("requested_tools")
+    if requested is not None and not isinstance(requested, list):
+        raise ValueError("envelope spec 'requested_tools' must be a list")
+    requested_tools = tuple(requested) if requested is not None else tuple(grant.name for grant in grants)
+    budget_spec = spec.get("budget") or {}
+    if not isinstance(budget_spec, dict):
+        raise ValueError("envelope spec 'budget' must be an object")
+    _reject_unknown(budget_spec, BUDGET_FIELDS, "budget")
+    budget = ResourceBudget(
+        max_steps=int(budget_spec.get("max_steps", 6)),
+        max_tool_calls=int(budget_spec.get("max_tool_calls", 2)),
+        max_output_bytes=int(budget_spec.get("max_output_bytes", 32_768)),
+    )
+    agent_id = str(spec.get("agent_id", "agent:portable"))
+    manifest = AgentManifest(
+        agent_id,
+        str(spec.get("version", "1.0.0")),
+        str(spec.get("provider", "deterministic")),
+        requested_tools,
+        str(spec.get("component_digest", "python:reference-agent-v1")),
+    )
+    permit = Permit(
+        issuer=str(spec.get("issuer") or getattr(signer, "issuer", HOST_ID)),
+        subject=agent_id,
+        audience=str(spec.get("audience", HOST_ID)),
+        expires_at=int(time.time()) + int(spec.get("ttl_seconds", 3600)),
+        # Always fresh: the host consumes the nonce, so a replayed envelope is refused.
+        nonce=secrets.token_hex(16),
+        grants=grants,
+        budget=budget,
+    )
+    return signer.seal(AgentEnvelope(manifest, permit, AgentState(secrets.token_hex(8), goal)))
 
 
 def make_demo_envelope(host: AgentHost, goal: str, provider: str = "deterministic") -> AgentEnvelope:
