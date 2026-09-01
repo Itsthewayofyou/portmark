@@ -1,0 +1,27 @@
+version: 2
+
+# Workflow actions are pinned to commit SHAs rather than moving tags, because the
+# publish job holds id-token: write and a compromised `@release/v1` would be a path
+# straight to PyPI under this project's name. A pin that nobody bumps rots into a
+# stale-dependency risk, so Dependabot maintains them.
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
+    labels:
+      - dependencies
+
+  # Runtime and optional dependencies are exact-pinned in pyproject.toml. The audit
+  # gate fails the build on a known vulnerability, but only once one is published --
+  # this raises the PR that fixes it.
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "deps"
+    labels:
+      - dependencies
