@@ -1,6 +1,6 @@
 """Property tests for permit/policy constraint intersection.
 
-Three distinct jobs, and they are not interchangeable:
+Five distinct jobs, and they are not interchangeable:
 
 1. ``NoWideningPropertyTest`` — the safety property. A merged constraint set must
    never accept an argument dict that either input would have rejected. This is
@@ -16,6 +16,14 @@ Three distinct jobs, and they are not interchangeable:
 3. ``NarrowingCompletenessTest`` — the #15 regression. A permit that narrows a
    nested argument schema below the host policy must keep the grant. Red before
    the fix, green after.
+
+4. ``DormantConstraintTest`` — hand-written cases the generator cannot reliably
+   reach. ``required`` and ``additional_arguments`` are inert without an
+   ``arguments`` schema, so a merge can activate one side's dormant key. These
+   pin both directions of that.
+
+5. ``OutputProjectionTest`` — the same subset discipline for the data-sharing
+   half of a grant, which merges alongside the constraints.
 
 The generator drives everything through ``check_constraints``. A constraint dict
 only means something via the checker, so comparing schemas structurally would be
@@ -142,10 +150,16 @@ def random_constraints(rng: random.Random) -> dict[str, Any]:
     if rng.random() < 0.85:
         names = rng.sample(ARGUMENT_NAMES, rng.randint(1, len(ARGUMENT_NAMES)))
         constraints["arguments"] = {name: random_argument_spec(rng) for name in names}
-        if rng.random() < 0.5:
-            constraints["additional_arguments"] = rng.choice([True, False])
-        if rng.random() < 0.3:
-            constraints["required"] = rng.sample(ARGUMENT_NAMES, rng.randint(1, 2))
+    # `required` and `additional_arguments` are emitted INDEPENDENTLY of
+    # `arguments` on purpose. Both are inert without a schema — check_constraints
+    # only consults them inside `if schema is not None` — so a generator that
+    # only ever emits them together can never produce the case where a merge
+    # brings a schema in from one side and activates the other side's dormant
+    # `required`. Keep them independent or that whole class goes untested.
+    if rng.random() < 0.4:
+        constraints["additional_arguments"] = rng.choice([True, False])
+    if rng.random() < 0.3:
+        constraints["required"] = rng.sample(ARGUMENT_NAMES, rng.randint(1, 2))
     if rng.random() < 0.25:
         constraints[f"max_{rng.choice(ARGUMENT_NAMES)}"] = rng.choice([5, 10])
     if rng.random() < 0.25:
@@ -256,6 +270,103 @@ class NoWideningPropertyTest(unittest.TestCase):
                 accepts(merged, arguments),
                 msg=f"merged constraints admit an argument the strict side rejects: {merged}",
             )
+
+
+class DormantConstraintTest(unittest.TestCase):
+    """`required` and `additional_arguments` are inert without an `arguments` schema.
+
+    check_constraints only consults them inside `if schema is not None`, so a
+    merge that brings a schema in from one side can ACTIVATE the other side's
+    dormant keys. Activating is narrowing and therefore safe; the direction that
+    would not be safe is a merge that loses enforcement one side had. These pin
+    both directions, because the generator cannot reliably reach them.
+    """
+
+    def require_merged(self, merged: dict[str, Any] | None) -> dict[str, Any]:
+        """Fail the test if the grant was dropped, and narrow the type for callers."""
+        if merged is None:
+            self.fail("grant was dropped instead of merged")
+        return merged
+
+    def test_a_schema_from_one_side_may_activate_the_others_required(self) -> None:
+        left = {"arguments": {"a": {}}}
+        right = {"required": ["a"]}
+        merged = self.require_merged(merge_real(left, right))
+        self.assertFalse(accepts(merged, {}), "required should now be enforced")
+        self.assertTrue(accepts(left, {}), "fixture: left had no required")
+        self.assertTrue(accepts(right, {}), "fixture: right's required was dormant")
+
+    def test_enforcement_is_never_lost_when_the_schema_is_emptied(self) -> None:
+        """Filtering by permitted names can empty the schema. `required` must not go inert."""
+        left = {"arguments": {"a": {}}, "required": ["a"], "additional_arguments": False}
+        right = {"arguments": {"b": {}}, "additional_arguments": False}
+        merged = merge_real(left, right)
+        if merged is not None:
+            for arguments in ({}, {"a": 1}, {"b": 1}, {"a": 1, "b": 1}):
+                if accepts(merged, arguments):
+                    self.assertTrue(accepts(left, arguments), f"left rejects {arguments}")
+                    self.assertTrue(accepts(right, arguments), f"right rejects {arguments}")
+
+    def test_required_naming_an_excluded_argument_drops_the_grant(self) -> None:
+        left = {"arguments": {"a": {}}, "required": ["a"], "additional_arguments": False}
+        right = {"arguments": {"b": {}}, "required": ["b"], "additional_arguments": False}
+        self.assertIsNone(
+            merge_real(left, right),
+            msg="each side requires an argument the other refuses; the set is unsatisfiable",
+        )
+
+    def test_dormant_additional_arguments_does_not_relax_a_live_one(self) -> None:
+        left = {"additional_arguments": False}
+        right = {"arguments": {"b": {}}}
+        merged = self.require_merged(merge_real(left, right))
+        self.assertTrue(accepts(left, {"z": 1}), "fixture: left's flag is dormant without a schema")
+        self.assertTrue(accepts(right, {"z": 1}), "fixture: right allows extra fields")
+        self.assertFalse(accepts(merged, {"z": 1}), "merging may narrow here, and does")
+
+
+class OutputProjectionTest(unittest.TestCase):
+    """The same subset discipline, for the other half of a grant.
+
+    `_projection_intersection` was not changed by this work, but it merges
+    alongside the constraints and answers a data-sharing question rather than an
+    acceptance one: which tool output fields reach the provider. The property is
+    the same shape — a field the merged grant shares must be shared by both
+    inputs — and `None` means "unrestricted", which is the part worth pinning.
+    """
+
+    def merged_projection(self, left, right):
+        grants = intersect_grants(
+            (ToolGrant(TOOL, {}, left),),
+            (ToolGrant(TOOL, {}, right),),
+        )
+        self.assertTrue(grants, "grant should survive; only projections differ")
+        return grants[0].output_projection
+
+    def shared(self, projection, field: str) -> bool:
+        if projection is None or "*" in projection:
+            return True
+        return field in projection
+
+    def test_merged_projection_shares_only_what_both_share(self) -> None:
+        cases = [
+            (None, ("a",)),
+            (("*",), ("a",)),
+            (("a", "b"), ("b", "c")),
+            ((), ("a",)),
+            (("a",), ()),
+            (None, None),
+            (("*",), ("*",)),
+        ]
+        for left, right in cases:
+            merged = self.merged_projection(left, right)
+            for field in ("a", "b", "c", "secret"):
+                if self.shared(merged, field):
+                    self.assertTrue(self.shared(left, field), f"{left} does not share {field!r}")
+                    self.assertTrue(self.shared(right, field), f"{right} does not share {field!r}")
+
+    def test_empty_projection_stays_empty(self) -> None:
+        """Sharing nothing is the strictest setting and must win."""
+        self.assertEqual(self.merged_projection((), ("a", "b")), ())
 
 
 class GeneratorDiscriminationTest(unittest.TestCase):
