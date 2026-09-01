@@ -50,19 +50,25 @@ Portmark has no user interface, because the client is another program rather tha
 screen. Sending an agent takes three commands and no Python:
 
 ```bash
-# 1. mint a signing key and the public trust registry the host will load
-eval "$(portmark keygen --issuer user:alice --out-registry trust.json --format env)"
+# 1. mint the agent's signing key and the public trust registry the host will load
+portmark keygen --issuer user:alice --out-registry trust.json --format env > agent.env
+chmod 600 agent.env
 
-# 2. start a host that trusts that registry
+# 2. start a host that trusts that registry -- with no agent key in its environment
 portmark --trust-registry-path trust.json serve --port 8080 &
 
-# 3. build a signed request and post it
+# 3. load the agent key into your shell, build a signed request, and post it
+source agent.env
 portmark envelope --goal "find a red widget" --tool catalog.search > request.json
 curl -X POST http://127.0.0.1:8080/message:send \
   -H 'Content-Type: application/json' --data @request.json
 ```
 
 Steps 1 and 2 run once. Only step 3 repeats.
+
+The agent key stays out of the host's environment on purpose. A host that inherits
+`PORTMARK_SIGNING_ISSUER` from a client would try to sign its own audit heads as the agent, so
+it refuses to start and says so.
 
 `portmark envelope` prints a ready-to-POST `message/send` request by default, or the bare signed
 envelope with `--format envelope`. For anything past a single tool, pass a spec file:

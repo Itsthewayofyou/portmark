@@ -99,9 +99,21 @@ def make_host(
                 required_for_migration=required,
                 external_verifier=verifier,
             )
+    host_signer = signer or signer_from_environment(host_id, configured_trust_registry_path)
+    signing_issuer = getattr(host_signer, "issuer", host_id)
+    if signing_issuer != host_id:
+        # Every run signs an audit head with the host id as issuer, so this config
+        # can only ever fail on the first request. Fail at boot and name both values
+        # instead. Usually means an agent's PORTMARK_SIGNING_ISSUER leaked into the
+        # server's environment -- keygen exports belong in the client's shell only.
+        raise ValueError(
+            f"host signing issuer {signing_issuer!r} must equal host id {host_id!r}; "
+            "unset PORTMARK_SIGNING_ISSUER/PORTMARK_ED25519_PRIVATE_KEY_B64 for the host process, "
+            "or start it with --host-id matching the signing issuer"
+        )
     return AgentHost(
         host_id,
-        signer or signer_from_environment(host_id, configured_trust_registry_path),
+        host_signer,
         policy,
         tools if tools is not None else demo_registry(),
         providers,
