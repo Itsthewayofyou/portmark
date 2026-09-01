@@ -119,7 +119,9 @@ class AgentHost:
             if not decision.tool:
                 raise SecurityError("provider proposed a tool action without a tool name")
             if not any(grant.name == decision.tool for grant in effective.grants):
-                raise SecurityError(f"tool {decision.tool!r} was not granted")
+                raise SecurityError(
+                    active_policy.explain_missing_grant(envelope.manifest, envelope.permit, decision.tool)
+                )
             approval_result = self._approval_gate(active_policy, effective, state, decision, audit)
             if approval_result is not None:
                 return approval_result

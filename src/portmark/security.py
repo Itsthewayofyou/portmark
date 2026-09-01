@@ -968,6 +968,52 @@ class HostPolicy:
             attestation=permit.attestation,
         )
 
+    def explain_missing_grant(self, manifest: AgentManifest, permit: Permit, tool: str) -> str:
+        """Say which stage of the intersection removed a tool, and why.
+
+        `effective_permit` folds three grant sets together and reports only the
+        absence, so every misconfiguration produces the same message and points
+        the operator at their envelope — the one place that is often not wrong.
+        This recomputes the chain on the error path, where the cost does not
+        matter, and names the stage that actually dropped the tool.
+        """
+        if tool not in manifest.requested_tools:
+            return (
+                f"tool {tool!r} was not granted: the agent manifest does not request it. "
+                f"Requested tools are {sorted(manifest.requested_tools) or 'none'}."
+            )
+        permit_grant = next((grant for grant in permit.grants if grant.name == tool), None)
+        if permit_grant is None:
+            return (
+                f"tool {tool!r} was not granted: it is requested by the manifest but absent "
+                f"from the permit. Permit grants are {sorted(grant.name for grant in permit.grants) or 'none'}."
+            )
+        policy_grant = next((grant for grant in self.grants if grant.name == tool), None)
+        if policy_grant is None:
+            return (
+                f"tool {tool!r} was not granted: host policy {self.policy_version!r} does not "
+                f"grant it. Policy grants are {sorted(grant.name for grant in self.grants) or 'none'}. "
+                "The host policy is a ceiling, so no permit can add a tool it omits."
+            )
+
+        merged: dict[str, Any] = {}
+        for stage, grant in (("permit", permit_grant), (f"host policy {self.policy_version!r}", policy_grant)):
+            merged_next, failing_key = _constraint_intersection(merged, grant.constraints)
+            if merged_next is None:
+                return (
+                    f"tool {tool!r} was not granted: it is granted by the manifest, the permit and "
+                    f"host policy {self.policy_version!r}, but their constraints could not be combined. "
+                    f"Constraint {failing_key!r} from the {stage} could not be narrowed against what "
+                    "came before it. Portmark refuses a merge it cannot prove is narrower, so the "
+                    "grant is dropped rather than widened. Define this constraint in one place — "
+                    "usually the host policy — instead of both."
+                )
+            merged = merged_next
+        return (
+            f"tool {tool!r} was not granted, and the cause could not be reproduced. "
+            "The permit may have expired or been replaced between the check and this message."
+        )
+
     def impact_for_tool(self, tool: str) -> str:
         return self.tool_impacts.get(tool, "low")
 

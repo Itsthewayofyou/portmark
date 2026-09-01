@@ -34,7 +34,14 @@ class ToolRegistry:
     def invoke(self, permit: Permit, name: str, arguments: dict[str, Any], max_output_bytes: int | None = None) -> Any:
         grant = next((grant for grant in permit.grants if grant.name == name), None)
         if grant is None:
-            raise SecurityError(f"tool {name!r} was not granted")
+            # Only the effective permit is visible here, so this cannot say which
+            # stage dropped the tool. AgentHost checks first and reports the
+            # cause; see HostPolicy.explain_missing_grant.
+            raise SecurityError(
+                f"tool {name!r} is not in the effective permit. It was removed by the manifest, "
+                "the permit or the host policy; run it through AgentHost, or call "
+                "HostPolicy.explain_missing_grant, to find out which."
+            )
         tool = self._tools.get(name)
         if tool is None:
             raise SecurityError(f"tool {name!r} is not installed")
