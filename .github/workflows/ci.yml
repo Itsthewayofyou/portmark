@@ -42,7 +42,7 @@ jobs:
         run: |
           python -m pip install coverage==7.16.0
           coverage run --source=portmark.security -m unittest discover -s tests -q
-          coverage report --include='src/portmark/security.py' --fail-under=89
+          coverage report --include='src/portmark/security.py' --fail-under=95
       - name: Run native Wasmtime component regression
         if: matrix.python-version == '3.12'
         run: |
@@ -61,7 +61,6 @@ jobs:
 
   postgres-store:
     runs-on: ubuntu-latest
-    continue-on-error: true
     services:
       postgres:
         image: postgres:17

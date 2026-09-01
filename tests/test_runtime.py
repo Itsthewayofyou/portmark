@@ -953,6 +953,34 @@ class RuntimeTests(unittest.TestCase):
 
         opened.assert_not_called()
 
+    def test_http_fetch_example_denies_ssrf_host_confusion_before_network_call(self):
+        cases = [
+            ("userinfo host confusion", "https://allowed.example@evil.com/resource", "must not contain userinfo"),
+            ("trailing dot host", "https://evil.com./resource", "host is outside its allowed set"),
+            ("sibling suffix host", "https://notexample.com/resource", "host is outside its allowed set"),
+            ("metadata ip host", "https://169.254.169.254/latest/meta-data/", "host is outside its allowed set"),
+        ]
+        for label, url, message in cases:
+            with self.subTest(label=label):
+                with tempfile.TemporaryDirectory() as directory:
+                    host, envelope = self._http_fetch_host(directory, {"url": url, "method": "GET"})
+                    with patch("urllib.request.OpenerDirector.open") as opened:
+                        with self.assertRaisesRegex(SecurityError, message):
+                            host.run(envelope)
+
+                opened.assert_not_called()
+
+    def test_http_fetch_example_accepts_uppercase_allowed_host(self):
+        with tempfile.TemporaryDirectory() as directory:
+            host, envelope = self._http_fetch_host(directory, {"url": "https://ALLOWED.EXAMPLE/resource", "method": "GET"})
+            response = FakeHttpResponse(b"hello", headers={"Content-Type": "text/plain"})
+            with patch("urllib.request.OpenerDirector.open", return_value=response) as opened:
+                result = host.run(envelope)
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.result["fetch"]["url"], "https://ALLOWED.EXAMPLE/resource")
+        self.assertEqual(opened.call_count, 1)
+
     def test_http_fetch_example_denies_non_https_before_network_call(self):
         with tempfile.TemporaryDirectory() as directory:
             host, envelope = self._http_fetch_host(directory, {"url": "http://allowed.example/resource", "method": "GET"})

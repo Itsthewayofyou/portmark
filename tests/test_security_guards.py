@@ -1,5 +1,6 @@
 import base64
 import json
+import sys
 import tempfile
 import unittest
 from dataclasses import replace
@@ -12,11 +13,14 @@ from portmark.security import (
     AttestationAuthority,
     AttestationPolicy,
     EnvelopeSigner,
+    ExternalAttestationVerifier,
+    HmacEnvelopeSigner,
     HostPolicy,
     SecurityError,
     TrustedApprover,
     TrustedIdentity,
     TrustRegistry,
+    audit_head_payload,
     check_constraints,
     load_trust_registry,
 )
@@ -134,6 +138,70 @@ class SecurityGuardTests(unittest.TestCase):
                 with self.assertRaisesRegex(SecurityError, message):
                     registry.require_identity(candidate, now=NOW)
 
+    def test_audit_head_signature_guards_are_table_driven(self):
+        signer = EnvelopeSigner.generate("audit-head-key", "host:local-demo", ("host:local-demo",))
+        trusted = signer.registry.identity(signer.key_id)
+        if trusted is None:
+            self.fail("generated signer did not register its audit-head identity")
+        trusted = replace(trusted, not_before=NOW - 1, expires_at=NOW + 60)
+        payload = audit_head_payload("task-1", "host:local-demo", "head-hash", 1)
+        signature = signer.sign_audit_head("task-1", "host:local-demo", "head-hash", 1)
+
+        TrustRegistry((trusted,)).verify_audit_head(signer.key_id, payload, signature, now=NOW)
+
+        cases = [
+            ("audit head signing key is not trusted", TrustRegistry(()), signer.key_id, payload, signature),
+            ("audit head signing key has been revoked", TrustRegistry((replace(trusted, revoked=True),)), signer.key_id, payload, signature),
+            ("audit head signing key is not active yet", TrustRegistry((replace(trusted, not_before=NOW + 1),)), signer.key_id, payload, signature),
+            ("audit head signing key has expired", TrustRegistry((replace(trusted, expires_at=NOW),)), signer.key_id, payload, signature),
+            ("audit head signer identity does not match host", TrustRegistry((trusted,)), signer.key_id, {**payload, "host_id": "host:other"}, signature),
+            ("audit head signature is invalid", TrustRegistry((trusted,)), signer.key_id, payload, "bad-signature"),
+        ]
+        for message, registry, key_id, candidate_payload, candidate_signature in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(SecurityError, message):
+                    registry.verify_audit_head(key_id, candidate_payload, candidate_signature, now=NOW)
+
+        with self.assertRaisesRegex(SecurityError, "audit head host does not match signing identity"):
+            signer.sign_audit_head("task-1", "host:other", "head-hash", 1)
+
+    def test_legacy_hmac_audit_head_guards_are_table_driven(self):
+        signer = HmacEnvelopeSigner(b"x" * 32)
+        envelope = AgentEnvelope(
+            AgentManifest("agent:demo", "1.0.0", "deterministic", ("catalog.search",)),
+            self._permit(),
+            AgentState("task-1", "goal"),
+        )
+        signer.seal(envelope)
+        signer.verify(envelope)
+        payload = audit_head_payload("task-1", "host:local-demo", "head-hash", 1)
+        signature = signer.sign_audit_head("task-1", "host:local-demo", "head-hash", 1)
+        signer.verify_audit_head(signer.key_id, payload, signature)
+
+        cases = [
+            ("signing keys must contain at least 32 bytes", lambda: HmacEnvelopeSigner(b"short")),
+            ("agent envelope signature key id is not trusted", lambda: signer.verify(replace(envelope, signature_key_id="other"))),
+            ("agent envelope signature is invalid", lambda: signer.verify(replace(envelope, signature="bad"))),
+            ("audit head signing key is not trusted", lambda: signer.verify_audit_head("other", payload, signature)),
+            ("audit head signature is invalid", lambda: signer.verify_audit_head(signer.key_id, payload, "bad")),
+        ]
+        for message, action in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex((SecurityError, ValueError), message):
+                    action()
+
+    def test_envelope_signer_key_export_and_import_guards(self):
+        signer = EnvelopeSigner.generate("export-key", "user:alice", ("host:local-demo",))
+        private_key = signer.private_key_bytes()
+
+        self.assertIn(b"BEGIN PRIVATE KEY", signer.private_key_pem())
+        self.assertIsInstance(signer.private_key_b64(), str)
+        imported = EnvelopeSigner.from_private_key_bytes("imported-key", "user:alice", private_key, ("host:local-demo",))
+        self.assertTrue(imported.registry.has_key("imported-key"))
+
+        with self.assertRaisesRegex(ValueError, "Ed25519 private keys must be 32 raw bytes"):
+            EnvelopeSigner.from_private_key_bytes("bad-key", "user:alice", b"short")
+
     def test_argument_constraint_malformed_schema_guards_are_table_driven(self):
         constraints = {
             "arguments": {"query": {"type": "string", "min_length": 1}, "limit": {"type": "integer", "minimum": 1, "maximum": 5}},
@@ -172,6 +240,56 @@ class SecurityGuardTests(unittest.TestCase):
             with self.subTest(message=message):
                 with self.assertRaisesRegex(SecurityError, message):
                     check_constraints(malformed, arguments)
+
+    def test_argument_constraint_value_guards_are_table_driven(self):
+        passing = {
+            "arguments": {
+                "count": {"type": "integer", "minimum": 1, "maximum": 5},
+                "ratio": {"type": "number"},
+                "flag": {"type": "boolean"},
+                "payload": {"type": "object"},
+                "items": {"type": "array"},
+                "empty": {"type": "null"},
+                "mode": {"const": "safe", "enum": ["safe"]},
+                "label": {"type": "string", "min_length": 2, "max_length": 5, "pattern": "^[a-z]+$"},
+                "url": {"type": "string", "allowed_schemes": ["HTTPS"], "allowed_domains": ["example.com"]},
+            },
+            "required": ["count"],
+            "additional_arguments": False,
+        }
+        valid = {
+            "count": 3,
+            "ratio": 1.5,
+            "flag": True,
+            "payload": {"ok": True},
+            "items": [1],
+            "empty": None,
+            "mode": "safe",
+            "label": "abc",
+            "url": "https://api.example.com/resource",
+        }
+        check_constraints(passing, valid)
+
+        cases = [
+            ({"arguments": {"needed": {"required": True}}}, {}, "argument 'needed' is required"),
+            ({"max_limit": 5}, {"limit": 6}, "argument 'limit' exceeds its permitted maximum"),
+            ({"allowed_region": ["us"]}, {"region": "eu"}, "argument 'region' is outside its allowed set"),
+            ({"method": "GET"}, {"method": "POST"}, "argument 'method' does not match its required value"),
+            ({"arguments": {"count": {"minimum": 1}}}, {"count": 0}, "argument 'count' is below its permitted minimum"),
+            ({"arguments": {"count": {"maximum": 5}}}, {"count": 6}, "argument 'count' exceeds its permitted maximum"),
+            ({"arguments": {"label": {"min_length": 2}}}, {"label": "a"}, "argument 'label' is shorter than its permitted minimum length"),
+            ({"arguments": {"label": {"max_length": 2}}}, {"label": "abc"}, "argument 'label' exceeds its permitted maximum length"),
+            ({"arguments": {"method": {"const": "GET"}}}, {"method": "POST"}, "argument 'method' does not match its required value"),
+            ({"arguments": {"mode": {"enum": ["safe"]}}}, {"mode": "unsafe"}, "argument 'mode' is outside its allowed set"),
+            ({"arguments": {"value": {"type": ["string", "integer"]}}}, {"value": False}, "argument 'value' has invalid type"),
+            ({"arguments": {"url": {"allowed_schemes": ["https"]}}}, {"url": "http://example.com"}, "argument 'url' URL scheme is outside its allowed set"),
+            ({"arguments": {"url": {"allowed_domains": ["example.com"]}}}, {"url": "https://notexample.com"}, "argument 'url' domain is outside its allowed set"),
+            ({"arguments": {"url": {"scheme": "https"}}}, {"url": 1}, "argument 'url' URL must be a string"),
+        ]
+        for constraints, arguments, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(SecurityError, message):
+                    check_constraints(constraints, arguments)
 
     def test_attestation_evidence_guards_are_table_driven(self):
         authority = AttestationAuthority.generate()
@@ -220,6 +338,97 @@ class SecurityGuardTests(unittest.TestCase):
                 expected_nonce="permit-nonce",
                 now=NOW,
             )
+
+    def test_external_attestation_verifier_process_guards_are_table_driven(self):
+        authority = AttestationAuthority.generate()
+        evidence = authority.issue(
+            "host:local-demo",
+            "user:alice",
+            "measurement:approved",
+            NOW + 60,
+            nonce="permit-nonce",
+            issued_at=NOW - 1,
+        )
+
+        constructor_cases = [
+            ("attestation verifier command must be a non-empty argv tuple", lambda: ExternalAttestationVerifier(())),
+            ("attestation verifier command must be a non-empty argv tuple", lambda: ExternalAttestationVerifier(("ok", ""))),
+            ("attestation verifier timeout must be positive", lambda: ExternalAttestationVerifier(("ok",), timeout=0)),
+            ("attestation verifier response limit must be at least 2 bytes", lambda: ExternalAttestationVerifier(("ok",), max_response_bytes=1)),
+        ]
+        for message, action in constructor_cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    action()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reject = root / "reject.py"
+            reject.write_text("import sys\nsys.exit(1)\n", encoding="utf-8")
+            malformed = root / "malformed.py"
+            malformed.write_text("print('not-json')\n", encoding="utf-8")
+            oversized = root / "oversized.py"
+            oversized.write_text("print('{\"valid\": true, \"padding\": \"' + 'x' * 200 + '\"}')\n", encoding="utf-8")
+            accept = root / "accept.py"
+            accept.write_text("print('{\"valid\": true}')\n", encoding="utf-8")
+
+            ExternalAttestationVerifier((sys.executable, str(accept))).verify(
+                evidence,
+                "host:local-demo",
+                "user:alice",
+                "permit-nonce",
+                NOW,
+            )
+            process_cases = [
+                ("external attestation verifier failed", ("missing-portmark-verifier-command",)),
+                ("external attestation verifier rejected evidence", (sys.executable, str(reject))),
+                ("external attestation verifier returned malformed JSON", (sys.executable, str(malformed))),
+                ("external attestation verifier response exceeds output limit", (sys.executable, str(oversized))),
+            ]
+            for message, command in process_cases:
+                with self.subTest(message=message):
+                    with self.assertRaisesRegex(SecurityError, message):
+                        ExternalAttestationVerifier(command, max_response_bytes=64).verify(
+                            evidence,
+                            "host:local-demo",
+                            "user:alice",
+                            "permit-nonce",
+                            NOW,
+                        )
+
+    def test_host_policy_effective_permit_guards_and_intersections(self):
+        manifest = AgentManifest("agent:demo", "1.0.0", "deterministic", ("catalog.search", "files.read"))
+        permit = self._permit()
+        object.__setattr__(permit, "subject", "agent:demo")
+        object.__setattr__(permit, "grants", (
+            ToolGrant("catalog.search", {"max_limit": 10, "allowed_region": ["us", "eu"]}, ("id", "title")),
+            ToolGrant("files.read", output_projection=("*",)),
+        ))
+        policy = HostPolicy(
+            "host:local-demo",
+            (
+                ToolGrant("catalog.search", {"max_limit": 5, "allowed_region": ["us"]}, ("title",)),
+                ToolGrant("files.read", {"path": "workspace/data"}, ("name",)),
+            ),
+            ResourceBudget(max_steps=4, max_tool_calls=2, max_output_bytes=128),
+        )
+
+        effective = policy.effective_permit(manifest, permit, now=NOW)
+
+        self.assertEqual(effective.grants[0].constraints, {"max_limit": 5, "allowed_region": ["us"]})
+        self.assertEqual(effective.grants[0].output_projection, ("title",))
+        self.assertEqual(effective.grants[1].constraints, {"path": "workspace/data"})
+        self.assertEqual(effective.grants[1].output_projection, ("name",))
+
+        cases = [
+            ("permit subject does not match agent", replace(manifest, agent_id="agent:other"), permit),
+            ("permit is not intended for this host", manifest, replace(permit, audience="host:other")),
+            ("permit has expired", manifest, replace(permit, expires_at=NOW)),
+        ]
+        for message, candidate_manifest, candidate_permit in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(SecurityError, message):
+                    policy.effective_permit(candidate_manifest, candidate_permit, now=NOW)
 
     def test_policy_and_trust_registry_loader_validation_guards_are_table_driven(self):
         with tempfile.TemporaryDirectory() as directory:
