@@ -2,6 +2,52 @@
 
 All notable changes to Portmark are recorded here. Versions follow [semantic versioning](https://semver.org/).
 
+## Unreleased
+
+Everything here came out of running Portmark against a real agent for the first time. None of it
+was findable by reading the code, and the 145-test suite was green through all of it.
+
+### Security
+
+- **A permit could widen a strict host policy's argument whitelist** ([#19](https://github.com/Itsthewayofyou/portmark/issues/19)).
+  `additional_arguments: false` turns a constraint set's argument-name list into a whitelist, and
+  that list is derived from the set's own keys — including flat `allowed_*`/`max_*` keys. Because
+  the intersection copied a one-sided key straight across, a flat key arriving from the permit
+  enlarged the whitelist the policy had closed. Reachable end to end: an argument the policy never
+  listed reached the tool body. Grant merging now intersects the permitted argument names first and
+  gates every key on the result. Affects 0.2.0.
+
+### Fixed
+
+- **A permit can now narrow a nested argument schema** ([#15](https://github.com/Itsthewayofyou/portmark/issues/15)).
+  Previously any difference inside `arguments` dropped the grant, so an envelope asking for *less*
+  than the policy allowed lost the tool entirely. The merge recurses per key with an explicit
+  narrowing rule for each, documented in `TOOLS.md`. Unrecognised keys still drop the grant.
+- **`"was not granted"` now says which stage refused the tool** ([#16](https://github.com/Itsthewayofyou/portmark/issues/16)).
+  One sentence covered four different causes and pointed at the envelope, which is frequently the
+  only correct part. `HostPolicy.explain_missing_grant` distinguishes a tool missing from the
+  manifest, from the permit, from the host policy, and one whose constraints could not be
+  combined — naming the failing key in the last case.
+
+### Added
+
+- **`make_host(providers=...)`** ([#18](https://github.com/Itsthewayofyou/portmark/issues/18)) —
+  pass an in-process `ModelProvider` instead of running an HTTP adapter. Merges over the built-in
+  providers rather than replacing them, so `deterministic` survives. No CLI flag: a dotted-path
+  loader would add an arbitrary-code-execution surface for a case `--provider-endpoint` covers.
+- **`tests/test_constraint_intersection.py`** — a seeded property test asserting that merged
+  constraints never accept what either input rejects, with its own control: the same generator is
+  run against a deliberately naive union merge and must find a violation. #19 was found by this
+  test on the day it was written.
+
+### Documented
+
+- `TOOLS.md` — how two constraint sets combine, key by key, including the three cases that are
+  deliberately conservative and drop a mergeable grant.
+- `THREAT_MODEL.md` — a recorded decision that a failing tool ends the whole run
+  ([#17](https://github.com/Itsthewayofyou/portmark/issues/17)), with the shape any future opt-out
+  must take.
+
 ## 0.2.0 — 2026-09-01
 
 The first release with usable content. `0.1.0` reserved the name and predates every feature below.

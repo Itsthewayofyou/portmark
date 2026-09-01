@@ -202,7 +202,9 @@ def find_widening(merge, iterations: int = ITERATIONS, seed: int = SEED) -> tupl
 
     Returns the offending (left, right, arguments, merged) tuple, or None.
     """
-    rng = random.Random(seed)
+    # nosec B311 - generating test inputs, not key material. A seeded PRNG is the
+    # point here: a failing case has to be reproducible from the seed alone.
+    rng = random.Random(seed)  # nosec B311
     for _ in range(iterations):
         left = random_constraints(rng)
         right = random_constraints(rng)
