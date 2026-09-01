@@ -53,13 +53,10 @@ jobs:
       - name: Run security scan
         run: python -m pip install bandit==1.9.4 && bandit -q -r src tests
       - name: Run dependency vulnerability audit
-        # --skip-editable excludes portmark itself, which is installed with -e . and
-        # whose version does not exist on PyPI until it is released -- otherwise every
-        # version bump fails this gate. --strict is dropped because it treats a skipped
-        # distribution as a collection failure, which is the same deadlock.
-        # Verified: with a known-vulnerable urllib3 installed this still reports three
-        # advisories and exits 1, so real findings continue to fail the build.
-        run: python -m pip install pip-audit==2.10.1 && pip-audit --skip-editable
+        # Fails closed on vulnerabilities AND on anything that could not be audited,
+        # with one named exemption for portmark's own editable install. See the module
+        # docstring for why plain `pip-audit --strict` deadlocks on a version bump.
+        run: python -m pip install pip-audit==2.10.1 && python scripts/audit_dependencies.py
       - name: Compile Python sources
         run: python -m compileall -q src tests
       - name: Build Docker image
