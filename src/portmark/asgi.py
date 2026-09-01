@@ -8,7 +8,7 @@ from .factory import HOST_ID, make_host
 from .logging_config import configure_logging
 from .policy import load_host_policy
 from .security import load_trust_registry
-from .storage import SQLiteRuntimeStore
+from .storage import create_runtime_store
 from .tool_loading import ToolLoaderError, load_tools
 
 
@@ -24,7 +24,7 @@ def create_app():
         raise RuntimeError(str(error)) from error
 
     audit_verifier = load_trust_registry(config.trust_registry_path) if config.trust_registry_path else None
-    store = SQLiteRuntimeStore(config.store_path, audit_verifier) if config.store_path else None
+    store = create_runtime_store(config.store_backend, config.store_path, audit_verifier) if config.store_path else None
     host = make_host(
         config.provider_endpoint,
         host_id=config.host_id or HOST_ID,
@@ -45,7 +45,7 @@ def create_app():
         if config.trust_registry_path:
             load_trust_registry(config.trust_registry_path)
         if config.store_path:
-            SQLiteRuntimeStore(config.store_path, audit_verifier)
+            create_runtime_store(config.store_backend, config.store_path, audit_verifier)
         default_readiness_check(host)
 
     return make_asgi_app(

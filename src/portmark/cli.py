@@ -91,7 +91,8 @@ def main() -> None:
     parser.add_argument("--provider-endpoint", help="generic HTTP model-provider endpoint")
     parser.add_argument("--wasm-component", help="Wasm capsule (.wasm or .wat) implementing the WIT resume ABI")
     parser.add_argument("--wasm-engine", choices=("node", "wasmtime"), help="Wasm provider engine")
-    parser.add_argument("--store-path", help="SQLite path for durable nonces, checkpoints, and audit heads")
+    parser.add_argument("--store-backend", choices=("sqlite", "postgres"), help="durable store backend")
+    parser.add_argument("--store-path", help="SQLite path or Postgres DSN for durable nonces, checkpoints, and audit heads")
     parser.add_argument("--policy-path", help="JSON host policy path")
     parser.add_argument("--tools", dest="tools_loader", help="load installed tools from module:function returning a ToolRegistry")
     parser.add_argument("--trust-registry-path", help="JSON trust registry path for envelope signing keys")
@@ -132,10 +133,10 @@ def main() -> None:
     envelope_parser.add_argument("--audience", help=f"host id that may run this envelope; must equal the host's --host-id (default {HOST_ID})")
     envelope_parser.add_argument("--format", choices=("jsonrpc", "envelope"), default="jsonrpc", help="'jsonrpc' emits a ready-to-POST message/send request")
     verify_audit = subparsers.add_parser("verify-audit")
-    verify_audit.add_argument("--task-id", required=True, help="task id whose SQLite audit chain should be verified")
+    verify_audit.add_argument("--task-id", required=True, help="task id whose audit chain should be verified")
     args = parser.parse_args()
     from .security import load_trust_registry
-    from .storage import SQLiteRuntimeStore
+    from .storage import create_runtime_store
 
     config = RuntimeConfig.from_environment().merged_with_args(args)
     configure_logging(config.log_level, config.log_json)
@@ -147,7 +148,7 @@ def main() -> None:
         _run_envelope(parser, args, config)
         return
     audit_verifier = load_trust_registry(config.trust_registry_path) if config.trust_registry_path else None
-    store = SQLiteRuntimeStore(config.store_path, audit_verifier) if config.store_path else None
+    store = create_runtime_store(config.store_backend, config.store_path, audit_verifier) if config.store_path else None
     if args.command == "verify-audit":
         if store is None:
             parser.error("verify-audit requires --store-path or PORTMARK_STORE_PATH")

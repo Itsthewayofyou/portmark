@@ -12,7 +12,7 @@ from .models import AgentEnvelope, AgentManifest, AgentState, Permit, ResourceBu
 from .policy import load_host_policy
 from .providers import DeterministicProvider, GenericHttpProvider, NativeWasmtimeComponentProvider, WasmDecisionProvider
 from .security import AttestationPolicy, EnvelopeSigner, EnvelopeSigningIdentity, ExternalAttestationVerifier, HmacEnvelopeSigner, HostPolicy, load_trust_registry
-from .storage import RuntimeStore, SQLiteRuntimeStore
+from .storage import RuntimeStore, create_runtime_store
 from .tools import ToolRegistry, demo_registry
 
 
@@ -82,7 +82,11 @@ def make_host(
     configured_store = store
     if configured_store is None and os.environ.get("PORTMARK_STORE_PATH"):
         audit_verifier = load_trust_registry(configured_trust_registry_path) if configured_trust_registry_path else None
-        configured_store = SQLiteRuntimeStore(os.environ["PORTMARK_STORE_PATH"], audit_verifier)
+        configured_store = create_runtime_store(
+            os.environ.get("PORTMARK_STORE_BACKEND", "sqlite"),
+            os.environ["PORTMARK_STORE_PATH"],
+            audit_verifier,
+        )
     configured_attestation_policy = attestation_policy
     if configured_attestation_policy is None:
         command = attestation_verifier_command or os.environ.get("PORTMARK_ATTESTATION_VERIFIER_COMMAND")

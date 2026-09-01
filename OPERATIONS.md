@@ -17,6 +17,7 @@ Runtime configuration can come from environment variables or CLI flags:
 - `PORTMARK_ATTESTATION_VERIFIER_COMMAND` / `--attestation-verifier-command`
 - `PORTMARK_REQUIRE_ATTESTATION` / `--require-attestation`
 - `PORTMARK_STORE_PATH` / `--store-path`
+- `PORTMARK_STORE_BACKEND` / `--store-backend`
 - `PORTMARK_PROVIDER_ENDPOINT` / `--provider-endpoint`
 - `PORTMARK_WASM_COMPONENT` / `--wasm-component`
 - `PORTMARK_WASM_ENGINE` / `--wasm-engine`
@@ -134,6 +135,13 @@ For SQLite-backed hosts, run:
 portmark --store-path runtime.sqlite --trust-registry-path trust.json verify-audit --task-id TASK_ID
 ```
 
+For Postgres-backed hosts, install the optional extra and use the same audit
+command with a DSN:
+
+```bash
+portmark --store-backend postgres --store-path postgresql://user:pass@db/portmark --trust-registry-path trust.json verify-audit --task-id TASK_ID
+```
+
 The command prints `{"status": "valid"}` and exits 0 for an intact chain whose stored audit head is signed by a trusted host key. It prints `{"status": "invalid"}` and exits 1 when the task is missing or when event sequence, previous hash, event hash, stored audit-head validation, missing signature material, trust-registry rejection, or audit-head signature validation fails. It prints `{"status": "unverifiable"}` and exits 2 when the local verifier cannot prove the signed head because no trust registry is configured. Treat invalid results as tampered or corrupted task history; treat unverifiable results as an operator configuration failure and re-run with `--trust-registry-path`.
 
 ## Metrics
@@ -165,7 +173,7 @@ Restore them as a consistent set. Restoring an old database with a newer policy 
 
 ## Storage Migrations
 
-SQLite runtime databases carry their schema version in `PRAGMA user_version`. Hosts migrate version `0` stores to the current baseline on open and refuse to open databases with a newer schema version than the runtime supports. Back up the runtime database before deploying runtime versions that include storage migrations, and validate representative task IDs with `verify-audit` after migration.
+SQLite runtime databases carry their schema version in `PRAGMA user_version`. Hosts migrate version `0` stores to the current baseline on open and refuse to open databases with a newer schema version than the runtime supports. Postgres stores keep their schema version in the `portmark_schema` table in the configured schema. Back up the runtime database before deploying runtime versions that include storage migrations, and validate representative task IDs with `verify-audit` after migration.
 
 ## Incident Response
 

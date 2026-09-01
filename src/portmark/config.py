@@ -19,6 +19,7 @@ class RuntimeConfig:
     provider_endpoint: str | None = None
     wasm_component: str | None = None
     wasm_engine: str = "node"
+    store_backend: str = "sqlite"
     store_path: str | None = None
     policy_path: str | None = None
     trust_registry_path: str | None = None
@@ -44,6 +45,7 @@ class RuntimeConfig:
             provider_endpoint=os.environ.get("PORTMARK_PROVIDER_ENDPOINT"),
             wasm_component=os.environ.get("PORTMARK_WASM_COMPONENT"),
             wasm_engine=os.environ.get("PORTMARK_WASM_ENGINE", "node"),
+            store_backend=os.environ.get("PORTMARK_STORE_BACKEND", "sqlite"),
             store_path=os.environ.get("PORTMARK_STORE_PATH"),
             policy_path=os.environ.get("PORTMARK_POLICY_PATH"),
             trust_registry_path=os.environ.get("PORTMARK_TRUST_REGISTRY_PATH"),
@@ -75,6 +77,7 @@ class RuntimeConfig:
             provider_endpoint=args.provider_endpoint or self.provider_endpoint,
             wasm_component=args.wasm_component or self.wasm_component,
             wasm_engine=getattr(args, "wasm_engine", None) or self.wasm_engine,
+            store_backend=getattr(args, "store_backend", None) or self.store_backend,
             store_path=args.store_path or self.store_path,
             policy_path=args.policy_path or self.policy_path,
             trust_registry_path=args.trust_registry_path or self.trust_registry_path,

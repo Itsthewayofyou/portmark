@@ -13,6 +13,7 @@ dependencies = ["cryptography==50.0.1", "uvicorn==0.52.4"]
 
 [project.optional-dependencies]
 a2a = ["a2a-sdk==1.1.2"]
+postgres = ["psycopg[binary]==3.3.4"]
 wasmtime = ["wasmtime==48.0.0"]
 
 [project.scripts]

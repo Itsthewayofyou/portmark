@@ -20,6 +20,7 @@ docker run --rm --name portmark \
   --env-file ./portmark.env \
   -e PORTMARK_POLICY_PATH=/config/host-policy.json \
   -e PORTMARK_TRUST_REGISTRY_PATH=/config/trust.json \
+  -e PORTMARK_STORE_BACKEND=sqlite \
   -e PORTMARK_STORE_PATH=/data/runtime.sqlite \
   -v "$PWD/examples/host-policy.json:/config/host-policy.json:ro" \
   -v "$PWD/trust.json:/config/trust.json:ro" \
@@ -104,7 +105,8 @@ Dockerfile. Common configuration:
 - `PORTMARK_SIGNING_ISSUER`: host signing issuer
 - `PORTMARK_POLICY_PATH`: mounted host policy JSON
 - `PORTMARK_TRUST_REGISTRY_PATH`: mounted trust registry JSON
-- `PORTMARK_STORE_PATH`: SQLite runtime store path on a writable volume
+- `PORTMARK_STORE_BACKEND`: `sqlite` by default, or `postgres` when the image includes `portmark[postgres]`
+- `PORTMARK_STORE_PATH`: SQLite runtime store path or Postgres DSN
 - `PORTMARK_TOOLS`: optional custom tool registry loader, `module:function`
 
 Do not bake tokens, private keys, policy files containing local secrets, or

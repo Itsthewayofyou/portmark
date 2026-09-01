@@ -8,6 +8,7 @@ import io
 import json
 import logging
 import os
+import secrets
 import sqlite3
 import sys
 import tempfile
@@ -49,7 +50,7 @@ from portmark.security import (
     generate_signing_material,
     load_trust_registry,
 )
-from portmark.storage import SQLITE_BUSY_TIMEOUT_MS, SQLITE_SCHEMA_VERSION, SQLiteRuntimeStore
+from portmark.storage import SQLITE_BUSY_TIMEOUT_MS, SQLITE_SCHEMA_VERSION, PostgresRuntimeStore, SQLiteRuntimeStore
 from portmark.cli import main as cli_main
 from portmark.tools import ToolRegistry
 from examples.tools import http_fetch
@@ -227,6 +228,7 @@ class RuntimeTests(unittest.TestCase):
         environment = {
             "PORTMARK_HOST_ID": "host:env",
             "PORTMARK_PROVIDER_ENDPOINT": "https://provider.example/run",
+            "PORTMARK_STORE_BACKEND": "postgres",
             "PORTMARK_STORE_PATH": "env.sqlite",
             "PORTMARK_WASM_ENGINE": "wasmtime",
             "PORTMARK_POLICY_PATH": "env-policy.json",
@@ -252,6 +254,7 @@ class RuntimeTests(unittest.TestCase):
                 provider_endpoint=None,
                 wasm_component="capsule.wasm",
                 wasm_engine=None,
+                store_backend=None,
                 store_path=None,
                 policy_path="cli-policy.json",
                 trust_registry_path=None,
@@ -271,6 +274,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(config.provider_endpoint, "https://provider.example/run")
         self.assertEqual(config.wasm_component, "capsule.wasm")
         self.assertEqual(config.wasm_engine, "wasmtime")
+        self.assertEqual(config.store_backend, "postgres")
         self.assertEqual(config.store_path, "env.sqlite")
         self.assertEqual(config.policy_path, "cli-policy.json")
         self.assertEqual(config.trust_registry_path, "env-trust.json")
@@ -1185,6 +1189,162 @@ class RuntimeTests(unittest.TestCase):
         host.signer.seal(envelope)
         with self.assertRaisesRegex(SecurityError, "nonce"):
             host.run(envelope)
+
+    @contextmanager
+    def _sqlite_store_case(self, verifier=None):
+        with tempfile.TemporaryDirectory() as directory:
+            yield "sqlite", SQLiteRuntimeStore(Path(directory) / "runtime.sqlite", verifier)
+
+    @contextmanager
+    def _postgres_store_case(self, verifier=None):
+        dsn = os.environ["PORTMARK_TEST_POSTGRES_DSN"]
+        schema = "portmark_test_" + secrets.token_hex(8)
+        store = PostgresRuntimeStore(dsn, verifier, schema=schema)
+        try:
+            yield "postgres", store
+        finally:
+            self._drop_postgres_schema(dsn, schema)
+
+    def _store_case_contexts(self, verifier=None):
+        contexts = [self._sqlite_store_case(verifier)]
+        if os.environ.get("PORTMARK_TEST_POSTGRES_DSN") and PostgresRuntimeStore.available():
+            contexts.append(self._postgres_store_case(verifier))
+        return contexts
+
+    @contextmanager
+    def _sqlite_dual_store_case(self, source_verifier=None, destination_verifier=None):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            yield (
+                "sqlite",
+                SQLiteRuntimeStore(root / "source.sqlite", source_verifier),
+                SQLiteRuntimeStore(root / "destination.sqlite", destination_verifier),
+            )
+
+    @contextmanager
+    def _postgres_dual_store_case(self, source_verifier=None, destination_verifier=None):
+        dsn = os.environ["PORTMARK_TEST_POSTGRES_DSN"]
+        source_schema = "portmark_source_" + secrets.token_hex(8)
+        destination_schema = "portmark_destination_" + secrets.token_hex(8)
+        source = PostgresRuntimeStore(dsn, source_verifier, schema=source_schema)
+        destination = PostgresRuntimeStore(dsn, destination_verifier, schema=destination_schema)
+        try:
+            yield "postgres", source, destination
+        finally:
+            self._drop_postgres_schema(dsn, source_schema)
+            self._drop_postgres_schema(dsn, destination_schema)
+
+    def _dual_store_case_contexts(self, source_verifier=None, destination_verifier=None):
+        contexts = [self._sqlite_dual_store_case(source_verifier, destination_verifier)]
+        if os.environ.get("PORTMARK_TEST_POSTGRES_DSN") and PostgresRuntimeStore.available():
+            contexts.append(self._postgres_dual_store_case(source_verifier, destination_verifier))
+        return contexts
+
+    def _drop_postgres_schema(self, dsn, schema):
+        import psycopg
+        from psycopg import sql
+
+        with psycopg.connect(dsn, autocommit=True) as connection:
+            connection.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema)))
+
+    def _reopen_store(self, backend, store, verifier=None):
+        if backend == "sqlite":
+            return SQLiteRuntimeStore(store.path, verifier)
+        return PostgresRuntimeStore(store.dsn, verifier, schema=store.schema)
+
+    def _corrupt_store_audit(self, store, task_id, backend):
+        if backend == "sqlite":
+            with sqlite3.connect(store.path) as connection:
+                connection.execute("UPDATE audit_heads SET head_hash = 'tampered' WHERE task_id = ?", (task_id,))
+            return
+        with store._connect() as connection:
+            connection.execute("UPDATE audit_heads SET head_hash = 'tampered' WHERE task_id = %s", (task_id,))
+            connection.commit()
+
+    def test_runtime_store_contract_persists_checkpoint_audit_and_three_state_verification(self):
+        signer = EnvelopeSigner.generate("contract-key", "host:local-demo", ("host:local-demo",))
+        for context in self._store_case_contexts(signer):
+            with context as (backend, store):
+                with self.subTest(backend=backend):
+                    host = make_host(signer=signer, store=store)
+                    result = host.run(make_demo_envelope(host, f"{backend} contract"))
+                    checkpoint = store.load_checkpoint(result.task_id)
+                    self.assertIsNotNone(checkpoint)
+                    self.assertEqual(checkpoint["status"], "completed")
+                    self.assertEqual(checkpoint["result"], result.result)
+                    self.assertEqual(store.audit_head(result.task_id), (result.audit[-1]["hash"], result.audit[-1]["sequence"] + 1))
+                    self.assertEqual(store.verify_audit_chain_status(result.task_id).status, "valid")
+                    self.assertTrue(store.verify_audit_chain(result.task_id))
+
+                    unverifiable = self._reopen_store(backend, store)
+                    self.assertEqual(unverifiable.verify_audit_chain_status(result.task_id).status, "unverifiable")
+
+    def test_runtime_store_contract_rejects_concurrent_nonce_replay(self):
+        signer = EnvelopeSigner.generate("contract-concurrent-key", "host:local-demo", ("host:local-demo",))
+        for context in self._store_case_contexts(signer):
+            with context as (backend, store):
+                with self.subTest(backend=backend):
+                    host = make_host(signer=signer, store=store)
+                    envelope = make_demo_envelope(host, f"{backend} race")
+
+                    def run_once():
+                        local_store = self._reopen_store(backend, store, signer)
+                        local_host = make_host(signer=signer, store=local_store)
+                        return local_host.run(copy.deepcopy(envelope)).status
+
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                        futures = [executor.submit(run_once) for _ in range(2)]
+                        outcomes = []
+                        for future in futures:
+                            try:
+                                outcomes.append(future.result())
+                            except SecurityError:
+                                outcomes.append("rejected")
+                    self.assertEqual(outcomes.count("completed"), 1)
+                    self.assertEqual(outcomes.count("rejected"), 1)
+                    self.assertTrue(store.consumed_nonce_exists(envelope.permit.nonce))
+
+    def test_runtime_store_contract_detects_audit_chain_corruption(self):
+        signer = EnvelopeSigner.generate("contract-corrupt-key", "host:local-demo", ("host:local-demo",))
+        for context in self._store_case_contexts(signer):
+            with context as (backend, store):
+                with self.subTest(backend=backend):
+                    host = make_host(signer=signer, store=store)
+                    result = host.run(make_demo_envelope(host, f"{backend} corrupt"))
+                    self.assertTrue(store.verify_audit_chain(result.task_id))
+                    self._corrupt_store_audit(store, result.task_id, backend)
+                    verification = store.verify_audit_chain_status(result.task_id)
+                    self.assertEqual(verification.status, "invalid")
+                    self.assertEqual(verification.reason, "stored audit head does not match audit events")
+                    self.assertFalse(store.verify_audit_chain(result.task_id))
+
+    def test_runtime_store_contract_recovers_migration_checkpoints_and_audits(self):
+        source_signer = EnvelopeSigner.generate("contract-source-key", "host:source", ("host:source", "host:destination"))
+        destination_signer = trust_signer(
+            EnvelopeSigner.generate("contract-destination-key", "host:destination", ("host:destination",)),
+            source_signer,
+        )
+        for context in self._dual_store_case_contexts(source_signer, destination_signer):
+            with context as (backend, source_store, destination_store):
+                with self.subTest(backend=backend):
+                    source = make_host(host_id="host:source", signer=source_signer, store=source_store)
+                    destination = make_host(host_id="host:destination", signer=destination_signer, store=destination_store)
+                    provider = MigrateThenCompleteProvider(destination.host_id)
+                    source.providers["migrator"] = provider
+                    destination.providers["migrator"] = provider
+                    envelope = make_demo_envelope(source, f"{backend} migration", "migrator")
+                    object.__setattr__(envelope.permit, "delegation_allowed", True)
+                    source_signer.seal(envelope)
+
+                    first = source.run(envelope)
+                    self.assertEqual(source_store.load_checkpoint(first.task_id)["status"], "ready")
+                    self.assertTrue(source_store.verify_audit_chain(first.task_id))
+                    self.assertIsNotNone(first.migration_envelope)
+
+                    second = destination.run(envelope_from_dict(first.migration_envelope))
+                    self.assertEqual(second.status, "completed")
+                    self.assertEqual(destination_store.load_checkpoint(second.task_id)["status"], "completed")
+                    self.assertTrue(destination_store.verify_audit_chain(second.task_id))
 
     def test_sqlite_store_rejects_replay_after_host_restart(self):
         with tempfile.TemporaryDirectory() as directory:

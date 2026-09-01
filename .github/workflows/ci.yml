@@ -58,3 +58,33 @@ jobs:
         run: python -m compileall -q src tests
       - name: Build Docker image
         run: docker build -t portmark-ci:${{ matrix.python-version }} .
+
+  postgres-store:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: portmark
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d portmark"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Pin build tooling
+        run: python -m pip install pip==26.2.1 setuptools==83.0.0
+      - name: Install package with Postgres extra
+        run: python -m pip install -e '.[postgres]'
+      - name: Run Postgres store contract tests
+        env:
+          PORTMARK_TEST_POSTGRES_DSN: postgresql://postgres:postgres@127.0.0.1:5432/portmark
+        run: python -m unittest discover -s tests -k runtime_store_contract -v

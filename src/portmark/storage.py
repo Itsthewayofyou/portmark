@@ -16,6 +16,7 @@ from .security import AuditHeadVerifier, SecurityError, audit_head_payload, cano
 
 
 SQLITE_SCHEMA_VERSION = 3
+POSTGRES_SCHEMA_VERSION = 1
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 AuditHeadSigner = Callable[[str, int], tuple[str, str]]
 AuditVerificationStatus = Literal["valid", "invalid", "unverifiable"]
@@ -360,6 +361,314 @@ class SQLiteRuntimeStore:
 
     def verify_audit_chain(self, task_id: str) -> bool:
         return self.verify_audit_chain_status(task_id).valid
+
+
+class PostgresRuntimeStore:
+    def __init__(self, dsn: str, audit_head_verifier: AuditHeadVerifier | None = None, schema: str = "public") -> None:
+        if not dsn:
+            raise ValueError("Postgres DSN must not be empty")
+        if not schema or "\x00" in schema:
+            raise ValueError("Postgres schema must not be empty")
+        self.dsn = dsn
+        self.schema = schema
+        self._audit_head_verifier = audit_head_verifier
+        self._ensure_schema()
+        self._initialize()
+
+    def set_audit_head_verifier(self, verifier: AuditHeadVerifier) -> None:
+        self._audit_head_verifier = verifier
+
+    @staticmethod
+    def available() -> bool:
+        try:
+            import psycopg  # noqa: F401
+        except ImportError:
+            return False
+        return True
+
+    def _ensure_schema(self) -> None:
+        psycopg, _, sql, _ = _postgres_modules()
+        with psycopg.connect(self.dsn, autocommit=True) as connection:
+            connection.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(self.schema)))
+
+    def _connect(self):
+        psycopg, rows, sql, _ = _postgres_modules()
+        connection = psycopg.connect(self.dsn, row_factory=rows.dict_row)
+        connection.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(self.schema)))
+        return connection
+
+    def _initialize(self) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS portmark_schema (
+                    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+                    version INTEGER NOT NULL
+                )
+                """
+            )
+            row = connection.execute("SELECT version FROM portmark_schema WHERE singleton = TRUE").fetchone()
+            if row is None:
+                connection.execute("INSERT INTO portmark_schema (singleton, version) VALUES (TRUE, %s)", (POSTGRES_SCHEMA_VERSION,))
+                version = POSTGRES_SCHEMA_VERSION
+            else:
+                version = int(row["version"])
+            if version > POSTGRES_SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"Postgres store schema version {version} is newer than supported version {POSTGRES_SCHEMA_VERSION}"
+                )
+            self._migrate_to_v1(connection)
+
+    def _migrate_to_v1(self, connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS consumed_nonces (
+                nonce TEXT PRIMARY KEY,
+                subject TEXT NOT NULL,
+                audience TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                consumed_at BIGINT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS checkpoints (
+                task_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                checkpoint_json TEXT NOT NULL,
+                updated_at BIGINT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audit_events (
+                task_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                host_id TEXT NOT NULL,
+                event TEXT NOT NULL,
+                details_json TEXT NOT NULL,
+                previous_hash TEXT NOT NULL,
+                hash TEXT NOT NULL,
+                created_at BIGINT NOT NULL,
+                PRIMARY KEY (task_id, sequence),
+                UNIQUE (task_id, hash)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audit_heads (
+                task_id TEXT PRIMARY KEY,
+                head_hash TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                host_id TEXT NOT NULL DEFAULT '',
+                signature_key_id TEXT NOT NULL DEFAULT '',
+                signature TEXT NOT NULL DEFAULT '',
+                updated_at BIGINT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO portmark_schema (singleton, version)
+            VALUES (TRUE, %s)
+            ON CONFLICT (singleton) DO UPDATE SET version = EXCLUDED.version
+            """,
+            (POSTGRES_SCHEMA_VERSION,),
+        )
+
+    def transaction(self) -> AbstractContextManager[RuntimeTransaction]:
+        return _PostgresTransaction(self)
+
+    def consumed_nonce_exists(self, nonce: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute("SELECT 1 FROM consumed_nonces WHERE nonce = %s", (nonce,)).fetchone()
+            return row is not None
+
+    def load_checkpoint(self, task_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT checkpoint_json FROM checkpoints WHERE task_id = %s", (task_id,)).fetchone()
+            return json.loads(row["checkpoint_json"]) if row is not None else None
+
+    def audit_head(self, task_id: str) -> tuple[str, int] | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT head_hash, sequence FROM audit_heads WHERE task_id = %s", (task_id,)).fetchone()
+            return (row["head_hash"], int(row["sequence"])) if row is not None else None
+
+    def verify_audit_chain_status(self, task_id: str) -> AuditVerificationResult:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT sequence, event, details_json, previous_hash, hash FROM audit_events WHERE task_id = %s ORDER BY sequence",
+                (task_id,),
+            ).fetchall()
+            head = connection.execute(
+                "SELECT head_hash, sequence, host_id, signature_key_id, signature FROM audit_heads WHERE task_id = %s",
+                (task_id,),
+            ).fetchone()
+        if not rows or head is None:
+            return AuditVerificationResult("invalid", "audit chain is missing")
+        previous = rows[0]["previous_hash"] if rows else ""
+        for expected_sequence, row in enumerate(rows):
+            if row["sequence"] != expected_sequence or row["previous_hash"] != previous:
+                return AuditVerificationResult("invalid", "audit chain sequence or previous hash is inconsistent")
+            try:
+                details = json.loads(row["details_json"])
+            except json.JSONDecodeError:
+                return AuditVerificationResult("invalid", "audit event details are malformed")
+            record = {
+                "sequence": row["sequence"],
+                "event": row["event"],
+                "details": details,
+                "previous": row["previous_hash"],
+            }
+            if row["hash"] != _audit_hash(record):
+                return AuditVerificationResult("invalid", "audit event hash is invalid")
+            previous = row["hash"]
+        try:
+            head_sequence = int(head["sequence"])
+        except (TypeError, ValueError):
+            return AuditVerificationResult("invalid", "signed audit head sequence is malformed")
+        if head["head_hash"] != previous or head_sequence != len(rows):
+            return AuditVerificationResult("invalid", "stored audit head does not match audit events")
+        return _verify_head_signature(
+            self._audit_head_verifier,
+            task_id,
+            {
+                "head_hash": head["head_hash"],
+                "sequence": head_sequence,
+                "host_id": head["host_id"],
+                "signature_key_id": head["signature_key_id"],
+                "signature": head["signature"],
+            },
+        )
+
+    def verify_audit_chain(self, task_id: str) -> bool:
+        return self.verify_audit_chain_status(task_id).valid
+
+
+class _PostgresTransaction:
+    def __init__(self, store: PostgresRuntimeStore) -> None:
+        self._store = store
+        self._connection = None
+
+    def __enter__(self) -> "_PostgresTransaction":
+        self._connection = self._store._connect()
+        self._connection.execute("BEGIN")
+        return self
+
+    def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: TracebackType | None) -> None:
+        if self._connection is None:
+            raise RuntimeError("Postgres transaction was not opened")
+        try:
+            if exc_type is None:
+                self._connection.commit()
+            else:
+                self._connection.rollback()
+        finally:
+            self._connection.close()
+
+    def consume_nonce(self, nonce: str, subject: str, audience: str, task_id: str) -> None:
+        if self._connection is None:
+            raise RuntimeError("Postgres transaction was not opened")
+        _, _, _, errors = _postgres_modules()
+        try:
+            self._connection.execute(
+                "INSERT INTO consumed_nonces (nonce, subject, audience, task_id, consumed_at) VALUES (%s, %s, %s, %s, %s)",
+                (nonce, subject, audience, task_id, int(time.time())),
+            )
+        except errors.UniqueViolation as error:
+            raise SecurityError("permit nonce has already been consumed") from error
+
+    def append_audit_events(self, task_id: str, host_id: str, events: tuple[dict[str, Any], ...], sign_head: AuditHeadSigner | None = None) -> None:
+        if self._connection is None:
+            raise RuntimeError("Postgres transaction was not opened")
+        _, _, _, errors = _postgres_modules()
+        self._connection.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (task_id,))
+        for event in events:
+            head = self._connection.execute(
+                "SELECT head_hash, sequence FROM audit_heads WHERE task_id = %s FOR UPDATE",
+                (task_id,),
+            ).fetchone()
+            expected_sequence = int(head["sequence"]) if head is not None else 0
+            expected_previous = head["head_hash"] if head is not None else event["previous"]
+            if event["sequence"] != expected_sequence:
+                raise SecurityError("audit event sequence is not contiguous")
+            if event["previous"] != expected_previous:
+                raise SecurityError("audit event previous hash does not match stored head")
+            try:
+                self._connection.execute(
+                    """
+                    INSERT INTO audit_events
+                        (task_id, sequence, host_id, event, details_json, previous_hash, hash, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        task_id,
+                        event["sequence"],
+                        host_id,
+                        event["event"],
+                        json.dumps(event["details"], sort_keys=True, separators=(",", ":")),
+                        event["previous"],
+                        event["hash"],
+                        int(time.time()),
+                    ),
+                )
+            except errors.UniqueViolation as error:
+                raise SecurityError("audit event already exists") from error
+            sequence = event["sequence"] + 1
+            signature_key_id, signature = sign_head(event["hash"], sequence) if sign_head is not None else ("", "")
+            self._connection.execute(
+                """
+                INSERT INTO audit_heads (task_id, head_hash, sequence, host_id, signature_key_id, signature, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT(task_id) DO UPDATE SET
+                    head_hash = EXCLUDED.head_hash,
+                    sequence = EXCLUDED.sequence,
+                    host_id = EXCLUDED.host_id,
+                    signature_key_id = EXCLUDED.signature_key_id,
+                    signature = EXCLUDED.signature,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (task_id, event["hash"], sequence, host_id, signature_key_id, signature, int(time.time())),
+            )
+
+    def save_checkpoint(self, task_id: str, state: AgentState) -> None:
+        if self._connection is None:
+            raise RuntimeError("Postgres transaction was not opened")
+        self._connection.execute(
+            """
+            INSERT INTO checkpoints (task_id, status, checkpoint_json, updated_at)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT(task_id) DO UPDATE SET
+                status = EXCLUDED.status,
+                checkpoint_json = EXCLUDED.checkpoint_json,
+                updated_at = EXCLUDED.updated_at
+            """,
+            (task_id, state.status, json.dumps(asdict(state), sort_keys=True, separators=(",", ":")), int(time.time())),
+        )
+
+
+def create_runtime_store(
+    backend: str,
+    location: str | Path,
+    audit_head_verifier: AuditHeadVerifier | None = None,
+) -> RuntimeStore:
+    if backend == "sqlite":
+        return SQLiteRuntimeStore(location, audit_head_verifier)
+    if backend == "postgres":
+        return PostgresRuntimeStore(str(location), audit_head_verifier)
+    raise ValueError("store backend must be 'sqlite' or 'postgres'")
+
+
+def _postgres_modules():
+    try:
+        import psycopg
+        from psycopg import errors, rows, sql
+    except ImportError as exc:
+        raise RuntimeError("Postgres storage requires installing portmark[postgres]") from exc
+    return psycopg, rows, sql, errors
 
 
 class _SQLiteTransaction:
