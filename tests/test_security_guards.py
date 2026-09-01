@@ -141,6 +141,10 @@ class SecurityGuardTests(unittest.TestCase):
             "additional_arguments": False,
         }
         check_constraints(constraints, {"query": "portable", "limit": 3})
+        check_constraints(
+            {"arguments": {"url": {"type": "string", "scheme": "https", "allowed_domains": ["example.com"]}}},
+            {"url": "https://api.example.com/resource"},
+        )
 
         cases = [
             ({"arguments": []}, {"query": "x"}, "argument constraints must be an object"),
@@ -157,6 +161,12 @@ class SecurityGuardTests(unittest.TestCase):
             ({"arguments": {"query": {"max_length": True}}}, {"query": "x"}, "argument 'query' max_length constraint must be a non-negative integer"),
             ({"arguments": {"query": {"pattern": 1}}}, {"query": "x"}, "argument 'query' pattern constraint must be a string"),
             ({"arguments": {"query": {"pattern": "["}}}, {"query": "x"}, "argument 'query' pattern constraint is invalid"),
+            ({"arguments": {"url": {"scheme": 1}}}, {"url": "https://example.com"}, "argument 'url' scheme constraint must be a non-empty string"),
+            ({"arguments": {"url": {"allowed_schemes": []}}}, {"url": "https://example.com"}, "argument 'url' allowed_schemes must be a non-empty list"),
+            ({"arguments": {"url": {"allowed_hosts": [""]}}}, {"url": "https://example.com"}, "argument 'url' allowed_hosts entries must be non-empty strings"),
+            ({"arguments": {"url": {"allowed_domains": "example.com"}}}, {"url": "https://example.com"}, "argument 'url' allowed_domains must be a non-empty list"),
+            ({"arguments": {"url": {"scheme": "https"}}}, {"url": "not-a-url"}, "argument 'url' must be an absolute URL"),
+            ({"arguments": {"url": {"scheme": "https"}}}, {"url": "https://user@example.com"}, "argument 'url' must not contain userinfo"),
         ]
         for malformed, arguments, message in cases:
             with self.subTest(message=message):

@@ -52,6 +52,7 @@ from portmark.security import (
 from portmark.storage import SQLITE_BUSY_TIMEOUT_MS, SQLITE_SCHEMA_VERSION, SQLiteRuntimeStore
 from portmark.cli import main as cli_main
 from portmark.tools import ToolRegistry
+from examples.tools import http_fetch
 from fuzz_a2a_parser import run_fuzz_cases
 
 
@@ -126,6 +127,16 @@ class EchoThenCompleteProvider(ModelProvider):
         return ProviderDecision("complete", content={"echo": state.memory["custom_echo"]})
 
 
+class HttpFetchThenCompleteProvider(ModelProvider):
+    def __init__(self, arguments):
+        self.arguments = arguments
+
+    def decide(self, state, available_tools, grants=()):
+        if "http_fetch" not in state.memory:
+            return ProviderDecision("tool", "http.fetch", self.arguments)
+        return ProviderDecision("complete", content={"fetch": state.memory["http_fetch"]})
+
+
 class DigestProvider(FixedProvider):
     component_digest = "wasm:expected"
 
@@ -141,9 +152,11 @@ def trust_signer(verifier: EnvelopeSigner, signer: EnvelopeSigner) -> EnvelopeSi
 
 
 class FakeHttpResponse:
-    def __init__(self, body):
+    def __init__(self, body, status=200, headers=None):
         self.body = body
         self.read_size = None
+        self.status = status
+        self.headers = headers or {}
 
     def __enter__(self):
         return self
@@ -183,6 +196,32 @@ class RuntimeTests(unittest.TestCase):
         snapshot = metrics.snapshot()["counters"]
         self.assertEqual(snapshot["runs.failed"], 1)
         self.assertEqual(snapshot["security.rejections"], 1)
+
+    def test_runtime_metrics_snapshot_remains_counter_only_json_shape(self):
+        metrics = RuntimeMetrics()
+        metrics.increment("runs.started")
+        metrics.increment_refusal("unauthorized")
+        metrics.observe_duration("run_duration_seconds", 0.01)
+        self.assertEqual(metrics.snapshot(), {"counters": {"runs.started": 1}})
+
+    def test_runtime_metrics_prometheus_output_includes_operational_metrics(self):
+        metrics = RuntimeMetrics()
+        metrics.increment("runs.started")
+        metrics.increment_refusal("unauthorized")
+        metrics.observe_duration("run_duration_seconds", 0.01)
+        text = metrics.prometheus_text()
+        self.assertIn('portmark_runtime_counter_total{name="runs.started"} 1', text)
+        self.assertIn('portmark_refusals_total{reason="unauthorized"} 1', text)
+        self.assertIn("portmark_run_duration_seconds_count 1", text)
+        self.assertIn("portmark_run_duration_seconds_sum ", text)
+
+    def test_runtime_metrics_refusal_labels_are_bounded(self):
+        metrics = RuntimeMetrics()
+        metrics.increment_refusal('task-123";tool="payments.reserve')
+        text = metrics.prometheus_text()
+        self.assertIn('portmark_refusals_total{reason="internal"} 1', text)
+        self.assertNotIn("task-123", text)
+        self.assertNotIn("payments.reserve", text)
 
     def test_runtime_config_merges_environment_and_cli_arguments(self):
         environment = {
@@ -824,6 +863,102 @@ class RuntimeTests(unittest.TestCase):
 
             with self.assertRaisesRegex(SecurityError, "not granted"):
                 host.run(envelope)
+
+    def _http_fetch_host(self, directory, arguments):
+        policy_path = self._write_policy(directory, tools={
+            "http.fetch": {
+                "impact": "low",
+                "constraints": {
+                    "arguments": {
+                        "url": {
+                            "type": "string",
+                            "scheme": "https",
+                            "allowed_hosts": ["allowed.example"],
+                            "max_length": 2048,
+                        },
+                        "method": {"const": "GET"},
+                    },
+                    "required": ["url"],
+                    "additional_arguments": False,
+                },
+                "output_projection": ["url", "status", "content_type"],
+            },
+        })
+        host = make_host(policy_path=str(policy_path), tools=http_fetch.registry())
+        host.providers["fetcher"] = HttpFetchThenCompleteProvider(arguments)
+        envelope = make_demo_envelope(host, "fetch", "fetcher")
+        object.__setattr__(envelope.manifest, "requested_tools", ("http.fetch",))
+        object.__setattr__(envelope.permit, "grants", (ToolGrant("http.fetch"),))
+        host.signer.seal(envelope)
+        return host, envelope
+
+    def test_http_fetch_example_allowed_url_succeeds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            host, envelope = self._http_fetch_host(directory, {"url": "https://allowed.example/resource", "method": "GET"})
+            response = FakeHttpResponse(b"hello", headers={"Content-Type": "text/plain"})
+            with patch("urllib.request.OpenerDirector.open", return_value=response) as opened:
+                result = host.run(envelope)
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.result["fetch"]["status"], 200)
+        self.assertEqual(result.result["fetch"]["body"], "hello")
+        self.assertEqual(response.read_size, http_fetch.MAX_RESPONSE_BYTES + 1)
+        self.assertEqual(opened.call_count, 1)
+
+    def test_http_fetch_example_denies_disallowed_host_before_network_call(self):
+        with tempfile.TemporaryDirectory() as directory:
+            host, envelope = self._http_fetch_host(directory, {"url": "https://evil.example/resource", "method": "GET"})
+            with patch("urllib.request.OpenerDirector.open") as opened:
+                with self.assertRaisesRegex(SecurityError, "host is outside its allowed set"):
+                    host.run(envelope)
+
+        opened.assert_not_called()
+
+    def test_http_fetch_example_denies_non_https_before_network_call(self):
+        with tempfile.TemporaryDirectory() as directory:
+            host, envelope = self._http_fetch_host(directory, {"url": "http://allowed.example/resource", "method": "GET"})
+            with patch("urllib.request.OpenerDirector.open") as opened:
+                with self.assertRaisesRegex(SecurityError, "URL scheme must be https"):
+                    host.run(envelope)
+
+        opened.assert_not_called()
+
+    def test_http_fetch_example_oversized_output_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            host, envelope = self._http_fetch_host(directory, {"url": "https://allowed.example/resource", "method": "GET"})
+            response = FakeHttpResponse(b"x" * (http_fetch.MAX_RESPONSE_BYTES + 1), headers={"Content-Type": "text/plain"})
+            with patch("urllib.request.OpenerDirector.open", return_value=response):
+                result = host.run(envelope)
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.result, {"error": "tool execution failed"})
+        failed = next(event for event in result.audit if event["event"] == "tool.failed")
+        self.assertEqual(failed["details"]["cause"], "ToolExecutionError")
+        self.assertEqual(failed["details"]["cause_message"], "http.fetch response exceeds output limit")
+
+    def test_http_fetch_example_timeout_fails_as_tool_failed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            host, envelope = self._http_fetch_host(directory, {"url": "https://allowed.example/resource", "method": "GET"})
+            with patch("urllib.request.OpenerDirector.open", side_effect=TimeoutError("timed out")):
+                result = host.run(envelope)
+
+        self.assertEqual(result.status, "failed")
+        failed = next(event for event in result.audit if event["event"] == "tool.failed")
+        self.assertEqual(failed["details"]["cause"], "ToolExecutionError")
+        self.assertEqual(failed["details"]["cause_message"], "http.fetch request failed")
+
+    def test_http_fetch_example_provider_cannot_request_undeclared_arguments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            host, envelope = self._http_fetch_host(directory, {
+                "url": "https://allowed.example/resource",
+                "method": "GET",
+                "headers": {"Authorization": "Bearer secret"},
+            })
+            with patch("urllib.request.OpenerDirector.open") as opened:
+                with self.assertRaisesRegex(SecurityError, "unsupported fields"):
+                    host.run(envelope)
+
+        opened.assert_not_called()
 
     def test_host_rejects_oversized_tool_output_before_checkpointing_it(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1747,11 +1882,25 @@ class RuntimeTests(unittest.TestCase):
 
             request = urllib.request.Request(base + "/metrics", headers={"Authorization": "Bearer metrics-secret"})
             with urllib.request.urlopen(request) as response:  # nosec B310
+                self.assertEqual(response.headers["Content-Type"], "application/json")
                 metrics = json.load(response)
             self.assertEqual(metrics["counters"]["runs.completed"], 1)
             self.assertEqual(metrics["counters"]["runs.started"], 1)
             self.assertEqual(metrics["counters"]["provider.decisions"], 2)
             self.assertEqual(metrics["counters"]["tools.executed"], 1)
+
+            prometheus = urllib.request.Request(
+                base + "/metrics",
+                headers={"Authorization": "Bearer metrics-secret", "Accept": "text/plain"},
+            )
+            with urllib.request.urlopen(prometheus) as response:  # nosec B310
+                self.assertTrue(response.headers["Content-Type"].startswith("text/plain"))
+                text = response.read().decode()
+            self.assertIn('portmark_runtime_counter_total{name="runs.started"} 1', text)
+            self.assertIn("portmark_run_duration_seconds_count 1", text)
+            self.assertIn("portmark_provider_decision_duration_seconds_count 2", text)
+            self.assertIn("portmark_tool_invocation_duration_seconds_count 1", text)
+            self.assertIn("portmark_a2a_request_duration_seconds_count 1", text)
         finally:
             server.shutdown()
             server.server_close()
@@ -1854,6 +2003,104 @@ class RuntimeTests(unittest.TestCase):
         for header in ("x-content-type-options", "x-frame-options", "content-security-policy", "referrer-policy"):
             self.assertIn(header, headers)
 
+    def test_asgi_healthz_and_readyz(self):
+        app = make_asgi_app(make_host())
+        status, _, payload = self._asgi_call(app, "GET", "/healthz")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload), {"status": "ok"})
+        status, _, payload = self._asgi_call(app, "GET", "/readyz")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload), {"status": "ready"})
+
+    def test_asgi_readyz_fails_generically_when_policy_or_store_config_is_invalid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bad_policy = root / "bad-policy.json"
+            bad_policy.write_text("[]", encoding="utf-8")
+            bad_store = root / "store-dir"
+            bad_store.mkdir()
+            cases = [
+                (lambda: load_host_policy(bad_policy, "host:local-demo"), "bad-policy"),
+                (lambda: SQLiteRuntimeStore(bad_store), "store-dir"),
+            ]
+            for readiness_check, leaked in cases:
+                with self.subTest(leaked=leaked):
+                    app = make_asgi_app(make_host(), readiness_check=readiness_check, readiness_cache_seconds=0)
+                    with patch("portmark.a2a.logger.exception") as logged:
+                        status, _, payload = self._asgi_call(app, "GET", "/readyz")
+                    self.assertEqual(status, 503)
+                    self.assertEqual(json.loads(payload), {"status": "not_ready"})
+                    self.assertNotIn(leaked, payload.decode())
+                    logged.assert_called_once_with("A2A readiness check failed")
+
+    def test_asgi_app_accepts_signed_message_submission(self):
+        host = make_host()
+        app = make_asgi_app(host, A2AAuthConfig("secret"))
+        body = self._a2a_request_body(host, "ASGI task")
+        status, _, payload = self._asgi_call(
+            app,
+            "POST",
+            "/message:send",
+            {"Content-Type": "application/json", "Content-Length": str(len(body)), "Authorization": "Bearer secret"},
+            body,
+        )
+        result = json.loads(payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(result["jsonrpc"], "2.0")
+        self.assertEqual(result["result"]["status"]["state"], "completed")
+
+        status, headers, metrics_payload = self._asgi_call(
+            app,
+            "GET",
+            "/metrics",
+            {"Authorization": "Bearer secret", "Accept": "text/plain"},
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(headers["content-type"].startswith("text/plain"))
+        text = metrics_payload.decode()
+        self.assertIn("portmark_run_duration_seconds_count 1", text)
+        self.assertIn("portmark_provider_decision_duration_seconds_count 2", text)
+        self.assertIn("portmark_tool_invocation_duration_seconds_count 1", text)
+        self.assertIn("portmark_a2a_request_duration_seconds_count 1", text)
+
+    def test_asgi_app_returns_generic_submission_errors(self):
+        host = make_host()
+        app = make_asgi_app(host, A2AAuthConfig("secret"))
+        envelope = make_demo_envelope(host, "ASGI tamper")
+        envelope.state.goal = 'tampered-goal-with-label";reason="owned'
+        envelope.state.task_id = 'task-with-label";reason="owned'
+        body = self._a2a_request_body(host, "ASGI tamper", envelope=envelope)
+        with patch("portmark.a2a.logger.exception") as logged:
+            status, _, payload = self._asgi_call(
+                app,
+                "POST",
+                "/message:send",
+                {
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(body)),
+                    "Authorization": "Bearer secret",
+                },
+                body,
+            )
+        decoded = json.loads(payload)
+        self.assertEqual(status, 400)
+        self.assertEqual(decoded["error"], {"code": -32000, "message": "message submission failed"})
+        self.assertNotIn("SecurityError", payload.decode())
+        self.assertNotIn("signature", payload.decode())
+        logged.assert_called_once_with("A2A message submission failed")
+
+        status, _, metrics_payload = self._asgi_call(
+            app,
+            "GET",
+            "/metrics",
+            {"Authorization": "Bearer secret", "Accept": "text/plain"},
+        )
+        text = metrics_payload.decode()
+        self.assertEqual(status, 200)
+        self.assertIn('portmark_refusals_total{reason="internal"} 1', text)
+        self.assertNotIn("tampered-goal-with-label", text)
+        self.assertNotIn("task-with-label", text)
+
     def test_asgi_app_rejects_oversized_content_length_without_reading_body(self):
         app = make_asgi_app(make_host())
         read = []
@@ -1883,7 +2130,8 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("www-authenticate", headers)  # ASGI header names are lowercase
         status, _, payload = self._asgi_call(app, "GET", "/metrics", {"Authorization": "Bearer secret"})
         self.assertEqual(status, 200)
-        self.assertIn("counters", json.loads(payload))
+        self.assertEqual(json.loads(payload), {"counters": {}})
+        self.assertNotIn("portmark_", payload.decode())
         # The limiter lives on the router, not the request: a third call must be refused.
         status, _, _ = self._asgi_call(app, "GET", "/metrics", {"Authorization": "Bearer secret"})
         self.assertEqual(status, 429)
@@ -1989,6 +2237,44 @@ class RuntimeTests(unittest.TestCase):
         ]:
             with self.subTest(required=required):
                 self.assertIn(required, config)
+
+    def test_dockerfile_uses_non_root_runtime_and_does_not_bake_secrets(self):
+        dockerfile = (Path(__file__).parents[1] / "Dockerfile").read_text(encoding="utf-8")
+        required = [
+            "FROM python:3.12.12-slim-bookworm",
+            "pip==26.2.1",
+            "setuptools==83.0.0",
+            "pip install --no-cache-dir .",
+            "useradd",
+            "USER portmark",
+            "uvicorn",
+            "portmark.asgi:app",
+        ]
+        for item in required:
+            with self.subTest(required=item):
+                self.assertIn(item, dockerfile)
+        forbidden = [
+            "PORTMARK_ED25519_PRIVATE_KEY_B64=",
+            "PORTMARK_SIGNING_KEY=",
+            "PORTMARK_A2A_TOKEN=",
+            "SECRET",
+            "TOKEN=",
+            "apt-get",
+            "build-essential",
+            " gcc",
+        ]
+        for item in forbidden:
+            with self.subTest(forbidden=item):
+                self.assertNotIn(item, dockerfile)
+
+    def test_container_asgi_entrypoint_builds_app_from_environment(self):
+        with patch.dict(os.environ, {}, clear=True):
+            from portmark.asgi import create_app
+
+            app = create_app()
+        status, _, payload = self._asgi_call(app, "GET", "/healthz")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload), {"status": "ok"})
 
     def test_a2a_errors_do_not_expose_internal_exception_details(self):
         host = make_host()
@@ -2224,16 +2510,37 @@ class RuntimeTests(unittest.TestCase):
                     data=self._a2a_request_body(host, "busy task"),
                     headers={"Content-Type": "application/json"},
                 )
-                with self.assertRaises(urllib.error.HTTPError) as raised:
-                    urllib.request.urlopen(second)  # nosec B310
-                self.assertEqual(raised.exception.code, 503)
-                payload = json.load(raised.exception)
+                status, payload = self._busy_rejection(server.server_port, second.data)
+                self.assertEqual(status, 503)
                 self.assertEqual(payload["error"], {"code": -32003, "message": "server busy"})
             finally:
                 release.set()
                 server.shutdown()
                 server.server_close()
             self.assertEqual(future.result(timeout=10)["result"]["status"]["state"], "completed")
+
+    def _busy_rejection(self, port, body):
+        sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+        try:
+            sock.sendall(
+                b"POST /message:send HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Content-Type: application/json\r\n"
+                + f"Content-Length: {len(body)}\r\n\r\n".encode()
+            )
+            response = sock.makefile("rb")
+            status = int(response.readline().split()[1])
+            headers = {}
+            while True:
+                line = response.readline()
+                if line in (b"\r\n", b""):
+                    break
+                key, value = line.decode("latin-1").split(":", 1)
+                headers[key.lower()] = value.strip()
+            payload = json.loads(response.read(int(headers["content-length"])))
+            return status, payload
+        finally:
+            sock.close()
 
     def _oversized_rejection(self, port):
         """Declare an oversized body in the headers without sending one.

@@ -145,6 +145,11 @@ telemetry pipeline. The reference A2A server publishes the same snapshot at
 requests must include `Authorization: Bearer <token>`. The endpoint is still
 served only from the loopback origin and should be exposed publicly only
 through the same authenticated production proxy boundary as `/message:send`.
+JSON remains the default response. Prometheus scrapers can request
+`Accept: text/plain` to receive counters, refusal counts, and latency
+histograms. Refusal labels are bounded reason codes only; tool arguments,
+user input, task IDs, and other request-controlled values are intentionally
+excluded from metric labels.
 
 ## Backup And Restore
 

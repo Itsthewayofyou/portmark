@@ -30,6 +30,7 @@ DEFAULT_RATE_LIMIT_WINDOW_SECONDS = 60
 DEFAULT_AGENT_CARD_RATE_LIMIT_PER_IP = 240
 DEFAULT_AGENT_CARD_RATE_LIMIT_WINDOW_SECONDS = 60
 DEFAULT_RATE_LIMIT_TRACKED_CLIENTS = 8192
+DEFAULT_READY_CACHE_SECONDS = 2.0
 A2A_ADAPTERS = ("local", "sdk")
 BUSY_RESPONSE = (
     b"HTTP/1.1 503 Service Unavailable\r\n"
@@ -203,6 +204,32 @@ def parse_content_length(raw: str) -> int:
     return size
 
 
+def accepts_plain_text(raw: str) -> bool:
+    for item in raw.split(","):
+        media_type = item.split(";", 1)[0].strip().lower()
+        if media_type == "text/plain":
+            return True
+    return False
+
+
+def refusal_reason_for_error(code: int, status: int | None = None) -> str:
+    if status == 429 or code == -32002:
+        return "rate_limited"
+    if status == 503 or code == -32003:
+        return "server_busy"
+    if code == -32700:
+        return "parse_error"
+    if code == -32602:
+        return "invalid_params"
+    if code == -32601:
+        return "method_not_found"
+    if code == -32600:
+        return "invalid_request"
+    if code == -32001:
+        return "unauthorized"
+    return "internal"
+
+
 @dataclass(frozen=True)
 class HttpResponse:
     status: int
@@ -229,9 +256,13 @@ class A2ARouter:
         agent_card_rate_limit_per_ip: int = DEFAULT_AGENT_CARD_RATE_LIMIT_PER_IP,
         agent_card_rate_limit_window_seconds: int = DEFAULT_AGENT_CARD_RATE_LIMIT_WINDOW_SECONDS,
         a2a_adapter: str = "local",
+        readiness_check: Callable[[], None] | None = None,
+        readiness_cache_seconds: float = DEFAULT_READY_CACHE_SECONDS,
     ) -> None:
         if a2a_adapter not in A2A_ADAPTERS:
             raise ValueError("a2a_adapter must be 'local' or 'sdk'")
+        if readiness_cache_seconds < 0:
+            raise ValueError("readiness_cache_seconds must not be negative")
         if a2a_adapter == "sdk":
             make_sdk_agent_card("http://127.0.0.1", False)
         self.host = host
@@ -243,6 +274,11 @@ class A2ARouter:
         self.network_guard = NetworkGuard(max_concurrent_requests, rate_limit_per_ip, rate_limit_window_seconds)
         self.agent_card_limiter = RateLimiter(agent_card_rate_limit_per_ip, agent_card_rate_limit_window_seconds)
         self.metrics_limiter = RateLimiter(rate_limit_per_ip, rate_limit_window_seconds)
+        self.readiness_check = readiness_check or (lambda: default_readiness_check(host))
+        self.readiness_cache_seconds = readiness_cache_seconds
+        self._readiness_lock = threading.Lock()
+        self._readiness_cached_until = 0.0
+        self._readiness_cached = False
 
     def response(self, status: int, value: Any, headers: dict[str, str] | None = None) -> HttpResponse:
         payload = json.dumps(value).encode()
@@ -256,6 +292,17 @@ class A2ARouter:
         if headers:
             out.update(headers)
         return HttpResponse(status, payload, out)
+
+    def text_response(self, status: int, payload: str, content_type: str) -> HttpResponse:
+        encoded = payload.encode()
+        headers = {
+            "Content-Type": content_type,
+            "Content-Length": str(len(encoded)),
+            **SECURITY_HEADERS,
+        }
+        if self.enable_hsts:
+            headers["Strict-Transport-Security"] = "max-age=31536000"
+        return HttpResponse(status, encoded, headers)
 
     def authorized(self, authorization: str) -> bool:
         if not self.auth_config.bearer_token:
@@ -272,10 +319,25 @@ class A2ARouter:
             {"WWW-Authenticate": f'Bearer realm="{self.auth_config.realm}"'},
         )
 
-    def handle_get(self, path: str, host_header: str, client_ip: str, authorization: str = "") -> HttpResponse:
+    def handle_get(
+        self,
+        path: str,
+        host_header: str,
+        client_ip: str,
+        authorization: str = "",
+        accept: str = "",
+    ) -> HttpResponse:
         base_url = f"http://{host_header or '127.0.0.1'}"
+        if path == "/healthz":
+            return self.response(200, {"status": "ok"})
+        if path == "/readyz":
+            if self.ready():
+                return self.response(200, {"status": "ready"})
+            self.host.metrics.increment_refusal("not_ready")
+            return self.response(503, {"status": "not_ready"})
         if path == "/.well-known/agent-card.json":
             if not self.agent_card_limiter.admit(client_ip):
+                self.host.metrics.increment_refusal("rate_limited")
                 return self.response(
                     429,
                     error_response(None, -32002, "rate limit exceeded"),
@@ -286,15 +348,38 @@ class A2ARouter:
             return self.response(200, make_agent_card(base_url, self.auth_config.required))
         if path == "/metrics":
             if not self.metrics_limiter.admit(client_ip):
+                self.host.metrics.increment_refusal("rate_limited")
                 return self.response(
                     429,
                     error_response(None, -32002, "rate limit exceeded"),
                     {"Retry-After": str(self.rate_limit_window_seconds)},
                 )
             if not self.auth_config.required or not self.authorized(authorization):
+                self.host.metrics.increment_refusal("unauthorized")
                 return self._unauthorized()
+            if accepts_plain_text(accept):
+                return self.text_response(
+                    200,
+                    self.host.metrics.prometheus_text(),
+                    "text/plain; version=0.0.4; charset=utf-8",
+                )
             return self.response(200, self.host.metrics.snapshot())
         return self.response(404, {"error": "not found"})
+
+    def ready(self) -> bool:
+        now = time.monotonic()
+        with self._readiness_lock:
+            if self._readiness_cached_until > now:
+                return self._readiness_cached
+            try:
+                self.readiness_check()
+            except Exception:
+                logger.exception("A2A readiness check failed")
+                self._readiness_cached = False
+            else:
+                self._readiness_cached = True
+            self._readiness_cached_until = now + self.readiness_cache_seconds
+            return self._readiness_cached
 
     @contextmanager
     def admit_post(
@@ -315,17 +400,20 @@ class A2ARouter:
         """
         try:
             if path != "/message:send":
+                self.host.metrics.increment_refusal("method_not_found")
                 yield self.response(404, error_response(None, -32601, "method not found")), 0
                 return
             if content_type.split(";", 1)[0].strip().lower() != "application/json":
                 raise A2ARequestError(-32600, "invalid request", 415)
             size = parse_content_length(content_length)
         except A2ARequestError as exc:
+            self.host.metrics.increment_refusal(refusal_reason_for_error(exc.code, exc.http_status))
             yield self.response(exc.http_status, error_response(None, exc.code, exc.message)), 0
             return
         with self.network_guard.admit(client_ip) as rejection:
             if rejection is not None:
                 status, code, message = rejection
+                self.host.metrics.increment_refusal(refusal_reason_for_error(code, status))
                 yield self.response(
                     status,
                     error_response(None, code, message),
@@ -333,6 +421,7 @@ class A2ARouter:
                 ), 0
                 return
             if not self.authorized(authorization):
+                self.host.metrics.increment_refusal("unauthorized")
                 yield self._unauthorized(), 0
                 return
             yield None, size
@@ -356,8 +445,10 @@ class A2ARouter:
             result = self.host.run(envelope)
             return self.response(200, success_response(request.id, task_from_run_result(result)))
         except A2ARequestError as exc:
+            self.host.metrics.increment_refusal(refusal_reason_for_error(exc.code, exc.http_status))
             return self.response(exc.http_status, error_response(exc.request_id, exc.code, exc.message))
         except Exception:
+            self.host.metrics.increment_refusal("internal")
             logger.exception("A2A message submission failed")
             return self.response(400, error_response(request_id, -32000, "message submission failed"))
 
@@ -393,20 +484,25 @@ def make_handler(host: AgentHost, auth: A2AAuthConfig | None = None, enable_hsts
                 self.headers.get("Host", "127.0.0.1"),
                 self._client_ip(),
                 self.headers.get("Authorization", ""),
+                self.headers.get("Accept", ""),
             ))
 
         def do_POST(self) -> None:
-            with router.admit_post(
-                self.path,
-                self.headers.get("Content-Type", ""),
-                self.headers.get("Content-Length", "0"),
-                self.headers.get("Authorization", ""),
-                self._client_ip(),
-            ) as (rejection, size):
-                if rejection is not None:
-                    self._send(rejection)
-                    return
-                self._send(router.dispatch_post(self.rfile.read(size)))
+            started = time.monotonic()
+            try:
+                with router.admit_post(
+                    self.path,
+                    self.headers.get("Content-Type", ""),
+                    self.headers.get("Content-Length", "0"),
+                    self.headers.get("Authorization", ""),
+                    self._client_ip(),
+                ) as (rejection, size):
+                    if rejection is not None:
+                        self._send(rejection)
+                        return
+                    self._send(router.dispatch_post(self.rfile.read(size)))
+            finally:
+                router.host.metrics.observe_duration("a2a_request_duration_seconds", time.monotonic() - started)
 
         def log_message(self, format: str, *args: Any) -> None:
             return
@@ -426,6 +522,17 @@ def is_loopback_bind(bind: str) -> bool:
         return ipaddress.ip_address(bind).is_loopback
     except ValueError:
         return False
+
+
+def default_readiness_check(host: AgentHost) -> None:
+    active_policy = host._active_policy()
+    if active_policy.audience != host.host_id:
+        raise RuntimeError("policy audience does not match host")
+    host.store.consumed_nonce_exists("__portmark_readyz__")
+    verifier = getattr(host.signer, "registry", None)
+    key_id = getattr(host.signer, "key_id", None)
+    if verifier is not None and key_id is not None and not verifier.has_key(key_id):
+        raise RuntimeError("host signing key is not trusted")
 
 
 def make_asgi_app(host: AgentHost, auth: A2AAuthConfig | None = None, enable_hsts: bool = False, **kwargs: Any):
@@ -478,8 +585,12 @@ def make_asgi_app(host: AgentHost, auth: A2AAuthConfig | None = None, enable_hst
         path, method = scope.get("path", ""), scope.get("method", "GET").upper()
         client_ip = _client_ip(scope)
         if method == "GET":
-            response = await asyncio.to_thread(
-                router.handle_get, path, _header(scope, b"host"), client_ip, _header(scope, b"authorization")
+            response = router.handle_get(
+                path,
+                _header(scope, b"host"),
+                client_ip,
+                _header(scope, b"authorization"),
+                _header(scope, b"accept"),
             )
             await _send(send, response)
             return
@@ -487,28 +598,33 @@ def make_asgi_app(host: AgentHost, auth: A2AAuthConfig | None = None, enable_hst
             await _send(send, router.response(404, {"error": "not found"}))
             return
 
-        raw_length = _header(scope, b"content-length")
-        content_type = _header(scope, b"content-type")
-        with router.admit_post(path, content_type, raw_length, _header(scope, b"authorization"), client_ip) as (
-            rejection,
-            size,
-        ):
-            if rejection is not None:
-                await _send(send, rejection)
-                return
-            body = bytearray()
-            while len(body) < size:
-                message = await receive()
-                if message["type"] == "http.disconnect":
+        started = time.monotonic()
+        try:
+            raw_length = _header(scope, b"content-length")
+            content_type = _header(scope, b"content-type")
+            with router.admit_post(path, content_type, raw_length, _header(scope, b"authorization"), client_ip) as (
+                rejection,
+                size,
+            ):
+                if rejection is not None:
+                    await _send(send, rejection)
                     return
-                body.extend(message.get("body", b""))
-                if len(body) > MAX_REQUEST_BYTES:
-                    await _send(send, router.response(413, error_response(None, -32600, "invalid request")))
-                    return
-                if not message.get("more_body", False):
-                    break
-            response = await asyncio.to_thread(router.dispatch_post, bytes(body))
-        await _send(send, response)
+                body = bytearray()
+                while len(body) < size:
+                    message = await receive()
+                    if message["type"] == "http.disconnect":
+                        return
+                    body.extend(message.get("body", b""))
+                    if len(body) > MAX_REQUEST_BYTES:
+                        router.host.metrics.increment_refusal("invalid_request")
+                        await _send(send, router.response(413, error_response(None, -32600, "invalid request")))
+                        return
+                    if not message.get("more_body", False):
+                        break
+                response = router.dispatch_post(bytes(body))
+            await _send(send, response)
+        finally:
+            router.host.metrics.observe_duration("a2a_request_duration_seconds", time.monotonic() - started)
 
     app.a2a_router = router  # type: ignore[attr-defined]
     return app

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import secrets
+import time
 from dataclasses import asdict
 from collections.abc import Callable
 from typing import Any
@@ -43,16 +44,20 @@ class AgentHost:
         self.metrics = metrics or RuntimeMetrics()
 
     def run(self, envelope: AgentEnvelope) -> RunResult:
+        started = time.monotonic()
         self.metrics.increment("runs.started")
         try:
             return self._run(envelope)
         except SecurityError:
             self.metrics.increment("runs.failed")
             self.metrics.increment("security.rejections")
+            self.metrics.increment_refusal("security")
             raise
         except Exception:
             self.metrics.increment("runs.failed")
             raise
+        finally:
+            self.metrics.observe_duration("run_duration_seconds", time.monotonic() - started)
 
     def _run(self, envelope: AgentEnvelope) -> RunResult:
         active_policy = self._active_policy()
@@ -84,7 +89,11 @@ class AgentHost:
         tool_names = tuple(grant.name for grant in effective.grants)
 
         while state.step < effective.budget.max_steps:
-            decision = provider.decide(state, tool_names, effective.grants)
+            decision_started = time.monotonic()
+            try:
+                decision = provider.decide(state, tool_names, effective.grants)
+            finally:
+                self.metrics.observe_duration("provider_decision_duration_seconds", time.monotonic() - decision_started)
             self.metrics.increment("provider.decisions")
             audit.append("provider.proposed", {"kind": decision.kind, "tool": decision.tool})
             finished, migration = self._apply_decision(decision, state, effective, audit, envelope, active_policy)
@@ -115,7 +124,11 @@ class AgentHost:
             if approval_result is not None:
                 return approval_result
             try:
-                result = self.tools.invoke(effective, decision.tool, decision.arguments, effective.budget.max_output_bytes)
+                tool_started = time.monotonic()
+                try:
+                    result = self.tools.invoke(effective, decision.tool, decision.arguments, effective.budget.max_output_bytes)
+                finally:
+                    self.metrics.observe_duration("tool_invocation_duration_seconds", time.monotonic() - tool_started)
             except ToolExecutionError as error:
                 self.metrics.increment("tools.failed")
                 state.status = "failed"

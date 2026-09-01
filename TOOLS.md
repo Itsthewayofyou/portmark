@@ -38,6 +38,25 @@ The loader is a Python import path, not a shell command. The named object may be
 a `ToolRegistry` or a zero-argument function that returns one. Anything else is
 rejected before the host starts.
 
+## Example HTTP Fetch Tool
+
+Portmark includes one opt-in side-effecting example:
+`examples.tools.http_fetch:registry`. It installs `http.fetch`, a bounded HTTPS
+GET tool. It is not loaded by default.
+
+```bash
+PYTHONPATH=src:. python -m portmark.cli \
+  --policy-path examples/http-fetch-policy.json \
+  --tools examples.tools.http_fetch:registry \
+  demo "fetch an allowlisted page"
+```
+
+The example tool enforces a fixed GET method, HTTPS URLs, no URL userinfo, no
+redirect following, a two-second network timeout, and a 65 KiB response cap. The
+allowlist belongs in host policy with URL constraints such as `scheme`,
+`allowed_hosts`, or `allowed_domains`; provider-supplied arguments cannot expand
+that allowlist.
+
 ## Grant Tools In Policy
 
 Installing a tool does not grant it. The host still intersects the agent

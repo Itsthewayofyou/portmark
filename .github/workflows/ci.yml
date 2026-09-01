@@ -56,3 +56,5 @@ jobs:
         run: python -m pip install pip-audit==2.10.1 && pip-audit --strict
       - name: Compile Python sources
         run: python -m compileall -q src tests
+      - name: Build Docker image
+        run: docker build -t portmark-ci:${{ matrix.python-version }} .

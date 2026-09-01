@@ -11,6 +11,7 @@ import base64
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import urlparse
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
@@ -931,6 +932,7 @@ def _check_argument_schema(name: str, value: Any, spec: dict[str, Any]) -> None:
             raise SecurityError(f"argument {name!r} pattern constraint is invalid") from error
         if matched is None:
             raise SecurityError(f"argument {name!r} does not match its required pattern")
+    _check_url_constraints(name, value, spec)
 
 
 def _matches_type(value: Any, expected_type: Any) -> bool:
@@ -953,3 +955,50 @@ def _matches_type(value: Any, expected_type: Any) -> bool:
         if item == "null" and value is None:
             return True
     return False
+
+
+def _check_url_constraints(name: str, value: Any, spec: dict[str, Any]) -> None:
+    has_url_constraint = any(key in spec for key in ("scheme", "allowed_schemes", "allowed_hosts", "allowed_domains"))
+    if not has_url_constraint:
+        return
+    if not isinstance(value, str):
+        raise SecurityError(f"argument {name!r} URL must be a string")
+    parsed = urlparse(value)
+    if not parsed.scheme or not parsed.hostname:
+        raise SecurityError(f"argument {name!r} must be an absolute URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise SecurityError(f"argument {name!r} must not contain userinfo")
+    host = parsed.hostname.rstrip(".").lower()
+    scheme = spec.get("scheme")
+    if scheme is not None:
+        if not isinstance(scheme, str) or not scheme:
+            raise SecurityError(f"argument {name!r} scheme constraint must be a non-empty string")
+        if parsed.scheme.lower() != scheme.lower():
+            raise SecurityError(f"argument {name!r} URL scheme must be {scheme.lower()}")
+    allowed_schemes = spec.get("allowed_schemes")
+    if allowed_schemes is not None:
+        schemes = _non_empty_string_tuple(allowed_schemes, f"argument {name!r} allowed_schemes")
+        if parsed.scheme.lower() not in {item.lower() for item in schemes}:
+            raise SecurityError(f"argument {name!r} URL scheme is outside its allowed set")
+    allowed_hosts = spec.get("allowed_hosts")
+    if allowed_hosts is not None:
+        hosts = _normalized_hosts(allowed_hosts, f"argument {name!r} allowed_hosts")
+        if host not in hosts:
+            raise SecurityError(f"argument {name!r} host is outside its allowed set")
+    allowed_domains = spec.get("allowed_domains")
+    if allowed_domains is not None:
+        domains = _normalized_hosts(allowed_domains, f"argument {name!r} allowed_domains")
+        if not any(host == domain or host.endswith(f".{domain}") for domain in domains):
+            raise SecurityError(f"argument {name!r} domain is outside its allowed set")
+
+
+def _non_empty_string_tuple(value: Any, label: str) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)) or not value:
+        raise SecurityError(f"{label} must be a non-empty list")
+    if not all(isinstance(item, str) and item for item in value):
+        raise SecurityError(f"{label} entries must be non-empty strings")
+    return tuple(value)
+
+
+def _normalized_hosts(value: Any, label: str) -> set[str]:
+    return {item.rstrip(".").lower() for item in _non_empty_string_tuple(value, label)}

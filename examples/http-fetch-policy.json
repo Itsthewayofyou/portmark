@@ -1,0 +1,29 @@
+{
+  "version": "http-fetch-example-v1",
+  "budget": {
+    "max_steps": 10,
+    "max_tool_calls": 3,
+    "max_output_bytes": 65536
+  },
+  "tools": {
+    "http.fetch": {
+      "impact": "data-exfiltration",
+      "constraints": {
+        "arguments": {
+          "url": {
+            "type": "string",
+            "scheme": "https",
+            "allowed_domains": ["example.com"],
+            "max_length": 2048
+          },
+          "method": {
+            "const": "GET"
+          }
+        },
+        "required": ["url"],
+        "additional_arguments": false
+      },
+      "output_projection": ["url", "status", "content_type"]
+    }
+  }
+}

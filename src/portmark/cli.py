@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import importlib
 import json
 import os
 import secrets
@@ -12,7 +11,7 @@ from .a2a import A2AAuthConfig, serve
 from .config import RuntimeConfig
 from .factory import HOST_ID, build_envelope, make_demo_envelope, make_host, signer_from_environment
 from .logging_config import configure_logging
-from .tools import ToolRegistry
+from .tool_loading import ToolLoaderError, load_tools
 
 
 def _run_keygen(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -45,30 +44,6 @@ def _load_spec(parser: argparse.ArgumentParser, path: str | None) -> dict:
     if not isinstance(spec, dict):
         parser.error("envelope spec must be a JSON object")
     return spec
-
-
-def _load_tools(parser: argparse.ArgumentParser, path: str | None) -> ToolRegistry | None:
-    if not path:
-        return None
-    module_name, separator, object_path = path.partition(":")
-    if not separator or not module_name or not object_path:
-        parser.error("--tools must use module:function syntax")
-    try:
-        module = importlib.import_module(module_name)
-        loaded = module
-        for part in object_path.split("."):
-            if not part:
-                raise AttributeError
-            loaded = getattr(loaded, part)
-    except (ImportError, AttributeError):
-        parser.error(f"could not load --tools {path!r}")
-    try:
-        registry = loaded() if callable(loaded) else loaded
-    except Exception:
-        parser.error("--tools loader failed")
-    if not isinstance(registry, ToolRegistry):
-        parser.error("--tools loader must return a portmark.tools.ToolRegistry")
-    return registry
 
 
 def _run_envelope(parser: argparse.ArgumentParser, args: argparse.Namespace, config: RuntimeConfig) -> None:
@@ -185,7 +160,10 @@ def main() -> None:
         return
     if args.tools_loader and not config.policy_path:
         parser.error("--tools requires --policy-path or PORTMARK_POLICY_PATH")
-    tools = _load_tools(parser, args.tools_loader)
+    try:
+        tools = load_tools(args.tools_loader)
+    except ToolLoaderError as exc:
+        parser.error(str(exc))
     host = make_host(
         config.provider_endpoint,
         host_id=config.host_id,
