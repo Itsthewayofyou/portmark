@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import secrets
@@ -11,6 +12,7 @@ from .a2a import A2AAuthConfig, serve
 from .config import RuntimeConfig
 from .factory import HOST_ID, build_envelope, make_demo_envelope, make_host, signer_from_environment
 from .logging_config import configure_logging
+from .tools import ToolRegistry
 
 
 def _run_keygen(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -43,6 +45,30 @@ def _load_spec(parser: argparse.ArgumentParser, path: str | None) -> dict:
     if not isinstance(spec, dict):
         parser.error("envelope spec must be a JSON object")
     return spec
+
+
+def _load_tools(parser: argparse.ArgumentParser, path: str | None) -> ToolRegistry | None:
+    if not path:
+        return None
+    module_name, separator, object_path = path.partition(":")
+    if not separator or not module_name or not object_path:
+        parser.error("--tools must use module:function syntax")
+    try:
+        module = importlib.import_module(module_name)
+        loaded = module
+        for part in object_path.split("."):
+            if not part:
+                raise AttributeError
+            loaded = getattr(loaded, part)
+    except (ImportError, AttributeError):
+        parser.error(f"could not load --tools {path!r}")
+    try:
+        registry = loaded() if callable(loaded) else loaded
+    except Exception:
+        parser.error("--tools loader failed")
+    if not isinstance(registry, ToolRegistry):
+        parser.error("--tools loader must return a portmark.tools.ToolRegistry")
+    return registry
 
 
 def _run_envelope(parser: argparse.ArgumentParser, args: argparse.Namespace, config: RuntimeConfig) -> None:
@@ -92,6 +118,7 @@ def main() -> None:
     parser.add_argument("--wasm-engine", choices=("node", "wasmtime"), help="Wasm provider engine")
     parser.add_argument("--store-path", help="SQLite path for durable nonces, checkpoints, and audit heads")
     parser.add_argument("--policy-path", help="JSON host policy path")
+    parser.add_argument("--tools", dest="tools_loader", help="load installed tools from module:function returning a ToolRegistry")
     parser.add_argument("--trust-registry-path", help="JSON trust registry path for envelope signing keys")
     parser.add_argument("--reload-policy", action="store_true", help="reload the JSON host policy before each run")
     parser.add_argument("--attestation-verifier-command", help="shell-free argv string for an external attestation verifier")
@@ -156,6 +183,9 @@ def main() -> None:
         if verification.status == "unverifiable":
             raise SystemExit(2)
         return
+    if args.tools_loader and not config.policy_path:
+        parser.error("--tools requires --policy-path or PORTMARK_POLICY_PATH")
+    tools = _load_tools(parser, args.tools_loader)
     host = make_host(
         config.provider_endpoint,
         host_id=config.host_id,
@@ -167,6 +197,7 @@ def main() -> None:
         reload_policy=config.reload_policy,
         attestation_verifier_command=config.attestation_verifier_command,
         require_attestation=config.require_attestation,
+        tools=tools,
     )
     if args.command == "demo":
         provider = "wasm" if config.wasm_component else ("http" if config.provider_endpoint else "deterministic")

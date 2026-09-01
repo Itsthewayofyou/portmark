@@ -827,6 +827,8 @@ def check_constraints(constraints: dict[str, Any], arguments: dict[str, Any]) ->
     schema = constraints.get("arguments")
     required = _required_arguments(constraints.get("required", ()))
     additional = constraints.get("additional_arguments", True)
+    if not isinstance(additional, bool):
+        raise SecurityError("additional_arguments constraint must be boolean")
     if schema is not None:
         if not isinstance(schema, dict):
             raise SecurityError("argument constraints must be an object")

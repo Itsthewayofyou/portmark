@@ -38,6 +38,11 @@ jobs:
         run: python -m pip install -e .
       - name: Run regression tests
         run: python -m unittest discover -s tests -v
+      - name: Check security.py coverage
+        run: |
+          python -m pip install coverage==7.16.0
+          coverage run --source=portmark.security -m unittest discover -s tests -q
+          coverage report --include='src/portmark/security.py' --fail-under=89
       - name: Run native Wasmtime component regression
         if: matrix.python-version == '3.12'
         run: |

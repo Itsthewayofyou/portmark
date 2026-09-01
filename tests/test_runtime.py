@@ -119,6 +119,13 @@ class LargeToolProvider(ModelProvider):
         return ProviderDecision("complete", content={"large": state.memory["large"]})
 
 
+class EchoThenCompleteProvider(ModelProvider):
+    def decide(self, state, available_tools, grants=()):
+        if "custom_echo" not in state.memory:
+            return ProviderDecision("tool", "custom.echo", {"text": "hello"})
+        return ProviderDecision("complete", content={"echo": state.memory["custom_echo"]})
+
+
 class DigestProvider(FixedProvider):
     component_digest = "wasm:expected"
 
@@ -764,6 +771,59 @@ class RuntimeTests(unittest.TestCase):
             with self.subTest(tool=tool):
                 with self.assertRaisesRegex(SecurityError, message):
                     registry.invoke(permit, tool, {})
+
+    def test_make_host_accepts_a_custom_tool_registry(self):
+        registry = ToolRegistry()
+        registry.register("custom.echo", lambda arguments: {"echo": arguments["text"]})
+
+        host = make_host(tools=registry)
+
+        self.assertIs(host.tools, registry)
+        self.assertEqual(host.tools.names(), ("custom.echo",))
+
+    def test_custom_tool_runs_only_when_policy_manifest_and_permit_align(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = ToolRegistry()
+            registry.register("custom.echo", lambda arguments: {"echo": arguments["text"]})
+            policy_path = self._write_policy(directory, tools={
+                "custom.echo": {
+                    "impact": "low",
+                    "constraints": {
+                        "arguments": {"text": {"type": "string", "max_length": 20}},
+                        "required": ["text"],
+                        "additional_arguments": False,
+                    },
+                    "output_projection": ["echo"],
+                },
+            })
+            host = make_host(policy_path=str(policy_path), tools=registry)
+            host.providers["echo"] = EchoThenCompleteProvider()
+            envelope = make_demo_envelope(host, "echo", "echo")
+            object.__setattr__(envelope.manifest, "requested_tools", ("custom.echo",))
+            object.__setattr__(envelope.permit, "grants", (ToolGrant("custom.echo"),))
+            host.signer.seal(envelope)
+
+            result = host.run(envelope)
+
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(result.result, {"echo": {"echo": "hello"}})
+
+    def test_custom_tool_is_denied_when_policy_does_not_grant_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = ToolRegistry()
+            registry.register("custom.echo", lambda arguments: {"echo": arguments["text"]})
+            policy_path = self._write_policy(directory, tools={
+                "catalog.search": {"impact": "low", "constraints": {"max_limit": 5}},
+            })
+            host = make_host(policy_path=str(policy_path), tools=registry)
+            host.providers["echo"] = EchoThenCompleteProvider()
+            envelope = make_demo_envelope(host, "echo", "echo")
+            object.__setattr__(envelope.manifest, "requested_tools", ("custom.echo",))
+            object.__setattr__(envelope.permit, "grants", (ToolGrant("custom.echo"),))
+            host.signer.seal(envelope)
+
+            with self.assertRaisesRegex(SecurityError, "not granted"):
+                host.run(envelope)
 
     def test_host_rejects_oversized_tool_output_before_checkpointing_it(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2518,6 +2578,20 @@ class AgentSideToolingTests(unittest.TestCase):
             "PORTMARK_SIGNING_ISSUER": material["issuer"],
         }
 
+    def _policy(self, directory, tools):
+        path = Path(directory) / "host-policy.json"
+        path.write_text(json.dumps({
+            "version": "policy-v1",
+            "budget": {"max_steps": 10, "max_tool_calls": 5, "max_output_bytes": 65536},
+            "tools": tools,
+        }), encoding="utf-8")
+        return path
+
+    def _tool_module(self, directory, body):
+        path = Path(directory) / "custom_tools.py"
+        path.write_text(body, encoding="utf-8")
+        return path
+
     def _run_cli(self, argv, env):
         output = io.StringIO()
         with patch.dict(os.environ, env, clear=False):
@@ -2525,6 +2599,83 @@ class AgentSideToolingTests(unittest.TestCase):
                 with redirect_stdout(output), redirect_stderr(io.StringIO()):
                     cli_main()
         return json.loads(output.getvalue())
+
+    def test_cli_refuses_custom_tools_without_policy_path(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with patch.object(sys, "argv", ["portmark", "--tools", "custom_tools:registry", "demo"]):
+                stderr = io.StringIO()
+                with redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as caught:
+                        cli_main()
+
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("--tools requires --policy-path", stderr.getvalue())
+
+    def test_cli_rejects_missing_tools_module_or_function(self):
+        with tempfile.TemporaryDirectory() as directory:
+            policy_path = self._policy(directory, {
+                "catalog.search": {"impact": "low", "constraints": {"max_limit": 5}},
+            })
+            cases = [
+                ("missing_tools_module:registry", "could not load --tools"),
+                ("custom_tools:missing_registry", "could not load --tools"),
+                ("custom_tools", "module:function"),
+            ]
+            self._tool_module(directory, "from portmark.tools import ToolRegistry\n\ndef registry():\n    return ToolRegistry()\n")
+            with patch.dict(os.environ, {}, clear=True):
+                with patch.object(sys, "path", [directory, *sys.path]):
+                    for loader, message in cases:
+                        with self.subTest(loader=loader):
+                            sys.modules.pop("custom_tools", None)
+                            with patch.object(sys, "argv", ["portmark", "--policy-path", str(policy_path), "--tools", loader, "demo"]):
+                                stderr = io.StringIO()
+                                with redirect_stderr(stderr):
+                                    with self.assertRaises(SystemExit) as caught:
+                                        cli_main()
+                            self.assertEqual(caught.exception.code, 2)
+                            self.assertIn(message, stderr.getvalue())
+
+    def test_cli_rejects_tools_loader_returning_the_wrong_type(self):
+        with tempfile.TemporaryDirectory() as directory:
+            policy_path = self._policy(directory, {
+                "catalog.search": {"impact": "low", "constraints": {"max_limit": 5}},
+            })
+            self._tool_module(directory, "def registry():\n    return {'catalog.search': object()}\n")
+            with patch.dict(os.environ, {}, clear=True):
+                with patch.object(sys, "path", [directory, *sys.path]):
+                    sys.modules.pop("custom_tools", None)
+                    with patch.object(sys, "argv", ["portmark", "--policy-path", str(policy_path), "--tools", "custom_tools:registry", "demo"]):
+                        stderr = io.StringIO()
+                        with redirect_stderr(stderr):
+                            with self.assertRaises(SystemExit) as caught:
+                                cli_main()
+
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("must return a portmark.tools.ToolRegistry", stderr.getvalue())
+
+    def test_cli_demo_uses_loaded_custom_tools_when_policy_grants_them(self):
+        with tempfile.TemporaryDirectory() as directory:
+            policy_path = self._policy(directory, {
+                "catalog.search": {"impact": "low", "constraints": {"max_limit": 5}, "output_projection": ["id", "title"]},
+            })
+            self._tool_module(directory, """
+from portmark.tools import ToolRegistry
+
+def registry():
+    tools = ToolRegistry()
+    tools.register("catalog.search", lambda arguments: [{"id": "custom-1", "title": "Custom result"}])
+    return tools
+""")
+            with patch.dict(os.environ, {}, clear=True):
+                with patch.object(sys, "path", [directory, *sys.path]):
+                    sys.modules.pop("custom_tools", None)
+                    result = self._run_cli(
+                        ["portmark", "--policy-path", str(policy_path), "--tools", "custom_tools:registry", "demo", "find custom"],
+                        {},
+                    )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["result"]["evidence"], [{"id": "custom-1", "title": "Custom result"}])
 
     def test_trust_registry_path_is_honoured_without_an_operator_private_key(self):
         """A host given only a registry file must trust the keys inside it.

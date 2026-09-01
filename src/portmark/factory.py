@@ -13,7 +13,7 @@ from .policy import load_host_policy
 from .providers import DeterministicProvider, GenericHttpProvider, NativeWasmtimeComponentProvider, WasmDecisionProvider
 from .security import AttestationPolicy, EnvelopeSigner, EnvelopeSigningIdentity, ExternalAttestationVerifier, HmacEnvelopeSigner, HostPolicy, load_trust_registry
 from .storage import RuntimeStore, SQLiteRuntimeStore
-from .tools import demo_registry
+from .tools import ToolRegistry, demo_registry
 
 
 HOST_ID = "host:local-demo"
@@ -58,6 +58,7 @@ def make_host(
     policy_path: str | None = None,
     trust_registry_path: str | None = None,
     reload_policy: bool = False,
+    tools: ToolRegistry | None = None,
 ) -> AgentHost:
     providers = {"deterministic": DeterministicProvider()}
     if provider_endpoint:
@@ -98,7 +99,7 @@ def make_host(
         host_id,
         signer or signer_from_environment(host_id, configured_trust_registry_path),
         policy,
-        demo_registry(),
+        tools if tools is not None else demo_registry(),
         providers,
         configured_store,
         configured_attestation_policy,

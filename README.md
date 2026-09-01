@@ -96,7 +96,8 @@ dropping a constraint. Three things are worth knowing before the first run:
 
 The tools behind that boundary — `catalog.search` and `payments.reserve` — are deterministic
 stubs. The enforcement around them is real and tested; the things being enforced against are
-placeholders for your own.
+placeholders for your own. See [TOOLS.md](TOOLS.md) for installing a custom `ToolRegistry` with
+`--tools module:function`, granting it in host policy, and controlling provider-visible output.
 
 ## Security boundary
 
