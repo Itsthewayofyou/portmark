@@ -2,14 +2,24 @@ name: Release
 
 # Publishes to PyPI using Trusted Publishing: GitHub proves this workflow's identity
 # to PyPI with a short-lived OIDC token, so no API token exists to store or leak.
-# There is deliberately no `password:` and no repository secret anywhere below.
+# There is deliberately no `password:` key and no `secrets.` reference below.
 #
-# Triggered by pushing a version tag:  git tag v0.3.0 && git push origin v0.3.0
+# Triggered ONLY by pushing a version tag:  git tag v0.3.0 && git push origin v0.3.0
+#
+# workflow_dispatch is deliberately absent. It would let anyone with write access run
+# this workflow from any branch, where github.ref is not a tag -- skipping the
+# tag/version agreement check and publishing whatever that branch contains. A failed
+# publish is re-run from the Actions UI on the original tag run instead, so nothing
+# is lost by leaving it out.
+#
+# Every action is pinned to a commit SHA, not a moving tag. The publish job holds
+# id-token: write, which is enough to release under this project's name, so a
+# compromised `@release/v1` or `@v7` would be a supply-chain path straight to PyPI.
+# Dependabot bumps these pins; see .github/dependabot.yml.
 
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch:
 
 permissions: {}
 
@@ -20,8 +30,8 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
 
@@ -36,10 +46,9 @@ jobs:
       - name: Run regression tests
         run: python -m unittest discover -s tests
 
-      # A tag that disagrees with pyproject would publish the wrong version number
-      # under the right-looking tag. Fail before anything is uploaded.
+      # Unconditional: there is no trigger that reaches this job without a tag, and a
+      # skipped check is indistinguishable from a passing one.
       - name: Check the tag matches the package version
-        if: startsWith(github.ref, 'refs/tags/v')
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
           PKG_VERSION=$(python -c "import importlib.metadata as m; print(m.version('portmark'))")
@@ -54,7 +63,7 @@ jobs:
       - name: Check distribution metadata
         run: python -m twine check --strict dist/*
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: distributions
           path: dist/
@@ -70,12 +79,12 @@ jobs:
       url: https://pypi.org/p/portmark
     permissions:
       # The only permission this job holds. It cannot read the repository,
-      # and it holds no token that outlives the run.
+      # and it holds no credential that outlives the run.
       id-token: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: distributions
           path: dist/
       - name: Publish package distributions to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2

@@ -37,6 +37,17 @@ git tag v0.3.0
 git push origin v0.3.0
 ```
 
+A pushed tag is the **only** trigger. `workflow_dispatch` is deliberately absent: it would run
+this workflow from any branch, where `github.ref` is not a tag, skipping the tag/version check
+and publishing whatever that branch contains. To retry a failed publish, re-run the original
+tag's run from the Actions tab.
+
+Every action is pinned to a commit SHA rather than a moving tag such as `@release/v1` or `@v7`.
+The publish job holds `id-token: write`, which is enough to release under this project's name, so
+a compromised action tag would be a supply-chain path straight to PyPI. Dependabot bumps the pins
+weekly — see `.github/dependabot.yml`. When updating a pin by hand, verify the SHA belongs to the
+tag in its trailing comment.
+
 The tag push triggers `.github/workflows/release.yml`, which:
 
 - reinstalls and **re-runs the full test suite against the exact tagged tree**, because a tag can
