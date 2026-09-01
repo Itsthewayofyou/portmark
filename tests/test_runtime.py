@@ -224,6 +224,41 @@ class RuntimeTests(unittest.TestCase):
         self.assertNotIn("task-123", text)
         self.assertNotIn("payments.reserve", text)
 
+    def test_external_validation_documents_are_reviewable_and_actionable(self):
+        root = Path(__file__).parents[1]
+        threat_model = (root / "THREAT_MODEL.md").read_text(encoding="utf-8")
+        security_policy = (root / "SECURITY.md").read_text(encoding="utf-8")
+        validation = (root / "EXTERNAL_VALIDATION.md").read_text(encoding="utf-8")
+
+        for required in (
+            "## Executive Summary",
+            "## Scope And Assumptions",
+            "## System Model",
+            "## Assets And Security Objectives",
+            "## Attacker Model",
+            "## Entry Points And Attack Surfaces",
+            "## Top Abuse Paths",
+            "## Threat Model Table",
+            "## Focus Paths For Security Review",
+            "## Residual Risks",
+        ):
+            with self.subTest(document="threat_model", required=required):
+                self.assertIn(required, threat_model)
+        for threat_id in ("TM-001", "TM-002", "TM-003", "TM-004", "TM-005", "TM-006", "TM-007", "TM-008"):
+            with self.subTest(threat_id=threat_id):
+                self.assertIn(threat_id, threat_model)
+
+        for required in ("## Supported Versions", "## Reporting A Vulnerability", "## Handling Timeline", "## Security Scope"):
+            with self.subTest(document="security", required=required):
+                self.assertIn(required, security_policy)
+
+        for task_id in ("EV-001", "EV-002", "EV-003", "EV-004", "EV-005", "EV-006", "EV-007"):
+            with self.subTest(task_id=task_id):
+                self.assertIn(task_id, validation)
+        self.assertIn("| Task ID | Priority | Finding | Concrete Task | Acceptance Criteria | Related Threats |", validation)
+        self.assertNotIn("harden more", validation.lower())
+        self.assertNotIn("todo", validation.lower())
+
     def test_runtime_config_merges_environment_and_cli_arguments(self):
         environment = {
             "PORTMARK_HOST_ID": "host:env",
