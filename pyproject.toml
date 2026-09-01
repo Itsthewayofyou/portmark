@@ -4,12 +4,31 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "portmark"
-version = "0.1.0"
+version = "0.2.0"
 description = "Provider-neutral, capability-secured portable agent reference runtime"
+readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
+keywords = ["agent", "a2a", "capability", "security", "audit", "wasm", "sandbox"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
 dependencies = ["cryptography==50.0.1", "uvicorn==0.52.4"]
+
+[project.urls]
+Homepage = "https://github.com/Itsthewayofyou/portmark"
+Repository = "https://github.com/Itsthewayofyou/portmark"
+Issues = "https://github.com/Itsthewayofyou/portmark/issues"
+Changelog = "https://github.com/Itsthewayofyou/portmark/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 a2a = ["a2a-sdk==1.1.2"]

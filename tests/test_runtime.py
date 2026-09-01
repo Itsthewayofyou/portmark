@@ -3207,6 +3207,29 @@ def registry():
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["result"]["evidence"], [{"id": "custom-1", "title": "Custom result"}])
 
+    def test_host_refuses_to_start_when_an_agent_signing_identity_leaks_into_its_environment(self):
+        """The documented quickstart exports an agent key; the host must not adopt it.
+
+        Every run signs an audit head with the host id as issuer, so a host holding an
+        agent's PORTMARK_SIGNING_ISSUER could only ever fail on its first request with
+        "audit head host does not match signing identity". Fail at boot and name both
+        values instead. Regression: the README quickstart eval'd the keygen exports and
+        then started the server in the same shell.
+        """
+        material = generate_signing_material("leaked-agent-key", "user:alice")
+        leaked = {
+            "PORTMARK_ED25519_PRIVATE_KEY_B64": material["private_key_b64"],
+            "PORTMARK_SIGNING_KEY_ID": material["key_id"],
+            "PORTMARK_SIGNING_ISSUER": material["issuer"],
+        }
+        with patch.dict(os.environ, leaked, clear=True):
+            with self.assertRaisesRegex(ValueError, "must equal host id"):
+                make_host()
+
+        # Control: the same host builds cleanly once the agent key is out of the way.
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNotNone(make_host())
+
     def test_trust_registry_path_is_honoured_without_an_operator_private_key(self):
         """A host given only a registry file must trust the keys inside it.
 
