@@ -273,12 +273,17 @@ class AttestationPolicy:
         required_for_execution: bool = False,
         required_for_migration: bool = False,
         external_verifier: ExternalAttestationVerifierProtocol | None = None,
+        require_execution_nonce: bool = False,
     ) -> None:
         self._authorities = {authority.key_id: authority for authority in authorities}
         self.allowed_measurements = allowed_measurements
         self.required_for_execution = required_for_execution
         self.required_for_migration = required_for_migration
         self.external_verifier = external_verifier
+        # When set, execution attestation must carry a nonce that matches the
+        # permit nonce — an empty nonce is rejected rather than skipped. Off by
+        # default because migrated measurement evidence is legitimately unbound.
+        self.require_execution_nonce = require_execution_nonce
 
     def verify_execution(self, permit: Permit, host_id: str, now: int | None = None) -> None:
         if not self.required_for_execution and permit.attestation is None:
@@ -289,6 +294,7 @@ class AttestationPolicy:
             relying_party=permit.issuer,
             expected_nonce=permit.nonce,
             now=now,
+            require_nonce=self.require_execution_nonce,
         )
 
     def verify_migration(self, evidence: AttestationEvidence | None, destination: str, source_host_id: str, now: int | None = None) -> None:
@@ -303,6 +309,7 @@ class AttestationPolicy:
         relying_party: str,
         expected_nonce: str | None = None,
         now: int | None = None,
+        require_nonce: bool = False,
     ) -> None:
         if evidence is None:
             raise SecurityError("attestation evidence is required")
@@ -329,8 +336,16 @@ class AttestationPolicy:
             raise SecurityError("attestation evidence has expired")
         if self.allowed_measurements and evidence.measurement not in self.allowed_measurements:
             raise SecurityError("attestation measurement is not approved")
-        if expected_nonce is not None and evidence.nonce and not hmac.compare_digest(evidence.nonce, expected_nonce):
-            raise SecurityError("attestation nonce does not match permit")
+        # `and evidence.nonce` used to short-circuit here, so evidence with
+        # nonce="" was accepted for any permit nonce. A non-empty nonce must
+        # always match; when the policy requires a bound execution nonce, an
+        # empty nonce is rejected too (migrated measurement evidence is
+        # legitimately unbound, so this stays opt-in).
+        if expected_nonce is not None:
+            if require_nonce and not evidence.nonce:
+                raise SecurityError("attestation nonce is required but missing")
+            if evidence.nonce and not hmac.compare_digest(evidence.nonce, expected_nonce):
+                raise SecurityError("attestation nonce does not match permit")
         if self.external_verifier is not None and not evidence.quote:
             raise SecurityError("attestation quote is required for external verification")
         if authority is not None:
