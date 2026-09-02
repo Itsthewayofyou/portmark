@@ -32,7 +32,7 @@ from portmark.config import RuntimeConfig
 from portmark.factory import build_envelope, make_demo_envelope, make_host, signer_from_environment
 from portmark.metrics import RuntimeMetrics
 from portmark.logging_config import JsonLogFormatter
-from portmark.models import AgentEnvelope, AgentManifest, AgentState, AttestationEvidence, Permit, ProviderDecision, ResourceBudget, ToolGrant
+from portmark.models import AgentState, AttestationEvidence, Permit, ProviderDecision, ResourceBudget, ToolGrant
 from portmark.providers import GenericHttpProvider, ModelProvider, NativeWasmtimeComponentProvider
 from portmark.policy import load_host_policy
 from portmark.security import (
@@ -2195,6 +2195,20 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["host"], "127.0.0.1")
         self.assertEqual(run.call_args.kwargs["limit_concurrency"], DEFAULT_MAX_CONCURRENT_REQUESTS)
 
+    def test_serve_warns_when_tls_not_asserted(self):
+        host = make_host()
+        # HSTS off => TLS not asserted => a loud startup warning must fire.
+        with patch("uvicorn.run"):
+            with self.assertLogs("portmark.a2a", level="WARNING") as captured:
+                serve(host, "127.0.0.1", 8080, enable_hsts=False)
+        joined = "\n".join(captured.output)
+        self.assertIn("TLS NOT asserted", joined)
+        self.assertIn("NOT encrypted in transit", joined)
+        # HSTS on => operator asserted HTTPS => no false alarm.
+        with patch("uvicorn.run"):
+            with self.assertNoLogs("portmark.a2a", level="WARNING"):
+                serve(host, "127.0.0.1", 8080, enable_hsts=True)
+
     def _asgi_call(self, app, method, path, headers=None, body=b"", client=("203.0.113.9", 5555)):
         """Drive an ASGI app directly and collect the response."""
         scope = {
@@ -2217,6 +2231,25 @@ class RuntimeTests(unittest.TestCase):
         response_headers = {k.decode(): v.decode() for k, v in sent[0]["headers"]}
         payload = b"".join(m.get("body", b"") for m in sent[1:])
         return status, response_headers, payload
+
+    def test_forwarded_proto_http_warns_once_of_cleartext(self):
+        host = make_host()
+        app = make_asgi_app(host)
+        headers = {"Content-Type": "application/json", "X-Forwarded-Proto": "http"}
+        # A request proven to arrive over plain HTTP must warn.
+        with self.assertLogs("portmark.a2a", level="WARNING") as captured:
+            self._asgi_call(app, "POST", "/message:send", headers, body=b"{}")
+        self.assertIn("PROVEN cleartext", "\n".join(captured.output))
+        # Subsequent cleartext requests stay quiet — logged once.
+        with self.assertNoLogs("portmark.a2a", level="WARNING"):
+            self._asgi_call(app, "POST", "/message:send", headers, body=b"{}")
+
+    def test_forwarded_proto_https_does_not_warn(self):
+        host = make_host()
+        app = make_asgi_app(host)
+        headers = {"Content-Type": "application/json", "X-Forwarded-Proto": "https"}
+        with self.assertNoLogs("portmark.a2a", level="WARNING"):
+            self._asgi_call(app, "POST", "/message:send", headers, body=b"{}")
 
     def test_asgi_app_serves_agent_card_with_security_headers(self):
         app = make_asgi_app(make_host())
