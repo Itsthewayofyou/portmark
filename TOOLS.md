@@ -90,6 +90,50 @@ Example policy:
 `--policy-path` is required when `--tools` is used so custom capabilities cannot
 be loaded under the demo-only default policy by accident.
 
+## How Two Constraint Sets Combine
+
+When the manifest, the permit, and the host policy all constrain the same tool,
+their constraints are merged. The merge only ever narrows: anything the merged
+constraints accept is accepted by every input. A merge that cannot be proven
+narrower drops the grant rather than guessing.
+
+Per key:
+
+| Key | Combined as |
+| --- | --- |
+| `minimum`, `min_length` | the larger of the two |
+| `maximum`, `max_length` | the smaller of the two |
+| `enum`, `allowed_schemes`, `allowed_hosts`, `allowed_domains` | set intersection; empty drops the grant |
+| `const`, `pattern`, `scheme` | must be identical, or the grant is dropped |
+| `type` | set intersection of the type lists; empty drops the grant |
+| `required` | required if either side requires it |
+| `additional_arguments` | `false` if either side says `false` |
+| flat `max_x` | the smaller of the two |
+| flat `allowed_x` | set intersection; empty drops the grant |
+| anything else | drops the grant |
+
+An argument named by only one side keeps that side's constraint — more
+constraint is narrower. But `additional_arguments: false` turns the set of
+argument **names** into a whitelist, so those names are intersected first and
+every key is gated on the result. A constraint naming an argument the other side
+would have refused drops the grant, because every flat constraint also requires
+its argument to be present, and the combination is then unsatisfiable.
+
+Three cases are deliberately conservative, and drop a grant that could in
+principle have been merged:
+
+- `"integer"` against `"number"` intersects to empty. Ranking the numeric tower
+  is not worth the risk of getting the direction backwards.
+- `allowed_domains: ["example.com"]` against `["api.example.com"]` intersects to
+  empty, even though the second is a subdomain of the first.
+- An unrecognised key drops the grant. A key added in a later version could mean
+  "relax", and copying it across would create authority.
+
+**Practical advice: constrain each argument in one place.** Putting the same
+argument's bounds in both the permit and the host policy works only when the two
+narrow cleanly; putting them in one place always works. If a grant disappears,
+the host's error names the key that failed to combine.
+
 ## Output Projection
 
 Tool return values are stored in the local checkpoint, but remote providers do

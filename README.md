@@ -99,6 +99,10 @@ dropping a constraint. Three things are worth knowing before the first run:
   re-posting it is a replay and the host refuses it. Rebuild it from the spec each time.
 - **Host policy is a ceiling, not a suggestion.** A tool granted here that the host policy does
   not allow is dropped from the effective permit; the agent runs without it rather than failing.
+- **Constrain each argument in one place.** When the envelope and the policy both constrain the
+  same argument, the two are merged, and the merge only ever narrows — a combination Portmark
+  cannot prove is narrower drops the grant instead of guessing. If a tool disappears, the host's
+  error names the stage and the key responsible. The full table is in [TOOLS.md](TOOLS.md).
 
 The tools behind that boundary — `catalog.search` and `payments.reserve` — are deterministic
 stubs. The enforcement around them is real and tested; the things being enforced against are

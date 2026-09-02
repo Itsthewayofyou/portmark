@@ -649,9 +649,124 @@ class HmacEnvelopeSigner:
             raise SecurityError("audit head signature is invalid")
 
 
-def _constraint_intersection(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any] | None:
+RESERVED_CONSTRAINT_KEYS = frozenset({"arguments", "required", "additional_arguments"})
+
+# Every key `_check_argument_schema` enforces, and how two of them combine so the
+# result admits no more than either input. Anything absent from this table is
+# unknown, and an unknown key is refused rather than merged: a future key could
+# mean "relax", and merging it blindly would create authority.
+_SPEC_NARROWERS: dict[str, str] = {
+    "type": "type-intersection",
+    "const": "identical",
+    "enum": "list-intersection",
+    "minimum": "numeric-max",
+    "maximum": "numeric-min",
+    "min_length": "numeric-max",
+    "max_length": "numeric-min",
+    "pattern": "identical",
+    "required": "either-true",
+    "scheme": "identical",
+    "allowed_schemes": "list-intersection",
+    "allowed_hosts": "list-intersection",
+    "allowed_domains": "list-intersection",
+}
+
+
+def _permitted_argument_names(constraints: dict[str, Any]) -> set[str] | None:
+    """Argument names this constraint set admits, or None when it admits any.
+
+    Mirrors `check_constraints` exactly, including the part that is easy to miss:
+    `additional_arguments: False` is inert unless an `arguments` schema is also
+    present, because the whitelist is only consulted inside that branch.
+    """
+    schema = constraints.get("arguments")
+    if not isinstance(schema, dict):
+        return None
+    if constraints.get("additional_arguments", True) is not False:
+        return None
+    required = constraints.get("required")
+    names = set(schema) | _legacy_constrained_arguments(constraints)
+    if isinstance(required, (list, tuple)):
+        names |= {item for item in required if isinstance(item, str)}
+    return names
+
+
+def _narrow_argument_spec(left: dict[str, Any], right: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """Combine two specs for the same argument. Returns (merged, failing_key)."""
     result: dict[str, Any] = {}
     for key in left.keys() | right.keys():
+        rule = _SPEC_NARROWERS.get(key)
+        if rule is None:
+            return None, key
+        if key not in left:
+            result[key] = right[key]
+            continue
+        if key not in right:
+            result[key] = left[key]
+            continue
+        if left[key] == right[key]:
+            result[key] = left[key]
+            continue
+        if rule == "identical":
+            return None, key
+        if rule == "either-true":
+            result[key] = bool(left[key]) or bool(right[key])
+            continue
+        if rule in {"numeric-max", "numeric-min"}:
+            if not all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in (left[key], right[key])):
+                return None, key
+            result[key] = max(left[key], right[key]) if rule == "numeric-max" else min(left[key], right[key])
+            continue
+        if rule == "list-intersection":
+            if not isinstance(left[key], list) or not isinstance(right[key], list):
+                return None, key
+            shared = [item for item in left[key] if item in right[key]]
+            if not shared:
+                return None, key
+            result[key] = shared
+            continue
+        if rule == "type-intersection":
+            # `type` accepts a bare string or a list of them, and a value passes
+            # if it matches ANY entry, so intersecting the lists narrows. The
+            # intersection is set-based, which means "integer" and "number" come
+            # out empty and drop the grant rather than trying to rank the two.
+            shared = [item for item in _as_type_list(left[key]) if item in _as_type_list(right[key])]
+            if not shared:
+                return None, key
+            result[key] = shared
+            continue
+        return None, key
+    return result, None
+
+
+def _as_type_list(value: Any) -> list[Any]:
+    return list(value) if isinstance(value, list) else [value]
+
+
+def _constraint_intersection(left: dict[str, Any], right: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """Combine two constraint sets so the result admits no more than either input.
+
+    Returns (merged, None) on success, or (None, failing_key) naming the key that
+    could not be combined, which is what the "was not granted" diagnostic reports.
+
+    The load-bearing subtlety is that a constraint set's argument-NAME whitelist
+    is derived from its own keys. Copying a key across from the other side can
+    therefore enlarge that whitelist, so a plain per-key merge widens authority
+    even when every individual key is narrowed correctly. The name set is
+    intersected first, and every key is then gated on it.
+    """
+    permitted = _intersect_permitted_names(left, right)
+    result: dict[str, Any] = {}
+
+    for key in left.keys() | right.keys():
+        if key in RESERVED_CONSTRAINT_KEYS:
+            continue
+        argument = _constrained_argument_name(key)
+        if permitted is not None and argument not in permitted:
+            # Every flat constraint also demands the argument be present, so a
+            # constraint on an excluded name makes the set unsatisfiable. Drop
+            # the grant rather than silently discarding the requirement.
+            return None, key
         if key not in left:
             result[key] = right[key]
         elif key not in right:
@@ -663,11 +778,116 @@ def _constraint_intersection(left: dict[str, Any], right: dict[str, Any]) -> dic
         elif key.startswith("allowed_") and isinstance(left[key], list) and isinstance(right[key], list):
             shared = [v for v in left[key] if v in right[key]]
             if not shared:
-                return None
+                return None, key
             result[key] = shared
         else:
-            return None
-    return result
+            return None, key
+
+    merged_schema, failing_key = _merge_argument_schemas(left, right, permitted)
+    if failing_key is not None:
+        return None, failing_key
+    if merged_schema is not None:
+        result["arguments"] = merged_schema
+
+    merged_required, failing_key = _merge_required(left, right, permitted)
+    if failing_key is not None:
+        return None, failing_key
+    if merged_required is not None:
+        result["required"] = merged_required
+
+    additional, failing_key = _merge_additional_arguments(left, right)
+    if failing_key is not None:
+        return None, failing_key
+    if additional is not None:
+        result["additional_arguments"] = additional
+    return result, None
+
+
+def _intersect_permitted_names(left: dict[str, Any], right: dict[str, Any]) -> set[str] | None:
+    left_names = _permitted_argument_names(left)
+    right_names = _permitted_argument_names(right)
+    if left_names is None:
+        return right_names
+    if right_names is None:
+        return left_names
+    return left_names & right_names
+
+
+def _constrained_argument_name(key: str) -> str:
+    if key.startswith("max_"):
+        return key[4:]
+    if key.startswith("allowed_"):
+        return key[8:]
+    return key
+
+
+def _merge_argument_schemas(
+    left: dict[str, Any], right: dict[str, Any], permitted: set[str] | None
+) -> tuple[dict[str, Any] | None, str | None]:
+    left_schema = left.get("arguments")
+    right_schema = right.get("arguments")
+    if left_schema is None and right_schema is None:
+        return None, None
+    for schema in (left_schema, right_schema):
+        if schema is not None and not isinstance(schema, dict):
+            return None, "arguments"
+    left_schema = left_schema or {}
+    right_schema = right_schema or {}
+
+    merged: dict[str, Any] = {}
+    for name in left_schema.keys() | right_schema.keys():
+        left_spec = left_schema.get(name)
+        right_spec = right_schema.get(name)
+        for spec in (left_spec, right_spec):
+            if spec is not None and not isinstance(spec, dict):
+                return None, f"arguments.{name}"
+        if permitted is not None and name not in permitted:
+            # The name is refused outright by the merged whitelist. Dropping a
+            # dead spec is safe; dropping one that demands the argument be
+            # present is not, because the set is then unsatisfiable.
+            if (left_spec or {}).get("required") is True or (right_spec or {}).get("required") is True:
+                return None, f"arguments.{name}"
+            continue
+        if left_spec is None:
+            merged[name] = right_spec
+            continue
+        if right_spec is None:
+            merged[name] = left_spec
+            continue
+        spec, failing_key = _narrow_argument_spec(left_spec, right_spec)
+        if spec is None:
+            return None, f"arguments.{name}.{failing_key}"
+        merged[name] = spec
+    return merged, None
+
+
+def _merge_required(
+    left: dict[str, Any], right: dict[str, Any], permitted: set[str] | None
+) -> tuple[list[str] | None, str | None]:
+    names: set[str] = set()
+    seen = False
+    for side in (left, right):
+        value = side.get("required")
+        if value is None:
+            continue
+        if not isinstance(value, (list, tuple)):
+            return None, "required"
+        seen = True
+        names |= set(value)
+    if not seen:
+        return None, None
+    if permitted is not None and not names <= permitted:
+        return None, "required"
+    return sorted(names), None
+
+
+def _merge_additional_arguments(left: dict[str, Any], right: dict[str, Any]) -> tuple[bool | None, str | None]:
+    values = [side["additional_arguments"] for side in (left, right) if "additional_arguments" in side]
+    if not values:
+        return None, None
+    if not all(isinstance(value, bool) for value in values):
+        return None, "additional_arguments"
+    return all(values), None
 
 
 def intersect_grants(*grant_sets: tuple[ToolGrant, ...]) -> tuple[ToolGrant, ...]:
@@ -678,7 +898,7 @@ def intersect_grants(*grant_sets: tuple[ToolGrant, ...]) -> tuple[ToolGrant, ...
         incoming = {grant.name: grant for grant in grants}
         next_current: dict[str, ToolGrant] = {}
         for name in current.keys() & incoming.keys():
-            constraints = _constraint_intersection(current[name].constraints, incoming[name].constraints)
+            constraints, _ = _constraint_intersection(current[name].constraints, incoming[name].constraints)
             if constraints is not None:
                 next_current[name] = ToolGrant(
                     name,
@@ -746,6 +966,52 @@ class HostPolicy:
             budget=permit.budget.intersect(self.budget),
             delegation_allowed=False,
             attestation=permit.attestation,
+        )
+
+    def explain_missing_grant(self, manifest: AgentManifest, permit: Permit, tool: str) -> str:
+        """Say which stage of the intersection removed a tool, and why.
+
+        `effective_permit` folds three grant sets together and reports only the
+        absence, so every misconfiguration produces the same message and points
+        the operator at their envelope — the one place that is often not wrong.
+        This recomputes the chain on the error path, where the cost does not
+        matter, and names the stage that actually dropped the tool.
+        """
+        if tool not in manifest.requested_tools:
+            return (
+                f"tool {tool!r} was not granted: the agent manifest does not request it. "
+                f"Requested tools are {sorted(manifest.requested_tools) or 'none'}."
+            )
+        permit_grant = next((grant for grant in permit.grants if grant.name == tool), None)
+        if permit_grant is None:
+            return (
+                f"tool {tool!r} was not granted: it is requested by the manifest but absent "
+                f"from the permit. Permit grants are {sorted(grant.name for grant in permit.grants) or 'none'}."
+            )
+        policy_grant = next((grant for grant in self.grants if grant.name == tool), None)
+        if policy_grant is None:
+            return (
+                f"tool {tool!r} was not granted: host policy {self.policy_version!r} does not "
+                f"grant it. Policy grants are {sorted(grant.name for grant in self.grants) or 'none'}. "
+                "The host policy is a ceiling, so no permit can add a tool it omits."
+            )
+
+        merged: dict[str, Any] = {}
+        for stage, grant in (("permit", permit_grant), (f"host policy {self.policy_version!r}", policy_grant)):
+            merged_next, failing_key = _constraint_intersection(merged, grant.constraints)
+            if merged_next is None:
+                return (
+                    f"tool {tool!r} was not granted: it is granted by the manifest, the permit and "
+                    f"host policy {self.policy_version!r}, but their constraints could not be combined. "
+                    f"Constraint {failing_key!r} from the {stage} could not be narrowed against what "
+                    "came before it. Portmark refuses a merge it cannot prove is narrower, so the "
+                    "grant is dropped rather than widened. Define this constraint in one place — "
+                    "usually the host policy — instead of both."
+                )
+            merged = merged_next
+        return (
+            f"tool {tool!r} was not granted, and the cause could not be reproduced. "
+            "The permit may have expired or been replaced between the check and this message."
         )
 
     def impact_for_tool(self, tool: str) -> str:

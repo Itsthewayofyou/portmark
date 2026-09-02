@@ -181,6 +181,50 @@ flowchart LR
 - In-process rate limiting is not sufficient as the only control in horizontally scaled deployments.
 - Provider endpoints can be configured with `http` for local gateways; production operators must keep non-loopback provider traffic protected.
 - `GET /.well-known/agent-card.json`, `/healthz`, and `/readyz` intentionally disclose limited operational metadata.
+- A tool failing at call time ends the whole run, so one flaky upstream costs every other reading the agent had collected. Deliberate — see Recorded Decisions below.
+- Two constraint sets that narrow the same argument in ways Portmark cannot prove are narrower cause the grant to be dropped rather than merged. Availability is traded for the guarantee that merging never creates authority.
+
+## Recorded Decisions
+
+### A failing tool ends the run (issue #17)
+
+**Decision: abort stays the default, and there is currently no way to opt out.**
+
+A tool that raises terminates the whole run. The audit chain shows
+`tool.failed` followed immediately by `agent.failed`. An agent collecting from
+three independent sources loses all three when one has a missing credential —
+the remaining two are not refused, they are never attempted.
+
+This was observed twice in one afternoon in the first real deployment: once from
+an absent API key, once from an upstream HTTP 400.
+
+**Why abort:** an agent whose tools partly failed is in a state the host cannot
+reason about. Continuing means acting on information the host knows to be
+incomplete, and every later decision inherits that. Fail-closed is the house
+style, and the audit chain stays a straight line: every run either completed on
+evidence the host can account for, or stopped.
+
+**Why the other side is not silly:** a collector reading N independent sources
+should arguably return N−1 when one is down. Losing everything makes a single
+flaky upstream indistinguishable from a total outage, and a misconfigured permit
+indistinguishable from an API being down.
+
+**What settles it for now:** capability belongs in the permit, not in error
+handling. If a credential is absent, withhold the grant rather than granting it
+and failing — the permit then describes the host's real capability and the
+failure never occurs. That covers every failure predictable before the run. It
+does not cover an upstream that fails at call time, which is the genuine gap.
+
+**If this is revisited**, the shape is a per-grant `on_failure: "abort" | "skip"`
+declared in the permit, so the agent's *authority* states what it may tolerate
+rather than the host guessing. It must satisfy:
+
+- default `abort`, so today's behaviour holds for anyone who does not opt in;
+- intersection rule **abort wins** — the same narrowing discipline as every other
+  constraint, so a permit can never relax a policy that demands abort;
+- a distinct, mandatory `tool.skipped` audit event. A silent skip trades a
+  visible failure for an invisible one, which is strictly worse than the
+  behaviour it replaces.
 
 ## Quality Check
 

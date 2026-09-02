@@ -10,7 +10,7 @@ from .host import AgentHost
 from .metrics import RuntimeMetrics
 from .models import AgentEnvelope, AgentManifest, AgentState, Permit, ResourceBudget, ToolGrant
 from .policy import load_host_policy
-from .providers import DeterministicProvider, GenericHttpProvider, NativeWasmtimeComponentProvider, WasmDecisionProvider
+from .providers import DeterministicProvider, GenericHttpProvider, ModelProvider, NativeWasmtimeComponentProvider, WasmDecisionProvider
 from .security import AttestationPolicy, EnvelopeSigner, EnvelopeSigningIdentity, ExternalAttestationVerifier, HmacEnvelopeSigner, HostPolicy, load_trust_registry
 from .storage import RuntimeStore, create_runtime_store
 from .tools import ToolRegistry, demo_registry
@@ -59,17 +59,25 @@ def make_host(
     trust_registry_path: str | None = None,
     reload_policy: bool = False,
     tools: ToolRegistry | None = None,
+    providers: dict[str, ModelProvider] | None = None,
 ) -> AgentHost:
-    providers = {"deterministic": DeterministicProvider()}
+    # Note the asymmetry with `tools`, which REPLACES the demo registry.
+    # Providers merge over the constructed defaults instead, so passing an
+    # in-process provider does not silently remove `deterministic` and break
+    # every envelope that names it. Callers can still shadow a default by
+    # reusing its key.
+    configured_providers: dict[str, ModelProvider] = {"deterministic": DeterministicProvider()}
     if provider_endpoint:
-        providers["http"] = GenericHttpProvider(provider_endpoint, os.environ.get("MODEL_PROVIDER_TOKEN"))
+        configured_providers["http"] = GenericHttpProvider(provider_endpoint, os.environ.get("MODEL_PROVIDER_TOKEN"))
     if wasm_component:
         if wasm_engine == "wasmtime":
-            providers["wasm"] = NativeWasmtimeComponentProvider.from_file(wasm_component)
+            configured_providers["wasm"] = NativeWasmtimeComponentProvider.from_file(wasm_component)
         elif wasm_engine == "node":
-            providers["wasm"] = WasmDecisionProvider.from_file(wasm_component)
+            configured_providers["wasm"] = WasmDecisionProvider.from_file(wasm_component)
         else:
             raise ValueError("wasm_engine must be 'node' or 'wasmtime'")
+    if providers:
+        configured_providers.update(providers)
     configured_policy_path = policy_path or os.environ.get("PORTMARK_POLICY_PATH")
     configured_trust_registry_path = trust_registry_path or os.environ.get("PORTMARK_TRUST_REGISTRY_PATH")
     policy_loader = (lambda: load_host_policy(configured_policy_path, host_id)) if configured_policy_path else None
@@ -116,7 +124,7 @@ def make_host(
         host_signer,
         policy,
         tools if tools is not None else demo_registry(),
-        providers,
+        configured_providers,
         configured_store,
         configured_attestation_policy,
         policy_loader,
