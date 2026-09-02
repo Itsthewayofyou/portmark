@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "portmark"
-version = "0.3.0"
+version = "0.3.1"
 description = "Provider-neutral, capability-secured portable agent reference runtime"
 readme = "README.md"
 license = "MIT"

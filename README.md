@@ -1,7 +1,7 @@
 # Portmark
 
 [![CI](https://github.com/Itsthewayofyou/portmark/actions/workflows/ci.yml/badge.svg)](https://github.com/Itsthewayofyou/portmark/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/Itsthewayofyou/portmark/blob/main/LICENSE)
 
 **Run someone else's AI agent on your machine without trusting it.**
 
@@ -17,12 +17,12 @@ These are enforced by the host, not requested politely from the agent:
 - **Your policy is a hard ceiling.** `effective_permit` intersects three sets: what the agent's
   manifest asks for, what its permit grants, and what your host policy allows. An agent arriving
   with a permit for `*` still gets only what you allow.
-  ([`security.py`](src/portmark/security.py), `intersect_grants`)
+  ([`security.py`](https://github.com/Itsthewayofyou/portmark/blob/main/src/portmark/security.py), `intersect_grants`)
 - **Budgets take the minimum.** Steps, tool calls, and output bytes are each `min(agent, host)`.
-  A visitor cannot raise its own limits. ([`models.py`](src/portmark/models.py), `ResourceBudget.intersect`)
+  A visitor cannot raise its own limits. ([`models.py`](https://github.com/Itsthewayofyou/portmark/blob/main/src/portmark/models.py), `ResourceBudget.intersect`)
 - **Wasm capsules declaring any import are refused, not sandboxed.** The guest therefore has no
   filesystem, network, process, environment, clock, randomness, or credential access at all.
-  ([`wasm_runner.mjs`](src/portmark/wasm_runner.mjs))
+  ([`wasm_runner.mjs`](https://github.com/Itsthewayofyou/portmark/blob/main/src/portmark/wasm_runner.mjs))
 - **Permits can only narrow on migration.** One hop, bound to the named destination, grants and
   budgets cannot increase, and further delegation is disabled. A visiting agent cannot accept a
   narrow permit at your door and widen it on the next hop.
@@ -102,11 +102,11 @@ dropping a constraint. Three things are worth knowing before the first run:
 - **Constrain each argument in one place.** When the envelope and the policy both constrain the
   same argument, the two are merged, and the merge only ever narrows — a combination Portmark
   cannot prove is narrower drops the grant instead of guessing. If a tool disappears, the host's
-  error names the stage and the key responsible. The full table is in [TOOLS.md](TOOLS.md).
+  error names the stage and the key responsible. The full table is in [TOOLS.md](https://github.com/Itsthewayofyou/portmark/blob/main/TOOLS.md).
 
 The tools behind that boundary — `catalog.search` and `payments.reserve` — are deterministic
 stubs. The enforcement around them is real and tested; the things being enforced against are
-placeholders for your own. See [TOOLS.md](TOOLS.md) for installing a custom `ToolRegistry` with
+placeholders for your own. See [TOOLS.md](https://github.com/Itsthewayofyou/portmark/blob/main/TOOLS.md) for installing a custom `ToolRegistry` with
 `--tools module:function`, granting it in host policy, and controlling provider-visible output.
 
 ## Security boundary
@@ -130,7 +130,7 @@ constraints, step budgets, tool-call budgets, output limits, and a hash-chained 
 Host policy can be loaded from JSON and every run records the active policy version and hash in
 the audit log. High-impact tools such as external payments, destructive actions, credentialed
 access, and data-exfiltration-risk actions require signed approval tokens bound to the task,
-permit nonce, tool arguments, and active policy hash. See [POLICY.md](POLICY.md) for the policy
+permit nonce, tool arguments, and active policy hash. See [POLICY.md](https://github.com/Itsthewayofyou/portmark/blob/main/POLICY.md) for the policy
 format, reload behavior, approval-token contract, and audit events.
 
 Migration requires `delegation_allowed` on the incoming permit. The source host can then create
@@ -143,12 +143,12 @@ Hosts can require signed confidential-computing attestation evidence before sens
 or delegated migration. The reference verifier binds the attested host identity, relying-party
 audience, approved measurement, freshness window, optional nonce, and verifier signature before
 the host runs the agent or emits a migration envelope. Deployments can also configure a bounded,
-shell-free external verifier command for platform quotes. See [ATTESTATION.md](ATTESTATION.md) for
+shell-free external verifier command for platform quotes. See [ATTESTATION.md](https://github.com/Itsthewayofyou/portmark/blob/main/ATTESTATION.md) for
 the evidence format, verification flow, external-verifier contract, sealed-storage decision, and
 residual risks.
 
 Envelopes are signed with Ed25519 by default and verified through a key-ID-based trust registry.
-See [SIGNING_KEYS.md](SIGNING_KEYS.md) for key generation, rotation, revocation, trust
+See [SIGNING_KEYS.md](https://github.com/Itsthewayofyou/portmark/blob/main/SIGNING_KEYS.md) for key generation, rotation, revocation, trust
 bootstrap guidance, and why SPIFFE is a planned opt-in rather than the trust root. The legacy HMAC signer is retained only behind
 `PORTMARK_ALLOW_LEGACY_HMAC=unsafe-test-only` plus an explicit `PORTMARK_SIGNING_KEY`.
 
@@ -188,7 +188,7 @@ artifact.
 The host executes each capsule in a short-lived worker with a strict deadline and rejects every
 module declaring an import. Its signed SHA-256 digest is checked before execution. Tool actions
 returned by the capsule still pass through the same host permit and argument enforcement as
-model-provider proposals. See [WASM_COMPONENTS.md](WASM_COMPONENTS.md) for the WIT binding
+model-provider proposals. See [WASM_COMPONENTS.md](https://github.com/Itsthewayofyou/portmark/blob/main/WASM_COMPONENTS.md) for the WIT binding
 contract. The included example capsule performs a projected `catalog.search` step and then
 completes from checkpointed tool output.
 
@@ -212,13 +212,13 @@ PORTMARK_A2A_TOKEN=change-me PYTHONPATH=src python -m portmark.cli serve --port 
 
 The reference A2A server is loopback-only for public deployments.
 Front it with a production HTTP proxy such as the Nginx example in
-[`deploy/nginx/portmark.conf`](deploy/nginx/portmark.conf). Public interface
+[`deploy/nginx/portmark.conf`](https://github.com/Itsthewayofyou/portmark/blob/main/deploy/nginx/portmark.conf). Public interface
 binds are refused; the legacy `--allow-direct-a2a` flag is accepted only for
 configuration compatibility and does not bypass the loopback requirement. The
 public Agent Card route is rate-limited separately from `/message:send`.
 
 The Agent Card is available at `/.well-known/agent-card.json`; signed envelopes are submitted to
-`/message:send` with the A2A JSON-RPC `message/send` method. See [A2A.md](A2A.md) for the Agent
+`/message:send` with the A2A JSON-RPC `message/send` method. See [A2A.md](https://github.com/Itsthewayofyou/portmark/blob/main/A2A.md) for the Agent
 Card fields, request shape, authentication profile, metrics endpoint, and error behavior.
 
 To validate the Agent Card and request shape through the official SDK types,
@@ -231,7 +231,7 @@ Persist replay nonces, checkpoints, and signed audit heads with SQLite:
 PYTHONPATH=src python -m portmark.cli --store-path runtime.sqlite demo "research modern mobile agents"
 ```
 
-See [RUNTIME_STORAGE.md](RUNTIME_STORAGE.md) for the storage schema, transaction guarantees,
+See [RUNTIME_STORAGE.md](https://github.com/Itsthewayofyou/portmark/blob/main/RUNTIME_STORAGE.md) for the storage schema, transaction guarantees,
 signed-head audit verification, and recovery behavior.
 
 Load policy from JSON:
@@ -240,7 +240,7 @@ Load policy from JSON:
 PYTHONPATH=src python -m portmark.cli --policy-path examples/host-policy.json --reload-policy demo "research modern mobile agents"
 ```
 
-See [OPERATIONS.md](OPERATIONS.md) for runtime configuration, trust registry format, policy
+See [OPERATIONS.md](https://github.com/Itsthewayofyou/portmark/blob/main/OPERATIONS.md) for runtime configuration, trust registry format, policy
 updates, audit verification, backup/restore, and incident response.
 
 ## Generic provider contract
@@ -286,14 +286,14 @@ included in the portable envelope.
 
 ## WebAssembly component boundary
 
-[`wit/portmark.wit`](wit/portmark.wit) defines the Wasm Component Model decision interface. The
+[`wit/portmark.wit`](https://github.com/Itsthewayofyou/portmark/blob/main/wit/portmark.wit) defines the Wasm Component Model decision interface. The
 capsule exports a checkpoint-based `resume` operation that receives structured context and
 checkpoint JSON and returns a structured outcome. A compiled capsule therefore cannot directly
 acquire filesystem, network, process, database, or credential access; the host must explicitly
 validate and mediate every requested action.
 
 The default runnable Node WebAssembly adapter uses the JSON-lowered WIT binding documented in
-[WASM_COMPONENTS.md](WASM_COMPONENTS.md). An optional native Wasmtime provider can execute
+[WASM_COMPONENTS.md](https://github.com/Itsthewayofyou/portmark/blob/main/WASM_COMPONENTS.md). An optional native Wasmtime provider can execute
 the signed Component Model artifact in a short-lived Python worker when `portmark[wasmtime]` is
 installed. Strong migration is implemented as checkpoint-and-resume: native stacks, threads,
 sockets, and file descriptors never cross hosts.
@@ -303,7 +303,7 @@ sockets, and file descriptors never cross hosts.
 Portmark is **reference-complete with six named substitution points**. Signing and trust,
 transactional persistence, the A2A 1.0 surface, external policy with approval gates, WIT-shaped
 Wasm execution, and confidential-computing attestation are all implemented and covered by the
-regression suite. [PRODUCTION_TASKS.md](PRODUCTION_TASKS.md) holds the task-level record.
+regression suite. [PRODUCTION_TASKS.md](https://github.com/Itsthewayofyou/portmark/blob/main/PRODUCTION_TASKS.md) holds the task-level record.
 
 It is a reference implementation: read it, fork it, and substitute the seams below. It is not
 intended as a drop-in production dependency.
@@ -326,4 +326,4 @@ stable interface to substitute against.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](https://github.com/Itsthewayofyou/portmark/blob/main/LICENSE).
