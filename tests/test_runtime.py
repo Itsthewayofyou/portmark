@@ -36,10 +36,12 @@ from portmark.models import AgentState, AttestationEvidence, Permit, ProviderDec
 from portmark.providers import GenericHttpProvider, ModelProvider, NativeWasmtimeComponentProvider
 from portmark.policy import load_host_policy
 from portmark.security import (
+    AUDIT_HASH_VERSION,
     ApprovalAuthority,
     AttestationAuthority,
     AttestationPolicy,
     EnvelopeSigner,
+    audit_event_record,
     ExternalAttestationVerifier,
     HmacEnvelopeSigner,
     HostPolicy,
@@ -1472,6 +1474,23 @@ class RuntimeTests(unittest.TestCase):
                     self.assertEqual(verification.status, "invalid")
                     self.assertEqual(verification.reason, "audit event hash is invalid")
                     self.assertFalse(store.verify_audit_chain(result.task_id))
+
+    def test_audit_event_hash_commits_to_format_version(self):
+        # The per-event hash covers hash_version, so the audit format is
+        # self-describing and a future format change stays backward compatible.
+        signer = EnvelopeSigner.generate("contract-version-key", "host:local-demo", ("host:local-demo",))
+        host = make_host(signer=signer)
+        result = host.run(make_demo_envelope(host, "version tag"))
+        first = result.audit[0]
+        versioned = audit_event_record(
+            first["sequence"], first["event"], first["details"], first["previous"], "host:local-demo", AUDIT_HASH_VERSION
+        )
+        self.assertEqual(first["hash"], hashlib.sha256(canonical_json(versioned)).hexdigest())
+        self.assertEqual(versioned["hash_version"], AUDIT_HASH_VERSION)
+        # A record WITHOUT the version tag (the pre-versioning format) hashes
+        # differently, proving the tag is actually committed to the bytes.
+        untagged = {k: v for k, v in versioned.items() if k != "hash_version"}
+        self.assertNotEqual(first["hash"], hashlib.sha256(canonical_json(untagged)).hexdigest())
 
     def test_runtime_store_contract_recovers_migration_checkpoints_and_audits(self):
         source_signer = EnvelopeSigner.generate("contract-source-key", "host:source", ("host:source", "host:destination"))

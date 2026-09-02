@@ -1083,6 +1083,35 @@ class HostPolicy:
             raise SecurityError("approval signature is invalid") from error
 
 
+AUDIT_HASH_VERSION = 2
+
+
+def audit_event_record(
+    sequence: int,
+    event: str,
+    details: dict[str, Any],
+    previous: str,
+    host_id: str,
+    version: int = AUDIT_HASH_VERSION,
+) -> dict[str, Any]:
+    """The exact fields committed to an audit event's hash, for one format version.
+
+    `hash_version` is inside the hashed bytes, so the format is self-describing: a
+    verifier can support several versions at once and each stored hash selects its
+    own recipe (distinct versions produce distinct digests, so no cross-version
+    downgrade). Establishing this now, while no persisted chains exist, means a
+    later format change need not break stored chains.
+    """
+    return {
+        "sequence": sequence,
+        "event": event,
+        "details": details,
+        "previous": previous,
+        "host_id": host_id,
+        "hash_version": version,
+    }
+
+
 class AuditLog:
     def __init__(self, previous_hash: str = "", start_sequence: int = 0, host_id: str = "") -> None:
         self._head = previous_hash
@@ -1100,8 +1129,9 @@ class AuditLog:
 
     def append(self, event: str, details: dict[str, Any]) -> None:
         # host_id is inside the hashed record so a stored event's host attribution
-        # cannot be altered after the fact while the chain still verifies. Finding #7.
-        record = {"sequence": self._start_sequence + len(self._events), "event": event, "details": details, "previous": self._head, "host_id": self._host_id}
+        # cannot be altered after the fact while the chain still verifies (finding #7).
+        # hash_version tags the format so verification is version-dispatched.
+        record = audit_event_record(self._start_sequence + len(self._events), event, details, self._head, self._host_id)
         record_hash = hashlib.sha256(canonical_json(record)).hexdigest()
         record["hash"] = record_hash
         self._events.append(record)
