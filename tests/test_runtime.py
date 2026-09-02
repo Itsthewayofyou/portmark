@@ -1324,6 +1324,19 @@ class RuntimeTests(unittest.TestCase):
             connection.execute("UPDATE audit_heads SET head_hash = 'tampered' WHERE task_id = %s", (task_id,))
             connection.commit()
 
+    def _tamper_store_host_id(self, store, task_id, backend):
+        if backend == "sqlite":
+            with sqlite3.connect(store.path) as connection:
+                connection.execute(
+                    "UPDATE audit_events SET host_id = 'host:impostor' WHERE task_id = ? AND sequence = 0", (task_id,)
+                )
+            return
+        with store._connect() as connection:
+            connection.execute(
+                "UPDATE audit_events SET host_id = 'host:impostor' WHERE task_id = %s AND sequence = 0", (task_id,)
+            )
+            connection.commit()
+
     def test_runtime_store_contract_persists_checkpoint_audit_and_three_state_verification(self):
         signer = EnvelopeSigner.generate("contract-key", "host:local-demo", ("host:local-demo",))
         for context in self._store_case_contexts(signer):
@@ -1379,6 +1392,23 @@ class RuntimeTests(unittest.TestCase):
                     verification = store.verify_audit_chain_status(result.task_id)
                     self.assertEqual(verification.status, "invalid")
                     self.assertEqual(verification.reason, "stored audit head does not match audit events")
+                    self.assertFalse(store.verify_audit_chain(result.task_id))
+
+    def test_runtime_store_contract_detects_audit_host_id_tamper(self):
+        # Altering a stored event's host_id must break verification: host_id is
+        # inside the per-event hash (finding #7). Without that, attribution could
+        # be rewritten while the chain still verified.
+        signer = EnvelopeSigner.generate("contract-host-key", "host:local-demo", ("host:local-demo",))
+        for context in self._store_case_contexts(signer):
+            with context as (backend, store):
+                with self.subTest(backend=backend):
+                    host = make_host(signer=signer, store=store)
+                    result = host.run(make_demo_envelope(host, f"{backend} host tamper"))
+                    self.assertTrue(store.verify_audit_chain(result.task_id))
+                    self._tamper_store_host_id(store, result.task_id, backend)
+                    verification = store.verify_audit_chain_status(result.task_id)
+                    self.assertEqual(verification.status, "invalid")
+                    self.assertEqual(verification.reason, "audit event hash is invalid")
                     self.assertFalse(store.verify_audit_chain(result.task_id))
 
     def test_runtime_store_contract_recovers_migration_checkpoints_and_audits(self):

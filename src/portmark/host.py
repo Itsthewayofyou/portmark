@@ -91,7 +91,7 @@ class AgentHost:
         consume_nonce = envelope.permit.nonce if state.status == "ready" else None
         state.status = "running"
         previous_hash, start_sequence = self._audit_start(envelope)
-        audit = AuditLog(previous_hash, start_sequence)
+        audit = AuditLog(previous_hash, start_sequence, self.host_id)
         audit.append(
             "agent.accepted",
             {

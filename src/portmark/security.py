@@ -1069,9 +1069,10 @@ class HostPolicy:
 
 
 class AuditLog:
-    def __init__(self, previous_hash: str = "", start_sequence: int = 0) -> None:
+    def __init__(self, previous_hash: str = "", start_sequence: int = 0, host_id: str = "") -> None:
         self._head = previous_hash
         self._start_sequence = start_sequence
+        self._host_id = host_id
         self._events: list[dict[str, Any]] = []
 
     @property
@@ -1083,7 +1084,9 @@ class AuditLog:
         return tuple(self._events)
 
     def append(self, event: str, details: dict[str, Any]) -> None:
-        record = {"sequence": self._start_sequence + len(self._events), "event": event, "details": details, "previous": self._head}
+        # host_id is inside the hashed record so a stored event's host attribution
+        # cannot be altered after the fact while the chain still verifies. Finding #7.
+        record = {"sequence": self._start_sequence + len(self._events), "event": event, "details": details, "previous": self._head, "host_id": self._host_id}
         record_hash = hashlib.sha256(canonical_json(record)).hexdigest()
         record["hash"] = record_hash
         self._events.append(record)
