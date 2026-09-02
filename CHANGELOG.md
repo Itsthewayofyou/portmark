@@ -4,6 +4,11 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 ## 0.3.1 — 2026-09-02
 
+### Changed
+
+- **Package metadata now names an author** (`Itsthewayofyou`), so the PyPI project
+  page shows a maintainer instead of "None".
+
 ### Documented
 
 - **README links now resolve on the PyPI project page.** Every in-repo link
