@@ -1726,6 +1726,16 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(SecurityError, "digest"):
             host.run(envelope)
 
+    def test_pinned_digest_without_verifiable_provider_fails_closed(self):
+        # A manifest that pins content-addressed bytes must not run unverified
+        # against a provider that exposes no digest to check (fail closed).
+        host = make_host()
+        envelope = make_demo_envelope(host, "pinned but unverifiable", "deterministic")
+        object.__setattr__(envelope.manifest, "component_digest", "sha256:" + "0" * 64)
+        host.signer.seal(envelope)
+        with self.assertRaisesRegex(SecurityError, "exposes none to verify"):
+            host.run(envelope)
+
         for decision, message, mutate in [
             (ProviderDecision("tool"), "without a tool name", None),
             (ProviderDecision("tool", "catalog.search", {"query": "x", "limit": 1}), "tool-call budget", lambda e: object.__setattr__(e.permit, "budget", ResourceBudget(max_steps=6, max_tool_calls=0))),
