@@ -255,6 +255,21 @@ class AgentHost:
         except SecurityError as error:
             event = "approval.expired" if "expired" in str(error) else "approval.denied"
             return self._approval_failure(state, audit, event, "invalid")
+        # Durable, replay-proof one-time consumption of this approval. The
+        # state.memory guard above lives in *wire* state, so a captured suspended
+        # ("awaiting_input") envelope could replay the same approval to re-run a
+        # side-effecting tool. Consume a namespaced token in the runtime store —
+        # atomic on every backend and independent of the replayable wire state.
+        try:
+            with self.store.transaction() as approval_transaction:
+                approval_transaction.consume_nonce(
+                    f"approval:{state.task_id}:{token.approval_id}",
+                    permit.subject,
+                    permit.audience,
+                    state.task_id,
+                )
+        except SecurityError:
+            return self._approval_failure(state, audit, "approval.denied", "replayed")
         audit.append("approval.approved", {"approval_id": token.approval_id, "tool": decision.tool, "approved_by": token.approved_by})
         used_values = list(state.memory.get("used_approval_ids", []))
         used_values.append(token.approval_id)

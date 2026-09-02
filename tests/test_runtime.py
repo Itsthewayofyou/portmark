@@ -1204,6 +1204,48 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(replay_result.status, "failed")
         self.assertIn("approval.denied", [event["event"] for event in replay_result.audit])
 
+    def test_captured_approved_suspended_envelope_cannot_replay_tool(self):
+        import copy
+        authority = ApprovalAuthority.generate()
+        policy = HostPolicy(
+            "host:local-demo",
+            (ToolGrant("payments.reserve", {"max_amount": 100, "currency": "USD"}),),
+            ResourceBudget(),
+            "policy-v1",
+            "policy-hash",
+            {"payments.reserve": "external-payment"},
+            (authority.trusted_approver(),),
+        )
+        host = make_host()
+        host.policy = policy
+        host.providers["payer"] = PaymentProvider()
+
+        env = make_demo_envelope(host, "approved once", "payer")
+        object.__setattr__(env.permit, "grants", (ToolGrant("payments.reserve", {"max_amount": 100, "currency": "USD"}),))
+        token = authority.issue(
+            "payments.reserve",
+            env.permit.subject,
+            env.permit.audience,
+            env.state.task_id,
+            env.permit.nonce,
+            {"amount": 50, "currency": "USD"},
+            "policy-hash",
+            int(time.time()) + 60,
+        )
+        env.state.memory["approvals"] = {"payments.reserve": asdict(token)}
+        # A suspended (resumed) envelope: the permit nonce is NOT consumed on this
+        # path, so nonce replay defense does not apply — the approval must.
+        object.__setattr__(env.state, "status", "awaiting_input")
+        host.signer.seal(env)
+        captured = copy.deepcopy(env)  # attacker captures the signed wire envelope
+
+        first = host.run(env)
+        self.assertEqual(first.status, "completed")  # legitimate resume executes once
+
+        replay = host.run(captured)  # same task_id + approval_id, same store
+        self.assertEqual(replay.status, "failed")
+        self.assertIn("approval.denied", [event["event"] for event in replay.audit])
+
     def test_policy_reload_invalidates_stale_approval(self):
         with tempfile.TemporaryDirectory() as directory:
             authority = ApprovalAuthority.generate()
