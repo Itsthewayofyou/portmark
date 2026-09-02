@@ -226,6 +226,30 @@ rather than the host guessing. It must satisfy:
   visible failure for an invisible one, which is strictly worse than the
   behaviour it replaces.
 
+### Components have no host imports (issue #23)
+
+**Decision: a Wasm component is a pure decision function with zero ambient host
+access, and the WIT world must stay import-free.**
+
+The `portmark` WIT world (`wit/portmark.wit`) exports one function, `resume`,
+and imports nothing. The native runner instantiates the component against an
+empty `wasmtime.component.Linker` (`src/portmark/wasmtime_component_runner.py`),
+so a component cannot open a socket, touch the filesystem, or read host memory.
+Its only channel to the outside world is *returning* a `tool-request`, which the
+host then scopes through permit ∩ policy tool grants and `check_constraints`
+(`allowed_*`, `max_*`, argument schema) in `src/portmark/security.py`.
+
+This is why Portmark has no per-component "capabilities" block like a
+manifest-based capsule system (the pattern that prompted issue #23): there is no
+host-import surface to scope. The scoping lives at the tool layer, where the only
+exercisable authority actually is.
+
+**Enforcement:** `test_wit_world_declares_no_host_imports` fails if any `import`
+is added to the world, and `test_wasm_with_ambient_wasi_import_cannot_instantiate`
+proves a component that imports host functions cannot instantiate. If a future
+design gives components direct host imports, both guards force the scoped
+host-capability grant to be designed at that moment, not bolted on after.
+
 ## Quality Check
 
 - Covered discovered runtime entry points: A2A message send, agent card, metrics, health, readiness, CLI, providers, tools, stores, attestation verifier.
