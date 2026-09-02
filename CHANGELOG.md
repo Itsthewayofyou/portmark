@@ -2,13 +2,51 @@
 
 All notable changes to Portmark are recorded here. Versions follow [semantic versioning](https://semver.org/).
 
-## Unreleased
+## 0.3.0 — 2026-09-02
 
-Everything here came out of running Portmark against a real agent for the first time. None of it
-was findable by reading the code, and the 145-test suite was green through all of it.
+Two waves of hardening. The first came out of running Portmark against a real agent for the first
+time. The second was a security audit of the enforcement path — a manual red-team pass, an
+independent Codex audit of the live source, and a second Codex review of the fixes themselves. The
+suite grew from 145 to 186 tests, and every guard added below was proven by tampering: neutering it
+turns exactly the test that names it red.
 
 ### Security
 
+- **A captured, approved, suspended envelope could replay a side-effecting tool** (Critical).
+  The permit nonce was consumed only for a `ready` envelope; an `awaiting_input` envelope skipped
+  it, and approval reuse was tracked in attacker-controlled wire state, so replaying a captured
+  signed envelope could re-run `payments.reserve` (or any approved tool) until permit expiry.
+  Approvals are now consumed durably in the runtime store, keyed by `(task_id, approval_id)`, so
+  exactly one legitimate resume is admitted and a replay is refused.
+- **Attestation nonce could fail open** (High). A bound attestation with an empty `nonce` was
+  accepted against any permit nonce because the check short-circuited on the empty field. An
+  opt-in `require_execution_nonce` now rejects a missing nonce when a binding is expected, without
+  breaking migration evidence that legitimately carries none.
+- **`additional_arguments: false` was ignored without an `arguments` schema.** A grant carrying only
+  flat constraints silently passed unexpected fields (e.g. `account_id`) to the tool. The whitelist
+  now applies with or without a schema, and the grant-merge planner mirrors it so enforcer and
+  planner cannot diverge.
+- **A scalar `allowed_*` constraint became a substring allowlist.** A mistyped policy
+  `"allowed_role": "admin"` accepted `role: "a"` via Python `in`. Non-list `allowed_*` values are
+  now rejected, fail-closed.
+- **Audit-event `host_id` was outside the per-event hash**, so historical host attribution could be
+  rewritten while the chain still verified. `host_id` is now covered by the hash in every store
+  backend, and the hash format carries an explicit `hash_version` so future format changes stay
+  backward compatible.
+- **A migrated audit chain dropped its prior continuity.** The verified prior head (hash, sequence,
+  host) is now recorded in the first audit event of the destination chain — inside the hashed,
+  tamper-evident record — instead of being discarded when the local sequence restarts.
+- **A native Wasm guest had no CPU or memory bound** beyond a 2-second wall clock. The Wasmtime
+  engine now runs guests under a fuel (instruction) budget and a memory limit, both configurable.
+- **The A2A agent card trusted the `Host` header** and could advertise an attacker-supplied URL.
+  The card now uses a configured `public_base_url`, else reflects only a loopback `Host`
+  (local development) and warns loudly otherwise. A2A also warns when it runs with no bearer token,
+  since transport auth is optional and only envelope signatures gate task submission.
+- **A signed manifest that pinned a component digest could run unverified** when the selected
+  provider exposed no digest. It now fails closed rather than running an unverified component under
+  a pinned manifest.
+- **Components run with no host imports**, now pinned by a test asserting the WIT world declares
+  none, so the import-free sandbox boundary cannot regress unnoticed.
 - **A permit could widen a strict host policy's argument whitelist** ([#19](https://github.com/Itsthewayofyou/portmark/issues/19)).
   `additional_arguments: false` turns a constraint set's argument-name list into a whitelist, and
   that list is derived from the set's own keys — including flat `allowed_*`/`max_*` keys. Because
@@ -16,6 +54,12 @@ was findable by reading the code, and the 145-test suite was green through all o
   enlarged the whitelist the policy had closed. Reachable end to end: an argument the policy never
   listed reached the tool body. Grant merging now intersects the permitted argument names first and
   gates every key on the result. Affects 0.2.0.
+
+### Changed
+
+- **`serve()` warns loudly at startup when TLS is not asserted** (`--enable-hsts` off): envelopes
+  are signed (tamper- and replay-proof) but not encrypted, so an interceptor can read a request in
+  transit. Terminate TLS at the reverse proxy before public exposure.
 
 ### Fixed
 
