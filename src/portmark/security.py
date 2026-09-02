@@ -675,17 +675,17 @@ _SPEC_NARROWERS: dict[str, str] = {
 def _permitted_argument_names(constraints: dict[str, Any]) -> set[str] | None:
     """Argument names this constraint set admits, or None when it admits any.
 
-    Mirrors `check_constraints` exactly, including the part that is easy to miss:
-    `additional_arguments: False` is inert unless an `arguments` schema is also
-    present, because the whitelist is only consulted inside that branch.
+    Mirrors `check_constraints` exactly: `additional_arguments: False` bounds the
+    admitted names whether or not an `arguments` schema is present (finding #4).
+    When it is not set to False, the grant admits any argument, so return None.
     """
-    schema = constraints.get("arguments")
-    if not isinstance(schema, dict):
-        return None
     if constraints.get("additional_arguments", True) is not False:
         return None
+    schema = constraints.get("arguments")
     required = constraints.get("required")
-    names = set(schema) | _legacy_constrained_arguments(constraints)
+    names = _legacy_constrained_arguments(constraints)
+    if isinstance(schema, dict):
+        names |= set(schema)
     if isinstance(required, (list, tuple)):
         names |= {item for item in required if isinstance(item, str)}
     return names
@@ -1111,11 +1111,18 @@ def check_constraints(constraints: dict[str, Any], arguments: dict[str, Any]) ->
                 raise SecurityError(f"argument {argument!r} is required")
             if argument in arguments:
                 _check_argument_schema(argument, arguments[argument], spec)
-        if additional is False:
-            known = set(schema) | set(required) | _legacy_constrained_arguments(constraints)
-            unexpected = set(arguments) - known
-            if unexpected:
-                raise SecurityError("tool arguments contain unsupported fields")
+    if additional is False:
+        # Reject unexpected fields even when the grant carries only flat
+        # constraints (no `arguments` schema). Previously this was nested under
+        # `if schema is not None`, so a flat-only grant silently passed extras
+        # like account_id. Finding #4. Kept consistent with
+        # `_permitted_argument_names`, which the merge planner uses.
+        known = set(required) | _legacy_constrained_arguments(constraints)
+        if isinstance(schema, dict):
+            known |= set(schema)
+        unexpected = set(arguments) - known
+        if unexpected:
+            raise SecurityError("tool arguments contain unsupported fields")
     for name, expected in constraints.items():
         if name in {"arguments", "required", "additional_arguments"}:
             continue

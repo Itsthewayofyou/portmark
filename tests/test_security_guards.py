@@ -277,6 +277,9 @@ class SecurityGuardTests(unittest.TestCase):
             ({"arguments": {"needed": {"required": True}}}, {}, "argument 'needed' is required"),
             ({"max_limit": 5}, {"limit": 6}, "argument 'limit' exceeds its permitted maximum"),
             ({"allowed_region": ["us"]}, {"region": "eu"}, "argument 'region' is outside its allowed set"),
+            # additional_arguments=False must reject smuggled fields even with no
+            # `arguments` schema — only flat constraints. Finding #4.
+            ({"max_amount": 100, "additional_arguments": False}, {"amount": 50, "account_id": "x"}, "unsupported fields"),
             ({"method": "GET"}, {"method": "POST"}, "argument 'method' does not match its required value"),
             ({"arguments": {"count": {"minimum": 1}}}, {"count": 0}, "argument 'count' is below its permitted minimum"),
             ({"arguments": {"count": {"maximum": 5}}}, {"count": 6}, "argument 'count' exceeds its permitted maximum"),

@@ -151,11 +151,11 @@ def random_constraints(rng: random.Random) -> dict[str, Any]:
         names = rng.sample(ARGUMENT_NAMES, rng.randint(1, len(ARGUMENT_NAMES)))
         constraints["arguments"] = {name: random_argument_spec(rng) for name in names}
     # `required` and `additional_arguments` are emitted INDEPENDENTLY of
-    # `arguments` on purpose. Both are inert without a schema — check_constraints
-    # only consults them inside `if schema is not None` — so a generator that
-    # only ever emits them together can never produce the case where a merge
-    # brings a schema in from one side and activates the other side's dormant
-    # `required`. Keep them independent or that whole class goes untested.
+    # `arguments` on purpose. `required` is still inert without a schema, so a
+    # generator that only ever emits it alongside `arguments` could never produce
+    # the merge case that activates the other side's dormant `required`. (Since
+    # finding #4, `additional_arguments: False` is live without a schema; emitting
+    # it independently now also exercises that path.) Keep them independent.
     if rng.random() < 0.4:
         constraints["additional_arguments"] = rng.choice([True, False])
     if rng.random() < 0.3:
@@ -273,13 +273,15 @@ class NoWideningPropertyTest(unittest.TestCase):
 
 
 class DormantConstraintTest(unittest.TestCase):
-    """`required` and `additional_arguments` are inert without an `arguments` schema.
+    """`required` is inert without an `arguments` schema; a merge can activate it.
 
-    check_constraints only consults them inside `if schema is not None`, so a
+    check_constraints only consults `required` inside `if schema is not None`, so a
     merge that brings a schema in from one side can ACTIVATE the other side's
-    dormant keys. Activating is narrowing and therefore safe; the direction that
-    would not be safe is a merge that loses enforcement one side had. These pin
+    dormant `required`. Activating is narrowing and therefore safe; the direction
+    that would not be safe is a merge that loses enforcement one side had. These pin
     both directions, because the generator cannot reliably reach them.
+    (`additional_arguments: False` is live without a schema since finding #4 — its
+    test below pins that, plus the merge-preservation property.)
     """
 
     def require_merged(self, merged: dict[str, Any] | None) -> dict[str, Any]:
@@ -315,13 +317,18 @@ class DormantConstraintTest(unittest.TestCase):
             msg="each side requires an argument the other refuses; the set is unsatisfiable",
         )
 
-    def test_dormant_additional_arguments_does_not_relax_a_live_one(self) -> None:
+    def test_additional_arguments_false_is_live_without_a_schema(self) -> None:
+        # Finding #4 fix: `additional_arguments: False` now bounds admitted fields
+        # even with no `arguments` schema. This test previously asserted the
+        # opposite (that left's flag was dormant); it now pins the live behavior
+        # and the property that a merge must not LOSE the stricter side's rejection.
         left = {"additional_arguments": False}
         right = {"arguments": {"b": {}}}
         merged = self.require_merged(merge_real(left, right))
-        self.assertTrue(accepts(left, {"z": 1}), "fixture: left's flag is dormant without a schema")
+        self.assertFalse(accepts(left, {"z": 1}), "left's flag is live: an unknown field is rejected")
+        self.assertTrue(accepts(left, {}), "left still admits the empty argument set")
         self.assertTrue(accepts(right, {"z": 1}), "fixture: right allows extra fields")
-        self.assertFalse(accepts(merged, {"z": 1}), "merging may narrow here, and does")
+        self.assertFalse(accepts(merged, {"z": 1}), "merge keeps the stricter side's rejection")
 
 
 class OutputProjectionTest(unittest.TestCase):
