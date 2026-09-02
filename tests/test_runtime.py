@@ -2391,21 +2391,25 @@ class RuntimeTests(unittest.TestCase):
         for header in ("x-content-type-options", "x-frame-options", "content-security-policy", "referrer-policy"):
             self.assertIn(header, headers)
 
-    def test_asgi_agent_card_ignores_forged_host_header(self):
-        # Finding #8: a forged Host must not be reflected into the advertised URL.
+    def test_asgi_agent_card_only_reflects_loopback_host(self):
+        # Finding #8 (hardened): a non-loopback Host — even a syntactically clean one
+        # (Codex review) — must NOT be reflected into the advertised URL without a
+        # configured public_base_url; a loopback Host still is (local development).
         app = make_asgi_app(make_host(), allow_anonymous=True)
+        for forged in ("evil.example/@attacker", "attacker.example:443", "svc.internal:8443"):
+            with self.subTest(host=forged), self.assertLogs("portmark.a2a", level="WARNING"):
+                _, _, payload = self._asgi_call(
+                    app, "GET", "/.well-known/agent-card.json", {"Host": forged}
+                )
+            self.assertEqual(
+                json.loads(payload)["supportedInterfaces"][0]["url"], "http://127.0.0.1/message:send"
+            )
+        # A loopback Host is trusted for local development and still reflected.
         _, _, payload = self._asgi_call(
-            app, "GET", "/.well-known/agent-card.json", {"Host": "evil.example/@attacker"}
+            app, "GET", "/.well-known/agent-card.json", {"Host": "127.0.0.1:9000"}
         )
         self.assertEqual(
-            json.loads(payload)["supportedInterfaces"][0]["url"], "http://127.0.0.1/message:send"
-        )
-        # A syntactically safe authority is still honoured.
-        _, _, payload = self._asgi_call(
-            app, "GET", "/.well-known/agent-card.json", {"Host": "svc.internal:8443"}
-        )
-        self.assertEqual(
-            json.loads(payload)["supportedInterfaces"][0]["url"], "http://svc.internal:8443/message:send"
+            json.loads(payload)["supportedInterfaces"][0]["url"], "http://127.0.0.1:9000/message:send"
         )
 
     def test_asgi_agent_card_prefers_configured_public_base_url(self):
