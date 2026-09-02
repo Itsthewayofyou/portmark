@@ -529,6 +529,26 @@ class RuntimeTests(unittest.TestCase):
                 with self.assertRaisesRegex(SecurityError, message):
                     host.run(envelope)
 
+    def test_attestation_empty_nonce_is_rejected_when_binding_expected(self):
+        authority = AttestationAuthority.generate()
+        policy = AttestationPolicy(
+            (authority.trusted_authority(),),
+            ("measurement:approved",),
+            required_for_execution=True,
+            require_execution_nonce=True,
+        )
+        host = make_host(attestation_policy=policy)
+        now = int(time.time())
+        # Valid in every dimension EXCEPT the nonce, which is empty while the
+        # permit nonce is not. With require_execution_nonce set, an empty nonce
+        # must not silently skip the binding.
+        evidence = authority.issue(host.host_id, "host:local-demo", "measurement:approved", now + 60)
+        envelope = make_demo_envelope(host, "empty attestation nonce")
+        object.__setattr__(envelope.permit, "attestation", evidence)
+        host.signer.seal(envelope)
+        with self.assertRaisesRegex(SecurityError, "nonce"):
+            host.run(envelope)
+
     def test_attestation_rejects_unknown_verifier_and_tampered_evidence(self):
         authority = AttestationAuthority.generate()
         other = AttestationAuthority.generate("other-attestation-key", "verifier:other")
