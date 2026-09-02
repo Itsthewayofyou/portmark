@@ -2,6 +2,21 @@
 
 All notable changes to Portmark are recorded here. Versions follow [semantic versioning](https://semver.org/).
 
+## 0.3.1 — 2026-09-02
+
+### Changed
+
+- **Package metadata now names an author** (`Itsthewayofyou`), so the PyPI project
+  page shows a maintainer instead of "None".
+
+### Documented
+
+- **README links now resolve on the PyPI project page.** Every in-repo link
+  (`LICENSE`, the `*.md` guides, `src/…`, `deploy/…`, `wit/…`) was relative, so it
+  worked on GitHub but 404'd on PyPI, which resolves relative links against
+  `pypi.org`. They now point at absolute `github.com/.../blob/main/…` URLs. No code
+  change.
+
 ## 0.3.0 — 2026-09-02
 
 Two waves of hardening. The first came out of running Portmark against a real agent for the first
