@@ -3104,6 +3104,30 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "ambient imports"):
             provider.decide(AgentState("task", "goal"), ())
 
+    def test_wit_world_declares_no_host_imports(self):
+        # Invariant tripwire: a Portmark component is a pure decision function.
+        # Its WIT world must import nothing, so a component has no ambient host
+        # access and can only act by returning a tool-request (which the host
+        # then scopes via tool grants + check_constraints). If someone adds an
+        # `import` to the world, this fails on purpose — forcing a scoped
+        # host-capability design (see issue #23) before the door opens.
+        import pathlib
+        wit_path = pathlib.Path(__file__).resolve().parent.parent / "wit" / "portmark.wit"
+        source = wit_path.read_text(encoding="utf-8")
+        world_body = source.split("world portmark", 1)[1]
+        world_body = world_body[world_body.index("{") + 1 : world_body.index("}")]
+        offending = [
+            line.strip()
+            for line in world_body.splitlines()
+            if line.strip().startswith("import ") or line.strip().startswith("import\t")
+        ]
+        self.assertEqual(
+            offending,
+            [],
+            "wit/portmark.wit world declares host imports; components must stay "
+            "import-free or gain scoped host-capability grants first (issue #23)",
+        )
+
     def test_wasm_component_tool_decision_uses_structured_wit_outcome(self):
         from portmark.providers import WasmDecisionProvider
         provider = WasmDecisionProvider(base64.b64decode(WASM_TOOL_REQUEST))
