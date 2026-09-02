@@ -12,7 +12,7 @@ from types import TracebackType
 from typing import Any, Callable, Literal, Protocol
 
 from .models import AgentState
-from .security import AuditHeadVerifier, SecurityError, audit_head_payload, canonical_json
+from .security import AUDIT_HASH_VERSION, AuditHeadVerifier, SecurityError, audit_event_record, audit_head_payload, canonical_json
 
 
 SQLITE_SCHEMA_VERSION = 3
@@ -105,14 +105,9 @@ class InMemoryRuntimeStore:
             for expected_sequence, event in enumerate(events):
                 if event["sequence"] != expected_sequence or event["previous"] != previous:
                     return AuditVerificationResult("invalid", "audit chain sequence or previous hash is inconsistent")
-                record = {
-                    "sequence": event["sequence"],
-                    "event": event["event"],
-                    "details": event["details"],
-                    "previous": event["previous"],
-                    "host_id": event.get("host_id", ""),
-                }
-                if event["hash"] != _audit_hash(record):
+                if not _audit_event_hash_matches(
+                    event["sequence"], event["event"], event["details"], event["previous"], event.get("host_id", ""), event["hash"]
+                ):
                     return AuditVerificationResult("invalid", "audit event hash is invalid")
                 previous = event["hash"]
             if head["head_hash"] != previous or head["sequence"] != len(events):
@@ -333,14 +328,9 @@ class SQLiteRuntimeStore:
                 details = json.loads(row["details_json"])
             except json.JSONDecodeError:
                 return AuditVerificationResult("invalid", "audit event details are malformed")
-            record = {
-                "sequence": row["sequence"],
-                "event": row["event"],
-                "details": details,
-                "previous": row["previous_hash"],
-                "host_id": row["host_id"],
-            }
-            if row["hash"] != _audit_hash(record):
+            if not _audit_event_hash_matches(
+                row["sequence"], row["event"], details, row["previous_hash"], row["host_id"], row["hash"]
+            ):
                 return AuditVerificationResult("invalid", "audit event hash is invalid")
             previous = row["hash"]
         try:
@@ -519,14 +509,9 @@ class PostgresRuntimeStore:
                 details = json.loads(row["details_json"])
             except json.JSONDecodeError:
                 return AuditVerificationResult("invalid", "audit event details are malformed")
-            record = {
-                "sequence": row["sequence"],
-                "event": row["event"],
-                "details": details,
-                "previous": row["previous_hash"],
-                "host_id": row["host_id"],
-            }
-            if row["hash"] != _audit_hash(record):
+            if not _audit_event_hash_matches(
+                row["sequence"], row["event"], details, row["previous_hash"], row["host_id"], row["hash"]
+            ):
                 return AuditVerificationResult("invalid", "audit event hash is invalid")
             previous = row["hash"]
         try:
@@ -777,6 +762,23 @@ class _SQLiteTransaction:
 
 def _audit_hash(record: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_json(record)).hexdigest()
+
+
+# Format versions this build can verify, newest first. A stored hash is valid if it
+# matches the recompute for any of them; distinct versions produce distinct digests,
+# so a v2 event (host_id covered) cannot be downgraded to a different recipe. A future
+# format bump adds its version here without breaking chains written under an older one.
+_SUPPORTED_AUDIT_HASH_VERSIONS = (AUDIT_HASH_VERSION,)
+
+
+def _audit_event_hash_matches(
+    sequence: int, event: str, details: Any, previous: str, host_id: str, stored_hash: str
+) -> bool:
+    for version in _SUPPORTED_AUDIT_HASH_VERSIONS:
+        record = audit_event_record(sequence, event, details, previous, host_id, version)
+        if _audit_hash(record) == stored_hash:
+            return True
+    return False
 
 
 def _verify_head_signature(verifier: AuditHeadVerifier | None, task_id: str, head: dict[str, Any]) -> AuditVerificationResult:

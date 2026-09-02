@@ -365,13 +365,22 @@ class A2ARouter:
         )
 
     def _agent_card_base_url(self, host_header: str) -> str:
-        # Prefer an operator-configured URL. Otherwise fall back to the Host header
-        # only if it is a syntactically safe authority, so a forged Host cannot be
-        # reflected into the advertised agent-card URL. Finding #8.
+        # Prefer an operator-configured URL. Otherwise reflect the Host header ONLY
+        # when it is a syntactically safe LOOPBACK authority (local development). A
+        # non-loopback Host may be forged by a client whose value a reverse proxy
+        # forwards verbatim, and must not become the advertised URL. Exposed
+        # deployments set public_base_url; warn loudly if one forgot. Finding #8.
         if self.public_base_url:
             return self.public_base_url
-        if host_header and _SAFE_HOST_RE.match(host_header):
+        if host_header and _SAFE_HOST_RE.match(host_header) and _host_authority_is_loopback(host_header):
             return f"http://{host_header}"
+        if host_header:
+            logger.warning(
+                "A2A agent card requested with Host %r but no public_base_url is set; "
+                "advertising http://127.0.0.1 rather than reflect a non-loopback Host. "
+                "Set public_base_url for a publicly reachable card.",
+                host_header,
+            )
         return "http://127.0.0.1"
 
     def handle_get(
@@ -578,6 +587,19 @@ def is_loopback_bind(bind: str) -> bool:
         return ipaddress.ip_address(bind).is_loopback
     except ValueError:
         return False
+
+
+def _host_authority_is_loopback(host_header: str) -> bool:
+    """Whether an HTTP Host authority (with optional port) names a loopback host."""
+    host = host_header
+    if host.startswith("["):  # bracketed IPv6, optionally "[::1]:port"
+        end = host.find("]")
+        if end == -1:
+            return False
+        host = host[1:end]
+    elif host.count(":") == 1:  # host:port for IPv4 or a hostname
+        host = host.rsplit(":", 1)[0]
+    return is_loopback_bind(host)
 
 
 def default_readiness_check(host: AgentHost) -> None:

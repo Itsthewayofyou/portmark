@@ -36,10 +36,12 @@ from portmark.models import AgentState, AttestationEvidence, Permit, ProviderDec
 from portmark.providers import GenericHttpProvider, ModelProvider, NativeWasmtimeComponentProvider
 from portmark.policy import load_host_policy
 from portmark.security import (
+    AUDIT_HASH_VERSION,
     ApprovalAuthority,
     AttestationAuthority,
     AttestationPolicy,
     EnvelopeSigner,
+    audit_event_record,
     ExternalAttestationVerifier,
     HmacEnvelopeSigner,
     HostPolicy,
@@ -1473,6 +1475,23 @@ class RuntimeTests(unittest.TestCase):
                     self.assertEqual(verification.reason, "audit event hash is invalid")
                     self.assertFalse(store.verify_audit_chain(result.task_id))
 
+    def test_audit_event_hash_commits_to_format_version(self):
+        # The per-event hash covers hash_version, so the audit format is
+        # self-describing and a future format change stays backward compatible.
+        signer = EnvelopeSigner.generate("contract-version-key", "host:local-demo", ("host:local-demo",))
+        host = make_host(signer=signer)
+        result = host.run(make_demo_envelope(host, "version tag"))
+        first = result.audit[0]
+        versioned = audit_event_record(
+            first["sequence"], first["event"], first["details"], first["previous"], "host:local-demo", AUDIT_HASH_VERSION
+        )
+        self.assertEqual(first["hash"], hashlib.sha256(canonical_json(versioned)).hexdigest())
+        self.assertEqual(versioned["hash_version"], AUDIT_HASH_VERSION)
+        # A record WITHOUT the version tag (the pre-versioning format) hashes
+        # differently, proving the tag is actually committed to the bytes.
+        untagged = {k: v for k, v in versioned.items() if k != "hash_version"}
+        self.assertNotEqual(first["hash"], hashlib.sha256(canonical_json(untagged)).hexdigest())
+
     def test_runtime_store_contract_recovers_migration_checkpoints_and_audits(self):
         source_signer = EnvelopeSigner.generate("contract-source-key", "host:source", ("host:source", "host:destination"))
         destination_signer = trust_signer(
@@ -2372,21 +2391,25 @@ class RuntimeTests(unittest.TestCase):
         for header in ("x-content-type-options", "x-frame-options", "content-security-policy", "referrer-policy"):
             self.assertIn(header, headers)
 
-    def test_asgi_agent_card_ignores_forged_host_header(self):
-        # Finding #8: a forged Host must not be reflected into the advertised URL.
+    def test_asgi_agent_card_only_reflects_loopback_host(self):
+        # Finding #8 (hardened): a non-loopback Host — even a syntactically clean one
+        # (Codex review) — must NOT be reflected into the advertised URL without a
+        # configured public_base_url; a loopback Host still is (local development).
         app = make_asgi_app(make_host(), allow_anonymous=True)
+        for forged in ("evil.example/@attacker", "attacker.example:443", "svc.internal:8443"):
+            with self.subTest(host=forged), self.assertLogs("portmark.a2a", level="WARNING"):
+                _, _, payload = self._asgi_call(
+                    app, "GET", "/.well-known/agent-card.json", {"Host": forged}
+                )
+            self.assertEqual(
+                json.loads(payload)["supportedInterfaces"][0]["url"], "http://127.0.0.1/message:send"
+            )
+        # A loopback Host is trusted for local development and still reflected.
         _, _, payload = self._asgi_call(
-            app, "GET", "/.well-known/agent-card.json", {"Host": "evil.example/@attacker"}
+            app, "GET", "/.well-known/agent-card.json", {"Host": "127.0.0.1:9000"}
         )
         self.assertEqual(
-            json.loads(payload)["supportedInterfaces"][0]["url"], "http://127.0.0.1/message:send"
-        )
-        # A syntactically safe authority is still honoured.
-        _, _, payload = self._asgi_call(
-            app, "GET", "/.well-known/agent-card.json", {"Host": "svc.internal:8443"}
-        )
-        self.assertEqual(
-            json.loads(payload)["supportedInterfaces"][0]["url"], "http://svc.internal:8443/message:send"
+            json.loads(payload)["supportedInterfaces"][0]["url"], "http://127.0.0.1:9000/message:send"
         )
 
     def test_asgi_agent_card_prefers_configured_public_base_url(self):
