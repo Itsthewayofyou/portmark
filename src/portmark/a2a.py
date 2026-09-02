@@ -279,6 +279,30 @@ class A2ARouter:
         self._readiness_lock = threading.Lock()
         self._readiness_cached_until = 0.0
         self._readiness_cached = False
+        self._cleartext_lock = threading.Lock()
+        self._cleartext_warned = False
+
+    def note_forwarded_proto(self, forwarded_proto: str) -> None:
+        """Warn once when a proxy forwarded a request over plain HTTP.
+
+        An `X-Forwarded-Proto` of anything other than https is positive proof the
+        upstream proxy did not terminate TLS — stronger than the startup check,
+        which can only observe whether HSTS was enabled. Fires once to avoid
+        per-request log noise.
+        """
+        proto = forwarded_proto.split(",", 1)[0].strip().lower()
+        if not proto or proto == "https":
+            return
+        with self._cleartext_lock:
+            if self._cleartext_warned:
+                return
+            self._cleartext_warned = True
+        logger.warning(
+            "PROVEN cleartext: a request arrived with X-Forwarded-Proto=%r, so the "
+            "upstream proxy is NOT terminating TLS. Envelopes are signed but readable "
+            "in transit. Terminate HTTPS at the proxy. (Logged once.)",
+            proto,
+        )
 
     def response(self, status: int, value: Any, headers: dict[str, str] | None = None) -> HttpResponse:
         payload = json.dumps(value).encode()
@@ -489,6 +513,7 @@ def make_handler(host: AgentHost, auth: A2AAuthConfig | None = None, enable_hsts
 
         def do_POST(self) -> None:
             started = time.monotonic()
+            router.note_forwarded_proto(self.headers.get("X-Forwarded-Proto", ""))
             try:
                 with router.admit_post(
                     self.path,
@@ -598,6 +623,7 @@ def make_asgi_app(host: AgentHost, auth: A2AAuthConfig | None = None, enable_hst
             await _send(send, router.response(404, {"error": "not found"}))
             return
 
+        router.note_forwarded_proto(_header(scope, b"x-forwarded-proto"))
         started = time.monotonic()
         try:
             raw_length = _header(scope, b"content-length")

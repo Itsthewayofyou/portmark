@@ -2232,6 +2232,25 @@ class RuntimeTests(unittest.TestCase):
         payload = b"".join(m.get("body", b"") for m in sent[1:])
         return status, response_headers, payload
 
+    def test_forwarded_proto_http_warns_once_of_cleartext(self):
+        host = make_host()
+        app = make_asgi_app(host)
+        headers = {"Content-Type": "application/json", "X-Forwarded-Proto": "http"}
+        # A request proven to arrive over plain HTTP must warn.
+        with self.assertLogs("portmark.a2a", level="WARNING") as captured:
+            self._asgi_call(app, "POST", "/message:send", headers, body=b"{}")
+        self.assertIn("PROVEN cleartext", "\n".join(captured.output))
+        # Subsequent cleartext requests stay quiet — logged once.
+        with self.assertNoLogs("portmark.a2a", level="WARNING"):
+            self._asgi_call(app, "POST", "/message:send", headers, body=b"{}")
+
+    def test_forwarded_proto_https_does_not_warn(self):
+        host = make_host()
+        app = make_asgi_app(host)
+        headers = {"Content-Type": "application/json", "X-Forwarded-Proto": "https"}
+        with self.assertNoLogs("portmark.a2a", level="WARNING"):
+            self._asgi_call(app, "POST", "/message:send", headers, body=b"{}")
+
     def test_asgi_app_serves_agent_card_with_security_headers(self):
         app = make_asgi_app(make_host())
         status, headers, payload = self._asgi_call(app, "GET", "/.well-known/agent-card.json", {"Host": "127.0.0.1"})
