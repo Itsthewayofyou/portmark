@@ -2310,6 +2310,43 @@ class RuntimeTests(unittest.TestCase):
         for header in ("x-content-type-options", "x-frame-options", "content-security-policy", "referrer-policy"):
             self.assertIn(header, headers)
 
+    def test_asgi_agent_card_ignores_forged_host_header(self):
+        # Finding #8: a forged Host must not be reflected into the advertised URL.
+        app = make_asgi_app(make_host(), allow_anonymous=True)
+        _, _, payload = self._asgi_call(
+            app, "GET", "/.well-known/agent-card.json", {"Host": "evil.example/@attacker"}
+        )
+        self.assertEqual(
+            json.loads(payload)["supportedInterfaces"][0]["url"], "http://127.0.0.1/message:send"
+        )
+        # A syntactically safe authority is still honoured.
+        _, _, payload = self._asgi_call(
+            app, "GET", "/.well-known/agent-card.json", {"Host": "svc.internal:8443"}
+        )
+        self.assertEqual(
+            json.loads(payload)["supportedInterfaces"][0]["url"], "http://svc.internal:8443/message:send"
+        )
+
+    def test_asgi_agent_card_prefers_configured_public_base_url(self):
+        app = make_asgi_app(make_host(), allow_anonymous=True, public_base_url="https://agents.example.com/")
+        _, _, payload = self._asgi_call(
+            app, "GET", "/.well-known/agent-card.json", {"Host": "evil.example"}
+        )
+        self.assertEqual(
+            json.loads(payload)["supportedInterfaces"][0]["url"], "https://agents.example.com/message:send"
+        )
+
+    def test_a2a_router_warns_when_unauthenticated_and_not_opted_in(self):
+        # Finding #8: an endpoint with no bearer token warns unless the operator
+        # explicitly opts into anonymous access (or configures a token).
+        with self.assertLogs("portmark.a2a", level="WARNING") as captured:
+            make_asgi_app(make_host())
+        self.assertTrue(any("NO bearer token" in message for message in captured.output))
+        with self.assertNoLogs("portmark.a2a", level="WARNING"):
+            make_asgi_app(make_host(), allow_anonymous=True)
+        with self.assertNoLogs("portmark.a2a", level="WARNING"):
+            make_asgi_app(make_host(), A2AAuthConfig("secret"))
+
     def test_asgi_healthz_and_readyz(self):
         app = make_asgi_app(make_host())
         status, _, payload = self._asgi_call(app, "GET", "/healthz")

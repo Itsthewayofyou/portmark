@@ -5,6 +5,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import secrets
 import threading
 import time
@@ -23,6 +24,12 @@ from .official_a2a import make_sdk_agent_card, validate_sdk_message_send_params
 
 
 logger = logging.getLogger(__name__)
+
+# A syntactically safe HTTP authority: hostname or IPv4, or a bracketed IPv6,
+# with an optional port. Anything else in the Host header (schemes, paths,
+# credentials, whitespace) is rejected so it cannot be reflected verbatim into
+# the advertised agent-card URL. Finding #8.
+_SAFE_HOST_RE = re.compile(r"^(?:[A-Za-z0-9.\-]+|\[[0-9A-Fa-f:]+\])(?::\d{1,5})?$")
 MAX_REQUEST_BYTES = 1_000_000
 DEFAULT_MAX_CONCURRENT_REQUESTS = 32
 DEFAULT_RATE_LIMIT_PER_IP = 120
@@ -258,6 +265,8 @@ class A2ARouter:
         a2a_adapter: str = "local",
         readiness_check: Callable[[], None] | None = None,
         readiness_cache_seconds: float = DEFAULT_READY_CACHE_SECONDS,
+        allow_anonymous: bool = False,
+        public_base_url: str | None = None,
     ) -> None:
         if a2a_adapter not in A2A_ADAPTERS:
             raise ValueError("a2a_adapter must be 'local' or 'sdk'")
@@ -267,6 +276,18 @@ class A2ARouter:
             make_sdk_agent_card("http://127.0.0.1", False)
         self.host = host
         self.auth_config = auth or A2AAuthConfig()
+        self.public_base_url = public_base_url.rstrip("/") if public_base_url else None
+        # Envelope signatures are the real task-auth gate; the bearer token is an
+        # additional transport gate. When it is absent AND the caller has not
+        # explicitly opted into anonymous access, warn loudly — this endpoint may
+        # sit behind a public reverse proxy (make_asgi_app has no loopback guard).
+        if not self.auth_config.required and not allow_anonymous:
+            logger.warning(
+                "A2A endpoint has NO bearer token: task submissions are gated only by "
+                "envelope signatures, not by transport auth. Set A2AAuthConfig(token) "
+                "before public exposure, or pass allow_anonymous=True to acknowledge "
+                "an intentionally open endpoint. See THREAT_MODEL.md."
+            )
         self.enable_hsts = enable_hsts
         self.a2a_adapter = a2a_adapter
         self.rate_limit_window_seconds = rate_limit_window_seconds
@@ -343,6 +364,16 @@ class A2ARouter:
             {"WWW-Authenticate": f'Bearer realm="{self.auth_config.realm}"'},
         )
 
+    def _agent_card_base_url(self, host_header: str) -> str:
+        # Prefer an operator-configured URL. Otherwise fall back to the Host header
+        # only if it is a syntactically safe authority, so a forged Host cannot be
+        # reflected into the advertised agent-card URL. Finding #8.
+        if self.public_base_url:
+            return self.public_base_url
+        if host_header and _SAFE_HOST_RE.match(host_header):
+            return f"http://{host_header}"
+        return "http://127.0.0.1"
+
     def handle_get(
         self,
         path: str,
@@ -351,7 +382,7 @@ class A2ARouter:
         authorization: str = "",
         accept: str = "",
     ) -> HttpResponse:
-        base_url = f"http://{host_header or '127.0.0.1'}"
+        base_url = self._agent_card_base_url(host_header)
         if path == "/healthz":
             return self.response(200, {"status": "ok"})
         if path == "/readyz":
@@ -704,6 +735,9 @@ def serve(
         agent_card_rate_limit_per_ip=agent_card_rate_limit_per_ip,
         agent_card_rate_limit_window_seconds=agent_card_rate_limit_window_seconds,
         a2a_adapter=a2a_adapter,
+        # The loopback bind enforced above is the compensating control, so a
+        # tokenless loopback server is an acknowledged configuration here.
+        allow_anonymous=True,
     )
     uvicorn.run(
         app,
