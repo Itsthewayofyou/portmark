@@ -13,6 +13,15 @@ from .security import AttestationPolicy, AuditLog, EnvelopeSigningIdentity, Host
 from .storage import InMemoryRuntimeStore, RuntimeStore
 from .tools import ToolExecutionError, ToolRegistry
 
+# Prefixes that mark a manifest's component_digest as a content-addressed pin of
+# exact bytes, as opposed to the symbolic default (e.g. "python:reference-agent-v1").
+_CONTENT_DIGEST_ALGOS = frozenset({"sha256", "sha384", "sha512", "blake3"})
+
+
+def _is_content_digest(digest: str) -> bool:
+    algo, _, rest = digest.partition(":")
+    return bool(rest) and algo in _CONTENT_DIGEST_ALGOS
+
 
 class AgentHost:
     def __init__(
@@ -68,8 +77,15 @@ class AgentHost:
         if provider is None:
             raise SecurityError(f"provider {envelope.manifest.provider!r} is not configured")
         provider_digest = getattr(provider, "component_digest", None)
-        if provider_digest is not None and envelope.manifest.component_digest != provider_digest:
-            raise SecurityError("Wasm component digest does not match the signed manifest")
+        manifest_digest = envelope.manifest.component_digest
+        if provider_digest is not None:
+            if manifest_digest != provider_digest:
+                raise SecurityError("Wasm component digest does not match the signed manifest")
+        elif _is_content_digest(manifest_digest):
+            # The signed manifest pins exact component bytes, but the selected
+            # provider exposes no digest to verify against. Fail closed rather
+            # than run an unverified component under a pinned manifest.
+            raise SecurityError("signed manifest pins a component digest but the provider exposes none to verify")
 
         state = envelope.state
         consume_nonce = envelope.permit.nonce if state.status == "ready" else None
