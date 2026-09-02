@@ -32,7 +32,7 @@ from portmark.config import RuntimeConfig
 from portmark.factory import build_envelope, make_demo_envelope, make_host, signer_from_environment
 from portmark.metrics import RuntimeMetrics
 from portmark.logging_config import JsonLogFormatter
-from portmark.models import AgentEnvelope, AgentManifest, AgentState, AttestationEvidence, Permit, ProviderDecision, ResourceBudget, ToolGrant
+from portmark.models import AgentState, AttestationEvidence, Permit, ProviderDecision, ResourceBudget, ToolGrant
 from portmark.providers import GenericHttpProvider, ModelProvider, NativeWasmtimeComponentProvider
 from portmark.policy import load_host_policy
 from portmark.security import (
