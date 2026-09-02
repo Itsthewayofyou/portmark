@@ -2195,6 +2195,20 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["host"], "127.0.0.1")
         self.assertEqual(run.call_args.kwargs["limit_concurrency"], DEFAULT_MAX_CONCURRENT_REQUESTS)
 
+    def test_serve_warns_when_tls_not_asserted(self):
+        host = make_host()
+        # HSTS off => TLS not asserted => a loud startup warning must fire.
+        with patch("uvicorn.run"):
+            with self.assertLogs("portmark.a2a", level="WARNING") as captured:
+                serve(host, "127.0.0.1", 8080, enable_hsts=False)
+        joined = "\n".join(captured.output)
+        self.assertIn("TLS NOT asserted", joined)
+        self.assertIn("NOT encrypted in transit", joined)
+        # HSTS on => operator asserted HTTPS => no false alarm.
+        with patch("uvicorn.run"):
+            with self.assertNoLogs("portmark.a2a", level="WARNING"):
+                serve(host, "127.0.0.1", 8080, enable_hsts=True)
+
     def _asgi_call(self, app, method, path, headers=None, body=b"", client=("203.0.113.9", 5555)):
         """Drive an ASGI app directly and collect the response."""
         scope = {

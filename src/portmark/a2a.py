@@ -655,6 +655,14 @@ def serve(
         raise ValueError(
             "A2A reference server must bind to loopback and be fronted by a production reverse proxy for public exposure"
         )
+    if not enable_hsts:
+        logger.warning(
+            "TLS NOT asserted: --enable-hsts is off, so the upstream reverse proxy is "
+            "not confirmed to terminate HTTPS. Envelopes are SIGNED (tamper- and "
+            "replay-proof) but NOT encrypted in transit — anyone who intercepts a "
+            "request can READ its contents. Terminate TLS at the proxy and pass "
+            "--enable-hsts before public exposure. See THREAT_MODEL.md."
+        )
     try:
         import uvicorn
     except ImportError as exc:  # pragma: no cover - exercised by packaging, not unit tests
