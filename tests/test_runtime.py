@@ -2966,11 +2966,19 @@ class RuntimeTests(unittest.TestCase):
             package = root / "wasmtime"
             package.mkdir()
             (package / "__init__.py").write_text(
+                "class Config:\n"
+                "    def __init__(self):\n"
+                "        self.consume_fuel = False\n"
                 "class Engine:\n"
-                "    pass\n"
+                "    def __init__(self, config=None):\n"
+                "        self.config = config\n"
                 "class Store:\n"
                 "    def __init__(self, engine=None):\n"
-                "        self.engine = engine\n",
+                "        self.engine = engine\n"
+                "    def set_fuel(self, fuel):\n"
+                "        pass\n"
+                "    def set_limits(self, memory_size=-1):\n"
+                "        pass\n",
                 encoding="utf-8",
             )
             response = content
@@ -3046,6 +3054,20 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result.result["evidence"], ["native-checkpoint-observed"])
         self.assertEqual([event["event"] for event in result.audit].count("tool.executed"), 1)
         self.assertEqual(result.checkpoint["messages"][0]["content"][0]["title"], "Result 1 for from native component checkpoint")
+
+    @unittest.skipUnless(HAS_REAL_WASMTIME, "requires portmark[wasmtime]")
+    def test_real_native_wasmtime_component_traps_on_exhausted_fuel_and_memory(self):
+        # Finding #6: a native guest is bounded by fuel (CPU) and a memory limit,
+        # not only the wall-clock. Proven with the benign capsule under tiny
+        # budgets — it runs fine at the defaults but is rejected when starved.
+        capsule = str(Path(__file__).parents[1] / "capsules" / "research-agent.component.wasm.b64")
+        state = AgentState("task", "goal")
+        starved_fuel = NativeWasmtimeComponentProvider.from_file(capsule, max_fuel=10)
+        with self.assertRaisesRegex(RuntimeError, "rejected|fuel"):
+            starved_fuel.decide(state, ("catalog.search",))
+        starved_memory = NativeWasmtimeComponentProvider.from_file(capsule, max_memory_bytes=1)
+        with self.assertRaisesRegex(RuntimeError, "rejected|memory"):
+            starved_memory.decide(state, ("catalog.search",))
 
     @unittest.skipUnless(HAS_REAL_WASMTIME, "requires portmark[wasmtime]")
     def test_real_native_wasmtime_component_artifact_matches_source(self):
