@@ -1434,10 +1434,21 @@ class RuntimeTests(unittest.TestCase):
                     self.assertTrue(source_store.verify_audit_chain(first.task_id))
                     self.assertIsNotNone(first.migration_envelope)
 
-                    second = destination.run(envelope_from_dict(first.migration_envelope))
+                    migrated = envelope_from_dict(first.migration_envelope)
+                    second = destination.run(migrated)
                     self.assertEqual(second.status, "completed")
                     self.assertEqual(destination_store.load_checkpoint(second.task_id)["status"], "completed")
                     self.assertTrue(destination_store.verify_audit_chain(second.task_id))
+
+                    # Finding #3: the destination's local sequence restarts at 0, so
+                    # the verified prior anchor is recorded in the first event's
+                    # details (inside the hashed chain) instead of being discarded.
+                    anchor = second.audit[0]["details"]["migration"]
+                    self.assertEqual(anchor["previous_audit_hash"], migrated.previous_audit_hash)
+                    self.assertEqual(anchor["previous_audit_sequence"], migrated.previous_audit_sequence)
+                    self.assertEqual(anchor["previous_audit_host_id"], "host:source")
+                    # The anchor ties this chain to the source's actual head hash.
+                    self.assertEqual(anchor["previous_audit_hash"], first.audit[-1]["hash"])
 
     def test_sqlite_store_rejects_replay_after_host_restart(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -90,17 +90,17 @@ class AgentHost:
         state = envelope.state
         consume_nonce = envelope.permit.nonce if state.status == "ready" else None
         state.status = "running"
-        previous_hash, start_sequence = self._audit_start(envelope)
+        previous_hash, start_sequence, migration_anchor = self._audit_start(envelope)
         audit = AuditLog(previous_hash, start_sequence, self.host_id)
-        audit.append(
-            "agent.accepted",
-            {
-                "agent": envelope.manifest.agent_id,
-                "host": self.host_id,
-                "policy_version": active_policy.policy_version,
-                "policy_hash": active_policy.policy_hash,
-            },
-        )
+        accepted_details: dict[str, Any] = {
+            "agent": envelope.manifest.agent_id,
+            "host": self.host_id,
+            "policy_version": active_policy.policy_version,
+            "policy_hash": active_policy.policy_hash,
+        }
+        if migration_anchor is not None:
+            accepted_details["migration"] = migration_anchor
+        audit.append("agent.accepted", accepted_details)
         persisted_events = self._persist(envelope, state, audit, 0, consume_nonce=consume_nonce)
         tool_names = tuple(grant.name for grant in effective.grants)
 
@@ -308,17 +308,28 @@ class AgentHost:
         if status == "failed":
             self.metrics.increment("runs.failed")
 
-    def _audit_start(self, envelope: AgentEnvelope) -> tuple[str, int]:
+    def _audit_start(self, envelope: AgentEnvelope) -> tuple[str, int, dict[str, Any] | None]:
         stored = self.store.audit_head(envelope.state.task_id)
         if envelope.previous_audit_hash:
             if stored is not None and stored[0] != envelope.previous_audit_hash:
                 raise SecurityError("envelope audit head does not match stored audit head")
             if stored is None:
+                # A migration accepted onto a fresh local chain. The prior head is
+                # signature-verified here but the local sequence restarts at 0, so
+                # record the verified anchor (prior head hash + sequence + host) in
+                # the first audit event. It lands inside the hashed event, making the
+                # migration point durable and tamper-evident. Finding #3.
                 self._verify_previous_audit_head(envelope)
-            return envelope.previous_audit_hash, stored[1] if stored is not None else 0
+                anchor = {
+                    "previous_audit_hash": envelope.previous_audit_hash,
+                    "previous_audit_sequence": envelope.previous_audit_sequence,
+                    "previous_audit_host_id": envelope.previous_audit_host_id,
+                }
+                return envelope.previous_audit_hash, 0, anchor
+            return envelope.previous_audit_hash, stored[1], None
         if stored is not None:
-            return stored
-        return "", 0
+            return stored[0], stored[1], None
+        return "", 0, None
 
     def _verify_previous_audit_head(self, envelope: AgentEnvelope) -> None:
         if (
