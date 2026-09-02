@@ -221,6 +221,9 @@ class SecurityGuardTests(unittest.TestCase):
             ({"required": "query"}, {"query": "x"}, "required argument constraints must be a list"),
             ({"required": [""]}, {"query": "x"}, "required argument constraints must be non-empty strings"),
             ({"additional_arguments": "false"}, {"query": "x"}, "additional_arguments constraint must be boolean"),
+            # A scalar allowed_* must be rejected, not treated as a substring allowlist
+            # ("admin" would otherwise accept role "a" via Python `in`). Finding #5.
+            ({"allowed_role": "admin"}, {"role": "a"}, "allowed_role constraint must be a list"),
             ({"arguments": {"query": {"type": [1]}}}, {"query": "x"}, "argument type constraints must be strings"),
             ({"arguments": {"query": {"enum": []}}}, {"query": "x"}, "argument 'query' enum constraint must be a non-empty list"),
             ({"arguments": {"limit": {"minimum": True}}}, {"limit": 1}, "argument 'limit' minimum constraint must be numeric"),
@@ -274,6 +277,9 @@ class SecurityGuardTests(unittest.TestCase):
             ({"arguments": {"needed": {"required": True}}}, {}, "argument 'needed' is required"),
             ({"max_limit": 5}, {"limit": 6}, "argument 'limit' exceeds its permitted maximum"),
             ({"allowed_region": ["us"]}, {"region": "eu"}, "argument 'region' is outside its allowed set"),
+            # additional_arguments=False must reject smuggled fields even with no
+            # `arguments` schema — only flat constraints. Finding #4.
+            ({"max_amount": 100, "additional_arguments": False}, {"amount": 50, "account_id": "x"}, "unsupported fields"),
             ({"method": "GET"}, {"method": "POST"}, "argument 'method' does not match its required value"),
             ({"arguments": {"count": {"minimum": 1}}}, {"count": 0}, "argument 'count' is below its permitted minimum"),
             ({"arguments": {"count": {"maximum": 5}}}, {"count": 6}, "argument 'count' exceeds its permitted maximum"),

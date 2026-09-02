@@ -18,12 +18,18 @@ def main() -> None:
         max_output_bytes = int(request["max_output_bytes"])
         if max_output_bytes < 1:
             raise RuntimeError("max_output_bytes must be positive")
+        max_fuel = int(request["max_fuel"])
+        if max_fuel < 1:
+            raise RuntimeError("max_fuel must be positive")
+        max_memory_bytes = int(request["max_memory_bytes"])
+        if max_memory_bytes < 1:
+            raise RuntimeError("max_memory_bytes must be positive")
     except (KeyError, TypeError, ValueError, json.JSONDecodeError, binascii.Error) as error:
         _fail(error)
         raise SystemExit(1)
 
     try:
-        from wasmtime import Engine, Store
+        from wasmtime import Config, Engine, Store
         try:
             from wasmtime import WasmtimeError
         except ImportError:
@@ -36,8 +42,15 @@ def main() -> None:
     try:
         captured_stdout = _CappedTextIO(max_output_bytes)
         with redirect_stdout(captured_stdout):
-            engine = Engine()
+            # Bound guest CPU with fuel (deterministic instruction budget) and guest
+            # memory with a store limit, so a component cannot exhaust the worker via
+            # a tight loop or aggressive memory.grow before the wall-clock fires. #6.
+            config = Config()
+            config.consume_fuel = True
+            engine = Engine(config)
             store = Store(engine)
+            store.set_fuel(max_fuel)
+            store.set_limits(memory_size=max_memory_bytes)
             instance = Linker(engine).instantiate(store, Component(engine, component))
             resume = instance.get_func(store, "resume")
             if resume is None:

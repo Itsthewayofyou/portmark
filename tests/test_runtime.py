@@ -1386,6 +1386,19 @@ class RuntimeTests(unittest.TestCase):
             connection.execute("UPDATE audit_heads SET head_hash = 'tampered' WHERE task_id = %s", (task_id,))
             connection.commit()
 
+    def _tamper_store_host_id(self, store, task_id, backend):
+        if backend == "sqlite":
+            with sqlite3.connect(store.path) as connection:
+                connection.execute(
+                    "UPDATE audit_events SET host_id = 'host:impostor' WHERE task_id = ? AND sequence = 0", (task_id,)
+                )
+            return
+        with store._connect() as connection:
+            connection.execute(
+                "UPDATE audit_events SET host_id = 'host:impostor' WHERE task_id = %s AND sequence = 0", (task_id,)
+            )
+            connection.commit()
+
     def test_runtime_store_contract_persists_checkpoint_audit_and_three_state_verification(self):
         signer = EnvelopeSigner.generate("contract-key", "host:local-demo", ("host:local-demo",))
         for context in self._store_case_contexts(signer):
@@ -1443,6 +1456,23 @@ class RuntimeTests(unittest.TestCase):
                     self.assertEqual(verification.reason, "stored audit head does not match audit events")
                     self.assertFalse(store.verify_audit_chain(result.task_id))
 
+    def test_runtime_store_contract_detects_audit_host_id_tamper(self):
+        # Altering a stored event's host_id must break verification: host_id is
+        # inside the per-event hash (finding #7). Without that, attribution could
+        # be rewritten while the chain still verified.
+        signer = EnvelopeSigner.generate("contract-host-key", "host:local-demo", ("host:local-demo",))
+        for context in self._store_case_contexts(signer):
+            with context as (backend, store):
+                with self.subTest(backend=backend):
+                    host = make_host(signer=signer, store=store)
+                    result = host.run(make_demo_envelope(host, f"{backend} host tamper"))
+                    self.assertTrue(store.verify_audit_chain(result.task_id))
+                    self._tamper_store_host_id(store, result.task_id, backend)
+                    verification = store.verify_audit_chain_status(result.task_id)
+                    self.assertEqual(verification.status, "invalid")
+                    self.assertEqual(verification.reason, "audit event hash is invalid")
+                    self.assertFalse(store.verify_audit_chain(result.task_id))
+
     def test_runtime_store_contract_recovers_migration_checkpoints_and_audits(self):
         source_signer = EnvelopeSigner.generate("contract-source-key", "host:source", ("host:source", "host:destination"))
         destination_signer = trust_signer(
@@ -1466,10 +1496,21 @@ class RuntimeTests(unittest.TestCase):
                     self.assertTrue(source_store.verify_audit_chain(first.task_id))
                     self.assertIsNotNone(first.migration_envelope)
 
-                    second = destination.run(envelope_from_dict(first.migration_envelope))
+                    migrated = envelope_from_dict(first.migration_envelope)
+                    second = destination.run(migrated)
                     self.assertEqual(second.status, "completed")
                     self.assertEqual(destination_store.load_checkpoint(second.task_id)["status"], "completed")
                     self.assertTrue(destination_store.verify_audit_chain(second.task_id))
+
+                    # Finding #3: the destination's local sequence restarts at 0, so
+                    # the verified prior anchor is recorded in the first event's
+                    # details (inside the hashed chain) instead of being discarded.
+                    anchor = second.audit[0]["details"]["migration"]
+                    self.assertEqual(anchor["previous_audit_hash"], migrated.previous_audit_hash)
+                    self.assertEqual(anchor["previous_audit_sequence"], migrated.previous_audit_sequence)
+                    self.assertEqual(anchor["previous_audit_host_id"], "host:source")
+                    # The anchor ties this chain to the source's actual head hash.
+                    self.assertEqual(anchor["previous_audit_hash"], first.audit[-1]["hash"])
 
     def test_sqlite_store_rejects_replay_after_host_restart(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2331,6 +2372,43 @@ class RuntimeTests(unittest.TestCase):
         for header in ("x-content-type-options", "x-frame-options", "content-security-policy", "referrer-policy"):
             self.assertIn(header, headers)
 
+    def test_asgi_agent_card_ignores_forged_host_header(self):
+        # Finding #8: a forged Host must not be reflected into the advertised URL.
+        app = make_asgi_app(make_host(), allow_anonymous=True)
+        _, _, payload = self._asgi_call(
+            app, "GET", "/.well-known/agent-card.json", {"Host": "evil.example/@attacker"}
+        )
+        self.assertEqual(
+            json.loads(payload)["supportedInterfaces"][0]["url"], "http://127.0.0.1/message:send"
+        )
+        # A syntactically safe authority is still honoured.
+        _, _, payload = self._asgi_call(
+            app, "GET", "/.well-known/agent-card.json", {"Host": "svc.internal:8443"}
+        )
+        self.assertEqual(
+            json.loads(payload)["supportedInterfaces"][0]["url"], "http://svc.internal:8443/message:send"
+        )
+
+    def test_asgi_agent_card_prefers_configured_public_base_url(self):
+        app = make_asgi_app(make_host(), allow_anonymous=True, public_base_url="https://agents.example.com/")
+        _, _, payload = self._asgi_call(
+            app, "GET", "/.well-known/agent-card.json", {"Host": "evil.example"}
+        )
+        self.assertEqual(
+            json.loads(payload)["supportedInterfaces"][0]["url"], "https://agents.example.com/message:send"
+        )
+
+    def test_a2a_router_warns_when_unauthenticated_and_not_opted_in(self):
+        # Finding #8: an endpoint with no bearer token warns unless the operator
+        # explicitly opts into anonymous access (or configures a token).
+        with self.assertLogs("portmark.a2a", level="WARNING") as captured:
+            make_asgi_app(make_host())
+        self.assertTrue(any("NO bearer token" in message for message in captured.output))
+        with self.assertNoLogs("portmark.a2a", level="WARNING"):
+            make_asgi_app(make_host(), allow_anonymous=True)
+        with self.assertNoLogs("portmark.a2a", level="WARNING"):
+            make_asgi_app(make_host(), A2AAuthConfig("secret"))
+
     def test_asgi_healthz_and_readyz(self):
         app = make_asgi_app(make_host())
         status, _, payload = self._asgi_call(app, "GET", "/healthz")
@@ -2987,11 +3065,19 @@ class RuntimeTests(unittest.TestCase):
             package = root / "wasmtime"
             package.mkdir()
             (package / "__init__.py").write_text(
+                "class Config:\n"
+                "    def __init__(self):\n"
+                "        self.consume_fuel = False\n"
                 "class Engine:\n"
-                "    pass\n"
+                "    def __init__(self, config=None):\n"
+                "        self.config = config\n"
                 "class Store:\n"
                 "    def __init__(self, engine=None):\n"
-                "        self.engine = engine\n",
+                "        self.engine = engine\n"
+                "    def set_fuel(self, fuel):\n"
+                "        pass\n"
+                "    def set_limits(self, memory_size=-1):\n"
+                "        pass\n",
                 encoding="utf-8",
             )
             response = content
@@ -3067,6 +3153,20 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result.result["evidence"], ["native-checkpoint-observed"])
         self.assertEqual([event["event"] for event in result.audit].count("tool.executed"), 1)
         self.assertEqual(result.checkpoint["messages"][0]["content"][0]["title"], "Result 1 for from native component checkpoint")
+
+    @unittest.skipUnless(HAS_REAL_WASMTIME, "requires portmark[wasmtime]")
+    def test_real_native_wasmtime_component_traps_on_exhausted_fuel_and_memory(self):
+        # Finding #6: a native guest is bounded by fuel (CPU) and a memory limit,
+        # not only the wall-clock. Proven with the benign capsule under tiny
+        # budgets — it runs fine at the defaults but is rejected when starved.
+        capsule = str(Path(__file__).parents[1] / "capsules" / "research-agent.component.wasm.b64")
+        state = AgentState("task", "goal")
+        starved_fuel = NativeWasmtimeComponentProvider.from_file(capsule, max_fuel=10)
+        with self.assertRaisesRegex(RuntimeError, "rejected|fuel"):
+            starved_fuel.decide(state, ("catalog.search",))
+        starved_memory = NativeWasmtimeComponentProvider.from_file(capsule, max_memory_bytes=1)
+        with self.assertRaisesRegex(RuntimeError, "rejected|memory"):
+            starved_memory.decide(state, ("catalog.search",))
 
     @unittest.skipUnless(HAS_REAL_WASMTIME, "requires portmark[wasmtime]")
     def test_real_native_wasmtime_component_artifact_matches_source(self):

@@ -110,6 +110,7 @@ class InMemoryRuntimeStore:
                     "event": event["event"],
                     "details": event["details"],
                     "previous": event["previous"],
+                    "host_id": event.get("host_id", ""),
                 }
                 if event["hash"] != _audit_hash(record):
                     return AuditVerificationResult("invalid", "audit event hash is invalid")
@@ -315,7 +316,7 @@ class SQLiteRuntimeStore:
     def verify_audit_chain_status(self, task_id: str) -> AuditVerificationResult:
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT sequence, event, details_json, previous_hash, hash FROM audit_events WHERE task_id = ? ORDER BY sequence",
+                "SELECT sequence, event, details_json, previous_hash, hash, host_id FROM audit_events WHERE task_id = ? ORDER BY sequence",
                 (task_id,),
             ).fetchall()
             head = connection.execute(
@@ -337,6 +338,7 @@ class SQLiteRuntimeStore:
                 "event": row["event"],
                 "details": details,
                 "previous": row["previous_hash"],
+                "host_id": row["host_id"],
             }
             if row["hash"] != _audit_hash(record):
                 return AuditVerificationResult("invalid", "audit event hash is invalid")
@@ -500,7 +502,7 @@ class PostgresRuntimeStore:
     def verify_audit_chain_status(self, task_id: str) -> AuditVerificationResult:
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT sequence, event, details_json, previous_hash, hash FROM audit_events WHERE task_id = %s ORDER BY sequence",
+                "SELECT sequence, event, details_json, previous_hash, hash, host_id FROM audit_events WHERE task_id = %s ORDER BY sequence",
                 (task_id,),
             ).fetchall()
             head = connection.execute(
@@ -522,6 +524,7 @@ class PostgresRuntimeStore:
                 "event": row["event"],
                 "details": details,
                 "previous": row["previous_hash"],
+                "host_id": row["host_id"],
             }
             if row["hash"] != _audit_hash(record):
                 return AuditVerificationResult("invalid", "audit event hash is invalid")

@@ -690,17 +690,17 @@ _SPEC_NARROWERS: dict[str, str] = {
 def _permitted_argument_names(constraints: dict[str, Any]) -> set[str] | None:
     """Argument names this constraint set admits, or None when it admits any.
 
-    Mirrors `check_constraints` exactly, including the part that is easy to miss:
-    `additional_arguments: False` is inert unless an `arguments` schema is also
-    present, because the whitelist is only consulted inside that branch.
+    Mirrors `check_constraints` exactly: `additional_arguments: False` bounds the
+    admitted names whether or not an `arguments` schema is present (finding #4).
+    When it is not set to False, the grant admits any argument, so return None.
     """
-    schema = constraints.get("arguments")
-    if not isinstance(schema, dict):
-        return None
     if constraints.get("additional_arguments", True) is not False:
         return None
+    schema = constraints.get("arguments")
     required = constraints.get("required")
-    names = set(schema) | _legacy_constrained_arguments(constraints)
+    names = _legacy_constrained_arguments(constraints)
+    if isinstance(schema, dict):
+        names |= set(schema)
     if isinstance(required, (list, tuple)):
         names |= {item for item in required if isinstance(item, str)}
     return names
@@ -1084,9 +1084,10 @@ class HostPolicy:
 
 
 class AuditLog:
-    def __init__(self, previous_hash: str = "", start_sequence: int = 0) -> None:
+    def __init__(self, previous_hash: str = "", start_sequence: int = 0, host_id: str = "") -> None:
         self._head = previous_hash
         self._start_sequence = start_sequence
+        self._host_id = host_id
         self._events: list[dict[str, Any]] = []
 
     @property
@@ -1098,7 +1099,9 @@ class AuditLog:
         return tuple(self._events)
 
     def append(self, event: str, details: dict[str, Any]) -> None:
-        record = {"sequence": self._start_sequence + len(self._events), "event": event, "details": details, "previous": self._head}
+        # host_id is inside the hashed record so a stored event's host attribution
+        # cannot be altered after the fact while the chain still verifies. Finding #7.
+        record = {"sequence": self._start_sequence + len(self._events), "event": event, "details": details, "previous": self._head, "host_id": self._host_id}
         record_hash = hashlib.sha256(canonical_json(record)).hexdigest()
         record["hash"] = record_hash
         self._events.append(record)
@@ -1126,11 +1129,18 @@ def check_constraints(constraints: dict[str, Any], arguments: dict[str, Any]) ->
                 raise SecurityError(f"argument {argument!r} is required")
             if argument in arguments:
                 _check_argument_schema(argument, arguments[argument], spec)
-        if additional is False:
-            known = set(schema) | set(required) | _legacy_constrained_arguments(constraints)
-            unexpected = set(arguments) - known
-            if unexpected:
-                raise SecurityError("tool arguments contain unsupported fields")
+    if additional is False:
+        # Reject unexpected fields even when the grant carries only flat
+        # constraints (no `arguments` schema). Previously this was nested under
+        # `if schema is not None`, so a flat-only grant silently passed extras
+        # like account_id. Finding #4. Kept consistent with
+        # `_permitted_argument_names`, which the merge planner uses.
+        known = set(required) | _legacy_constrained_arguments(constraints)
+        if isinstance(schema, dict):
+            known |= set(schema)
+        unexpected = set(arguments) - known
+        if unexpected:
+            raise SecurityError("tool arguments contain unsupported fields")
     for name, expected in constraints.items():
         if name in {"arguments", "required", "additional_arguments"}:
             continue
@@ -1140,6 +1150,11 @@ def check_constraints(constraints: dict[str, Any], arguments: dict[str, Any]) ->
             if actual is None or not isinstance(actual, (int, float)) or actual > expected:
                 raise SecurityError(f"argument {argument!r} exceeds its permitted maximum")
         elif name.startswith("allowed_"):
+            # `expected` must be a collection. A scalar string would make `in` a
+            # substring test ("admin" accepting "a"), silently widening authority
+            # on a mistyped policy. Fail closed on non-list. Finding #5.
+            if not isinstance(expected, (list, tuple, set)):
+                raise SecurityError(f"{name} constraint must be a list")
             argument = name[8:]
             if arguments.get(argument) not in expected:
                 raise SecurityError(f"argument {argument!r} is outside its allowed set")

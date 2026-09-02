@@ -18,6 +18,11 @@ from .projection import provider_state
 from .security import SecurityError
 
 DEFAULT_MAX_WASM_COMPONENT_BYTES = 10_000_000
+# CPU (instruction) and memory ceilings for a native Wasmtime guest. A legitimate
+# single decision consumes tens of fuel units and a small memory; these leave huge
+# headroom while trapping a runaway loop or memory.grow. See finding #6.
+DEFAULT_WASM_FUEL = 1_000_000_000
+DEFAULT_WASM_MEMORY_BYTES = 256 * 1024 * 1024
 
 
 class ModelProvider(ABC):
@@ -113,6 +118,14 @@ def _read_component_file(path: str, max_component_bytes: int) -> bytes:
 class WasmDecisionProvider(ModelProvider):
     """Runs WIT-shaped portable agent decision logic in Wasm with no ambient imports."""
 
+    # debt: the Node fallback guest EXPORTS its own memory, so the host cannot cap
+    # it post-instantiation; memory is bounded only by the module's declared maximum
+    # (spec cap 4 GiB) plus the subprocess wall-clock (memory.grow past the OS limit
+    # returns -1 gracefully and degrades to a CPU loop the deadline catches). An OS
+    # RLIMIT_AS is unusable here because V8 reserves multi-GB of virtual space at
+    # startup. The native Wasmtime engine (the default) enforces real fuel + memory
+    # limits. Upgrade when the Node path becomes primary or needs a hard memory cap.
+
     def __init__(
         self,
         component: bytes,
@@ -175,12 +188,20 @@ class NativeWasmtimeComponentProvider(ModelProvider):
         timeout: float = 2.0,
         max_output_bytes: int = 65_536,
         max_component_bytes: int = DEFAULT_MAX_WASM_COMPONENT_BYTES,
+        max_fuel: int = DEFAULT_WASM_FUEL,
+        max_memory_bytes: int = DEFAULT_WASM_MEMORY_BYTES,
     ) -> None:
         if len(component) > max_component_bytes:
             raise RuntimeError("Wasm component exceeds input limit")
+        if max_fuel < 1:
+            raise RuntimeError("max_fuel must be positive")
+        if max_memory_bytes < 1:
+            raise RuntimeError("max_memory_bytes must be positive")
         self._component = component
         self._timeout = timeout
         self._max_output_bytes = max_output_bytes
+        self._max_fuel = max_fuel
+        self._max_memory_bytes = max_memory_bytes
         self.component_digest = "sha256:" + hashlib.sha256(component).hexdigest()
 
     @classmethod
@@ -190,9 +211,11 @@ class NativeWasmtimeComponentProvider(ModelProvider):
         timeout: float = 2.0,
         max_output_bytes: int = 65_536,
         max_component_bytes: int = DEFAULT_MAX_WASM_COMPONENT_BYTES,
+        max_fuel: int = DEFAULT_WASM_FUEL,
+        max_memory_bytes: int = DEFAULT_WASM_MEMORY_BYTES,
     ) -> "NativeWasmtimeComponentProvider":
         component = _read_component_file(path, max_component_bytes)
-        return cls(component, timeout, max_output_bytes, max_component_bytes)
+        return cls(component, timeout, max_output_bytes, max_component_bytes, max_fuel, max_memory_bytes)
 
     def decide(
         self,
@@ -214,6 +237,8 @@ class NativeWasmtimeComponentProvider(ModelProvider):
                     "context_json": context_json,
                     "checkpoint_json": checkpoint_json,
                     "max_output_bytes": self._max_output_bytes,
+                    "max_fuel": self._max_fuel,
+                    "max_memory_bytes": self._max_memory_bytes,
                 }),
                 capture_output=True,
                 text=True,
