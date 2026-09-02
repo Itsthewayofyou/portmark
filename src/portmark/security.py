@@ -1125,6 +1125,11 @@ def check_constraints(constraints: dict[str, Any], arguments: dict[str, Any]) ->
             if actual is None or not isinstance(actual, (int, float)) or actual > expected:
                 raise SecurityError(f"argument {argument!r} exceeds its permitted maximum")
         elif name.startswith("allowed_"):
+            # `expected` must be a collection. A scalar string would make `in` a
+            # substring test ("admin" accepting "a"), silently widening authority
+            # on a mistyped policy. Fail closed on non-list. Finding #5.
+            if not isinstance(expected, (list, tuple, set)):
+                raise SecurityError(f"{name} constraint must be a list")
             argument = name[8:]
             if arguments.get(argument) not in expected:
                 raise SecurityError(f"argument {argument!r} is outside its allowed set")

@@ -221,6 +221,9 @@ class SecurityGuardTests(unittest.TestCase):
             ({"required": "query"}, {"query": "x"}, "required argument constraints must be a list"),
             ({"required": [""]}, {"query": "x"}, "required argument constraints must be non-empty strings"),
             ({"additional_arguments": "false"}, {"query": "x"}, "additional_arguments constraint must be boolean"),
+            # A scalar allowed_* must be rejected, not treated as a substring allowlist
+            # ("admin" would otherwise accept role "a" via Python `in`). Finding #5.
+            ({"allowed_role": "admin"}, {"role": "a"}, "allowed_role constraint must be a list"),
             ({"arguments": {"query": {"type": [1]}}}, {"query": "x"}, "argument type constraints must be strings"),
             ({"arguments": {"query": {"enum": []}}}, {"query": "x"}, "argument 'query' enum constraint must be a non-empty list"),
             ({"arguments": {"limit": {"minimum": True}}}, {"limit": 1}, "argument 'limit' minimum constraint must be numeric"),
