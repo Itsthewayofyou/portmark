@@ -2,6 +2,53 @@
 
 All notable changes to Portmark are recorded here. Versions follow [semantic versioning](https://semver.org/).
 
+## 0.4.0 — 2026-09-03
+
+Focused security release from an independent code-review pass. No new features.
+
+### Security
+
+- **Host policy is now the projection ceiling (Finding #1).** An omitted
+  `output_projection` in a host policy parsed to `None`, which the intersection
+  treated as "defer to the other side", so an incoming permit granting `["*"]`
+  could widen the effective projection to the full tool output — the opposite of
+  what `POLICY.md`/`TOOLS.md` promised ("omit or `[]` to share nothing"). An
+  omitted host-policy projection now means deny-all. The bundled default policy
+  explicitly grants `catalog.search` the `id` and `title` fields, since the demo
+  Wasm capsule reads its own result back from projected state.
+- **Permit-nonce consumption no longer trusts caller-supplied status (Finding
+  #2).** Whether to spend a permit's one-time nonce was decided by
+  `state.status == "ready"`, a field that rides in on the signed envelope; an
+  issuer could set it to `"running"` on a first submission to skip consumption
+  entirely and replay the permit. A run is now treated as a resume only when a
+  checkpoint already exists for the task, so a first submission consumes the nonce
+  regardless of the status it claims. (Replaying a suspended checkpoint as a resume
+  still needs a checkpoint-generation CAS, tracked as a 0.4.x follow-up.)
+- **Side-effecting tools fail closed on the thread-timeout path (Finding #3).**
+  `ToolRegistry.register(..., side_effecting=True)` marks a tool whose effects
+  cannot be undone. Such a tool is refused on the daemon-thread + queue-timeout
+  path, which cannot cancel a started tool — a deadline there would record failure
+  while the effect still lands. A hard-kill isolated executor is the follow-up that
+  will let these tools run.
+- **The A2A egress no longer returns internal state (Finding #4).**
+  `task_from_run_result` returned `asdict(result)` — the entire internal checkpoint
+  and audit log, including `cause_message` and tool arguments. It now releases only
+  the run status, task id, the agent's declared result, and a migration envelope
+  when present. The checkpoint and raw audit chain stay host-internal.
+- **Malformed constraints fail at load, not silently at runtime (Finding #5).** An
+  unknown key inside an argument spec (a `maxium` typo for `maximum`) was ignored
+  by the enforcer, so a mistyped policy looked enforced and did nothing.
+  `validate_constraints` now rejects unknown argument-spec keys — derived from the
+  same `_SPEC_NARROWERS` table the intersection planner uses — at policy load,
+  envelope build, and A2A decode.
+
+### Documented
+
+- `EXTERNAL_VALIDATION.md`: approval-replay tracking is durable (not
+  checkpoint-only); the in-process side-effecting-tool risk now fails closed
+  pending the isolated executor.
+- `.coverage` is untracked and git-ignored.
+
 ## 0.3.1 — 2026-09-02
 
 ### Changed

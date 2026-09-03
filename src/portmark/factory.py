@@ -11,7 +11,7 @@ from .metrics import RuntimeMetrics
 from .models import AgentEnvelope, AgentManifest, AgentState, Permit, ResourceBudget, ToolGrant
 from .policy import load_host_policy
 from .providers import DeterministicProvider, GenericHttpProvider, ModelProvider, NativeWasmtimeComponentProvider, WasmDecisionProvider
-from .security import AttestationPolicy, EnvelopeSigner, EnvelopeSigningIdentity, ExternalAttestationVerifier, HmacEnvelopeSigner, HostPolicy, load_trust_registry
+from .security import AttestationPolicy, EnvelopeSigner, EnvelopeSigningIdentity, ExternalAttestationVerifier, HmacEnvelopeSigner, HostPolicy, load_trust_registry, validate_constraints
 from .storage import RuntimeStore, create_runtime_store
 from .tools import ToolRegistry, demo_registry
 
@@ -83,7 +83,14 @@ def make_host(
     policy_loader = (lambda: load_host_policy(configured_policy_path, host_id)) if configured_policy_path else None
     policy = policy_loader() if policy_loader else HostPolicy(
         host_id,
-        grants=(ToolGrant("catalog.search", {"max_limit": 5}), ToolGrant("payments.reserve", {"max_amount": 100, "currency": "USD"})),
+        # Finding #1: host policy is the projection ceiling, and an omitted
+        # output_projection now means share-nothing. The demo capsule reads the
+        # search result back from its projected state, so the host must explicitly
+        # grant the fields it is willing to expose (id + title, not score).
+        grants=(
+            ToolGrant("catalog.search", {"max_limit": 5}, ("id", "title")),
+            ToolGrant("payments.reserve", {"max_amount": 100, "currency": "USD"}),
+        ),
         budget=ResourceBudget(max_steps=10, max_tool_calls=5, max_output_bytes=65_536),
         tool_impacts={"catalog.search": "low", "payments.reserve": "external-payment"},
     )
@@ -156,6 +163,8 @@ def _grant_from_spec(value: object) -> ToolGrant:
     constraints = value.get("constraints") or {}
     if not isinstance(constraints, dict):
         raise ValueError(f"grant {name!r} constraints must be an object")
+    # Finding #5: reject unknown argument-spec keys (typos) at decode, not silently at runtime.
+    validate_constraints(constraints)
     projection = value.get("output_projection")
     if projection is not None and not isinstance(projection, list):
         raise ValueError(f"grant {name!r} output_projection must be a list")

@@ -806,6 +806,31 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(SecurityError, "maximum"):
             host.run(envelope)
 
+    def test_side_effecting_tool_is_refused_on_the_thread_timeout_path(self):
+        # Finding #3: a side-effecting tool must not run on the thread+timeout
+        # path, which cannot cancel it -- a deadline there records failure while
+        # the side effect may still land. It fails closed until an isolated
+        # hard-kill executor exists.
+        from portmark.tools import ToolExecutionError
+
+        ran = []
+        registry = ToolRegistry()
+        registry.register("payments.charge", lambda arguments: ran.append(True) or {"ok": True}, side_effecting=True)
+        registry.register("catalog.search", lambda arguments: {"ok": True})
+        permit = Permit(
+            issuer="issuer",
+            subject="agent",
+            audience="host",
+            expires_at=int(time.time()) + 60,
+            nonce="nonce-se",
+            grants=(ToolGrant("payments.charge"), ToolGrant("catalog.search")),
+        )
+        with self.assertRaisesRegex(ToolExecutionError, "side-effecting"):
+            registry.invoke(permit, "payments.charge", {})
+        self.assertEqual(ran, [])  # the tool never executed
+        # A tool not marked side-effecting still runs on the normal path.
+        self.assertEqual(registry.invoke(permit, "catalog.search", {}), {"ok": True})
+
     def test_rich_argument_constraints_enforce_required_type_range_enum_pattern_and_extras(self):
         registry = ToolRegistry()
         registry.register("catalog.search", lambda arguments: {"ok": True})
@@ -1316,6 +1341,27 @@ class RuntimeTests(unittest.TestCase):
         host.signer.seal(envelope)
         with self.assertRaisesRegex(SecurityError, "nonce"):
             host.run(envelope)
+
+    def test_forged_running_status_still_consumes_nonce_on_first_run(self):
+        # Finding #2: an issuer must not skip nonce consumption by signing a FIRST
+        # submission with a non-"ready" status. Pre-fix, any status other than
+        # "ready" meant "resume, do not consume", so the permit's nonce was never
+        # spent and the permit could be replayed. The fix only treats a run as a
+        # resume when a checkpoint already exists, so a first submission consumes
+        # the nonce no matter what status it claims.
+        host = make_host()
+        envelope = make_demo_envelope(host, "goal")
+        envelope.state.status = "running"  # forged on the very first submission
+        host.signer.seal(envelope)
+        host.run(envelope)
+
+        # A different task reusing the same permit nonce must now be rejected.
+        replay = make_demo_envelope(host, "goal")
+        object.__setattr__(replay.permit, "nonce", envelope.permit.nonce)
+        replay.state.task_id = "a-different-task"
+        host.signer.seal(replay)
+        with self.assertRaisesRegex(SecurityError, "nonce"):
+            host.run(replay)
 
     @contextmanager
     def _sqlite_store_case(self, verifier=None):
@@ -2130,6 +2176,29 @@ class RuntimeTests(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+    def test_a2a_result_artifact_excludes_checkpoint_and_audit(self):
+        # Finding #4: the A2A egress must not hand the caller the internal
+        # checkpoint or the raw audit chain (cause_message, tool arguments).
+        from portmark.models import RunResult
+        from portmark.a2a_types import task_from_run_result
+
+        result = RunResult(
+            status="completed",
+            task_id="task-1",
+            result={"answer": 42},
+            checkpoint={"memory": {"secret": "do-not-leak"}, "messages": [{"role": "tool", "content": {"pan": "4111"}}]},
+            audit=({"type": "tool.failed", "cause_message": "boom", "arguments": {"pan": "4111"}},),
+        )
+        task = task_from_run_result(result)
+        artifact = task["artifacts"][0]
+        self.assertEqual(artifact, {"task_id": "task-1", "status": "completed", "result": {"answer": 42}})
+        self.assertNotIn("checkpoint", artifact)
+        self.assertNotIn("audit", artifact)
+        # Nothing from the checkpoint or audit leaks anywhere in the serialised task.
+        blob = json.dumps(task)
+        for secret in ("do-not-leak", "boom", "4111"):
+            self.assertNotIn(secret, blob)
 
     def test_a2a_sdk_adapter_emits_official_agent_card_shape(self):
         with self._fake_official_a2a_sdk():

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .models import ResourceBudget, ToolGrant
-from .security import HostPolicy, TrustedApprover, canonical_json
+from .security import HostPolicy, TrustedApprover, canonical_json, validate_constraints
 
 
 VALID_IMPACTS = {"low", "medium", "high", "destructive", "external-payment", "credentialed", "data-exfiltration"}
@@ -35,6 +35,8 @@ def policy_from_dict(value: dict[str, Any], audience: str) -> HostPolicy:
         constraints = config.get("constraints", {})
         if not isinstance(constraints, dict):
             raise ValueError(f"policy tool {name!r} constraints must be an object")
+        # Finding #5: reject unknown argument-spec keys (typos) at load, not silently at runtime.
+        validate_constraints(constraints)
         grants.append(ToolGrant(name, constraints, _output_projection(config.get("output_projection"), name)))
         impacts[name] = impact
     if not grants:

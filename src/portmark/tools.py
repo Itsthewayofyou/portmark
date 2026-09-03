@@ -20,13 +20,16 @@ class ToolRegistry:
     def __init__(self, default_timeout: float = 5.0, max_output_bytes: int = 65_536) -> None:
         self._tools: dict[str, Tool] = {}
         self._timeouts: dict[str, float] = {}
+        self._side_effecting: set[str] = set()
         self.default_timeout = default_timeout
         self.max_output_bytes = max_output_bytes
 
-    def register(self, name: str, tool: Tool, timeout: float | None = None) -> None:
+    def register(self, name: str, tool: Tool, timeout: float | None = None, side_effecting: bool = False) -> None:
         self._tools[name] = tool
         if timeout is not None:
             self._timeouts[name] = timeout
+        if side_effecting:
+            self._side_effecting.add(name)
 
     def names(self) -> tuple[str, ...]:
         return tuple(sorted(self._tools))
@@ -46,6 +49,20 @@ class ToolRegistry:
         if tool is None:
             raise SecurityError(f"tool {name!r} is not installed")
         check_constraints(grant.constraints, arguments)
+        if name in self._side_effecting:
+            # Finding #3: the thread + queue-timeout path below cannot cancel a
+            # tool once it has started. If the deadline fires, the host raises
+            # ToolExecutionError and records failure, but the daemon thread keeps
+            # running and its side effect (a payment, a booking) can still land --
+            # the audit record and the outside world then disagree. A tool the
+            # operator marks side-effecting must not run on this path; it needs an
+            # isolated executor the host can hard-kill (a 0.4.x follow-up). Until
+            # that exists, fail closed rather than run it and risk a false failure.
+            raise ToolExecutionError(
+                f"tool {name!r} is marked side-effecting and cannot run on the thread-timeout "
+                "path, which cannot cancel a tool once started; an isolated hard-kill executor "
+                "is required to run it safely."
+            )
         timeout = self._timeouts.get(name, self.default_timeout)
         result_queue: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
 
