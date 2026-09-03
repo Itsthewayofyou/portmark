@@ -476,7 +476,7 @@ class SecurityGuardTests(unittest.TestCase):
 
         # And end to end, no tool content reaches a provider.
         state = AgentState(task_id="t1", goal="g")
-        state.messages = [{"role": "tool", "name": "catalog.search", "content": {"id": "1", "secret": "x"}}]
+        state.messages = [{"role": "tool", "name": "catalog.search", "content": {"id": "1", "confidential": "x"}}]
         projected = provider_state(state, effective.grants)
         self.assertEqual(projected["messages"], [{"role": "tool", "name": "catalog.search"}])
 

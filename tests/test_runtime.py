@@ -2187,7 +2187,7 @@ class RuntimeTests(unittest.TestCase):
             status="completed",
             task_id="task-1",
             result={"answer": 42},
-            checkpoint={"memory": {"secret": "do-not-leak"}, "messages": [{"role": "tool", "content": {"pan": "4111"}}]},
+            checkpoint={"memory": {"confidential": "do-not-leak"}, "messages": [{"role": "tool", "content": {"pan": "4111"}}]},
             audit=({"type": "tool.failed", "cause_message": "boom", "arguments": {"pan": "4111"}},),
         )
         task = task_from_run_result(result)
