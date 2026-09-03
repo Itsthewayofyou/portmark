@@ -3,12 +3,26 @@
 [![CI](https://github.com/Itsthewayofyou/portmark/actions/workflows/ci.yml/badge.svg)](https://github.com/Itsthewayofyou/portmark/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/Itsthewayofyou/portmark/blob/main/LICENSE)
 
-**Run someone else's AI agent on your machine without trusting it.**
+**A signed leash for AI agents that go out and act — enforced by the host, not the prompt.**
 
-An agent arrives as a signed envelope carrying its manifest, permit, state checkpoint, and
-component identity. Your host verifies the signature itself, intersects the agent's requested
-authority with your local policy, and mediates every single tool call. The agent's model
-proposes actions; it never executes them and never sees your credentials.
+Agents are starting to *do* things: spend, book, transact. Portmark makes that authority explicit
+and cryptographic. An agent travels as a signed envelope — its manifest, its **permit** (the exact
+scope it may act in), its state checkpoint, and its code identity. The host verifies the signature,
+intersects the requested authority with its own policy, and mediates every single tool call. A
+vague instruction or a prompt injection can't widen the permit, because the limit lives in the
+runtime, not the model — and the agent's model proposes actions but never executes them and never
+sees your credentials.
+
+It works both ways, and either side is useful on its own:
+
+- **Send an agent** with a permit it can't exceed — dispatch it and know a misread instruction or
+  an injection can't make it overspend or overreach.
+- **Host agents** you didn't write — run incoming agents mediated, capped by your policy, and
+  audited, without trusting their behavior.
+
+Built on **A2A** — Google's [Agent2Agent](https://github.com/a2aproject/A2A) protocol. Portmark's agent
+card is byte-identical to the official SDK's, so it drops into the A2A ecosystem you're already
+building in; the signed permit is the capability-security layer A2A leaves to you.
 
 ## What the host is guaranteed
 
