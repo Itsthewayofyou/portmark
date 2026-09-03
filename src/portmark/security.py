@@ -970,7 +970,21 @@ class HostPolicy:
         if permit.expires_at <= current_time:
             raise SecurityError("permit has expired")
         requested = tuple(ToolGrant(name) for name in manifest.requested_tools)
-        grants = intersect_grants(requested, permit.grants, self.grants)
+        # Finding #1: an omitted host-policy output_projection parses to None, and
+        # _projection_intersection treats None as "defer to the other side", so an
+        # incoming permit granting ["*"] could widen the effective projection to
+        # full tool output. POLICY.md and TOOLS.md promise that omitting
+        # output_projection shares nothing. Host policy is the ceiling, so its None
+        # means deny-all: normalise None -> () before the fold. Manifest/permit None
+        # stay "defer" (identity), so an agent that omits projection is unaffected
+        # unless the host also declined to grant any.
+        policy_grants = tuple(
+            grant
+            if grant.output_projection is not None
+            else ToolGrant(grant.name, grant.constraints, ())
+            for grant in self.grants
+        )
+        grants = intersect_grants(requested, permit.grants, policy_grants)
         return Permit(
             issuer=permit.issuer,
             subject=permit.subject,
@@ -1212,6 +1226,54 @@ def _legacy_constrained_arguments(constraints: dict[str, Any]) -> set[str]:
         elif name not in {"arguments", "required", "additional_arguments"}:
             result.add(name)
     return result
+
+
+# The valid argument-spec keys are exactly those the intersection planner knows
+# how to narrow. _SPEC_NARROWERS is the single source of truth (its own docstring
+# already says an unknown key must be refused, not merged); derive from it so this
+# validator and the merge planner can never drift apart.
+_ARGUMENT_SPEC_KEYS = frozenset(_SPEC_NARROWERS)
+
+
+def validate_constraints(constraints: Any) -> None:
+    """Reject structurally malformed constraints at load/decode time.
+
+    Finding #5: `check_constraints` enforces constraints at invoke time, but
+    `_check_argument_schema` only reads the keys it recognises. An unknown key
+    inside an argument spec — a `maxium` typo for `maximum`, say — is silently
+    ignored, so a mistyped security policy looks enforced and does nothing. Fail
+    closed early: a typo in a policy or an incoming permit is a load error here,
+    not a silent runtime no-op.
+
+    Only *argument-spec* keys form a closed set. Top-level flat keys stay open by
+    design (a bare `region: "us"` is an exact-match constraint), and a top-level
+    typo there fails closed at invoke time anyway, so it is not a hole.
+    """
+    if not isinstance(constraints, dict):
+        raise SecurityError("constraints must be an object")
+    required = constraints.get("required")
+    if required is not None and (
+        not isinstance(required, (list, tuple)) or not all(isinstance(item, str) and item for item in required)
+    ):
+        raise SecurityError("required constraint must be a list of non-empty strings")
+    additional = constraints.get("additional_arguments", True)
+    if not isinstance(additional, bool):
+        raise SecurityError("additional_arguments constraint must be boolean")
+    schema = constraints.get("arguments")
+    if schema is None:
+        return
+    if not isinstance(schema, dict):
+        raise SecurityError("argument constraints must be an object")
+    for argument, spec in schema.items():
+        if not isinstance(argument, str) or not argument:
+            raise SecurityError("argument constraint names must be non-empty strings")
+        if not isinstance(spec, dict):
+            raise SecurityError(f"argument {argument!r} constraint must be an object")
+        unknown = set(spec) - _ARGUMENT_SPEC_KEYS
+        if unknown:
+            raise SecurityError(
+                f"argument {argument!r} constraint has unknown keys: {sorted(unknown)}"
+            )
 
 
 def _check_argument_schema(name: str, value: Any, spec: dict[str, Any]) -> None:

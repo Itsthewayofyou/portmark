@@ -20,6 +20,7 @@ from typing import Any, Iterator
 from .a2a_types import A2ARequestError, error_response, make_agent_card, parse_jsonrpc_request, success_response, task_from_run_result
 from .host import AgentHost
 from .models import AgentEnvelope, AgentManifest, AgentState, AttestationEvidence, Permit, ResourceBudget, ToolGrant
+from .security import SecurityError, validate_constraints
 from .official_a2a import make_sdk_agent_card, validate_sdk_message_send_params
 
 
@@ -57,6 +58,12 @@ def envelope_from_dict(value: dict[str, Any]) -> AgentEnvelope:
         if not isinstance(manifest_value, dict) or not isinstance(permit_value, dict):
             raise TypeError("envelope manifest and permit must be objects")
         manifest = AgentManifest(**{**manifest_value, "requested_tools": tuple(manifest_value["requested_tools"])})
+        # Finding #5: an incoming permit is untrusted input; reject unknown
+        # argument-spec keys at decode so a malformed constraint fails closed here
+        # rather than passing as a silent no-op at invoke time.
+        for grant in permit_value["grants"]:
+            if isinstance(grant, dict):
+                validate_constraints(grant.get("constraints") or {})
         permit = Permit(
             issuer=permit_value["issuer"], subject=permit_value["subject"], audience=permit_value["audience"],
             expires_at=permit_value["expires_at"], nonce=permit_value["nonce"],
@@ -77,7 +84,7 @@ def envelope_from_dict(value: dict[str, Any]) -> AgentEnvelope:
             signature_key_id=value.get("signature_key_id", ""),
             signature=value["signature"],
         )
-    except (KeyError, TypeError, ValueError) as exc:
+    except (KeyError, TypeError, ValueError, SecurityError) as exc:
         raise A2ARequestError(-32602, "invalid params") from exc
 
 

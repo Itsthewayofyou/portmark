@@ -194,10 +194,25 @@ def parse_message_send_params(value: Any) -> MessageSendParams:
 
 
 def task_from_run_result(result: Any) -> dict[str, Any]:
+    # Finding #4: the model provider is denied raw checkpoint memory
+    # (projection.provider_state), but this A2A egress previously returned
+    # asdict(result) -- the full internal checkpoint and the entire audit log,
+    # including cause_message and tool arguments. Release only what the caller
+    # needs: run status, task id, the agent's declared result, and the migration
+    # envelope when the agent is handing off. The checkpoint and the raw audit
+    # chain stay internal to the host.
+    artifact: dict[str, Any] = {
+        "task_id": result.task_id,
+        "status": result.status,
+        "result": result.result,
+    }
+    migration = getattr(result, "migration_envelope", None)
+    if migration is not None:
+        artifact["migration_envelope"] = migration
     return Task(
         id=result.task_id,
         status=TaskStatus(_task_state(result.status)),
-        artifacts=(asdict(result),),
+        artifacts=(artifact,),
         metadata={"portmark_status": result.status},
     ).to_dict()
 

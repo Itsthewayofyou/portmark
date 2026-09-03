@@ -23,6 +23,7 @@ from portmark.security import (
     audit_head_payload,
     check_constraints,
     load_trust_registry,
+    validate_constraints,
 )
 
 
@@ -435,6 +436,49 @@ class SecurityGuardTests(unittest.TestCase):
             with self.subTest(message=message):
                 with self.assertRaisesRegex(SecurityError, message):
                     policy.effective_permit(candidate_manifest, candidate_permit, now=NOW)
+
+    def test_unknown_argument_spec_key_is_rejected_not_silently_ignored(self):
+        # Finding #5: a typo'd argument-spec key ("maxium" for "maximum") is a
+        # no-op in check_constraints -- it enforces nothing -- so a mistyped
+        # policy looks enforced and silently allows anything.
+        typo = {"arguments": {"amount": {"maxium": 100}}}
+        # Pre-fix behaviour, unchanged: invoke-time enforcement silently allows a
+        # huge amount, because the typo'd key is never read.
+        check_constraints(typo, {"amount": 10_000})  # does not raise -> the no-op
+        # The fix: reject the typo up front at load/decode time.
+        with self.assertRaisesRegex(SecurityError, "unknown keys"):
+            validate_constraints(typo)
+        # A correctly spelled spec, and open top-level flat constraints, still pass.
+        validate_constraints({"arguments": {"amount": {"maximum": 100}}})
+        validate_constraints({"max_amount": 100, "region": "us"})
+
+    def test_host_omitted_projection_cannot_be_widened_by_permit(self):
+        # Finding #1: a host operator who omits output_projection expects "share
+        # nothing" (POLICY.md / TOOLS.md). A permit granting ["*"] must not widen
+        # that to full tool output. Pre-fix, the omitted host projection parsed to
+        # None, and the permit's ("*",) survived the intersection unchanged.
+        from portmark.projection import provider_state
+
+        manifest = AgentManifest("agent:demo", "1.0.0", "deterministic", ("catalog.search",))
+        permit = self._permit()
+        object.__setattr__(permit, "subject", "agent:demo")
+        object.__setattr__(permit, "grants", (ToolGrant("catalog.search", output_projection=("*",)),))
+        policy = HostPolicy(
+            "host:local-demo",
+            (ToolGrant("catalog.search"),),  # output_projection omitted -> share nothing
+            ResourceBudget(),
+        )
+
+        effective = policy.effective_permit(manifest, permit, now=NOW)
+
+        # The host's omitted projection is the ceiling: deny-all, not "defer to permit".
+        self.assertEqual(effective.grants[0].output_projection, ())
+
+        # And end to end, no tool content reaches a provider.
+        state = AgentState(task_id="t1", goal="g")
+        state.messages = [{"role": "tool", "name": "catalog.search", "content": {"id": "1", "confidential": "x"}}]
+        projected = provider_state(state, effective.grants)
+        self.assertEqual(projected["messages"], [{"role": "tool", "name": "catalog.search"}])
 
     def test_policy_and_trust_registry_loader_validation_guards_are_table_driven(self):
         with tempfile.TemporaryDirectory() as directory:

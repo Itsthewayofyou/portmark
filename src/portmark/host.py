@@ -46,7 +46,7 @@ class AgentHost:
         self.providers = providers
         self.store = store or InMemoryRuntimeStore()
         if hasattr(self.store, "set_audit_head_verifier"):
-            self.store.set_audit_head_verifier(self.signer)
+            self.store.set_audit_head_verifier(self.signer)  # type: ignore[attr-defined]  # guarded by hasattr; not on the base RuntimeStore protocol
         self.attestation_policy = attestation_policy or AttestationPolicy()
         self._policy_loader = policy_loader
         self._reload_policy = reload_policy
@@ -88,7 +88,20 @@ class AgentHost:
             raise SecurityError("signed manifest pins a component digest but the provider exposes none to verify")
 
         state = envelope.state
-        consume_nonce = envelope.permit.nonce if state.status == "ready" else None
+        # Finding #2: whether to spend the permit's one-time nonce must not be
+        # decided by state.status alone. That field rides in on the signed
+        # envelope, so an issuer could set it to "running" on a FIRST submission to
+        # skip nonce consumption entirely and defeat replay protection. Only skip
+        # consumption for a *genuine resume*: a non-"ready" status AND a checkpoint
+        # already stored for this task. A first submission has no stored checkpoint
+        # yet, so it consumes the nonce no matter what status it claims; and a
+        # replayed "ready" envelope still re-attempts consumption and is rejected.
+        # Consumption stays atomic inside _persist, so concurrent first runs race
+        # to a single winner. (This closes the "lie about status to never consume"
+        # hole. Replaying a suspended checkpoint as a resume still needs the
+        # checkpoint-generation CAS tracked as a 0.4.x follow-up.)
+        is_resume = state.status != "ready" and self.store.load_checkpoint(state.task_id) is not None
+        consume_nonce = None if is_resume else envelope.permit.nonce
         state.status = "running"
         previous_hash, start_sequence, migration_anchor = self._audit_start(envelope)
         audit = AuditLog(previous_hash, start_sequence, self.host_id)
