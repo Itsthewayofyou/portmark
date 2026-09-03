@@ -46,7 +46,7 @@ class AgentHost:
         self.providers = providers
         self.store = store or InMemoryRuntimeStore()
         if hasattr(self.store, "set_audit_head_verifier"):
-            self.store.set_audit_head_verifier(self.signer)
+            self.store.set_audit_head_verifier(self.signer)  # type: ignore[attr-defined]  # guarded by hasattr; not on the base RuntimeStore protocol
         self.attestation_policy = attestation_policy or AttestationPolicy()
         self._policy_loader = policy_loader
         self._reload_policy = reload_policy
