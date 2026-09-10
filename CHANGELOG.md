@@ -2,6 +2,26 @@
 
 All notable changes to Portmark are recorded here. Versions follow [semantic versioning](https://semver.org/).
 
+## 0.5.1 — 2026-09-10
+
+Closes EV-009 (host-side migration destination ceiling). PR 2 of the two EV-008/
+EV-009 follow-ups; EV-008 shipped in 0.5.0.
+
+### Security
+
+- **Host policy is now a ceiling over movement, not only over tools.** Previously
+  a migration was authorized on the incoming permit's `delegation_allowed` alone,
+  so the host could not say "I will run this agent but I will not send it to
+  host:foo." `HostPolicy` gains a `migration` field (`MigrationPolicy`), and
+  `authorize_migration` enforces all three conditions at the migration decision:
+  the incoming permit delegates migration, the host policy allows it, and the
+  destination is on the host's allowlist. The default is **deny-all** — a host
+  that says nothing about migration sends agents nowhere.
+- The policy loader parses and validates a `migration` block
+  (`{"allowed": bool, "destinations": [host-id, ...]}`), failing closed on a
+  malformed value, an unknown key, or `allowed: true` with no destinations. An
+  omitted block is deny-all.
+
 ## 0.5.0 — 2026-09-10
 
 Closes EV-008 (stale-checkpoint resume rollback). PR 1 of the two follow-ups; the

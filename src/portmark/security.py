@@ -938,6 +938,23 @@ def _projection_intersection(left: tuple[str, ...] | None, right: tuple[str, ...
     return tuple(item for item in left if item in set(right))
 
 
+@dataclass(frozen=True)
+class MigrationPolicy:
+    """Host-side ceiling over where an agent may migrate (finding EV-009).
+
+    Migration is authority, not convenience, so the default is deny-all. The
+    incoming permit's `delegation_allowed` says the issuer permits migration; this
+    says the host allows it, and only to explicitly named destinations. Host policy
+    bounds movement the same way it bounds tools.
+    """
+
+    allowed: bool = False
+    destinations: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "destinations", tuple(self.destinations))
+
+
 class HostPolicy:
     DEFAULT_APPROVAL_REQUIRED_IMPACTS = ("high", "destructive", "external-payment", "credentialed", "data-exfiltration")
 
@@ -951,6 +968,7 @@ class HostPolicy:
         tool_impacts: dict[str, str] | None = None,
         approval_authorities: tuple[TrustedApprover, ...] = (),
         approval_required_impacts: tuple[str, ...] = DEFAULT_APPROVAL_REQUIRED_IMPACTS,
+        migration: "MigrationPolicy | None" = None,
     ) -> None:
         self.audience = audience
         self.grants = grants
@@ -960,6 +978,21 @@ class HostPolicy:
         self.tool_impacts = tool_impacts or {}
         self.approval_required_impacts = approval_required_impacts
         self._approval_authorities = {authority.key_id: authority for authority in approval_authorities}
+        # Finding EV-009: default deny. A host that says nothing about migration
+        # refuses to send agents anywhere.
+        self.migration = migration or MigrationPolicy()
+
+    def authorize_migration(self, permit: "Permit", destination: str) -> None:
+        """Authorize a migration to `destination`, or raise. Both the incoming
+        permit and the host policy must allow it, and the destination must be on the
+        host's allowlist (finding EV-009). Host policy is a ceiling over movement,
+        not only over tools."""
+        if not permit.delegation_allowed:
+            raise SecurityError("permit does not allow migration")
+        if not self.migration.allowed:
+            raise SecurityError("host policy does not allow migration")
+        if destination not in self.migration.destinations:
+            raise SecurityError(f"host policy does not allow migration to {destination!r}")
 
     def effective_permit(self, manifest: AgentManifest, permit: Permit, now: int | None = None) -> Permit:
         current_time = int(time.time()) if now is None else now

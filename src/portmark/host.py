@@ -202,8 +202,10 @@ class AgentHost:
         if decision.kind == "migrate":
             if not decision.destination:
                 raise SecurityError("migration proposal lacks a destination")
-            if not envelope.permit.delegation_allowed:
-                raise SecurityError("permit does not allow migration delegation")
+            # Finding EV-009: host policy is a ceiling over movement, not only tools.
+            # The incoming permit's delegation_allowed alone is not enough; the host
+            # must also allow migration and allowlist this destination.
+            active_policy.authorize_migration(envelope.permit, decision.destination)
             destination_attestation = self._migration_attestation(decision)
             self.attestation_policy.verify_migration(destination_attestation, decision.destination, self.host_id)
             state.status = "ready"
