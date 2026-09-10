@@ -2,6 +2,21 @@
 
 All notable changes to Portmark are recorded here. Versions follow [semantic versioning](https://semver.org/).
 
+## 0.6.1 — 2026-09-10
+
+Follow-up to EV-002 (0.6.0): fail closed on platforms without process-group kill.
+A Windows test run showed the isolated worker's grandchild survived the deadline.
+
+### Security
+
+- **Fail-closed where the hard-kill guarantee cannot hold.** The process-group
+  kill needs `os.killpg`, which POSIX has and Windows does not (a Windows kill
+  leaves a grandchild running). `register_isolated(..., side_effecting=True)` is
+  now **refused at registration** on a platform without process groups, rather
+  than run without the guarantee. Non-side-effecting isolated tools still run
+  there (a leaked grandchild is a resource concern, not an effect-safety one).
+  The kill and the refusal are gated on one positive-capability constant.
+
 ## 0.6.0 — 2026-09-10
 
 Closes EV-002 (isolated tool executor). Untrusted or side-effecting tools can now
