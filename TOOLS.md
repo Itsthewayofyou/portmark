@@ -147,6 +147,50 @@ projected tool messages:
 Projection is configured in host policy because the operator, not the agent,
 owns the data-sharing decision.
 
+## Isolated Tools (Hard-Kill Executor)
+
+By default a tool runs in-process on a worker thread. That path cannot cancel a
+tool once it has started: if the deadline fires, the host records failure but the
+thread keeps running. For untrusted tools, or any tool with a side effect,
+register it isolated instead:
+
+```python
+tools.register_isolated(
+    "http.fetch",
+    "examples.tools.http_fetch:fetch",   # module:function, resolved in the worker
+    timeout=3.0,
+    side_effecting=True,
+    env={"HTTPS_PROXY": "http://proxy.internal:8080"},  # optional, off by default
+)
+```
+
+An isolated tool is named by an import path, not a callable, because it runs in a
+fresh Python process (`portmark.tool_subprocess_runner`) that imports the target
+itself. The process talks to the host with one JSON document each way and nothing
+else. What this buys you:
+
+- **Hard-kill at the deadline.** The host kills the whole worker process group, so
+  the tool and anything it spawned stop at the deadline -- the thread path cannot
+  do this.
+- **Minimal environment.** The worker inherits only a small allowlist
+  (`PYTHONPATH`, `PATH`, locale, `SYSTEMROOT`). Host secrets in the environment
+  (API keys, tokens, database URLs) are **not** passed. Add exactly what the tool
+  needs with `env=`; nothing else crosses.
+- **Bounded output.** The worker refuses output over the budget before sending it,
+  and the host reads bounded, so a tool cannot balloon host memory.
+
+Only an isolated tool may be `side_effecting=True`. A side-effecting tool
+registered on the plain thread path is refused, because that path cannot be
+cancelled.
+
+**One honest limit.** Hard-kill stops any *new* side effect, but it cannot undo
+one already in flight when the deadline fires -- a payment request already sent is
+already sent. When the host kills a tool it audits `tool.killed` with
+`effect_status: "unknown"`, distinct from a clean `tool.failed`, so the audit
+trail never claims an effect did not happen when it might have. Keep tool
+deadlines comfortably above normal completion time so the kill path is the rare
+exception, not the norm.
+
 ## Credential Handling
 
 Tools may use local credentials internally, but returned data is audit material

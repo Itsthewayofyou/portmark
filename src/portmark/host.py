@@ -11,7 +11,7 @@ from .models import AgentEnvelope, ApprovalToken, AttestationEvidence, ProviderD
 from .providers import ModelProvider
 from .security import AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, SecurityError, arguments_hash, audit_head_payload, canonical_json
 from .storage import InMemoryRuntimeStore, RuntimeStore
-from .tools import ToolExecutionError, ToolRegistry
+from .tools import ToolExecutionError, ToolKilledError, ToolRegistry
 
 # Prefixes that mark a manifest's component_digest as a content-addressed pin of
 # exact bytes, as opposed to the symbolic default (e.g. "python:reference-agent-v1").
@@ -165,6 +165,26 @@ class AgentHost:
                     result = self.tools.invoke(effective, decision.tool, decision.arguments, effective.budget.max_output_bytes)
                 finally:
                     self.metrics.observe_duration("tool_invocation_duration_seconds", time.monotonic() - tool_started)
+            except ToolKilledError as error:
+                # EV-002: the isolated tool was hard-killed at its deadline. The
+                # kill stops any *new* side effect, but a call already in flight
+                # (a payment POST mid-request) may have landed, so the audit
+                # trail records the effect status as unknown rather than a clean
+                # failure. This is a narrowed race, not an eliminated one.
+                self.metrics.increment("tools.failed")
+                state.status = "failed"
+                state.result = {"error": "tool killed at deadline"}
+                audit.append(
+                    "tool.killed",
+                    {
+                        "tool": decision.tool,
+                        "arguments": decision.arguments,
+                        "error": str(error),
+                        "effect_status": "unknown",
+                    },
+                )
+                audit.append("agent.failed", state.result)
+                return True, None
             except ToolExecutionError as error:
                 self.metrics.increment("tools.failed")
                 state.status = "failed"

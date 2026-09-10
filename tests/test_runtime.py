@@ -844,6 +844,143 @@ class RuntimeTests(unittest.TestCase):
         # A tool not marked side-effecting still runs on the normal path.
         self.assertEqual(registry.invoke(permit, "catalog.search", {}), {"ok": True})
 
+    def _isolated_env(self):
+        # The worker runs in a fresh process, so it must be able to import both
+        # portmark (from src) and the fixture module (from tests). Absolute paths
+        # so the worker's cwd does not matter.
+        import portmark
+
+        src_dir = os.path.dirname(os.path.dirname(os.path.abspath(portmark.__file__)))
+        tests_dir = os.path.dirname(os.path.abspath(__file__))
+        return {"PYTHONPATH": os.pathsep.join([src_dir, tests_dir])}
+
+    def _isolated_permit(self, *names):
+        return Permit(
+            issuer="issuer",
+            subject="agent",
+            audience="host",
+            expires_at=int(time.time()) + 60,
+            nonce="nonce-iso",
+            grants=tuple(ToolGrant(name) for name in names),
+        )
+
+    def test_isolated_tool_runs_in_a_subprocess_and_ignores_stdout_noise(self):
+        # EV-002: a tool registered isolated runs in a hard-killable worker. Its
+        # stdout noise (including a forged JSON line) must not corrupt the
+        # protocol -- the real result still comes back.
+        registry = ToolRegistry()
+        registry.register_isolated("iso.echo", "isolated_tool_fixtures:echo", env=self._isolated_env())
+        registry.register_isolated("iso.noisy", "isolated_tool_fixtures:noisy", env=self._isolated_env())
+        permit = self._isolated_permit("iso.echo", "iso.noisy")
+        self.assertEqual(registry.invoke(permit, "iso.echo", {"text": "hi"}), {"echo": {"text": "hi"}})
+        self.assertEqual(registry.invoke(permit, "iso.noisy", {"n": 1}), {"echo": {"n": 1}})
+
+    def test_isolated_tool_does_not_inherit_host_secrets(self):
+        # The minimal-env property: a secret in the host process must not reach
+        # the worker, because it is not on the inherited allowlist.
+        registry = ToolRegistry()
+        registry.register_isolated("iso.env", "isolated_tool_fixtures:read_env", env=self._isolated_env())
+        permit = self._isolated_permit("iso.env")
+        key = "PORTMARK_TEST_SECRET_" + secrets.token_hex(4)
+        os.environ[key] = "leaked-value"
+        try:
+            result = registry.invoke(permit, "iso.env", {"key": key})
+        finally:
+            os.environ.pop(key, None)
+        self.assertEqual(result, {"value": None})
+
+    def test_isolated_tool_timeout_hard_kills_and_fails_closed(self):
+        from portmark.tools import ToolKilledError
+
+        registry = ToolRegistry()
+        registry.register_isolated(
+            "iso.slow", "isolated_tool_fixtures:slow_then_return", timeout=1.0, env=self._isolated_env()
+        )
+        permit = self._isolated_permit("iso.slow")
+        with self.assertRaises(ToolKilledError):
+            registry.invoke(permit, "iso.slow", {"seconds": 30})
+
+    def test_isolated_tool_kill_reaches_grandchildren(self):
+        # The kill must reach the whole process group, not just the worker: a
+        # grandchild the tool spawned would otherwise survive and write a marker.
+        from portmark.tools import ToolKilledError
+
+        registry = ToolRegistry()
+        registry.register_isolated(
+            "iso.spawn", "isolated_tool_fixtures:spawn_grandchild_then_sleep", timeout=1.0, env=self._isolated_env()
+        )
+        permit = self._isolated_permit("iso.spawn")
+        with tempfile.TemporaryDirectory() as directory:
+            marker = os.path.join(directory, "grandchild-alive")
+            with self.assertRaises(ToolKilledError):
+                registry.invoke(permit, "iso.spawn", {"marker": marker, "delay": 5.0})
+            # Wait past the grandchild's +5.0s "alive" write. The "started" marker
+            # proves the grandchild really ran; "alive" being absent proves the
+            # process-group kill reached it before the delay elapsed -- so the
+            # test cannot pass merely because the grandchild never spawned.
+            time.sleep(6.0)
+            self.assertTrue(os.path.exists(marker + ".started"))
+            self.assertFalse(os.path.exists(marker))
+
+    def test_isolated_tool_exception_fails_closed(self):
+        from portmark.tools import ToolExecutionError
+
+        registry = ToolRegistry()
+        registry.register_isolated("iso.boom", "isolated_tool_fixtures:boom", env=self._isolated_env())
+        permit = self._isolated_permit("iso.boom")
+        with self.assertRaisesRegex(ToolExecutionError, "isolated tool failed"):
+            registry.invoke(permit, "iso.boom", {})
+
+    def test_isolated_tool_oversized_output_fails_closed(self):
+        from portmark.tools import ToolExecutionError
+
+        registry = ToolRegistry(max_output_bytes=64)
+        registry.register_isolated("iso.big", "isolated_tool_fixtures:oversized", env=self._isolated_env())
+        permit = self._isolated_permit("iso.big")
+        with self.assertRaisesRegex(ToolExecutionError, "output budget"):
+            registry.invoke(permit, "iso.big", {"size": 100_000})
+
+    def test_side_effecting_tool_runs_when_registered_isolated(self):
+        # The thread path refuses side-effecting tools; the isolated path is the
+        # sanctioned way to run one, because the host can hard-kill it.
+        registry = ToolRegistry()
+        registry.register_isolated(
+            "iso.pay", "isolated_tool_fixtures:echo", side_effecting=True, env=self._isolated_env()
+        )
+        permit = self._isolated_permit("iso.pay")
+        self.assertEqual(registry.invoke(permit, "iso.pay", {"amount": 10}), {"echo": {"amount": 10}})
+
+    def test_host_audits_isolated_tool_kill_as_effect_status_unknown(self):
+        # The honest audit trail: a hard-kill stops new effects but cannot prove
+        # an in-flight one did not land, so the host records effect status as
+        # unknown -- a distinct signal from a clean tool.failed.
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            tools = ToolRegistry()
+            tools.register_isolated(
+                "slow.side",
+                "isolated_tool_fixtures:slow_then_return",
+                timeout=1.0,
+                side_effecting=True,
+                env=self._isolated_env(),
+            )
+            host = make_host(store=store)
+            host.tools = tools
+            host.policy = HostPolicy(host.host_id, (ToolGrant("slow.side"),), ResourceBudget())
+            host.providers["kill"] = FixedProvider(ProviderDecision("tool", "slow.side", {"seconds": 30}))
+            envelope = make_demo_envelope(host, "slow side kill", "kill")
+            object.__setattr__(envelope.manifest, "requested_tools", ("slow.side",))
+            object.__setattr__(envelope.permit, "grants", (ToolGrant("slow.side"),))
+            host.signer.seal(envelope)
+
+            result = host.run(envelope)
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(result.result, {"error": "tool killed at deadline"})
+            killed = next(event for event in result.audit if event["event"] == "tool.killed")
+            self.assertEqual(killed["details"]["effect_status"], "unknown")
+            self.assertEqual(killed["details"]["tool"], "slow.side")
+
     def test_rich_argument_constraints_enforce_required_type_range_enum_pattern_and_extras(self):
         registry = ToolRegistry()
         registry.register("catalog.search", lambda arguments: {"ok": True})
