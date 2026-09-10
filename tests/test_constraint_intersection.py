@@ -323,11 +323,14 @@ class DormantConstraintTest(unittest.TestCase):
         # opposite (that left's flag was dormant); it now pins the live behavior
         # and the property that a merge must not LOSE the stricter side's rejection.
         left = {"additional_arguments": False}
-        right = {"arguments": {"b": {}}}
+        # `right` must OPT IN to extra fields explicitly now: a bare `arguments`
+        # schema is deny-by-default, so without the flag it would reject `z` too
+        # and the merge below would no longer be testing "keeps the stricter side".
+        right = {"arguments": {"b": {}}, "additional_arguments": True}
         merged = self.require_merged(merge_real(left, right))
         self.assertFalse(accepts(left, {"z": 1}), "left's flag is live: an unknown field is rejected")
         self.assertTrue(accepts(left, {}), "left still admits the empty argument set")
-        self.assertTrue(accepts(right, {"z": 1}), "fixture: right allows extra fields")
+        self.assertTrue(accepts(right, {"z": 1}), "fixture: right opts into extra fields")
         self.assertFalse(accepts(merged, {"z": 1}), "merge keeps the stricter side's rejection")
 
 
@@ -432,8 +435,10 @@ class NarrowingCompletenessTest(unittest.TestCase):
         self.assertEqual(merged["arguments"]["query"], {"min_length": 3, "max_length": 20})
 
     def test_extra_argument_constraint_is_kept_when_both_sides_are_open(self) -> None:
-        policy = {"arguments": {"a": {"type": "string"}}}
-        envelope = {"arguments": {"a": {"type": "string"}, "b": {"maximum": 5}}}
+        # Both sides must declare themselves open now: deny-by-default would
+        # otherwise bound each to {a} and drop b from the merged whitelist.
+        policy = {"arguments": {"a": {"type": "string"}}, "additional_arguments": True}
+        envelope = {"arguments": {"a": {"type": "string"}, "b": {"maximum": 5}}, "additional_arguments": True}
         merged = self.assert_kept(envelope, policy)
         self.assertIn("b", merged["arguments"])
 
@@ -454,6 +459,32 @@ class NarrowingCompletenessTest(unittest.TestCase):
         shared = {"arguments": {"a": {"type": "string", "max_length": 4}}}
         merged = self.assert_kept(dict(shared), dict(shared))
         self.assertEqual(merged, shared)
+
+
+class AdditionalArgumentsEmissionTest(unittest.TestCase):
+    """Pin the merge's `additional_arguments` emission guard: the merged grant
+    carries the flag only when it overrides the merged constraints' own default,
+    and either way the effective acceptance is correct."""
+
+    def test_both_open_result_declares_names_stays_open(self):
+        # Both sides opt in; the merged result declares `a`, so its default would
+        # be deny -- the merge must emit `true` to keep it open.
+        merged = merge_real(
+            {"additional_arguments": True},
+            {"additional_arguments": True, "arguments": {"a": {}}},
+        )
+        self.assertIsNotNone(merged)
+        self.assertTrue(accepts(merged, {"z": 1}), "both sides opted in; extras still admitted")
+
+    def test_one_bounded_side_denies_extras_with_no_emitted_flag(self):
+        # Left bounds `amount` (declares policy); right is open but declares
+        # nothing. Merged flag is False and the result still carries `max_amount`,
+        # so the guard emits no flag and check_constraints denies via the default.
+        merged = merge_real({"max_amount": 5}, {"additional_arguments": True})
+        self.assertIsNotNone(merged)
+        self.assertNotIn("additional_arguments", merged)
+        self.assertFalse(accepts(merged, {"amount": 1, "z": 2}), "the bounded side's whitelist survives")
+        self.assertTrue(accepts(merged, {"amount": 1}), "the declared argument is still accepted")
 
 
 if __name__ == "__main__":

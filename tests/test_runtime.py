@@ -767,7 +767,7 @@ class RuntimeTests(unittest.TestCase):
         host = make_host(provider_endpoint="https://provider.example/run")
         host.policy = HostPolicy(
             host.host_id,
-            (ToolGrant("catalog.search", {"max_limit": 3}, ("*",)),),
+            (ToolGrant("catalog.search", {"max_limit": 3, "arguments": {"query": {"type": "string"}}}, ("*",)),),
             ResourceBudget(max_steps=6, max_tool_calls=2, max_output_bytes=32_768),
         )
         envelope = make_demo_envelope(host, "portable agents", "http")
@@ -1005,6 +1005,48 @@ class RuntimeTests(unittest.TestCase):
             killed = next(event for event in result.audit if event["event"] == "tool.killed")
             self.assertEqual(killed["details"]["effect_status"], "unknown")
             self.assertEqual(killed["details"]["tool"], "slow.side")
+
+    def test_constrained_grant_denies_unknown_arguments_without_an_explicit_flag(self):
+        # Regression: a grant that constrains ANY argument thereby whitelists the
+        # names it mentions -- an unknown field must not ride through to a
+        # side-effecting tool just because additional_arguments was not set to
+        # false. Previously {amount, currency, recipient, memo} passed against a
+        # grant of {max_amount, allowed_currency}; recipient/memo reached the tool.
+        executed: list[dict] = []
+        registry = ToolRegistry()
+        registry.register("payments.reserve", lambda arguments: executed.append(arguments) or {"ok": True})
+        permit = Permit(
+            issuer="issuer",
+            subject="agent",
+            audience="host",
+            expires_at=int(time.time()) + 60,
+            nonce="nonce-deny",
+            grants=(ToolGrant("payments.reserve", {"max_amount": 20, "allowed_currency": ["USD"]}),),
+        )
+        with self.assertRaisesRegex(SecurityError, "unsupported fields"):
+            registry.invoke(
+                permit,
+                "payments.reserve",
+                {"amount": 5, "currency": "USD", "recipient": "attacker", "memo": "drain"},
+            )
+        self.assertEqual(executed, [])  # the tool never ran
+        # The declared arguments alone are still accepted.
+        self.assertEqual(
+            registry.invoke(permit, "payments.reserve", {"amount": 5, "currency": "USD"}), {"ok": True}
+        )
+        # A grant that constrains nothing stays a pure capability grant: it is the
+        # shape a bare tool-name manifest produces and must still pass arguments.
+        open_permit = Permit(
+            issuer="issuer",
+            subject="agent",
+            audience="host",
+            expires_at=int(time.time()) + 60,
+            nonce="nonce-open",
+            grants=(ToolGrant("payments.reserve"),),
+        )
+        self.assertEqual(
+            registry.invoke(open_permit, "payments.reserve", {"amount": 5, "extra": "ok"}), {"ok": True}
+        )
 
     def test_rich_argument_constraints_enforce_required_type_range_enum_pattern_and_extras(self):
         registry = ToolRegistry()
@@ -1320,7 +1362,7 @@ class RuntimeTests(unittest.TestCase):
     def test_external_policy_denies_unlisted_tool_and_narrows_grant(self):
         with tempfile.TemporaryDirectory() as directory:
             policy_path = self._write_policy(directory, tools={
-                "catalog.search": {"impact": "low", "constraints": {"max_limit": 2}},
+                "catalog.search": {"impact": "low", "constraints": {"max_limit": 2, "arguments": {"query": {"type": "string"}}}},
             })
             host = make_host(policy_path=str(policy_path))
             host.providers["evil"] = FixedProvider(ProviderDecision("tool", "payments.reserve", {"amount": 50, "currency": "USD"}))
@@ -3926,7 +3968,7 @@ class AgentSideToolingTests(unittest.TestCase):
     def test_cli_demo_uses_loaded_custom_tools_when_policy_grants_them(self):
         with tempfile.TemporaryDirectory() as directory:
             policy_path = self._policy(directory, {
-                "catalog.search": {"impact": "low", "constraints": {"max_limit": 5}, "output_projection": ["id", "title"]},
+                "catalog.search": {"impact": "low", "constraints": {"max_limit": 5, "arguments": {"query": {"type": "string"}}}, "output_projection": ["id", "title"]},
             })
             self._tool_module(directory, """
 from portmark.tools import ToolRegistry

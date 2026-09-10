@@ -88,7 +88,7 @@ def make_host(
         # search result back from its projected state, so the host must explicitly
         # grant the fields it is willing to expose (id + title, not score).
         grants=(
-            ToolGrant("catalog.search", {"max_limit": 5}, ("id", "title")),
+            ToolGrant("catalog.search", {"max_limit": 5, "arguments": {"query": {"type": "string"}}}, ("id", "title")),
             ToolGrant("payments.reserve", {"max_amount": 100, "currency": "USD"}),
         ),
         budget=ResourceBudget(max_steps=10, max_tool_calls=5, max_output_bytes=65_536),
@@ -229,7 +229,7 @@ def make_demo_envelope(host: AgentHost, goal: str, provider: str = "deterministi
     permit = Permit(
         issuer=getattr(host.signer, "issuer", host.host_id), subject=manifest.agent_id, audience=host.host_id,
         expires_at=int(time.time()) + 3600, nonce=secrets.token_hex(16),
-        grants=(ToolGrant("catalog.search", {"max_limit": 3}, ("id", "title")),),
+        grants=(ToolGrant("catalog.search", {"max_limit": 3, "arguments": {"query": {"type": "string"}}}, ("id", "title")),),
         budget=ResourceBudget(max_steps=6, max_tool_calls=2, max_output_bytes=32_768),
     )
     return host.signer.seal(AgentEnvelope(manifest, permit, AgentState(secrets.token_hex(8), goal)))

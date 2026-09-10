@@ -45,3 +45,15 @@ Reviewed areas:
 - The highest remaining review concern is not a known bypass in the current
   code. It is the operational trust boundary around host-loaded Python tools
   and deployment-supplied attestation verifiers.
+- **Argument names are deny-by-default (0.7.0), with one residual by design.** A
+  grant that constrains any argument now rejects undeclared fields, closing the
+  gap where a `{max_amount, allowed_currency}` grant let a `recipient`/`memo`
+  field reach a side-effecting tool. **Still open:** a grant that constrains
+  *nothing* (a host policy that lists a tool with no argument constraints) remains
+  a passthrough and admits any field — the lazy-policy version of the same
+  scenario. It is not closed further because the manifest turns a bare tool name
+  into an empty-constraint grant, so "empty means deny" would break tool routing;
+  distinguishing a policy's empty grant from the manifest's would require
+  separating name-filtering from constraint intersection in `effective_permit`, a
+  larger change worth its own review. The per-grant fix today is
+  `additional_arguments: false` or naming the tool's arguments.

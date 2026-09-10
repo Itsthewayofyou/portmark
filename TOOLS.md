@@ -107,17 +107,32 @@ Per key:
 | `const`, `pattern`, `scheme` | must be identical, or the grant is dropped |
 | `type` | set intersection of the type lists; empty drops the grant |
 | `required` | required if either side requires it |
-| `additional_arguments` | `false` if either side says `false` |
+| `additional_arguments` | permissive only if BOTH sides admit extra names; a bounded side wins |
 | flat `max_x` | the smaller of the two |
 | flat `allowed_x` | set intersection; empty drops the grant |
 | anything else | drops the grant |
 
 An argument named by only one side keeps that side's constraint — more
-constraint is narrower. But `additional_arguments: false` turns the set of
-argument **names** into a whitelist, so those names are intersected first and
-every key is gated on the result. A constraint naming an argument the other side
-would have refused drops the grant, because every flat constraint also requires
-its argument to be present, and the combination is then unsatisfiable.
+constraint is narrower.
+
+**Deny-by-default on argument names.** A grant that constrains *any* argument
+(an `arguments` schema, `required`, or a legacy `max_`/`allowed_`/exact key)
+thereby turns the set of argument **names** into a whitelist: only the names it
+mentions may reach the tool, and an unknown field (a `recipient` slipped in by a
+prompt injection) is rejected — no `additional_arguments: false` needed. Set
+`additional_arguments: true` to opt a grant back out and admit any name. A grant
+that constrains *nothing* is a pure capability grant — the shape the manifest
+produces from a bare tool name — and passes arguments through, so it never bounds
+the intersection. When names are bounded, they are intersected first and every
+key is gated on the result; a constraint naming an argument the other side would
+have refused drops the grant, because every flat constraint also requires its
+argument to be present, and the combination is then unsatisfiable.
+
+**One consequence worth stating:** if a policy bounds only *some* of a tool's
+arguments, the unbounded-but-legitimate ones are now rejected too. List every
+argument name the tool legitimately takes (in the `arguments` schema, or via the
+legacy keys), or set `additional_arguments: true` — otherwise a valid call is
+refused as an unsupported field.
 
 Three cases are deliberately conservative, and drop a grant that could in
 principle have been merged:
