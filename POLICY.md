@@ -60,8 +60,17 @@ must be in the allowed list, and a plain key such as `currency: "USD"` requires
 exact equality. Rich constraints can be placed under `constraints.arguments`
 with `type`, `const`, `enum`, `minimum`, `maximum`, `min_length`, `max_length`,
 and `pattern`. Use top-level `required` or per-argument `required: true` for
-mandatory arguments, and `additional_arguments: false` to reject undeclared
-fields.
+mandatory arguments.
+
+**Argument names are deny-by-default.** A grant that constrains any argument
+(a schema, `required`, or a legacy `max_`/`allowed_`/exact key) admits only the
+names it mentions — an undeclared field is rejected without setting
+`additional_arguments: false`. This is the host's ceiling on argument names, so a
+prompt-injected `recipient`/`memo` cannot ride through to a side-effecting tool.
+Set `additional_arguments: true` to opt a grant back out and allow any field. A
+grant that constrains no argument at all is a pure capability grant and passes
+arguments through. Practical rule: when you bound one argument of a tool, list
+the tool's other legitimate argument names too, or the host will reject them.
 
 `output_projection` controls what tool output, if any, is sent back to a model provider on later steps. Omit it or set it to `[]` to share no tool output. Use a list of top-level JSON object fields, such as `["id", "title"]`, to share only those fields from dict outputs or lists of dicts. Use `["*"]` only when the provider is allowed to see the full output for that tool. Projection is intersected across the manifest request, incoming permit, and local host policy; the effective projection can only narrow. Host policy is the ceiling: omitting `output_projection` on a policy tool shares nothing, and no incoming permit can widen it — to expose fields you must list them (or `["*"]`) in the policy itself.
 

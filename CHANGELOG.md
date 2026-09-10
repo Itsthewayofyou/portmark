@@ -2,6 +2,32 @@
 
 All notable changes to Portmark are recorded here. Versions follow [semantic versioning](https://semver.org/).
 
+## 0.7.0 — 2026-09-10
+
+Security: argument names are now deny-by-default. **Breaking** behavioral change.
+
+### Security
+
+- **A grant that constrains any argument now whitelists the names it mentions.**
+  Previously `additional_arguments` defaulted to `true`, so a grant of
+  `{max_amount, allowed_currency}` let an unknown `recipient`/`memo` field ride
+  straight through to a side-effecting tool — the exact gap a prompt injection
+  would find, and inconsistent with a runtime whose pitch is that the host is the
+  ceiling on everything. Now an undeclared field is rejected without needing an
+  explicit `additional_arguments: false`. Set `additional_arguments: true` to opt
+  a grant back out. Enforced at `check_constraints`, in `_permitted_argument_names`,
+  and in the intersection merge together, so no single-grant or merged path leaks.
+
+### Changed (breaking)
+
+- **A grant that constrains no argument at all is a pure capability grant** and
+  still passes any argument through — this is the shape the manifest produces from
+  a bare tool name, so the change does not break tool routing. But a policy that
+  bounds only *some* of a tool's arguments will now reject the unbounded-but-
+  legitimate ones: **list every argument name the tool legitimately takes**, or set
+  `additional_arguments: true`. The bundled demo/default policy grants were updated
+  to declare `query` alongside the existing `limit` bound. See TOOLS.md / POLICY.md.
+
 ## 0.6.2 — 2026-09-10
 
 Portability fix from the Windows test review: close SQLite connections after use.

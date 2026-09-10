@@ -687,14 +687,38 @@ _SPEC_NARROWERS: dict[str, str] = {
 }
 
 
+def _declares_argument_policy(constraints: dict[str, Any]) -> bool:
+    """True if the grant constrains at least one argument by name (an `arguments`
+    schema, `required`, or a legacy `max_`/`allowed_`/exact key).
+
+    Such a grant thereby whitelists the names it mentions: deny-by-default, only
+    those may be passed. A grant that constrains nothing is a pure capability
+    grant (the shape the manifest produces from a bare tool name) and passes
+    arguments through, so it never poisons the intersection. `additional_arguments`
+    overrides either way (`true` re-opens, `false` bounds even a bare grant).
+    """
+    schema = constraints.get("arguments")
+    if isinstance(schema, dict) and schema:
+        return True
+    if constraints.get("required"):
+        return True
+    return bool(_legacy_constrained_arguments(constraints))
+
+
+def _admits_any_argument(constraints: dict[str, Any]) -> bool:
+    """Whether this grant lets through argument names it does not mention."""
+    return bool(constraints.get("additional_arguments", not _declares_argument_policy(constraints)))
+
+
 def _permitted_argument_names(constraints: dict[str, Any]) -> set[str] | None:
     """Argument names this constraint set admits, or None when it admits any.
 
-    Mirrors `check_constraints` exactly: `additional_arguments: False` bounds the
-    admitted names whether or not an `arguments` schema is present (finding #4).
-    When it is not set to False, the grant admits any argument, so return None.
+    Mirrors `check_constraints` exactly under deny-by-default: a grant admits any
+    argument only when it explicitly sets `additional_arguments: true`; otherwise
+    it is bounded to its declared names (schema keys, required, legacy keys),
+    whether or not an `arguments` schema is present.
     """
-    if constraints.get("additional_arguments", True) is not False:
+    if _admits_any_argument(constraints):
         return None
     schema = constraints.get("arguments")
     required = constraints.get("required")
@@ -813,7 +837,10 @@ def _constraint_intersection(left: dict[str, Any], right: dict[str, Any]) -> tup
     additional, failing_key = _merge_additional_arguments(left, right)
     if failing_key is not None:
         return None, failing_key
-    if additional is not None:
+    # Only record the flag when it overrides what the merged constraints would
+    # default to on their own, so an intersection stays as small as its inputs
+    # and does not sprout a redundant `additional_arguments` key.
+    if additional is not None and additional != (not _declares_argument_policy(result)):
         result["additional_arguments"] = additional
     return result, None
 
@@ -897,12 +924,17 @@ def _merge_required(
 
 
 def _merge_additional_arguments(left: dict[str, Any], right: dict[str, Any]) -> tuple[bool | None, str | None]:
-    values = [side["additional_arguments"] for side in (left, right) if "additional_arguments" in side]
-    if not values:
-        return None, None
-    if not all(isinstance(value, bool) for value in values):
-        return None, "additional_arguments"
-    return all(values), None
+    # The merged grant admits extra argument names only when BOTH inputs did.
+    # Deriving "admits extras" from `_permitted_argument_names(...) is None` keeps
+    # this consistent with check_constraints and stops one layer setting `true`
+    # from re-opening a whitelist another layer left bounded.
+    for side in (left, right):
+        flag = side.get("additional_arguments")
+        if flag is not None and not isinstance(flag, bool):
+            return None, "additional_arguments"
+    left_open = _permitted_argument_names(left) is None
+    right_open = _permitted_argument_names(right) is None
+    return (left_open and right_open), None
 
 
 def intersect_grants(*grant_sets: tuple[ToolGrant, ...]) -> tuple[ToolGrant, ...]:
@@ -1188,7 +1220,14 @@ class AuditLog:
 def check_constraints(constraints: dict[str, Any], arguments: dict[str, Any]) -> None:
     schema = constraints.get("arguments")
     required = _required_arguments(constraints.get("required", ()))
-    additional = constraints.get("additional_arguments", True)
+    # Deny-by-default (finding: the host is the ceiling on argument *names* too).
+    # A grant that constrains any argument thereby whitelists the names it
+    # mentions -- extras are rejected without an explicit `additional_arguments:
+    # true`. This closes the gap where a grant of {max_amount, allowed_currency}
+    # let an unknown `recipient`/`memo` field ride through to a side-effecting
+    # tool. A grant that constrains nothing is a pure capability grant (what the
+    # manifest builds from a bare tool name) and still passes arguments through.
+    additional = constraints.get("additional_arguments", not _declares_argument_policy(constraints))
     if not isinstance(additional, bool):
         raise SecurityError("additional_arguments constraint must be boolean")
     if schema is not None:
