@@ -35,11 +35,12 @@ class DeterministicProvider(ModelProvider):
     """Offline provider used for tests and the demo."""
 
     def decide(self, state: AgentState, available_tools: tuple[str, ...], grants: tuple[ToolGrant, ...] = ()) -> ProviderDecision:
-        if not state.memory.get("catalog") and "catalog.search" in available_tools:
+        results = state.memory.get("tool_results", {})
+        if not results.get("catalog.search") and "catalog.search" in available_tools:
             return ProviderDecision("tool", "catalog.search", {"query": state.goal, "limit": 3})
         return ProviderDecision(
             "complete",
-            content={"summary": f"Completed: {state.goal}", "evidence": state.memory.get("catalog", [])},
+            content={"summary": f"Completed: {state.goal}", "evidence": results.get("catalog.search", [])},
         )
 
 

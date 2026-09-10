@@ -2,6 +2,21 @@
 
 All notable changes to Portmark are recorded here. Versions follow [semantic versioning](https://semver.org/).
 
+## 0.7.1 — 2026-09-10
+
+Cleanup: remove demo residue from the enforcement core.
+
+### Changed
+
+- **The host no longer derives demo-shaped memory keys from tool names.**
+  `_apply_decision` previously stored a tool's result under a munged key
+  (stripping a `.search` suffix, dots to underscores) and carried a hardcoded
+  `catalog.search` branch — demo wiring living in the enforcement core. Results
+  are now recorded generically under `state.memory["tool_results"][<tool name>]`,
+  keyed by the exact tool name; the core names no specific tool. Providers that
+  consulted the old top-level keys (e.g. `state.memory["catalog"]`) should read
+  `state.memory.get("tool_results", {}).get("<tool name>")` instead.
+
 ## 0.7.0 — 2026-09-10
 
 Security: argument names are now deny-by-default. **Breaking** behavioral change.

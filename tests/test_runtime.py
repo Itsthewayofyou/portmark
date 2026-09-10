@@ -113,9 +113,10 @@ class PaymentProvider(ModelProvider):
     def __init__(self, amount=50):
         self.amount = amount
     def decide(self, state, available_tools, grants=()):
-        if "payments_reserve" not in state.memory:
+        results = state.memory.get("tool_results", {})
+        if "payments.reserve" not in results:
             return ProviderDecision("tool", "payments.reserve", {"amount": self.amount, "currency": "USD"})
-        return ProviderDecision("complete", content={"payment": state.memory["payments_reserve"]})
+        return ProviderDecision("complete", content={"payment": results["payments.reserve"]})
 
 
 class BlockingProvider(ModelProvider):
@@ -138,9 +139,10 @@ class LargeToolProvider(ModelProvider):
 
 class EchoThenCompleteProvider(ModelProvider):
     def decide(self, state, available_tools, grants=()):
-        if "custom_echo" not in state.memory:
+        results = state.memory.get("tool_results", {})
+        if "custom.echo" not in results:
             return ProviderDecision("tool", "custom.echo", {"text": "hello"})
-        return ProviderDecision("complete", content={"echo": state.memory["custom_echo"]})
+        return ProviderDecision("complete", content={"echo": results["custom.echo"]})
 
 
 class HttpFetchThenCompleteProvider(ModelProvider):
@@ -148,9 +150,10 @@ class HttpFetchThenCompleteProvider(ModelProvider):
         self.arguments = arguments
 
     def decide(self, state, available_tools, grants=()):
-        if "http_fetch" not in state.memory:
+        results = state.memory.get("tool_results", {})
+        if "http.fetch" not in results:
             return ProviderDecision("tool", "http.fetch", self.arguments)
-        return ProviderDecision("complete", content={"fetch": state.memory["http_fetch"]})
+        return ProviderDecision("complete", content={"fetch": results["http.fetch"]})
 
 
 class DigestProvider(FixedProvider):

@@ -203,9 +203,12 @@ class AgentHost:
                 return True, None
             state.tool_calls += 1
             self.metrics.increment("tools.executed")
-            state.memory[decision.tool.removesuffix(".search").replace(".", "_")] = result
-            if decision.tool == "catalog.search":
-                state.memory["catalog"] = result
+            # Record the raw tool result generically, keyed by the tool name, so a
+            # provider can consult it on a later step. The enforcement core names
+            # no specific tool -- the previous demo-shaped key derivation
+            # (stripping ".search", and a hardcoded catalog.search branch) lived
+            # here only to feed the bundled demo provider.
+            state.memory.setdefault("tool_results", {})[decision.tool] = result
             state.messages.append({"role": "tool", "name": decision.tool, "content": result})
             audit.append("tool.executed", {"tool": decision.tool, "arguments": decision.arguments})
             return False, None
