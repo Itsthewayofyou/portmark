@@ -126,12 +126,28 @@ class AgentHost:
                 self.metrics.observe_duration("provider_decision_duration_seconds", time.monotonic() - decision_started)
             self.metrics.increment("provider.decisions")
             audit.append("provider.proposed", {"kind": decision.kind, "tool": decision.tool})
+            tool_calls_before = state.tool_calls
             finished, migration = self._apply_decision(decision, state, effective, audit, envelope, active_policy)
             state.step += 1
             # Close the checkpoint's lineage at this host when the task terminates
             # (completed/failed) or migrates away, so it can never be resumed here
             # again (finding EV-008). An awaiting_input suspend stays open.
             closed = migration is not None or state.status in ("completed", "failed")
+            if state.tool_calls > tool_calls_before and not self._checkpoint_fits(envelope, state):
+                # EV-002 class: a tool executed this step and its side effect may have
+                # landed, but the resulting checkpoint exceeds the output budget. A
+                # legal-sized tool result is recorded both in memory["tool_results"] and
+                # in messages, so a result under the invoke cap can still double over the
+                # checkpoint ceiling. Persisting the full checkpoint is impossible, and
+                # raising here would roll back this step's transaction -- erasing the
+                # durable record that the tool ran, and leaving the checkpoint "running"
+                # (resumable, so a resume could re-propose the tool and land the effect
+                # twice). Record an honest, bounded, terminal refusal instead, closing
+                # the lineage. The effect status is unknown, exactly like tool.killed.
+                persisted_events = self._refuse_oversized_checkpoint(envelope, state, audit, persisted_events, decision.tool)
+                result = self._result(envelope, audit)
+                self._record_run_status(result.status)
+                return result
             persisted_events = self._persist(envelope, state, audit, persisted_events, closed=closed)
             if finished:
                 result = self._result(envelope, audit, migration)
@@ -367,6 +383,50 @@ class AgentHost:
         if encoded_size > envelope.permit.budget.max_output_bytes:
             raise SecurityError("checkpoint exceeds output budget")
         return RunResult(envelope.state.status, envelope.state.task_id, envelope.state.result, checkpoint, audit.events, migration)
+
+    def _checkpoint_fits(self, envelope, state) -> bool:
+        # Mirrors the ceiling _persist enforces (envelope.permit.budget), so the loop
+        # can foresee a persist that would refuse the checkpoint and turn it into an
+        # honest terminal event rather than an uncaught raise.
+        return len(canonical_json(asdict(state))) <= envelope.permit.budget.max_output_bytes
+
+    def _refuse_oversized_checkpoint(self, envelope, state, audit, persisted_events, tool):
+        # Collapse the state to a fixed-shape terminal checkpoint that fits by
+        # construction: the only growth since the last (passing) persist is this step's
+        # tool result, held in memory["tool_results"] and echoed into messages, so
+        # replacing both with a small marker returns the checkpoint to roughly its prior
+        # size regardless of how large the refused output was. The full result is
+        # deliberately dropped from durable state -- the hash-chained audit, not the
+        # checkpoint, is the record of what happened.
+        oversized = len(canonical_json(asdict(state)))
+        refused_tools = sorted(state.memory.get("tool_results", {}).keys())
+        state.memory["tool_results"] = {
+            "__refused__": {"reason": "checkpoint output budget exceeded", "tools": refused_tools}
+        }
+        state.messages = [
+            {
+                "role": "system",
+                "name": "portmark",
+                "content": "checkpoint output refused: exceeded output budget after tool execution",
+            }
+        ]
+        state.status = "failed"
+        state.result = {"error": "checkpoint exceeds output budget after tool execution"}
+        self.metrics.increment("tools.output_refused")
+        # effect_status is "unknown" because the tool ran before the checkpoint was
+        # sized: any side effect it performed has already landed and cannot be undone
+        # from here, exactly as with a hard-killed tool (tool.killed, EV-002).
+        audit.append(
+            "output.refused",
+            {
+                "tool": tool,
+                "encoded_size": oversized,
+                "max_output_bytes": envelope.permit.budget.max_output_bytes,
+                "effect_status": "unknown",
+            },
+        )
+        audit.append("agent.failed", state.result)
+        return self._persist(envelope, state, audit, persisted_events, closed=True)
 
     def _record_run_status(self, status: str) -> None:
         self.metrics.increment(f"runs.{status}")
