@@ -45,6 +45,7 @@ from portmark.security import (
     ExternalAttestationVerifier,
     HmacEnvelopeSigner,
     HostPolicy,
+    MigrationPolicy,
     SecurityError,
     TrustRegistry,
     TrustedIdentity,
@@ -1569,6 +1570,7 @@ class RuntimeTests(unittest.TestCase):
                 with self.subTest(backend=backend):
                     source = make_host(host_id="host:source", signer=source_signer, store=source_store)
                     destination = make_host(host_id="host:destination", signer=destination_signer, store=destination_store)
+                    source.policy.migration = MigrationPolicy(allowed=True, destinations=(destination.host_id,))
                     provider = MigrateThenCompleteProvider(destination.host_id)
                     source.providers["migrator"] = provider
                     destination.providers["migrator"] = provider
@@ -1999,6 +2001,10 @@ class RuntimeTests(unittest.TestCase):
         ]:
             with self.subTest(message=message):
                 host = make_host()
+                # Allow migration to the destination so the migration subtests reach
+                # the check each is pinning (e.g. attestation shape); the no-delegation
+                # case still fails earlier, on the permit.
+                host.policy.migration = MigrationPolicy(allowed=True, destinations=("host:destination",))
                 host.providers["guard"] = FixedProvider(decision)
                 envelope = make_demo_envelope(host, message, "guard")
                 if mutate is not None:
@@ -2069,6 +2075,7 @@ class RuntimeTests(unittest.TestCase):
             destination_store = SQLiteRuntimeStore(Path(directory) / "destination.sqlite")
             source = make_host(host_id="host:source", signer=source_signer, store=source_store)
             destination = make_host(host_id="host:destination", signer=destination_signer, store=destination_store)
+            source.policy.migration = MigrationPolicy(allowed=True, destinations=(destination.host_id,))
             provider = MigrateThenCompleteProvider(destination.host_id)
             source.providers["migrator"] = provider
             destination.providers["migrator"] = provider
@@ -2155,6 +2162,7 @@ class RuntimeTests(unittest.TestCase):
         destination_signer = trust_signer(EnvelopeSigner.generate("destination-key", "host:destination", ("host:destination",)), source_signer)
         source = make_host(host_id="host:source", signer=source_signer)
         destination = make_host(host_id="host:destination", signer=destination_signer)
+        source.policy.migration = MigrationPolicy(allowed=True, destinations=(destination.host_id,))
         provider = MigrateThenCompleteProvider(destination.host_id)
         source.providers["migrator"] = provider
         destination.providers["migrator"] = provider
@@ -2192,6 +2200,7 @@ class RuntimeTests(unittest.TestCase):
         destination_signer = trust_signer(EnvelopeSigner.generate("destination-key", "host:destination", ("host:destination",)), source_signer)
         source = make_host(host_id="host:source", signer=source_signer, attestation_policy=policy)
         destination = make_host(host_id="host:destination", signer=destination_signer, attestation_policy=policy)
+        source.policy.migration = MigrationPolicy(allowed=True, destinations=(destination.host_id,))
         destination_evidence = authority.issue(
             subject=destination.host_id,
             audience=source.host_id,
@@ -2223,12 +2232,69 @@ class RuntimeTests(unittest.TestCase):
         policy = AttestationPolicy((authority.trusted_authority(),), ("measurement:destination",), required_for_migration=True)
         signer = EnvelopeSigner.generate("source-key", "host:source", ("host:source", "host:destination"))
         source = make_host(host_id="host:source", signer=signer, attestation_policy=policy)
+        source.policy.migration = MigrationPolicy(allowed=True, destinations=("host:destination",))
         source.providers["migrator"] = MigrateThenCompleteProvider("host:destination")
         envelope = make_demo_envelope(source, "move without proof", "migrator")
         object.__setattr__(envelope.permit, "delegation_allowed", True)
         signer.seal(envelope)
         with self.assertRaisesRegex(SecurityError, "required"):
             source.run(envelope)
+
+    def test_host_policy_migration_ceiling_bounds_destinations(self):
+        # Finding EV-009: host policy is a ceiling over movement. A migration needs
+        # the incoming permit's delegation AND the host's allow AND an allowlisted
+        # destination -- all three, or it is refused. The provider always proposes
+        # migrating to host:allowed; only the source policy and permit vary.
+        source_signer = EnvelopeSigner.generate("ev009-key", "host:source", ("host:source", "host:allowed"))
+
+        def run_migration(destinations, allowed=True, delegation=True):
+            source = make_host(host_id="host:source", signer=source_signer)
+            source.policy.migration = MigrationPolicy(allowed=allowed, destinations=destinations)
+            source.providers["migrator"] = MigrateThenCompleteProvider("host:allowed")
+            env = make_demo_envelope(source, "ev009 movement", "migrator")
+            object.__setattr__(env.permit, "delegation_allowed", delegation)
+            source_signer.seal(env)
+            return source.run(env)
+
+        # All three conditions satisfied: migration is authorized.
+        self.assertIsNotNone(run_migration(("host:allowed",)).migration_envelope)
+
+        # Destination not on the host allowlist: refused.
+        with self.assertRaisesRegex(SecurityError, "does not allow migration to"):
+            run_migration(("host:elsewhere",))
+
+        # Host policy disallows migration entirely (the default posture): refused.
+        with self.assertRaisesRegex(SecurityError, "host policy does not allow migration"):
+            run_migration((), allowed=False)
+
+        # Permit does not delegate: refused regardless of host allowlist.
+        with self.assertRaisesRegex(SecurityError, "permit does not allow migration"):
+            run_migration(("host:allowed",), delegation=False)
+
+    def test_policy_loader_validates_migration_block(self):
+        from portmark.policy import policy_from_dict
+
+        base = {"version": "v1", "tools": {"catalog.search": {"impact": "low"}}}
+        # An omitted migration block defaults to deny-all.
+        default_policy = policy_from_dict(base, "host:local-demo")
+        self.assertFalse(default_policy.migration.allowed)
+        self.assertEqual(default_policy.migration.destinations, ())
+        # A valid opt-in round-trips.
+        opted_in = policy_from_dict({**base, "migration": {"allowed": True, "destinations": ["host:a", "host:b"]}}, "host:local-demo")
+        self.assertTrue(opted_in.migration.allowed)
+        self.assertEqual(opted_in.migration.destinations, ("host:a", "host:b"))
+        # Malformed migration blocks fail closed at load.
+        cases = [
+            ({"allowed": "yes"}, "allowed must be a boolean"),
+            ({"allowed": True, "destinations": "host:a"}, "destinations must be a list"),
+            ({"allowed": True, "destinations": [""]}, "non-empty strings"),
+            ({"allowed": True}, "lists no destinations"),
+            ({"allowed": True, "destinations": ["host:a"], "extra": 1}, "unknown keys"),
+        ]
+        for migration, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    policy_from_dict({**base, "migration": migration}, "host:local-demo")
 
     def test_a2a_agent_card_and_signed_submission(self):
         host = make_host()

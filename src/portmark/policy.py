@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .models import ResourceBudget, ToolGrant
-from .security import HostPolicy, TrustedApprover, canonical_json, validate_constraints
+from .security import HostPolicy, MigrationPolicy, TrustedApprover, canonical_json, validate_constraints
 
 
 VALID_IMPACTS = {"low", "medium", "high", "destructive", "external-payment", "credentialed", "data-exfiltration"}
@@ -51,7 +51,31 @@ def policy_from_dict(value: dict[str, Any], audience: str) -> HostPolicy:
         tool_impacts=impacts,
         approval_authorities=_approval_authorities(value.get("approval_authorities", ())),
         approval_required_impacts=approval_required_impacts,
+        migration=_migration_policy(value.get("migration")),
     )
+
+
+def _migration_policy(value: Any) -> MigrationPolicy:
+    # Finding EV-009: default deny. An omitted migration block means the host sends
+    # agents nowhere; opting in requires listing explicit destinations.
+    if value is None:
+        return MigrationPolicy()
+    if not isinstance(value, dict):
+        raise ValueError("policy migration must be an object")
+    unknown = set(value) - {"allowed", "destinations"}
+    if unknown:
+        raise ValueError(f"policy migration has unknown keys: {sorted(unknown)}")
+    allowed = value.get("allowed", False)
+    if not isinstance(allowed, bool):
+        raise ValueError("policy migration allowed must be a boolean")
+    destinations = value.get("destinations", ())
+    if not isinstance(destinations, (list, tuple)):
+        raise ValueError("policy migration destinations must be a list")
+    if not all(isinstance(item, str) and item for item in destinations):
+        raise ValueError("policy migration destinations must be non-empty strings")
+    if allowed and not destinations:
+        raise ValueError("policy migration is allowed but lists no destinations")
+    return MigrationPolicy(allowed=allowed, destinations=tuple(destinations))
 
 
 def _read_policy(path: str | Path) -> dict[str, Any]:
