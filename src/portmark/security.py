@@ -706,8 +706,16 @@ def _declares_argument_policy(constraints: dict[str, Any]) -> bool:
 
 
 def _admits_any_argument(constraints: dict[str, Any]) -> bool:
-    """Whether this grant lets through argument names it does not mention."""
-    return bool(constraints.get("additional_arguments", not _declares_argument_policy(constraints)))
+    """Whether this grant lets through argument names it does not mention.
+
+    Runs during the merge, before check_constraints' invoke-time bool check, so it
+    fails closed on a non-bool flag: only a literal `True` opens the grant. A
+    `False` or a malformed value leaves it bounded rather than silently open.
+    """
+    value = constraints.get("additional_arguments")
+    if value is None:
+        return not _declares_argument_policy(constraints)
+    return value is True
 
 
 def _permitted_argument_names(constraints: dict[str, Any]) -> set[str] | None:

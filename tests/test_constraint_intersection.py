@@ -461,5 +461,31 @@ class NarrowingCompletenessTest(unittest.TestCase):
         self.assertEqual(merged, shared)
 
 
+class AdditionalArgumentsEmissionTest(unittest.TestCase):
+    """Pin the merge's `additional_arguments` emission guard: the merged grant
+    carries the flag only when it overrides the merged constraints' own default,
+    and either way the effective acceptance is correct."""
+
+    def test_both_open_result_declares_names_stays_open(self):
+        # Both sides opt in; the merged result declares `a`, so its default would
+        # be deny -- the merge must emit `true` to keep it open.
+        merged = merge_real(
+            {"additional_arguments": True},
+            {"additional_arguments": True, "arguments": {"a": {}}},
+        )
+        self.assertIsNotNone(merged)
+        self.assertTrue(accepts(merged, {"z": 1}), "both sides opted in; extras still admitted")
+
+    def test_one_bounded_side_denies_extras_with_no_emitted_flag(self):
+        # Left bounds `amount` (declares policy); right is open but declares
+        # nothing. Merged flag is False and the result still carries `max_amount`,
+        # so the guard emits no flag and check_constraints denies via the default.
+        merged = merge_real({"max_amount": 5}, {"additional_arguments": True})
+        self.assertIsNotNone(merged)
+        self.assertNotIn("additional_arguments", merged)
+        self.assertFalse(accepts(merged, {"amount": 1, "z": 2}), "the bounded side's whitelist survives")
+        self.assertTrue(accepts(merged, {"amount": 1}), "the declared argument is still accepted")
+
+
 if __name__ == "__main__":
     unittest.main()
