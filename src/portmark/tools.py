@@ -30,6 +30,15 @@ _RESPONSE_ENVELOPE_SLACK = 65_536
 # for the worker to import portmark and the tool module at all.
 _INHERITED_ENV_KEYS = ("PYTHONPATH", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "SYSTEMROOT")
 
+# The isolated executor's hard-kill guarantee rests on two things being true
+# together: the worker became its own session leader (start_new_session) and the
+# platform can signal a whole process group (os.killpg). On Windows both are
+# absent -- start_new_session is silently ignored and killpg does not exist -- so
+# a kill reaches only the worker, not a grandchild it spawned. We refuse to
+# *claim* the guarantee where we cannot keep it: this positive capability, tested
+# once here, gates both the side-effecting refusal and the kill itself.
+_CAN_KILL_PROCESS_GROUP = hasattr(os, "killpg") and hasattr(os, "getpgid")
+
 
 class ToolExecutionError(SecurityError):
     pass
@@ -91,6 +100,15 @@ class ToolRegistry:
         module_name, separator, object_path = target.partition(":")
         if not separator or not module_name or not object_path:
             raise ValueError("register_isolated target must use module:function syntax")
+        if side_effecting and not _CAN_KILL_PROCESS_GROUP:
+            # Fail closed at startup, not at the first payment: on a platform
+            # without process groups the host cannot guarantee the tool stops at
+            # its deadline, so it must not promise to run a side-effecting one.
+            raise SecurityError(
+                f"tool {name!r} is side-effecting but this platform cannot hard-kill a worker's "
+                "process group (no os.killpg), so the host cannot guarantee it stops at its "
+                "deadline; refusing to register it. Non-side-effecting isolated tools are allowed."
+            )
         self._isolated[name] = _IsolatedSpec(target=target, env=dict(env or {}))
         self._tools.pop(name, None)
         if timeout is not None:
@@ -264,7 +282,7 @@ def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
         # an unrelated process that reused it.
         return
     try:
-        if hasattr(os, "killpg"):
+        if _CAN_KILL_PROCESS_GROUP:
             os.killpg(os.getpgid(process.pid), signal.SIGKILL)
         else:  # pragma: no cover - Windows fallback, CI is Linux
             process.kill()
