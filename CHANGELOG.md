@@ -2,6 +2,34 @@
 
 All notable changes to Portmark are recorded here. Versions follow [semantic versioning](https://semver.org/).
 
+## 0.6.0 — 2026-09-10
+
+Closes EV-002 (isolated tool executor). Untrusted or side-effecting tools can now
+run in a hard-killable subprocess instead of the host process.
+
+### Added
+
+- **`ToolRegistry.register_isolated(name, "module:function", ...)`.** Runs a tool
+  in a fresh worker process (`portmark.tool_subprocess_runner`) that imports the
+  target itself and speaks one JSON document each way. The host can hard-kill it
+  at the deadline — killing the whole process group (`start_new_session` +
+  `killpg`), so a grandchild the tool spawned dies too. The thread path could
+  never cancel a started tool; this one can.
+- The worker inherits only a **default-deny env allowlist** (`PYTHONPATH`,
+  `PATH`, locale, `SYSTEMROOT`) — host secrets in the environment never reach an
+  untrusted tool unless the operator names them via `env=`. Its stdout is caged so
+  `print()` (or a forged JSON line) cannot corrupt the protocol, and the host
+  reads bounded and re-checks output size.
+
+### Security
+
+- **Side-effecting tools now have a sanctioned path.** A `side_effecting=True`
+  tool, still refused on the thread path, may run isolated — because the host can
+  hard-kill it. The kill is audited honestly: `tool.killed` with
+  `effect_status: "unknown"` (a `ToolKilledError`), distinct from a clean
+  `tool.failed`. Hard-kill stops any *new* effect but cannot roll back one already
+  in flight at the deadline; it narrows the race, it does not eliminate it.
+
 ## 0.5.1 — 2026-09-10
 
 Closes EV-009 (host-side migration destination ceiling). PR 2 of the two EV-008/
