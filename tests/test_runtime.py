@@ -1956,7 +1956,7 @@ class RuntimeTests(unittest.TestCase):
             with self._raw_sqlite(path) as connection:
                 self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SQLITE_SCHEMA_VERSION)
                 connection.execute("PRAGMA user_version = 999")
-            with store._connect() as connection:
+            with store._connection() as connection:
                 self.assertEqual(connection.execute("PRAGMA busy_timeout").fetchone()[0], SQLITE_BUSY_TIMEOUT_MS)
             with self.assertRaisesRegex(RuntimeError, "newer than supported"):
                 SQLiteRuntimeStore(path)
