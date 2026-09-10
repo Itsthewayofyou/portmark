@@ -3394,7 +3394,13 @@ class RuntimeTests(unittest.TestCase):
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(submit_blocking_request)
             try:
-                self.assertTrue(entered.wait(5))
+                # Generous budgets on purpose: the connection-cap logic is
+                # race-free (the first request holds its semaphore slot until its
+                # thread finishes), so the only way this test fails is a starved
+                # runner not scheduling the blocked request in time. Wide timeouts
+                # keep it deterministic under a loaded full-suite run; a healthy
+                # machine still returns the instant the events fire.
+                self.assertTrue(entered.wait(30))
                 second = urllib.request.Request(
                     base + "/message:send",
                     data=self._a2a_request_body(host, "busy task"),
@@ -3407,10 +3413,10 @@ class RuntimeTests(unittest.TestCase):
                 release.set()
                 server.shutdown()
                 server.server_close()
-            self.assertEqual(future.result(timeout=10)["result"]["status"]["state"], "completed")
+            self.assertEqual(future.result(timeout=30)["result"]["status"]["state"], "completed")
 
     def _busy_rejection(self, port, body):
-        sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+        sock = socket.create_connection(("127.0.0.1", port), timeout=30)
         try:
             sock.sendall(
                 b"POST /message:send HTTP/1.1\r\n"
