@@ -53,7 +53,7 @@ from portmark.security import (
     generate_signing_material,
     load_trust_registry,
 )
-from portmark.storage import SQLITE_BUSY_TIMEOUT_MS, SQLITE_SCHEMA_VERSION, PostgresRuntimeStore, SQLiteRuntimeStore
+from portmark.storage import SQLITE_BUSY_TIMEOUT_MS, SQLITE_SCHEMA_VERSION, InMemoryRuntimeStore, PostgresRuntimeStore, SQLiteRuntimeStore
 from portmark.cli import main as cli_main
 from portmark.tools import ToolRegistry, _CAN_KILL_PROCESS_GROUP
 from examples.tools import http_fetch
@@ -1840,6 +1840,55 @@ class RuntimeTests(unittest.TestCase):
                     with store.transaction() as txn:
                         with self.assertRaisesRegex(SecurityError, "closed"):
                             txn.save_checkpoint("cas-task", state, 3)
+
+    @contextmanager
+    def _inmemory_store_case(self):
+        yield "inmemory", InMemoryRuntimeStore()
+
+    def test_runtime_store_contract_checkpoint_generation_cas_under_real_concurrency(self):
+        # Finding EV-008: the sequential contract test proves the CAS *logic*, but
+        # the guarantee that matters is under contention -- many hosts resuming the
+        # same checkpoint at once, exactly one advancing. This exercises that
+        # genuinely: N threads released together all try to advance generation 1,
+        # and the store must let exactly one win (1 -> 2) and reject the rest as
+        # stale, on every backend. InMemory serializes on its lock, SQLite on
+        # BEGIN IMMEDIATE, Postgres on an advisory xact lock.
+        writers = 8
+        state = AgentState(task_id="cas-race", goal="cas")
+        contexts = [self._inmemory_store_case()] + self._store_case_contexts()
+        for context in contexts:
+            with context as (backend, store):
+                with self.subTest(backend=backend):
+                    with store.transaction() as txn:
+                        self.assertEqual(txn.save_checkpoint("cas-race", state, 0), 1)
+
+                    barrier = threading.Barrier(writers)
+                    results: list[tuple[str, object]] = []
+                    results_lock = threading.Lock()
+
+                    def writer():
+                        barrier.wait()  # release all writers at the same instant
+                        try:
+                            with store.transaction() as txn:
+                                outcome: tuple[str, object] = ("won", txn.save_checkpoint("cas-race", state, 1))
+                        except SecurityError as error:
+                            outcome = ("rejected", str(error))
+                        with results_lock:
+                            results.append(outcome)
+
+                    threads = [threading.Thread(target=writer) for _ in range(writers)]
+                    for thread in threads:
+                        thread.start()
+                    for thread in threads:
+                        thread.join(timeout=60)
+
+                    won = [value for kind, value in results if kind == "won"]
+                    rejected = [value for kind, value in results if kind == "rejected"]
+                    self.assertEqual(len(results), writers, f"{backend}: every writer must finish")
+                    self.assertEqual(won, [2], f"{backend}: exactly one writer advances 1 -> 2")
+                    self.assertEqual(len(rejected), writers - 1)
+                    self.assertTrue(all("stale checkpoint generation" in message for message in rejected))
+                    self.assertEqual(store.load_checkpoint("cas-race")["checkpoint_generation"], 2)
 
     def test_sqlite_store_persists_checkpoint_and_audit_chain(self):
         with tempfile.TemporaryDirectory() as directory:
