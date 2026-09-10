@@ -2,6 +2,16 @@
 
 All notable changes to Portmark are recorded here. Versions follow [semantic versioning](https://semver.org/).
 
+## 0.4.1 — 2026-09-10
+
+### Documented
+
+- **Two open security follow-ups are now tracked on the threat ledger** so they
+  don't fall off after the 0.4.0 release: `EV-008` (stale-checkpoint resume
+  rollback → checkpoint-generation CAS) and `EV-009` (host-side migration
+  destination ceiling). 0.4.0 fixed the immediately exploitable form of each
+  finding; these rows record the architectural work that remains. Docs only.
+
 ## 0.4.0 — 2026-09-03
 
 Focused security release from an independent code-review pass. No new features.
