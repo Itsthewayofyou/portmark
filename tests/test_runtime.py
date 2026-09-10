@@ -73,6 +73,18 @@ class FixedProvider(ModelProvider):
     def decide(self, state, available_tools, grants=()): return self.decision
 
 
+class AlwaysSuspendProvider(ModelProvider):
+    """Suspends on every decision (awaiting_input), so its checkpoint stays open
+    and resumable. Counts decisions to prove a rejected replay never reaches it."""
+
+    def __init__(self):
+        self.decisions = 0
+
+    def decide(self, state, available_tools, grants=()):
+        self.decisions += 1
+        return ProviderDecision("await_input", None, {"need": "more input"})
+
+
 class MigrateThenCompleteProvider(ModelProvider):
     def __init__(self, destination): self.destination = destination
     def decide(self, state, available_tools, grants=()):
@@ -1289,9 +1301,13 @@ class RuntimeTests(unittest.TestCase):
         first = host.run(env)
         self.assertEqual(first.status, "completed")  # legitimate resume executes once
 
-        replay = host.run(captured)  # same task_id + approval_id, same store
-        self.assertEqual(replay.status, "failed")
-        self.assertIn("approval.denied", [event["event"] for event in replay.audit])
+        # Finding EV-008 now backstops the approval-nonce defense (EV-005). Once the
+        # task completes its checkpoint is closed, so replaying the captured envelope
+        # is rejected at admission by the generation/closed guard -- before the
+        # approval gate is ever reached, and before any tool runs. The durable
+        # approval-id consumption remains underneath as defense in depth.
+        with self.assertRaisesRegex(SecurityError, "closed"):
+            host.run(captured)  # same task_id + approval_id, same store
 
     def test_policy_reload_invalidates_stale_approval(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1334,12 +1350,16 @@ class RuntimeTests(unittest.TestCase):
                 host.run(envelope)
 
     def test_replay_of_fresh_envelope_is_rejected(self):
+        # Finding EV-008: after the task completes, its checkpoint is closed, so a
+        # replay of the original envelope is rejected at admission by the
+        # checkpoint-generation guard -- before any provider or tool runs -- rather
+        # than later by the permit nonce. A finished task must never re-run.
         host = make_host()
         envelope = make_demo_envelope(host, "goal")
         host.run(envelope)
         envelope.state.status = "ready"
         host.signer.seal(envelope)
-        with self.assertRaisesRegex(SecurityError, "nonce"):
+        with self.assertRaisesRegex(SecurityError, "closed"):
             host.run(envelope)
 
     def test_forged_running_status_still_consumes_nonce_on_first_run(self):
@@ -1590,9 +1610,75 @@ class RuntimeTests(unittest.TestCase):
             replay = copy.deepcopy(envelope)
             replay.state.status = "ready"
             signer.seal(replay)
-            with self.assertRaisesRegex(SecurityError, "nonce"):
+            # Finding EV-008: the completed task's checkpoint is closed durably, so a
+            # brand-new host process opening the same SQLite store rejects the replay
+            # at admission -- proving the protection is durable state, not an
+            # in-process cache.
+            with self.assertRaisesRegex(SecurityError, "closed"):
                 second_host.run(replay)
             self.assertTrue(second_host.store.consumed_nonce_exists(replay.permit.nonce))
+
+    def test_captured_suspended_envelope_rejected_after_resume_advances_generation(self):
+        # Finding EV-008, the reviewer's adversarial sequence: a suspended envelope
+        # captured at generation N must be rejected once a legitimate resume has
+        # advanced the stored generation past N -- and rejected at admission, before
+        # the provider is ever consulted. Proven on every store backend.
+        signer = EnvelopeSigner.generate("ev008-key", "host:local-demo", ("host:local-demo",))
+        for context in self._store_case_contexts(signer):
+            with context as (backend, store):
+                with self.subTest(backend=backend):
+                    provider = AlwaysSuspendProvider()
+                    host = make_host(signer=signer, store=store, providers={"suspender": provider})
+                    env = make_demo_envelope(host, f"{backend} adversarial", "suspender")
+                    signer.seal(env)
+
+                    first = host.run(env)  # submit -> suspends (checkpoint left open)
+                    self.assertEqual(first.status, "awaiting_input")
+                    captured_generation = first.checkpoint["checkpoint_generation"]
+                    # The run mutates the envelope in place; re-seal the suspended
+                    # state so it is a valid, replayable wire envelope, then capture it.
+                    host.signer.seal(env)
+                    captured = copy.deepcopy(env)  # attacker captures the suspended envelope
+                    self.assertEqual(captured.state.checkpoint_generation, captured_generation)
+
+                    second = host.run(env)  # legitimate resume advances the stored generation
+                    self.assertEqual(second.status, "awaiting_input")
+                    self.assertGreater(second.checkpoint["checkpoint_generation"], captured_generation)
+                    decisions_before_replay = provider.decisions
+
+                    # Resubmitting the stale captured envelope is rejected at admission.
+                    with self.assertRaisesRegex(SecurityError, "stale checkpoint generation"):
+                        host.run(captured)
+                    # The provider was never consulted for the rejected replay.
+                    self.assertEqual(provider.decisions, decisions_before_replay)
+
+    def test_runtime_store_contract_checkpoint_generation_cas(self):
+        # Finding EV-008: the store-owned generation is a compare-and-swap. A fresh
+        # create must assert generation 0; a resume advances only from the exact
+        # stored generation; two writers at the same generation cannot both win; and
+        # a closed checkpoint can never be reopened. Proven on every store backend.
+        state = AgentState(task_id="cas-task", goal="cas")
+        for context in self._store_case_contexts():
+            with context as (backend, store):
+                with self.subTest(backend=backend):
+                    # A fresh create must assert generation 0.
+                    with store.transaction() as txn:
+                        with self.assertRaisesRegex(SecurityError, "stale checkpoint generation"):
+                            txn.save_checkpoint("cas-task", state, 7)
+                    with store.transaction() as txn:
+                        self.assertEqual(txn.save_checkpoint("cas-task", state, 0), 1)
+                    # One writer at generation 1 advances to 2; a second at 1 is stale.
+                    with store.transaction() as txn:
+                        self.assertEqual(txn.save_checkpoint("cas-task", state, 1), 2)
+                    with store.transaction() as txn:
+                        with self.assertRaisesRegex(SecurityError, "stale checkpoint generation"):
+                            txn.save_checkpoint("cas-task", state, 1)
+                    # Closing the checkpoint bars every later resume.
+                    with store.transaction() as txn:
+                        self.assertEqual(txn.save_checkpoint("cas-task", state, 2, closed=True), 3)
+                    with store.transaction() as txn:
+                        with self.assertRaisesRegex(SecurityError, "closed"):
+                            txn.save_checkpoint("cas-task", state, 3)
 
     def test_sqlite_store_persists_checkpoint_and_audit_chain(self):
         with tempfile.TemporaryDirectory() as directory:
