@@ -1853,6 +1853,38 @@ class RuntimeTests(unittest.TestCase):
             self.assertTrue(store.verify_audit_chain(result.task_id))
             self.assertEqual(store.audit_head(result.task_id), (result.audit[-1]["hash"], result.audit[-1]["sequence"] + 1))
 
+    def test_sqlite_store_closes_connections_after_reads(self):
+        # A read must close its SQLite connection, not just commit: sqlite3's own
+        # `with connection` commits but never closes, and an open connection holds
+        # the database file open -- which breaks temp-file deletion on Windows and
+        # leaks descriptors in a long-running host. Spy on every connection the
+        # reads open and assert each one is closed (a closed connection raises).
+        import sqlite3 as sqlite_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            host = make_host(store=store)
+            result = host.run(make_demo_envelope(host, "leak check"))
+
+            opened: list[sqlite_module.Connection] = []
+            real_connect = sqlite_module.connect
+
+            def tracking_connect(*args, **kwargs):
+                connection = real_connect(*args, **kwargs)
+                opened.append(connection)
+                return connection
+
+            with patch("portmark.storage.sqlite3.connect", side_effect=tracking_connect):
+                store.consumed_nonce_exists("no-such-nonce")
+                store.load_checkpoint(result.task_id)
+                store.audit_head(result.task_id)
+                store.verify_audit_chain_status(result.task_id)
+
+            self.assertTrue(opened, "reads must open a connection for the close to be provable")
+            for connection in opened:
+                with self.assertRaises(sqlite_module.ProgrammingError):
+                    connection.execute("SELECT 1")
+
     def test_sqlite_store_sets_schema_version_busy_timeout_and_rejects_future_schema(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runtime.sqlite"

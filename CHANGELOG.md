@@ -2,6 +2,21 @@
 
 All notable changes to Portmark are recorded here. Versions follow [semantic versioning](https://semver.org/).
 
+## 0.6.2 — 2026-09-10
+
+Portability fix from the Windows test review: close SQLite connections after use.
+
+### Fixed
+
+- **SQLite read/query methods leaked their connections.** They used sqlite3's own
+  `with connection:`, which commits or rolls back but never *closes* the
+  connection. An open connection holds the database file open, so on Windows temp
+  files could not be deleted (breaking test cleanup) and a long-running host could
+  exhaust descriptors. Reads now go through a `_connection()` context manager that
+  closes in a `finally`. Postgres already closed via psycopg's context manager;
+  the transaction paths already closed explicitly. No security content. A
+  regression test spies on every connection a read opens and asserts it is closed.
+
 ## 0.6.1 — 2026-09-10
 
 Follow-up to EV-002 (0.6.0): fail closed on platforms without process-group kill.

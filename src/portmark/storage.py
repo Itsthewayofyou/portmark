@@ -5,7 +5,8 @@ import hashlib
 import sqlite3
 import threading
 import time
-from contextlib import AbstractContextManager
+from collections.abc import Generator
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import TracebackType
@@ -228,9 +229,22 @@ class SQLiteRuntimeStore:
         connection.execute("PRAGMA journal_mode = WAL")
         return connection
 
+    @contextmanager
+    def _connection(self) -> Generator[sqlite3.Connection, None, None]:
+        # sqlite3's own `with connection` commits/rolls back but never *closes* the
+        # connection. On Windows an open connection holds the database file open, so
+        # temp files cannot be deleted and long-running processes leak descriptors.
+        # Wrap the transactional context and close in a finally.
+        connection = self._connect()
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
     def _initialize(self) -> None:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as connection:
+        with self._connection() as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             if version > SQLITE_SCHEMA_VERSION:
                 raise RuntimeError(f"SQLite store schema version {version} is newer than supported version {SQLITE_SCHEMA_VERSION}")
@@ -343,22 +357,22 @@ class SQLiteRuntimeStore:
         return _SQLiteTransaction(self)
 
     def consumed_nonce_exists(self, nonce: str) -> bool:
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute("SELECT 1 FROM consumed_nonces WHERE nonce = ?", (nonce,)).fetchone()
             return row is not None
 
     def load_checkpoint(self, task_id: str) -> dict[str, Any] | None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute("SELECT checkpoint_json FROM checkpoints WHERE task_id = ?", (task_id,)).fetchone()
             return json.loads(row["checkpoint_json"]) if row is not None else None
 
     def audit_head(self, task_id: str) -> tuple[str, int] | None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute("SELECT head_hash, sequence FROM audit_heads WHERE task_id = ?", (task_id,)).fetchone()
             return (row["head_hash"], int(row["sequence"])) if row is not None else None
 
     def verify_audit_chain_status(self, task_id: str) -> AuditVerificationResult:
-        with self._connect() as connection:
+        with self._connection() as connection:
             rows = connection.execute(
                 "SELECT sequence, event, details_json, previous_hash, hash, host_id FROM audit_events WHERE task_id = ? ORDER BY sequence",
                 (task_id,),
