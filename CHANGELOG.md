@@ -2,6 +2,46 @@
 
 All notable changes to Portmark are recorded here. Versions follow [semantic versioning](https://semver.org/).
 
+## 0.5.0 — 2026-09-10
+
+Closes EV-008 (stale-checkpoint resume rollback). PR 1 of the two follow-ups; the
+migration-destination ceiling (EV-009) follows separately.
+
+### Security
+
+- **The durable store now owns a monotonic checkpoint generation, admitted by
+  compare-and-swap.** Previously the host ran from the state carried in the signed
+  envelope and only checked that a checkpoint existed, so a captured suspended
+  checkpoint (generation N) could be re-submitted as a resume after the task had
+  advanced and re-run from stale state. Now every stored checkpoint carries a
+  store-owned generation and a terminal `closed` flag. A fresh task must carry
+  generation 0 and consumes the permit nonce; a resume is admitted only by
+  advancing the exact stored generation (`generation == expected AND NOT closed`,
+  in one store statement), and a completed, failed, or migrated-away checkpoint is
+  closed and can never reopen. The comparison and the advance commit together with
+  the nonce consumption and audit append in the first `_persist`, so a stale or
+  replayed resume is rejected at admission — before any provider decision, tool
+  call, approval, or migration. `AgentState.checkpoint_generation` carries the
+  assertion on the wire; the store, never the caller, sets the value.
+- Migration resets the destination's generation to 0 (it starts its own lineage,
+  guarded by a fresh delegated nonce) and closes the source task, so neither side
+  is left with a resumable lineage.
+
+### Storage
+
+- `RuntimeStore.save_checkpoint(task_id, state, expected_generation, closed=False)
+  -> int` replaces the previous fire-and-forget signature and performs the CAS on
+  all three backends: InMemory (under its lock), SQLite (`UPDATE ... WHERE
+  generation = ? AND closed = 0`, rowcount checked), and Postgres (`UPDATE ...
+  RETURNING`). SQLite schema **v4** and Postgres schema **v2** add the `generation`
+  and `closed` columns; the migration is idempotent and closes any pre-existing
+  terminal checkpoint so an old envelope cannot re-run it.
+- New tests run on every backend (SQLite + Postgres in CI): the reviewer's
+  adversarial capture/resume/replay sequence (rejected before the provider is
+  consulted), the compare-and-swap contract (fresh requires generation 0, exactly
+  one writer at a generation wins, a closed checkpoint bars resume), and a durable
+  cross-restart rejection.
+
 ## 0.4.1 — 2026-09-10
 
 ### Documented

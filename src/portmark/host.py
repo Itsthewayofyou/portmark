@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import secrets
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from collections.abc import Callable
 from typing import Any
 
@@ -88,20 +88,21 @@ class AgentHost:
             raise SecurityError("signed manifest pins a component digest but the provider exposes none to verify")
 
         state = envelope.state
-        # Finding #2: whether to spend the permit's one-time nonce must not be
-        # decided by state.status alone. That field rides in on the signed
-        # envelope, so an issuer could set it to "running" on a FIRST submission to
-        # skip nonce consumption entirely and defeat replay protection. Only skip
-        # consumption for a *genuine resume*: a non-"ready" status AND a checkpoint
-        # already stored for this task. A first submission has no stored checkpoint
-        # yet, so it consumes the nonce no matter what status it claims; and a
-        # replayed "ready" envelope still re-attempts consumption and is rejected.
-        # Consumption stays atomic inside _persist, so concurrent first runs race
-        # to a single winner. (This closes the "lie about status to never consume"
-        # hole. Replaying a suspended checkpoint as a resume still needs the
-        # checkpoint-generation CAS tracked as a 0.4.x follow-up.)
-        is_resume = state.status != "ready" and self.store.load_checkpoint(state.task_id) is not None
-        consume_nonce = None if is_resume else envelope.permit.nonce
+        # Finding EV-008: fresh-vs-resume and replay protection come from the durable
+        # store's checkpoint generation, not from caller-supplied state.status. A task
+        # with no stored checkpoint is a fresh run: it must carry generation 0 and it
+        # consumes the permit nonce. A task with a stored checkpoint is a resume whose
+        # admission is a compare-and-swap on that generation. This load only selects the
+        # branch and whether to consume the nonce; the atomic CAS in the first _persist
+        # is the actual authorization, so a stale or replayed resume is rejected there,
+        # before any provider decision, tool call, approval, or migration.
+        stored = self.store.load_checkpoint(state.task_id)
+        if stored is None:
+            if state.checkpoint_generation != 0:
+                raise SecurityError("new task has invalid checkpoint generation")
+            consume_nonce: str | None = envelope.permit.nonce
+        else:
+            consume_nonce = None
         state.status = "running"
         previous_hash, start_sequence, migration_anchor = self._audit_start(envelope)
         audit = AuditLog(previous_hash, start_sequence, self.host_id)
@@ -127,7 +128,11 @@ class AgentHost:
             audit.append("provider.proposed", {"kind": decision.kind, "tool": decision.tool})
             finished, migration = self._apply_decision(decision, state, effective, audit, envelope, active_policy)
             state.step += 1
-            persisted_events = self._persist(envelope, state, audit, persisted_events)
+            # Close the checkpoint's lineage at this host when the task terminates
+            # (completed/failed) or migrates away, so it can never be resumed here
+            # again (finding EV-008). An awaiting_input suspend stays open.
+            closed = migration is not None or state.status in ("completed", "failed")
+            persisted_events = self._persist(envelope, state, audit, persisted_events, closed=closed)
             if finished:
                 result = self._result(envelope, audit, migration)
                 self._record_run_status(result.status)
@@ -136,7 +141,7 @@ class AgentHost:
         state.status = "failed"
         state.result = {"error": "step budget exhausted"}
         audit.append("agent.failed", state.result)
-        self._persist(envelope, state, audit, persisted_events)
+        self._persist(envelope, state, audit, persisted_events, closed=True)
         result = self._result(envelope, audit)
         self._record_run_status(result.status)
         return result
@@ -219,10 +224,17 @@ class AgentHost:
                 attestation=destination_attestation,
             )
             previous_sequence = audit.events[-1]["sequence"] + 1
+            # Finding EV-008: the destination host runs its own checkpoint lineage,
+            # so the migrated envelope must start at generation 0 (a fresh task
+            # there). Carrying the source generation would make the destination's
+            # fresh-task admission reject it. Safe because the delegated permit
+            # mints a fresh nonce, so the first admission at the destination is
+            # nonce-guarded and every later one is generation-guarded. The source
+            # task is closed by the final _persist of this run (closed=True).
             migrated = AgentEnvelope(
                 envelope.manifest,
                 delegated,
-                state,
+                replace(state, checkpoint_generation=0),
                 previous_audit_hash=audit.head,
                 previous_audit_sequence=previous_sequence,
                 previous_audit_host_id=self.host_id,
@@ -385,11 +397,18 @@ class AgentHost:
         audit: AuditLog,
         persisted_events: int,
         consume_nonce: str | None = None,
+        closed: bool = False,
     ) -> int:
         checkpoint = asdict(state)
         encoded_size = len(canonical_json(checkpoint))
         if encoded_size > envelope.permit.budget.max_output_bytes:
             raise SecurityError("checkpoint exceeds output budget")
+        # Finding EV-008: nonce consumption, audit append, and the checkpoint-generation
+        # compare-and-swap all commit or roll back together. save_checkpoint raises on a
+        # stale or closed generation, so a replayed resume is rejected here — before any
+        # provider decision, tool call, approval, or migration — and the nonce it tried
+        # to reuse and the audit it tried to append are rolled back with it. The store
+        # owns the generation; state.checkpoint_generation is only the CAS assertion.
         with self.store.transaction() as transaction:
             if consume_nonce is not None:
                 transaction.consume_nonce(consume_nonce, envelope.permit.subject, envelope.permit.audience, state.task_id)
@@ -399,5 +418,6 @@ class AgentHost:
                 audit.events[persisted_events:],
                 lambda head_hash, sequence: (self.signer.key_id, self.signer.sign_audit_head(state.task_id, self.host_id, head_hash, sequence)),
             )
-            transaction.save_checkpoint(state.task_id, state)
+            new_generation = transaction.save_checkpoint(state.task_id, state, state.checkpoint_generation, closed)
+        state.checkpoint_generation = new_generation
         return len(audit.events)

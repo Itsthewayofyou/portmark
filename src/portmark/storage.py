@@ -15,8 +15,8 @@ from .models import AgentState
 from .security import AUDIT_HASH_VERSION, AuditHeadVerifier, SecurityError, audit_event_record, audit_head_payload, canonical_json
 
 
-SQLITE_SCHEMA_VERSION = 3
-POSTGRES_SCHEMA_VERSION = 1
+SQLITE_SCHEMA_VERSION = 4
+POSTGRES_SCHEMA_VERSION = 2
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 AuditHeadSigner = Callable[[str, int], tuple[str, str]]
 AuditVerificationStatus = Literal["valid", "invalid", "unverifiable"]
@@ -39,7 +39,23 @@ class RuntimeTransaction(Protocol):
     def append_audit_events(self, task_id: str, host_id: str, events: tuple[dict[str, Any], ...], sign_head: AuditHeadSigner | None = None) -> None:
         ...
 
-    def save_checkpoint(self, task_id: str, state: AgentState) -> None:
+    def save_checkpoint(self, task_id: str, state: AgentState, expected_generation: int, closed: bool = False) -> int:
+        """Atomically admit and persist a checkpoint, returning its new generation.
+
+        Compare-and-swap on the store-owned generation (finding EV-008). The store
+        is the authority; `expected_generation` is the caller's assertion about
+        which stored generation it is advancing, never the new value:
+
+        - no stored checkpoint + `expected_generation == 0` -> create generation 1.
+        - a stored checkpoint whose generation equals `expected_generation` and is
+          not closed -> advance to `expected_generation + 1`.
+        - anything else (stale generation, a closed checkpoint, or a fresh create
+          over an existing task) -> raise `SecurityError`.
+
+        `closed=True` marks the checkpoint terminal (completed, failed, or migrated
+        away); a closed checkpoint can never be reopened by a later resume. The
+        comparison and the advance happen in the same store transaction.
+        """
         ...
 
 
@@ -84,8 +100,9 @@ class InMemoryRuntimeStore:
 
     def load_checkpoint(self, task_id: str) -> dict[str, Any] | None:
         with self._lock:
-            checkpoint = self._checkpoints.get(task_id)
-            return json.loads(json.dumps(checkpoint)) if checkpoint is not None else None
+            row = self._checkpoints.get(task_id)
+            # Stored rows are {generation, closed, state}; callers see the state blob.
+            return json.loads(json.dumps(row["state"])) if row is not None else None
 
     def audit_head(self, task_id: str) -> tuple[str, int] | None:
         with self._lock:
@@ -171,8 +188,26 @@ class _InMemoryTransaction:
                 "signature": signature,
             }
 
-    def save_checkpoint(self, task_id: str, state: AgentState) -> None:
-        self._store._checkpoints[task_id] = asdict(state)
+    def save_checkpoint(self, task_id: str, state: AgentState, expected_generation: int, closed: bool = False) -> int:
+        row = self._store._checkpoints.get(task_id)
+        if row is None:
+            if expected_generation != 0:
+                raise SecurityError("stale checkpoint generation")
+            new_generation = 1
+        else:
+            if row["closed"]:
+                raise SecurityError("task checkpoint is closed")
+            if row["generation"] != expected_generation:
+                raise SecurityError("stale checkpoint generation")
+            new_generation = expected_generation + 1
+        blob = asdict(state)
+        blob["checkpoint_generation"] = new_generation
+        self._store._checkpoints[task_id] = {
+            "generation": new_generation,
+            "closed": bool(closed),
+            "state": blob,
+        }
+        return new_generation
 
 
 class SQLiteRuntimeStore:
@@ -210,6 +245,7 @@ class SQLiteRuntimeStore:
             0: self._migrate_to_v1,
             1: self._migrate_to_v2,
             2: self._migrate_to_v3,
+            3: self._migrate_to_v4,
         }
         migration = migrations.get(version)
         if migration is None:
@@ -287,6 +323,19 @@ class SQLiteRuntimeStore:
             ALTER TABLE audit_heads ADD COLUMN signature_key_id TEXT NOT NULL DEFAULT '';
             ALTER TABLE audit_heads ADD COLUMN signature TEXT NOT NULL DEFAULT '';
             PRAGMA user_version = 3;
+            """
+        )
+
+    def _migrate_to_v4(self, connection: sqlite3.Connection) -> None:
+        # Finding EV-008: give every stored checkpoint a store-owned monotonic
+        # generation and a terminal `closed` flag, so a resume is a compare-and-swap
+        # on the durable row rather than trust in caller-supplied state.
+        connection.executescript(
+            """
+            ALTER TABLE checkpoints ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE checkpoints ADD COLUMN closed INTEGER NOT NULL DEFAULT 0;
+            UPDATE checkpoints SET closed = 1 WHERE status IN ('completed', 'failed');
+            PRAGMA user_version = 4;
             """
         )
 
@@ -429,10 +478,20 @@ class PostgresRuntimeStore:
                 task_id TEXT PRIMARY KEY,
                 status TEXT NOT NULL,
                 checkpoint_json TEXT NOT NULL,
+                generation BIGINT NOT NULL DEFAULT 0,
+                closed BOOLEAN NOT NULL DEFAULT FALSE,
                 updated_at BIGINT NOT NULL
             )
             """
         )
+        # Finding EV-008 (schema v2): an existing deployment's checkpoints table
+        # predates the generation/closed columns; CREATE TABLE IF NOT EXISTS will
+        # not add them, so ALTER them in idempotently. No-op on a fresh table.
+        connection.execute("ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS generation BIGINT NOT NULL DEFAULT 0")
+        connection.execute("ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS closed BOOLEAN NOT NULL DEFAULT FALSE")
+        # An already-terminal checkpoint from before this column existed must be
+        # closed so a pre-EV-008 envelope (default generation 0) cannot re-run it.
+        connection.execute("UPDATE checkpoints SET closed = TRUE WHERE closed = FALSE AND status IN ('completed', 'failed')")
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS audit_events (
@@ -622,20 +681,49 @@ class _PostgresTransaction:
                 (task_id, event["hash"], sequence, host_id, signature_key_id, signature, int(time.time())),
             )
 
-    def save_checkpoint(self, task_id: str, state: AgentState) -> None:
+    def save_checkpoint(self, task_id: str, state: AgentState, expected_generation: int, closed: bool = False) -> int:
         if self._connection is None:
             raise RuntimeError("Postgres transaction was not opened")
-        self._connection.execute(
+        row = self._connection.execute(
+            "SELECT generation, closed FROM checkpoints WHERE task_id = %s", (task_id,)
+        ).fetchone()
+        if row is None:
+            if expected_generation != 0:
+                raise SecurityError("stale checkpoint generation")
+            new_generation = 1
+            result = self._connection.execute(
+                """
+                INSERT INTO checkpoints (task_id, status, checkpoint_json, generation, closed, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (task_id) DO NOTHING
+                RETURNING generation
+                """,
+                (task_id, state.status, self._checkpoint_json(state, new_generation), new_generation, bool(closed), int(time.time())),
+            ).fetchone()
+            if result is None:
+                raise SecurityError("stale checkpoint generation")
+            return new_generation
+        if row["closed"]:
+            raise SecurityError("task checkpoint is closed")
+        new_generation = expected_generation + 1
+        result = self._connection.execute(
             """
-            INSERT INTO checkpoints (task_id, status, checkpoint_json, updated_at)
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT(task_id) DO UPDATE SET
-                status = EXCLUDED.status,
-                checkpoint_json = EXCLUDED.checkpoint_json,
-                updated_at = EXCLUDED.updated_at
+            UPDATE checkpoints
+            SET generation = %s, status = %s, checkpoint_json = %s, closed = %s, updated_at = %s
+            WHERE task_id = %s AND generation = %s AND closed = FALSE
+            RETURNING generation
             """,
-            (task_id, state.status, json.dumps(asdict(state), sort_keys=True, separators=(",", ":")), int(time.time())),
-        )
+            (new_generation, state.status, self._checkpoint_json(state, new_generation), bool(closed), int(time.time()), task_id, expected_generation),
+        ).fetchone()
+        if result is None:
+            raise SecurityError("stale checkpoint generation")
+        return new_generation
+
+    @staticmethod
+    def _checkpoint_json(state: AgentState, generation: int) -> str:
+        blob = asdict(state)
+        blob["checkpoint_generation"] = generation
+        return json.dumps(blob, sort_keys=True, separators=(",", ":"))
 
 
 def create_runtime_store(
@@ -744,20 +832,47 @@ class _SQLiteTransaction:
                 (task_id, event["hash"], sequence, host_id, signature_key_id, signature, int(time.time())),
             )
 
-    def save_checkpoint(self, task_id: str, state: AgentState) -> None:
+    def save_checkpoint(self, task_id: str, state: AgentState, expected_generation: int, closed: bool = False) -> int:
         if self._connection is None:
             raise RuntimeError("SQLite transaction was not opened")
-        self._connection.execute(
+        row = self._connection.execute(
+            "SELECT generation, closed FROM checkpoints WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            if expected_generation != 0:
+                raise SecurityError("stale checkpoint generation")
+            new_generation = 1
+            cursor = self._connection.execute(
+                """
+                INSERT INTO checkpoints (task_id, status, checkpoint_json, generation, closed, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(task_id) DO NOTHING
+                """,
+                (task_id, state.status, self._checkpoint_json(state, new_generation), new_generation, 1 if closed else 0, int(time.time())),
+            )
+            if cursor.rowcount != 1:
+                raise SecurityError("stale checkpoint generation")
+            return new_generation
+        if row["closed"]:
+            raise SecurityError("task checkpoint is closed")
+        new_generation = expected_generation + 1
+        cursor = self._connection.execute(
             """
-            INSERT INTO checkpoints (task_id, status, checkpoint_json, updated_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(task_id) DO UPDATE SET
-                status = excluded.status,
-                checkpoint_json = excluded.checkpoint_json,
-                updated_at = excluded.updated_at
+            UPDATE checkpoints
+            SET generation = ?, status = ?, checkpoint_json = ?, closed = ?, updated_at = ?
+            WHERE task_id = ? AND generation = ? AND closed = 0
             """,
-            (task_id, state.status, json.dumps(asdict(state), sort_keys=True, separators=(",", ":")), int(time.time())),
+            (new_generation, state.status, self._checkpoint_json(state, new_generation), 1 if closed else 0, int(time.time()), task_id, expected_generation),
         )
+        if cursor.rowcount != 1:
+            raise SecurityError("stale checkpoint generation")
+        return new_generation
+
+    @staticmethod
+    def _checkpoint_json(state: AgentState, generation: int) -> str:
+        blob = asdict(state)
+        blob["checkpoint_generation"] = generation
+        return json.dumps(blob, sort_keys=True, separators=(",", ":"))
 
 
 def _audit_hash(record: dict[str, Any]) -> str:

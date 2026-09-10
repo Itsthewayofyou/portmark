@@ -100,6 +100,11 @@ class Permit:
 class AgentState:
     task_id: str
     goal: str
+    # Which stored checkpoint this state represents. The store owns and advances
+    # this value (finding EV-008); on the wire it is an *assertion* the durable
+    # store verifies via compare-and-swap, never authority. 0 means "a fresh task,
+    # no checkpoint yet".
+    checkpoint_generation: int = 0
     step: int = 0
     tool_calls: int = 0
     memory: Json = field(default_factory=dict)
