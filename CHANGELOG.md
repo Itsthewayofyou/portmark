@@ -29,6 +29,11 @@ run in a hard-killable subprocess instead of the host process.
   `effect_status: "unknown"` (a `ToolKilledError`), distinct from a clean
   `tool.failed`. Hard-kill stops any *new* effect but cannot roll back one already
   in flight at the deadline; it narrows the race, it does not eliminate it.
+- **Fail-closed where the guarantee cannot hold.** The process-group hard-kill
+  needs `os.killpg`, which POSIX has and Windows does not (a Windows kill leaves a
+  grandchild running). `register_isolated(..., side_effecting=True)` is therefore
+  **refused at registration** on a platform without process groups, rather than
+  run without the guarantee. Non-side-effecting isolated tools still run there.
 
 ## 0.5.1 — 2026-09-10
 

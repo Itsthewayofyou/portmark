@@ -183,6 +183,14 @@ Only an isolated tool may be `side_effecting=True`. A side-effecting tool
 registered on the plain thread path is refused, because that path cannot be
 cancelled.
 
+**Platform support.** The hard-kill guarantee needs process groups, which POSIX
+provides and Windows does not: on Windows a kill reaches only the worker, not a
+grandchild it spawned. So `register_isolated(..., side_effecting=True)` is
+**refused at registration** on a platform without `os.killpg` — the host will not
+promise a guarantee it cannot keep. Non-side-effecting isolated tools still run
+there; the only residual is that a grandchild may outlive the kill, which is a
+resource concern (a leaked process), not an effect-safety one. CI runs on Linux.
+
 **One honest limit.** Hard-kill stops any *new* side effect, but it cannot undo
 one already in flight when the deadline fires -- a payment request already sent is
 already sent. When the host kills a tool it audits `tool.killed` with
