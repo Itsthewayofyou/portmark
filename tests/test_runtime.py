@@ -944,9 +944,12 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(ToolExecutionError, "output budget"):
             registry.invoke(permit, "iso.big", {"size": 100_000})
 
+    @unittest.skipUnless(_CAN_KILL_PROCESS_GROUP, "requires POSIX process groups")
     def test_side_effecting_tool_runs_when_registered_isolated(self):
         # The thread path refuses side-effecting tools; the isolated path is the
-        # sanctioned way to run one, because the host can hard-kill it.
+        # sanctioned way to run one, because the host can hard-kill it. Skipped
+        # where the platform cannot hard-kill (Windows): register_isolated refuses
+        # a side-effecting tool there, which the sibling fail-closed test asserts.
         registry = ToolRegistry()
         registry.register_isolated(
             "iso.pay", "isolated_tool_fixtures:echo", side_effecting=True, env=self._isolated_env()
@@ -1558,6 +1561,18 @@ class RuntimeTests(unittest.TestCase):
         finally:
             self._drop_postgres_schema(dsn, schema)
 
+    @contextmanager
+    def _raw_sqlite(self, path):
+        # Tests that open a raw connection to inspect or tamper with the store must
+        # close it, or Windows keeps the database file open and its temp dir cannot
+        # be deleted. sqlite3's own `with connection` commits but never closes.
+        connection = sqlite3.connect(path)
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
     def _store_case_contexts(self, verifier=None):
         contexts = [self._sqlite_store_case(verifier)]
         if os.environ.get("PORTMARK_TEST_POSTGRES_DSN") and PostgresRuntimeStore.available():
@@ -1607,7 +1622,7 @@ class RuntimeTests(unittest.TestCase):
 
     def _corrupt_store_audit(self, store, task_id, backend):
         if backend == "sqlite":
-            with sqlite3.connect(store.path) as connection:
+            with self._raw_sqlite(store.path) as connection:
                 connection.execute("UPDATE audit_heads SET head_hash = 'tampered' WHERE task_id = ?", (task_id,))
             return
         with store._connect() as connection:
@@ -1616,7 +1631,7 @@ class RuntimeTests(unittest.TestCase):
 
     def _tamper_store_host_id(self, store, task_id, backend):
         if backend == "sqlite":
-            with sqlite3.connect(store.path) as connection:
+            with self._raw_sqlite(store.path) as connection:
                 connection.execute(
                     "UPDATE audit_events SET host_id = 'host:impostor' WHERE task_id = ? AND sequence = 0", (task_id,)
                 )
@@ -1938,10 +1953,10 @@ class RuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runtime.sqlite"
             store = SQLiteRuntimeStore(path)
-            with sqlite3.connect(path) as connection:
+            with self._raw_sqlite(path) as connection:
                 self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SQLITE_SCHEMA_VERSION)
                 connection.execute("PRAGMA user_version = 999")
-            with store._connect() as connection:
+            with store._connection() as connection:
                 self.assertEqual(connection.execute("PRAGMA busy_timeout").fetchone()[0], SQLITE_BUSY_TIMEOUT_MS)
             with self.assertRaisesRegex(RuntimeError, "newer than supported"):
                 SQLiteRuntimeStore(path)
@@ -1949,7 +1964,7 @@ class RuntimeTests(unittest.TestCase):
     def test_sqlite_store_migrates_legacy_v0_database_without_losing_existing_rows(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runtime.sqlite"
-            with sqlite3.connect(path) as connection:
+            with self._raw_sqlite(path) as connection:
                 connection.executescript(
                     """
                     CREATE TABLE consumed_nonces (
@@ -1989,13 +2004,13 @@ class RuntimeTests(unittest.TestCase):
 
             store = SQLiteRuntimeStore(path)
             self.assertTrue(store.consumed_nonce_exists("legacy-nonce"))
-            with sqlite3.connect(path) as connection:
+            with self._raw_sqlite(path) as connection:
                 self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SQLITE_SCHEMA_VERSION)
 
     def test_sqlite_store_migrates_v1_global_audit_hash_uniqueness(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runtime.sqlite"
-            with sqlite3.connect(path) as connection:
+            with self._raw_sqlite(path) as connection:
                 connection.executescript(
                     """
                     CREATE TABLE consumed_nonces (
@@ -2039,7 +2054,7 @@ class RuntimeTests(unittest.TestCase):
             second = make_host(signer=signer, store=SQLiteRuntimeStore(path))
             self.assertEqual(first.run(make_demo_envelope(first, "first migrated task")).status, "completed")
             self.assertEqual(second.run(make_demo_envelope(second, "second migrated task")).status, "completed")
-            with sqlite3.connect(path) as connection:
+            with self._raw_sqlite(path) as connection:
                 indexes = {
                     row[1]: connection.execute(f"PRAGMA index_info({row[1]})").fetchall()
                     for row in connection.execute("PRAGMA index_list(audit_events)").fetchall()
@@ -2066,7 +2081,7 @@ class RuntimeTests(unittest.TestCase):
                     host = make_host(store=store)
                     result = host.run(make_demo_envelope(host, f"audit tamper {name}"))
                     self.assertTrue(store.verify_audit_chain(result.task_id))
-                    with sqlite3.connect(path) as connection:
+                    with self._raw_sqlite(path) as connection:
                         connection.execute(statement, (result.task_id,))
                     self.assertEqual(store.verify_audit_chain_status(result.task_id).status, "invalid")
                     self.assertFalse(store.verify_audit_chain(result.task_id))
@@ -2097,7 +2112,7 @@ class RuntimeTests(unittest.TestCase):
                 fabricated.append(row)
                 previous = row["hash"]
 
-            with sqlite3.connect(path) as connection:
+            with self._raw_sqlite(path) as connection:
                 for row in fabricated:
                     connection.execute(
                         """
@@ -2130,7 +2145,7 @@ class RuntimeTests(unittest.TestCase):
             host = make_host(signer=signer, store=store)
             result = host.run(make_demo_envelope(host, "signed history"))
             self.assertTrue(store.verify_audit_chain(result.task_id))
-            with sqlite3.connect(path) as connection:
+            with self._raw_sqlite(path) as connection:
                 connection.execute("UPDATE audit_heads SET signature = 'tampered' WHERE task_id = ?", (result.task_id,))
             self.assertEqual(store.verify_audit_chain_status(result.task_id).status, "invalid")
             self.assertFalse(store.verify_audit_chain(result.task_id))
@@ -2182,7 +2197,7 @@ class RuntimeTests(unittest.TestCase):
                 {"task_id": result.task_id, "status": "unverifiable", "reason": "trust registry is not configured"},
             )
 
-            with sqlite3.connect(path) as connection:
+            with self._raw_sqlite(path) as connection:
                 connection.execute("UPDATE audit_heads SET head_hash = 'tampered' WHERE task_id = ?", (result.task_id,))
             output = io.StringIO()
             with patch.object(sys, "argv", ["portmark", "--store-path", str(path), "--trust-registry-path", str(registry_path), "verify-audit", "--task-id", result.task_id]):
@@ -2382,7 +2397,7 @@ class RuntimeTests(unittest.TestCase):
             for result in results:
                 self.assertTrue(store.verify_audit_chain(result.task_id))
                 self.assertTrue(store.consumed_nonce_exists(nonces_by_task[result.task_id]))
-            with sqlite3.connect(path) as connection:
+            with self._raw_sqlite(path) as connection:
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM consumed_nonces").fetchone()[0], len(envelopes))
                 rows = connection.execute(
                     """
@@ -3704,21 +3719,27 @@ class RuntimeTests(unittest.TestCase):
                 provider.decide(AgentState("task", "goal"), ("catalog.search",))
 
     def test_native_wasmtime_provider_rejects_oversized_component_files(self):
-        with tempfile.NamedTemporaryFile() as capsule:
+        capsule = tempfile.NamedTemporaryFile(delete=False)
+        try:
             capsule.write(b"x" * 5)
-            capsule.flush()
+            capsule.close()  # Windows cannot reopen an open NamedTemporaryFile by name
             with self.assertRaisesRegex(RuntimeError, "input limit"):
                 NativeWasmtimeComponentProvider.from_file(capsule.name, max_component_bytes=4)
+        finally:
+            os.unlink(capsule.name)
 
     def test_factory_selects_optional_native_wasmtime_provider(self):
         with self._fake_wasmtime_runtime():
-            with tempfile.NamedTemporaryFile() as capsule:
+            capsule = tempfile.NamedTemporaryFile(delete=False)
+            try:
                 capsule.write(b"native-component")
-                capsule.flush()
+                capsule.close()  # Windows cannot reopen an open NamedTemporaryFile by name
                 host = make_host(
                     wasm_component=capsule.name,
                     wasm_engine="wasmtime",
                 )
+            finally:
+                os.unlink(capsule.name)
         self.assertIsInstance(host.providers["wasm"], NativeWasmtimeComponentProvider)
 
     def test_wasm_component_inputs_use_projected_provider_state(self):
