@@ -913,10 +913,13 @@ class RuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             marker = os.path.join(directory, "grandchild-alive")
             with self.assertRaises(ToolKilledError):
-                registry.invoke(permit, "iso.spawn", {"marker": marker, "delay": 2.0})
-            # Grandchild would write the marker at +2.0s; wait past that and past
-            # the +1.0s deadline, then confirm the group kill reached it.
-            time.sleep(3.0)
+                registry.invoke(permit, "iso.spawn", {"marker": marker, "delay": 5.0})
+            # Wait past the grandchild's +5.0s "alive" write. The "started" marker
+            # proves the grandchild really ran; "alive" being absent proves the
+            # process-group kill reached it before the delay elapsed -- so the
+            # test cannot pass merely because the grandchild never spawned.
+            time.sleep(6.0)
+            self.assertTrue(os.path.exists(marker + ".started"))
             self.assertFalse(os.path.exists(marker))
 
     def test_isolated_tool_exception_fails_closed(self):

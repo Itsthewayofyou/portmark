@@ -46,14 +46,22 @@ def slow_then_return(arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 def spawn_grandchild_then_sleep(arguments: dict[str, Any]) -> dict[str, Any]:
-    # Spawn a grandchild that writes a marker file only after a delay, then keep
-    # the tool itself alive so the host kills it at the deadline. The grandchild
-    # does not start its own session, so it stays in the worker's process group
-    # and must die with it -- if it survives, it writes the marker.
+    # Spawn a grandchild that writes a "started" marker immediately, then an
+    # "alive" marker only after a delay, then keep the tool itself alive so the
+    # host kills it at the deadline. The grandchild does not start its own
+    # session, so it stays in the worker's process group and must die with it.
+    # The test asserts started EXISTS (it really ran) but alive is ABSENT (the
+    # group kill reached it before the delay elapsed) -- so the test cannot pass
+    # merely because the grandchild was never spawned.
     marker = str(arguments["marker"])
-    delay = float(arguments.get("delay", 2.0))
+    started = marker + ".started"
+    delay = float(arguments.get("delay", 5.0))
+    program = (
+        f"import time,pathlib;pathlib.Path({started!r}).write_text('x');"
+        f"time.sleep({delay});pathlib.Path({marker!r}).write_text('alive')"
+    )
     subprocess.Popen(  # nosec B603
-        [sys.executable, "-c", f"import time,pathlib;time.sleep({delay});pathlib.Path({marker!r}).write_text('alive')"],
+        [sys.executable, "-c", program],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
