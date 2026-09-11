@@ -68,9 +68,18 @@ names it mentions — an undeclared field is rejected without setting
 `additional_arguments: false`. This is the host's ceiling on argument names, so a
 prompt-injected `recipient`/`memo` cannot ride through to a side-effecting tool.
 Set `additional_arguments: true` to opt a grant back out and allow any field. A
-grant that constrains no argument at all is a pure capability grant and passes
-arguments through. Practical rule: when you bound one argument of a tool, list
-the tool's other legitimate argument names too, or the host will reject them.
+**host-policy** grant that constrains no argument at all now admits **no**
+arguments (deny-by-default): the tool is callable, but only with arguments you
+name — a bare policy grant is no longer an argument passthrough. This closes the
+lazy-policy hole where `{"payments.reserve": {}}` let any field reach the tool.
+To allow arguments, name them (or set `additional_arguments: true` for a
+deliberate passthrough). A permit's bare grant is unaffected — it stays a
+passthrough, and the host policy remains the ceiling either way. Because a policy
+grant with no argument constraints admits none, an argument the *permit*
+legitimately bounds is still refused unless the *policy* also names it: bound
+arguments live in one place, usually the host policy. Practical rule: when you
+grant a tool that takes arguments, list its legitimate argument names in policy,
+or the host will reject them.
 
 `output_projection` controls what tool output, if any, is sent back to a model provider on later steps. Omit it or set it to `[]` to share no tool output. Use a list of top-level JSON object fields, such as `["id", "title"]`, to share only those fields from dict outputs or lists of dicts. Use `["*"]` only when the provider is allowed to see the full output for that tool. Projection is intersected across the manifest request, incoming permit, and local host policy; the effective projection can only narrow. Host policy is the ceiling: omitting `output_projection` on a policy tool shares nothing, and no incoming permit can widen it — to expose fields you must list them (or `["*"]`) in the policy itself.
 

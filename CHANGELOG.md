@@ -2,6 +2,39 @@
 
 All notable changes to Portmark are recorded here. Versions follow [semantic versioning](https://semver.org/).
 
+## 0.8.0 — 2026-09-11
+
+Security: a host-policy grant that constrains no argument now denies unnamed arguments by default (B-lite). **Breaking** behavioral change. Builds on the 0.7.4 name-filter separation.
+
+### Security
+
+- **A bare host-policy grant is deny-by-default on argument names.** After 0.7.0
+  closed the gap for a policy that bounds *some* arguments, a policy that bounded
+  *nothing* — `{"payments.reserve": {}}` — remained a passthrough and let any field
+  (a prompt-injected `recipient`/`memo`) reach a side-effecting tool: the lazy-policy
+  version of the same hole. A host-policy grant that names no argument now admits
+  none by default. The tool stays callable, but only with arguments the host names
+  (or after an explicit `additional_arguments: true`). Normalized once at
+  `HostPolicy` construction — a bare policy grant is rewritten to carry
+  `additional_arguments: false` — so `effective_permit` and `explain_missing_grant`
+  enforce the same shape. This was safe to make only after 0.7.4 removed the
+  manifest's empty grants from the intersection; every empty grant now originates
+  from a permit or the host policy.
+
+### Changed (breaking)
+
+- **This is B-lite: only the host tightens its own default.** A *permit's* bare
+  grant is left untouched — it stays a passthrough — because a permit is the
+  visitor's voice, not the host's ceiling. A host policy remains the ceiling either
+  way.
+- **A host policy that relied on a bare `{}` grant to pass arguments must change.**
+  Name the tool's legitimate arguments in policy, or set `additional_arguments: true`
+  for a deliberate passthrough. Because a bare policy grant now admits no arguments,
+  an argument a *permit* legitimately bounds is refused unless the *policy* also
+  names it — define bound arguments in one place, usually the host policy. The
+  bundled demo/default policy grants already declare their arguments and are
+  unaffected. See POLICY.md / TOOLS.md and EXTERNAL_VALIDATION.md.
+
 ## 0.7.4 — 2026-09-11
 
 Structural: the manifest is now a pure name filter in the permit intersection, separated from argument-constraint merging. No behavior change.

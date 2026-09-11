@@ -1009,6 +1009,30 @@ class MigrationPolicy:
         object.__setattr__(self, "destinations", tuple(self.destinations))
 
 
+def _policy_grant_denies_unnamed_arguments(grant: ToolGrant) -> ToolGrant:
+    """B-lite deny-by-default for host-policy grants that constrain no argument.
+
+    A policy grant is the host's own voice, and the host is the ceiling. A bare
+    grant ("I allow this tool") used to pass any argument through -- the lazy-policy
+    hole where a `recipient`/`memo` a prompt injection slips in reaches a
+    side-effecting tool. Now a policy grant that names no argument admits none by
+    default: the tool is callable, but only with arguments the host explicitly
+    names (or after an explicit `additional_arguments: true` opt-out).
+
+    Implemented by making the implicit deny explicit -- the same
+    `additional_arguments: false` the checker already enforces -- so the whole
+    intersection and `explain_missing_grant` see one normalized shape from
+    `self.grants`. A grant that already declares an argument policy, or that set the
+    flag either way, is returned unchanged. Only host-policy grants are normalized;
+    a permit's bare grant is left as a passthrough (this is B-lite, not B-full --
+    only the host tightens its own default).
+    """
+    constraints = grant.constraints
+    if "additional_arguments" in constraints or _declares_argument_policy(constraints):
+        return grant
+    return ToolGrant(grant.name, {**constraints, "additional_arguments": False}, grant.output_projection)
+
+
 class HostPolicy:
     DEFAULT_APPROVAL_REQUIRED_IMPACTS = ("high", "destructive", "external-payment", "credentialed", "data-exfiltration")
 
@@ -1025,7 +1049,10 @@ class HostPolicy:
         migration: "MigrationPolicy | None" = None,
     ) -> None:
         self.audience = audience
-        self.grants = grants
+        # B-lite: normalize each policy grant so a bare one denies unnamed arguments
+        # by default. Done once here, so every reader of self.grants -- effective_permit
+        # and explain_missing_grant alike -- sees the same explicit shape.
+        self.grants = tuple(_policy_grant_denies_unnamed_arguments(grant) for grant in grants)
         self.budget = budget
         self.policy_version = policy_version
         self.policy_hash = policy_hash
