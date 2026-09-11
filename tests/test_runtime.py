@@ -1497,6 +1497,67 @@ class RuntimeTests(unittest.TestCase):
             self.assertIsNone(store.load_checkpoint(task))
             self.assertIsNone(store.audit_head(task))
 
+    def _counting_tool_host(self, store, calls, budget):
+        # A host whose one tool tallies each execution, so a budget-bypass test can
+        # assert exactly how many times the tool actually ran.
+        tools = ToolRegistry()
+
+        def counting(arguments):
+            calls["n"] += 1
+            return {"ok": True}
+
+        tools.register("noop", counting)
+        host = make_host(store=store)
+        host.tools = tools
+        host.policy = HostPolicy(host.host_id, (ToolGrant("noop", {"arguments": {"n": {"type": "number"}}}),), budget)
+        host.providers["always"] = FixedProvider(ProviderDecision("tool", "noop", {"n": 1}))
+        return host
+
+    def test_negative_starting_counter_is_rejected_before_any_tool_runs(self):
+        # Finding #3: budget accounting (max_tool_calls) trusts the caller-supplied
+        # state.tool_calls. A fresh task that starts at tool_calls=-3 under a 1-call
+        # budget runs the tool four times (-3,-2,-1,0) before the counter climbs to the
+        # limit. Admission must reject the negative counter, and reject it BEFORE the
+        # loop executes a single tool call, so nothing durable is left behind either.
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            calls = {"n": 0}
+            budget = ResourceBudget(max_steps=10, max_tool_calls=1, max_output_bytes=32768)
+            host = self._counting_tool_host(store, calls, budget)
+            envelope = make_demo_envelope(host, "negative counter", "always")
+            object.__setattr__(envelope.manifest, "requested_tools", ("noop",))
+            object.__setattr__(envelope.permit, "grants", (ToolGrant("noop"),))
+            object.__setattr__(envelope.permit, "budget", budget)
+            object.__setattr__(envelope.state, "tool_calls", -3)
+            host.signer.seal(envelope)
+            with self.assertRaisesRegex(SecurityError, "invalid tool_calls counter"):
+                host.run(envelope)
+            self.assertEqual(calls["n"], 0)  # rejected before any tool executed
+            self.assertIsNone(store.load_checkpoint(envelope.state.task_id))
+
+    def test_crafted_migration_envelope_cannot_inject_negative_counter(self):
+        # A migration accepted onto a fresh local chain legitimately carries the source
+        # run's non-zero counters, so the fresh-admission guard cannot simply demand
+        # zero. But a crafted migration-shaped envelope (a forged previous_audit_hash)
+        # must not smuggle in a negative counter either: the counter guard runs at
+        # admission -- before the audit head is even checked -- so the tool never runs.
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            calls = {"n": 0}
+            budget = ResourceBudget(max_steps=10, max_tool_calls=1, max_output_bytes=32768)
+            host = self._counting_tool_host(store, calls, budget)
+            envelope = make_demo_envelope(host, "crafted migration", "always")
+            object.__setattr__(envelope.manifest, "requested_tools", ("noop",))
+            object.__setattr__(envelope.permit, "grants", (ToolGrant("noop"),))
+            object.__setattr__(envelope.permit, "budget", budget)
+            object.__setattr__(envelope.state, "tool_calls", -3)
+            object.__setattr__(envelope, "previous_audit_hash", "forged-head")
+            host.signer.seal(envelope)
+            with self.assertRaisesRegex(SecurityError, "invalid tool_calls counter"):
+                host.run(envelope)
+            self.assertEqual(calls["n"], 0)
+            self.assertIsNone(store.load_checkpoint(envelope.state.task_id))
+
     def test_checkpoint_ceiling_is_the_host_minimum_not_the_permit(self):
         # F1: the checkpoint size ceiling must be effective.budget = min(permit, host),
         # not the visitor's permit alone -- "budgets take the minimum", and a migration

@@ -100,8 +100,30 @@ class AgentHost:
         if stored is None:
             if state.checkpoint_generation != 0:
                 raise SecurityError("new task has invalid checkpoint generation")
+            # Finding #3: budget accounting (max_steps / max_tool_calls) trusts the
+            # step/tool_calls counters on the incoming state. A fresh admission with
+            # caller-supplied NEGATIVE (or bool/float) counters -- e.g. tool_calls=-3
+            # under a 1-call budget -- runs the tool several extra times before the
+            # counter climbs to the limit. Reject non-nonnegative-int counters at the
+            # door. Only their type/sign is constrained here, not their value: a fresh
+            # admission legitimately carries POSITIVE counters and populated memory --
+            # a suspended `awaiting_input` envelope resumes by presenting its own
+            # signed wire state (its memory holds the injected approval), and a
+            # migration arrives with the source run's counters. The exact values are
+            # re-bound from the durable checkpoint on a local resume (below), which is
+            # where a captured envelope could otherwise under-report consumed budget.
+            self._require_nonnegative_counters(state)
             consume_nonce: str | None = envelope.permit.nonce
         else:
+            # Local resume: the durable checkpoint is the sole authority on how much
+            # budget has been spent. Rebind the counters from the store so a resume
+            # envelope cannot under-report step/tool_calls to win extra budget.
+            # memory/messages/result stay caller-visible on purpose -- an
+            # awaiting_input resume injects approval input into state.memory before
+            # re-running, and that wire state is already treated as untrusted
+            # (approvals are consumed via a namespaced store nonce, not memory).
+            state.step = int(stored["step"])
+            state.tool_calls = int(stored["tool_calls"])
             consume_nonce = None
         state.status = "running"
         previous_hash, start_sequence, migration_anchor = self._audit_start(envelope)
@@ -457,6 +479,16 @@ class AgentHost:
         self.metrics.increment(f"runs.{status}")
         if status == "failed":
             self.metrics.increment("runs.failed")
+
+    @staticmethod
+    def _require_nonnegative_counters(state) -> None:
+        # A bool is an int subclass and a float slips past a bare `>= 0` while still
+        # arithmetic-working through `+= 1`, so exclude both -- same root cause as the
+        # numeric-limit fix (Finding #2), kept consistent here.
+        for name in ("step", "tool_calls"):
+            value = getattr(state, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise SecurityError(f"migrated state has invalid {name} counter")
 
     def _audit_start(self, envelope: AgentEnvelope) -> tuple[str, int, dict[str, Any] | None]:
         stored = self.store.audit_head(envelope.state.task_id)

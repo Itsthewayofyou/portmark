@@ -2,7 +2,28 @@
 
 All notable changes to Portmark are recorded here. Versions follow [semantic versioning](https://semver.org/).
 
-## 0.8.1 — 2026-09-11
+## 0.8.2 — 2026-09-11
+
+Security: fresh-task admission no longer trusts caller-supplied budget counters, closing a budget bypass via negative starting counters (Codex audit finding #3).
+
+### Fixed
+
+- **A fresh task can no longer be admitted with a negative (or `bool`/`float`) step or
+  tool-call counter.** Budget accounting (`max_steps` / `max_tool_calls`) trusted the
+  `step` and `tool_calls` on the incoming state, so a fresh envelope that started at
+  `tool_calls=-3` under a 1-call budget executed the tool four times (`-3, -2, -1, 0`)
+  before the counter climbed to the limit. Admission now rejects a non-nonnegative-`int`
+  counter at the door — before the loop runs a single tool call and before anything
+  durable is written. Only the counter's type and sign are constrained: a fresh
+  admission legitimately carries *positive* counters (a suspended `awaiting_input`
+  envelope resumes by presenting its own signed wire state; a migration arrives with the
+  source run's counters). On a **local resume** the exact `step`/`tool_calls` are now
+  re-bound from the durable checkpoint, so a captured resume envelope cannot under-report
+  consumed budget to win extra calls. `state.memory` stays caller-visible on resume by
+  design — approval input is injected there and is already treated as untrusted wire
+  state (approvals are consumed via a namespaced store nonce, EV-005).
+
+
 
 Security: every post-admission terminal-checkpoint persist is now bounded, generalizing the EV-010 fix so a killed side-effecting tool near the ceiling can no longer leave a resumable checkpoint.
 
