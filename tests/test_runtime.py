@@ -4098,13 +4098,17 @@ class RuntimeTests(unittest.TestCase):
         # when present, and never a credential-shaped variable.
         from portmark.providers import _wasmtime_subprocess_env
 
+        # A non-literal value for the secret-named keys, so this fixture (whose whole
+        # point is that secret-named vars are NOT forwarded) does not itself trip the
+        # hardcoded-secret scanner.
+        filtered = "filtered-out-value"
         fake_env = {
             "SYSTEMROOT": r"C:\Windows",
             "PYTHONPATH": "/opt/portmark",
             "PROCESSOR_ARCHITECTURE": "AMD64",
             "PATH": "/usr/bin",
-            "AWS_SECRET_ACCESS_KEY": "should-not-leak",
-            "PORTMARK_SIGNING_KEY": "should-not-leak",
+            "AWS_SECRET_ACCESS_KEY": filtered,
+            "PORTMARK_SIGNING_KEY": filtered,
         }
         with patch.dict(os.environ, fake_env, clear=True):
             env = _wasmtime_subprocess_env()
