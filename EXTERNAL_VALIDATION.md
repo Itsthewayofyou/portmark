@@ -52,12 +52,19 @@ Reviewed areas:
   field reach a side-effecting tool. **Still open:** a grant that constrains
   *nothing* (a host policy that lists a tool with no argument constraints) remains
   a passthrough and admits any field — the lazy-policy version of the same
-  scenario. It is not closed further because the manifest turns a bare tool name
-  into an empty-constraint grant, so "empty means deny" would break tool routing;
-  distinguishing a policy's empty grant from the manifest's would require
-  separating name-filtering from constraint intersection in `effective_permit`, a
-  larger change worth its own review. The per-grant fix today is
-  `additional_arguments: false` or naming the tool's arguments.
+  scenario. The per-grant fix today is `additional_arguments: false` or naming the
+  tool's arguments.
+  **Structural precondition resolved (0.7.4):** the reason "empty means deny" could
+  not simply be flipped was that the manifest turned a bare tool name into an
+  empty-constraint grant, so a global flip would have blocked tool routing. The
+  manifest is now a pure name filter (`intersect_grants(..., allow=)`), separated
+  from constraint intersection, so every empty grant in the intersection now comes
+  from a permit or the host policy. **Still open, now an owner decision:** whether a
+  policy/permit grant that constrains nothing should default to deny-by-default. It
+  is a breaking behavioral change (same class as the 0.7.0 flip), and the secure
+  behavior is already reachable per-grant via `additional_arguments: false`, so this
+  changes only the default. Two shapes to weigh: policy-only (the host's voice, less
+  breakage) or policy-and-permit.
 - **Resolved (0.7.3, found during EV-010): the checkpoint output-budget ceiling now
   honors the host minimum.** `_persist`/`_checkpoint_fits` and the `output.refused`
   audit detail sized the checkpoint against `envelope.permit.budget.max_output_bytes`,
