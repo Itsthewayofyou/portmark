@@ -119,14 +119,14 @@ class ToolRegistry:
         module_name, separator, object_path = target.partition(":")
         if not separator or not module_name or not object_path:
             raise ValueError("register_isolated target must use module:function syntax")
-        if side_effecting and not _CAN_KILL_PROCESS_GROUP:
-            # Fail closed at startup, not at the first payment: on a platform
-            # without process groups the host cannot guarantee the tool stops at
-            # its deadline, so it must not promise to run a side-effecting one.
+        if side_effecting and not _can_hard_kill_process_tree():
+            # Fail closed at startup, not at the first payment: on a platform with no
+            # tree-kill primitive the host cannot guarantee the tool and its descendants
+            # stop at the deadline, so it must not promise to run a side-effecting one.
             raise SecurityError(
                 f"tool {name!r} is side-effecting but this platform cannot hard-kill a worker's "
-                "process group (no os.killpg), so the host cannot guarantee it stops at its "
-                "deadline; refusing to register it. Non-side-effecting isolated tools are allowed."
+                "process tree, so the host cannot guarantee it stops at its deadline; refusing "
+                "to register it. Non-side-effecting isolated tools are allowed."
             )
         self._isolated[name] = _IsolatedSpec(target=target, env=dict(env or {}))
         self._tools.pop(name, None)
@@ -218,13 +218,9 @@ class ToolRegistry:
             {"target": spec.target, "arguments": arguments, "max_output_bytes": cap}
         ).encode("utf-8")
         try:
-            process = subprocess.Popen(  # nosec B603
+            tree = _launch_process_tree(
                 [sys.executable, "-m", "portmark.tool_subprocess_runner"],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                env=self._child_env(spec.env),
-                start_new_session=True,
+                self._child_env(spec.env),
             )
         except OSError as error:
             raise ToolExecutionError("could not start isolated tool worker") from error
@@ -234,7 +230,7 @@ class ToolRegistry:
         overflow = threading.Event()
 
         def drain() -> None:
-            stream = process.stdout
+            stream = tree.stdout
             if stream is None:
                 return
             try:
@@ -245,35 +241,34 @@ class ToolRegistry:
                     buffer.extend(chunk)
                     if len(buffer) > hard_cap:
                         overflow.set()
-                        _terminate_process_group(process)
+                        tree.terminate_tree()
                         break
             except (OSError, ValueError):
                 pass
 
         reader = threading.Thread(target=drain, daemon=True)
         try:
-            if process.stdin is not None:
+            if tree.stdin is not None:
                 try:
-                    process.stdin.write(request)
-                    process.stdin.close()
+                    tree.stdin.write(request)
+                    tree.stdin.close()
                 except (BrokenPipeError, OSError):
                     pass
             reader.start()
             timed_out = False
             try:
-                process.wait(timeout=timeout)
+                tree.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 timed_out = True
-                _terminate_process_group(process)
+                tree.terminate_tree()
                 try:
-                    process.wait(timeout=2.0)
+                    tree.wait(timeout=2.0)
                 except subprocess.TimeoutExpired:
                     pass
             reader.join(timeout=2.0)
         finally:
-            _terminate_process_group(process)
-            if process.stdout is not None:
-                process.stdout.close()
+            tree.terminate_tree()
+            tree.close()
 
         if timed_out:
             raise ToolKilledError("isolated tool exceeded its deadline and was killed")
@@ -305,8 +300,17 @@ class ToolRegistry:
         return env
 
 
-def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
-    """Hard-kill the worker and any descendants.
+def _can_hard_kill_process_tree() -> bool:
+    # Whether this platform can kill a worker AND every descendant as one unit.
+    # POSIX: a new session (start_new_session) + os.killpg. Windows gains this via the
+    # Job Object executor once that lands; until then it is False and a side-effecting
+    # isolated tool is refused rather than run with a leak. Enforcement reads this, not
+    # a scattered platform check.
+    return _CAN_KILL_PROCESS_GROUP
+
+
+def _terminate_posix_process_group(process: subprocess.Popen[bytes]) -> None:
+    """Hard-kill the worker and every descendant via its process group.
 
     The worker is its own session leader (start_new_session), so killing its
     process group reaches grandchildren it spawned. Without this, a tool that
@@ -314,19 +318,89 @@ def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
     host can hard-kill it", the whole premise of EV-002, would be false.
     """
     if process.poll() is not None:
-        # Already exited; nothing to kill, and signalling a reaped pid could hit
-        # an unrelated process that reused it.
+        # Already exited; signalling a reaped pid could hit an unrelated reused pid.
         return
     try:
-        if _CAN_KILL_PROCESS_GROUP:
-            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-        else:  # pragma: no cover - Windows fallback, CI is Linux
-            process.kill()
+        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
     except (ProcessLookupError, PermissionError, OSError):
         try:
             process.kill()
         except (ProcessLookupError, OSError):
             pass
+
+
+class _ProcessTree:
+    """A launched isolated-tool worker with a tree-kill contract.
+
+    `terminate_tree()` stops the worker AND every descendant it spawned;
+    `kills_tree` states whether this implementation can actually guarantee that.
+    The isolated executor talks to this interface instead of scattering platform
+    branches through `_invoke_isolated`, so a Windows Job Object implementation
+    (`_WindowsJobProcessTree`) can be dropped in without touching the executor.
+    """
+
+    kills_tree: bool = False
+
+    def __init__(self, process: subprocess.Popen[bytes]) -> None:
+        self._process = process
+
+    @property
+    def stdin(self) -> Any:
+        return self._process.stdin
+
+    @property
+    def stdout(self) -> Any:
+        return self._process.stdout
+
+    def poll(self) -> int | None:
+        return self._process.poll()
+
+    def wait(self, timeout: float) -> int:
+        return self._process.wait(timeout=timeout)
+
+    def terminate_tree(self) -> None:  # pragma: no cover - overridden
+        raise NotImplementedError
+
+    def close(self) -> None:
+        if self._process.stdout is not None:
+            self._process.stdout.close()
+
+
+class _PosixProcessTree(_ProcessTree):
+    kills_tree = True
+
+    def terminate_tree(self) -> None:
+        _terminate_posix_process_group(self._process)
+
+
+class _UnmanagedProcessTree(_ProcessTree):
+    # A platform with no tree-kill primitive: kills only the root process, so
+    # descendants may outlive it -- which is exactly why `kills_tree` is False and
+    # side-effecting isolated tools are refused here. Windows uses this until the Job
+    # Object executor lands.
+    kills_tree = False
+
+    def terminate_tree(self) -> None:
+        if self._process.poll() is not None:
+            return
+        try:
+            self._process.kill()
+        except (ProcessLookupError, OSError):
+            pass
+
+
+def _launch_process_tree(argv: list[str], env: dict[str, str]) -> _ProcessTree:
+    common: dict[str, Any] = {
+        "stdin": subprocess.PIPE,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.DEVNULL,
+        "env": env,
+    }
+    if _CAN_KILL_PROCESS_GROUP:
+        process = subprocess.Popen(argv, start_new_session=True, **common)  # nosec B603
+        return _PosixProcessTree(process)
+    process = subprocess.Popen(argv, **common)  # nosec B603
+    return _UnmanagedProcessTree(process)
 
 
 def demo_registry() -> ToolRegistry:
