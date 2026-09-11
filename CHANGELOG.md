@@ -2,6 +2,33 @@
 
 All notable changes to Portmark are recorded here. Versions follow [semantic versioning](https://semver.org/).
 
+## 0.9.0 — 2026-09-11
+
+Feature: real cross-platform process-tree hard-kill. The isolated-tool executor now enforces the same "kill the worker and every descendant at the deadline" guarantee on Windows (via Job Objects) that it already had on POSIX (process groups), so Windows is no longer a weaker execution mode.
+
+### Added
+
+- **Windows Job Object executor for isolated tools.** Isolated tools launched on Windows
+  now run inside a Job Object created with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. The
+  worker is created **suspended**, assigned to the job before it can spawn anything
+  (closing the launch-to-assignment race), then resumed; `TerminateJobObject` reaps the
+  worker and every descendant as one unit, and closing the last job handle reaps the tree
+  as a safety net. Descendant-kill, race resistance (validated over hundreds of
+  immediate-spawn iterations), and kill-on-close were verified on Windows.
+- **`register_isolated(side_effecting=True)` is now supported on Windows.** The
+  side-effecting refusal is driven by an actual tree-kill capability check
+  (`_can_hard_kill_process_tree()`), which is now true on Windows as well as POSIX. It
+  still fails closed on any platform that has neither primitive.
+
+### Changed
+
+- The isolated executor talks to a platform-neutral `ProcessTree` interface
+  (`_PosixProcessTree` / `_WindowsJobProcessTree` / `_UnmanagedProcessTree`) instead of
+  branching on the platform inline. No behavior change on POSIX.
+- The isolated-tool descendant-kill, side-effecting-runs, and kill-audit tests now run on
+  both POSIX and Windows CI (a `windows-latest` matrix job was added) instead of being
+  skipped off-POSIX.
+
 ## 0.8.7 — 2026-09-11
 
 Hardening: the thread-timeout tool path now caps in-flight executions so a timed-out tool cannot leak unbounded threads (Codex audit finding #5).
