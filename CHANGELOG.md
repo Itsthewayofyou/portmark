@@ -2,6 +2,32 @@
 
 All notable changes to Portmark are recorded here. Versions follow [semantic versioning](https://semver.org/).
 
+## 0.8.1 — 2026-09-11
+
+Security: every post-admission terminal-checkpoint persist is now bounded, generalizing the EV-010 fix so a killed side-effecting tool near the ceiling can no longer leave a resumable checkpoint.
+
+### Fixed
+
+- **A terminal failure near the output-budget ceiling no longer leaves a resumable
+  checkpoint.** The 0.7.2 EV-010 handling only collapsed the checkpoint when a tool
+  had *succeeded* (`tool_calls` incremented). A tool exception, a hard
+  `ToolKilledError`, step-exhaustion, or an oversized completion does **not**
+  increment `tool_calls`, so when the small terminal-failure state tipped a
+  near-ceiling checkpoint over the budget, `_persist` raised out of `run()` and the
+  durable checkpoint stayed `status="running"` — resumable. For a **killed
+  side-effecting tool** that meant the effect may have landed *and* the provider
+  could re-propose it on resume. Every closed (terminal) persist that would exceed
+  the budget is now collapsed to a bounded terminal tombstone (memory and messages
+  dropped; result kept when it fits, else nulled) that is provably ≤ the admitted
+  checkpoint, so it always lands `closed`. The cause survives in the audit chain —
+  `tool.killed` with `effect_status: "unknown"` is preserved — and a new
+  `checkpoint.terminalized` event records that working state was dropped under budget
+  pressure. `await_input` and `migrate` are deliberately excluded: an open or
+  relocating checkpoint cannot be shrunk without losing resume state, so those still
+  raise. Admission itself is unchanged — a fresh task whose first checkpoint already
+  exceeds the budget still raises and commits nothing (nothing to resume). See
+  EXTERNAL_VALIDATION.md (EV-011).
+
 ## 0.8.0 — 2026-09-11
 
 Security: a host-policy grant that constrains no argument now denies unnamed arguments by default (B-lite). **Breaking** behavioral change. Builds on the 0.7.4 name-filter separation.

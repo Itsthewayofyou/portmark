@@ -1395,18 +1395,107 @@ class RuntimeTests(unittest.TestCase):
             # The tool.executed for this step is durable too -- the step was not rolled back.
             self.assertTrue(any(event["event"] == "tool.executed" for event in durable_events))
 
-            # The durable checkpoint is the bounded terminal state, not the oversized one.
+            # The durable checkpoint is the bounded terminal tombstone: the working
+            # state (memory + messages) is dropped so it fits by construction, and the
+            # oversized tool result is not in it. The record of what happened lives in
+            # the audit chain (output.refused, above), not the checkpoint.
             checkpoint = reopened.load_checkpoint(task)
             self.assertIsNotNone(checkpoint)
             self.assertEqual(checkpoint["status"], "failed")
-            self.assertIn("__refused__", checkpoint["memory"]["tool_results"])
-            self.assertNotIn("big.echo", checkpoint["memory"]["tool_results"])
+            self.assertEqual(checkpoint["memory"], {})
+            self.assertEqual(checkpoint["messages"], [])
 
             # The checkpoint is closed: a resume cannot reopen it, so the tool's side
             # effect can never be landed a second time.
             with self.assertRaisesRegex(SecurityError, "closed"):
                 with reopened.transaction() as transaction:
                     transaction.save_checkpoint(task, envelope.state, envelope.state.checkpoint_generation, closed=False)
+
+    @unittest.skipUnless(_CAN_KILL_PROCESS_GROUP, "requires POSIX process groups")
+    def test_killed_tool_near_ceiling_terminalizes_and_keeps_kill_reason(self):
+        # Finding 1, the dangerous case: a hard-killed side-effecting tool near the
+        # checkpoint ceiling. The kill sets a small terminal failure state that tips a
+        # near-ceiling checkpoint over the budget. tool_calls does NOT increment on a
+        # kill, so the original EV-010 guard did not fire: _persist raised out of run()
+        # and the durable checkpoint stayed status="running" -- resumable, so a resume
+        # could re-propose the killed effect and land it twice. The generalized
+        # terminalization now closes it, and the tool.killed record (effect_status
+        # "unknown") survives in the durable audit.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(path)
+            tools = ToolRegistry()
+            tools.register_isolated(
+                "slow.side",
+                "isolated_tool_fixtures:slow_then_return",
+                timeout=1.0,
+                side_effecting=True,
+                env=self._isolated_env(),
+            )
+            host = make_host(store=store)
+            host.tools = tools
+            budget = ResourceBudget(max_steps=6, max_tool_calls=2, max_output_bytes=32768)
+            host.policy = HostPolicy(
+                host.host_id,
+                (ToolGrant("slow.side", {"arguments": {"seconds": {"type": "number"}}}),),
+                budget,
+            )
+            host.providers["kill"] = FixedProvider(ProviderDecision("tool", "slow.side", {"seconds": 30}))
+            # A goal that lands the initial (running) checkpoint just under the ceiling,
+            # so the small kill-failure terminal state tips it over.
+            envelope = make_demo_envelope(host, "x" * 32600, "kill")
+            object.__setattr__(envelope.manifest, "requested_tools", ("slow.side",))
+            object.__setattr__(envelope.permit, "grants", (ToolGrant("slow.side"),))
+            object.__setattr__(envelope.permit, "budget", budget)
+            host.signer.seal(envelope)
+            task = envelope.state.task_id
+
+            result = host.run(envelope)  # returns, does not raise
+
+            self.assertEqual(result.status, "failed")
+            durable_events = self._read_durable_audit_events(path, task)
+            killed = [event for event in durable_events if event["event"] == "tool.killed"]
+            self.assertEqual(len(killed), 1)
+            self.assertEqual(killed[0]["details"]["effect_status"], "unknown")
+            self.assertTrue(any(event["event"] == "checkpoint.terminalized" for event in durable_events))
+
+            reopened = SQLiteRuntimeStore(path)
+            checkpoint = reopened.load_checkpoint(task)
+            self.assertIsNotNone(checkpoint)
+            self.assertEqual(checkpoint["status"], "failed")
+            # Closed: a resume is refused, so the killed effect can never be re-proposed.
+            with self.assertRaisesRegex(SecurityError, "closed"):
+                with reopened.transaction() as transaction:
+                    transaction.save_checkpoint(task, envelope.state, envelope.state.checkpoint_generation, closed=False)
+
+    def test_admission_failure_over_budget_leaves_nothing_durable(self):
+        # The safe boundary the fix must NOT terminalize: a fresh task whose very first
+        # (admission) checkpoint already exceeds the budget. Admission is the gate --
+        # nothing was committed, so nothing is resumable. run() must keep raising and
+        # leave no durable checkpoint or audit head; a too-eager fallback that committed
+        # here would admit a task the budget rejected.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(path)
+            tools = ToolRegistry()
+            tools.register("noop", lambda arguments: {"ok": True})
+            host = make_host(store=store)
+            host.tools = tools
+            budget = ResourceBudget(max_steps=6, max_tool_calls=2, max_output_bytes=32768)
+            host.policy = HostPolicy(host.host_id, (ToolGrant("noop", {"arguments": {"n": {"type": "number"}}}),), budget)
+            host.providers["big"] = OversizedResultProvider()  # never reached; admission fails first
+            envelope = make_demo_envelope(host, "x" * 33000, "big")  # goal alone exceeds the ceiling
+            object.__setattr__(envelope.manifest, "requested_tools", ("noop",))
+            object.__setattr__(envelope.permit, "grants", (ToolGrant("noop"),))
+            object.__setattr__(envelope.permit, "budget", budget)
+            host.signer.seal(envelope)
+            task = envelope.state.task_id
+
+            with self.assertRaisesRegex(SecurityError, "checkpoint exceeds output budget"):
+                host.run(envelope)
+
+            self.assertIsNone(store.load_checkpoint(task))
+            self.assertIsNone(store.audit_head(task))
 
     def test_checkpoint_ceiling_is_the_host_minimum_not_the_permit(self):
         # F1: the checkpoint size ceiling must be effective.budget = min(permit, host),

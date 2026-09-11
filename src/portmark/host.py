@@ -133,18 +133,23 @@ class AgentHost:
             # (completed/failed) or migrates away, so it can never be resumed here
             # again (finding EV-008). An awaiting_input suspend stays open.
             closed = migration is not None or state.status in ("completed", "failed")
-            if state.tool_calls > tool_calls_before and not self._checkpoint_fits(effective, state):
-                # EV-002 class: a tool executed this step and its side effect may have
-                # landed, but the resulting checkpoint exceeds the output budget. A
-                # legal-sized tool result is recorded both in memory["tool_results"] and
-                # in messages, so a result under the invoke cap can still double over the
-                # checkpoint ceiling. Persisting the full checkpoint is impossible, and
-                # raising here would roll back this step's transaction -- erasing the
-                # durable record that the tool ran, and leaving the checkpoint "running"
-                # (resumable, so a resume could re-propose the tool and land the effect
-                # twice). Record an honest, bounded, terminal refusal instead, closing
-                # the lineage. The effect status is unknown, exactly like tool.killed.
-                persisted_events = self._refuse_oversized_checkpoint(envelope, effective, state, audit, persisted_events, decision.tool)
+            # Terminalization guarantee (generalizes EV-010): an admitted task must
+            # always reach a durable CLOSED checkpoint. A closed persist that would
+            # exceed the output budget is collapsed to a bounded terminal tombstone
+            # instead of raising out of run() and leaving the prior checkpoint
+            # resumable. Covers a successful tool whose result overflowed AND a tool
+            # exception, a hard kill, step-exhaustion, or an oversized completion whose
+            # small terminal state tipped a near-ceiling checkpoint over. The killed
+            # side-effecting-tool case is the dangerous one: a resumable pre-tool
+            # checkpoint would let the provider re-propose the effect. await_input and
+            # migrate are deliberately excluded -- an open or relocating checkpoint
+            # cannot be shrunk without losing resume state, so those still raise (rare,
+            # and neither carries a re-proposal risk here).
+            tool_ran = state.tool_calls > tool_calls_before
+            if not self._checkpoint_fits(effective, state) and (tool_ran or state.status in ("completed", "failed")):
+                persisted_events = self._terminalize_over_budget(
+                    envelope, effective, state, audit, persisted_events, decision, tool_ran
+                )
                 result = self._result(envelope, audit)
                 self._record_run_status(result.status)
                 return result
@@ -157,7 +162,12 @@ class AgentHost:
         state.status = "failed"
         state.result = {"error": "step budget exhausted"}
         audit.append("agent.failed", state.result)
-        self._persist(envelope, effective, state, audit, persisted_events, closed=True)
+        # Same terminalization guarantee as the loop: if the step-exhaustion tombstone
+        # tips a near-ceiling checkpoint over the budget, bound it rather than raise.
+        if self._checkpoint_fits(effective, state):
+            self._persist(envelope, effective, state, audit, persisted_events, closed=True)
+        else:
+            self._terminalize_over_budget(envelope, effective, state, audit, persisted_events, None, False)
         result = self._result(envelope, audit)
         self._record_run_status(result.status)
         return result
@@ -392,42 +402,55 @@ class AgentHost:
         # into an honest terminal event rather than an uncaught raise.
         return len(canonical_json(asdict(state))) <= effective.budget.max_output_bytes
 
-    def _refuse_oversized_checkpoint(self, envelope, effective, state, audit, persisted_events, tool):
-        # Collapse the state to a fixed-shape terminal checkpoint that fits by
-        # construction: the only growth since the last (passing) persist is this step's
-        # tool result, held in memory["tool_results"] and echoed into messages, so
-        # replacing both with a small marker returns the checkpoint to roughly its prior
-        # size regardless of how large the refused output was. The full result is
-        # deliberately dropped from durable state -- the hash-chained audit, not the
-        # checkpoint, is the record of what happened.
+    def _terminalize_over_budget(self, envelope, effective, state, audit, persisted_events, decision, tool_ran):
+        # Collapse an over-budget terminal state to a bounded closed tombstone that is
+        # provably <= the admitted checkpoint, so the closed persist always lands. The
+        # admitted checkpoint already held the goal plus this working state, so goal +
+        # empty memory + empty messages + a null result cannot exceed it -- and the
+        # audit chain, not the checkpoint, is the durable record of what happened.
+        ceiling = effective.budget.max_output_bytes
         oversized = len(canonical_json(asdict(state)))
-        refused_tools = sorted(state.memory.get("tool_results", {}).keys())
-        state.memory["tool_results"] = {
-            "__refused__": {"reason": "checkpoint output budget exceeded", "tools": refused_tools}
-        }
-        state.messages = [
-            {
-                "role": "system",
-                "name": "portmark",
-                "content": "checkpoint output refused: exceeded output budget after tool execution",
-            }
-        ]
-        state.status = "failed"
-        state.result = {"error": "checkpoint exceeds output budget after tool execution"}
-        self.metrics.increment("tools.output_refused")
-        # effect_status is "unknown" because the tool ran before the checkpoint was
-        # sized: any side effect it performed has already landed and cannot be undone
-        # from here, exactly as with a hard-killed tool (tool.killed, EV-002).
-        audit.append(
-            "output.refused",
-            {
-                "tool": tool,
-                "encoded_size": oversized,
-                "max_output_bytes": effective.budget.max_output_bytes,
-                "effect_status": "unknown",
-            },
-        )
-        audit.append("agent.failed", state.result)
+        state.memory = {}
+        state.messages = []
+        if tool_ran and state.status == "running":
+            # A successful tool's result overflowed the checkpoint and no failure has
+            # been recorded yet (EV-010). The tool ran, so the effect status is unknown,
+            # exactly as for a hard kill: a resume must not re-propose it.
+            state.status = "failed"
+            state.result = {"error": "checkpoint exceeds output budget after tool execution"}
+            audit.append(
+                "output.refused",
+                {
+                    "tool": decision.tool if decision is not None else None,
+                    "encoded_size": oversized,
+                    "max_output_bytes": ceiling,
+                    "effect_status": "unknown",
+                },
+            )
+            audit.append("agent.failed", state.result)
+        else:
+            # The state is already terminal (a tool exception or hard kill, an oversized
+            # completion, or step-exhaustion). Its cause -- including tool.killed with
+            # effect_status "unknown" -- is already in the audit; keep the status and
+            # the result when they fit, and record that the checkpoint was terminalized
+            # under budget pressure with its working state dropped.
+            audit.append(
+                "checkpoint.terminalized",
+                {
+                    "status": state.status,
+                    "encoded_size": oversized,
+                    "max_output_bytes": ceiling,
+                    "dropped": ["memory", "messages"],
+                },
+            )
+        self.metrics.increment("checkpoints.terminalized")
+        # Guarantee fit: with memory and messages emptied the checkpoint is the admitted
+        # one minus its working state plus this result. If the result still tips it over
+        # (a large kill reason or an oversized completion payload), drop it to null --
+        # goal + empty memory + empty messages + null result is <= the admitted
+        # checkpoint, which admitted under the ceiling with the goal already present.
+        if len(canonical_json(asdict(state))) > ceiling:
+            state.result = None
         return self._persist(envelope, effective, state, audit, persisted_events, closed=True)
 
     def _record_run_status(self, status: str) -> None:
