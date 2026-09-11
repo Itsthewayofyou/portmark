@@ -2,7 +2,23 @@
 
 All notable changes to Portmark are recorded here. Versions follow [semantic versioning](https://semver.org/).
 
-## 0.8.6 — 2026-09-11
+## 0.8.7 — 2026-09-11
+
+Hardening: the thread-timeout tool path now caps in-flight executions so a timed-out tool cannot leak unbounded threads (Codex audit finding #5).
+
+### Fixed
+
+- **A timed-out thread-path tool can no longer leak unbounded daemon threads.** The
+  thread + queue-timeout path cannot cancel a tool once it starts, so a tool that exceeds
+  its deadline leaves its daemon thread running. `ToolRegistry` now holds a bounded
+  semaphore (`max_inflight_threaded`, default 64): a slot is acquired before the worker
+  thread starts and released only when that thread actually finishes — so a leaked,
+  timed-out thread keeps its slot. Once the cap fills with leaked threads, a new
+  invocation fails closed with a clear error instead of spawning another leak. The error
+  points operators at `register_isolated`, whose process-based executor the host *can*
+  hard-kill; long-running or side-effecting tools belong there.
+
+
 
 Fixed: the native Wasmtime provider now starts on Windows (Codex audit finding #6).
 

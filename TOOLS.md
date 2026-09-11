@@ -179,8 +179,11 @@ not truthiness, or a re-proposal guard like `if not results.get("tool")` can loo
 
 By default a tool runs in-process on a worker thread. That path cannot cancel a
 tool once it has started: if the deadline fires, the host records failure but the
-thread keeps running. For untrusted tools, or any tool with a side effect,
-register it isolated instead:
+thread keeps running. To keep such leaked threads bounded, `ToolRegistry` caps how
+many thread-path executions may be in flight at once (`max_inflight_threaded`,
+default 64); beyond the cap a tool invocation fails closed. For untrusted tools,
+any tool with a side effect, or any tool that may run long, register it isolated
+instead:
 
 ```python
 tools.register_isolated(

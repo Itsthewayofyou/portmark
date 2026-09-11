@@ -858,6 +858,36 @@ class RuntimeTests(unittest.TestCase):
         # A tool not marked side-effecting still runs on the normal path.
         self.assertEqual(registry.invoke(permit, "catalog.search", {}), {"ok": True})
 
+    def test_thread_path_caps_inflight_executions_and_fails_closed(self):
+        # Finding #5: a thread-path tool that exceeds its deadline leaks a daemon thread
+        # (the queue-timeout path cannot cancel it). A bounded semaphore caps how many can
+        # be in flight; a leaked thread holds its slot until it actually finishes, so once
+        # the cap fills with leaked threads a new invocation fails closed instead of
+        # spawning another unbounded leak.
+        from portmark.tools import ToolExecutionError
+
+        release = threading.Event()
+        registry = ToolRegistry(max_inflight_threaded=2)
+        registry.register("hang", lambda arguments: release.wait(10) or {"ok": True}, timeout=0.05)
+        permit = Permit(
+            issuer="issuer",
+            subject="agent",
+            audience="host",
+            expires_at=int(time.time()) + 60,
+            nonce="nonce-cap",
+            grants=(ToolGrant("hang"),),
+        )
+        try:
+            # Two timed-out invocations leak their still-running threads; each holds a slot.
+            for _ in range(2):
+                with self.assertRaisesRegex(ToolExecutionError, "deadline"):
+                    registry.invoke(permit, "hang", {})
+            # Both slots held by the leaked threads -> the next invocation fails closed.
+            with self.assertRaisesRegex(ToolExecutionError, "in-flight"):
+                registry.invoke(permit, "hang", {})
+        finally:
+            release.set()  # let the leaked threads finish and release their slots
+
     def _isolated_env(self):
         # The worker runs in a fresh process, so it must be able to import both
         # portmark (from src) and the fixture module (from tests). Absolute paths
