@@ -2,6 +2,28 @@
 
 All notable changes to Portmark are recorded here. Versions follow [semantic versioning](https://semver.org/).
 
+## 0.7.3 — 2026-09-11
+
+Consistency: the checkpoint output ceiling is now the host minimum, and a dead size guard is removed. Both surfaced during the EV-010 review.
+
+### Fixed
+
+- **The checkpoint output-budget ceiling now uses `effective.budget` (`min(permit,
+  host)`), not the visitor's permit alone.** `_persist`, `_checkpoint_fits`, and the
+  `output.refused` audit detail sized the checkpoint against
+  `permit.budget.max_output_bytes`, but tool output is capped against
+  `effective.budget` at invoke. When a host policy set a *narrower* output budget
+  than the visiting permit, the checkpoint ceiling silently followed the looser
+  permit — against "budgets take the minimum," and material because a migration can
+  transport the checkpoint to a peer host. The ceiling is now the host minimum in
+  every spot; the replay nonce still binds to the incoming permit. A new test proves
+  a checkpoint the permit would allow is refused at the host's smaller number.
+- **Removed an unreachable size guard in `_result`.** `_result` runs only right after
+  a `_persist` that already sized the same state against the same budget, so its
+  `checkpoint exceeds output budget` raise could never fire — and had it ever become
+  reachable, it would have raised out of `run()`, the exact uncaught-raise EV-010
+  removed. Enforcement stays solely in `_persist`.
+
 ## 0.7.2 — 2026-09-10
 
 Audit honesty: an oversized checkpoint after a tool runs is now a recorded terminal event, not an uncaught raise.

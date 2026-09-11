@@ -115,7 +115,7 @@ class AgentHost:
         if migration_anchor is not None:
             accepted_details["migration"] = migration_anchor
         audit.append("agent.accepted", accepted_details)
-        persisted_events = self._persist(envelope, state, audit, 0, consume_nonce=consume_nonce)
+        persisted_events = self._persist(envelope, effective, state, audit, 0, consume_nonce=consume_nonce)
         tool_names = tuple(grant.name for grant in effective.grants)
 
         while state.step < effective.budget.max_steps:
@@ -133,7 +133,7 @@ class AgentHost:
             # (completed/failed) or migrates away, so it can never be resumed here
             # again (finding EV-008). An awaiting_input suspend stays open.
             closed = migration is not None or state.status in ("completed", "failed")
-            if state.tool_calls > tool_calls_before and not self._checkpoint_fits(envelope, state):
+            if state.tool_calls > tool_calls_before and not self._checkpoint_fits(effective, state):
                 # EV-002 class: a tool executed this step and its side effect may have
                 # landed, but the resulting checkpoint exceeds the output budget. A
                 # legal-sized tool result is recorded both in memory["tool_results"] and
@@ -144,11 +144,11 @@ class AgentHost:
                 # (resumable, so a resume could re-propose the tool and land the effect
                 # twice). Record an honest, bounded, terminal refusal instead, closing
                 # the lineage. The effect status is unknown, exactly like tool.killed.
-                persisted_events = self._refuse_oversized_checkpoint(envelope, state, audit, persisted_events, decision.tool)
+                persisted_events = self._refuse_oversized_checkpoint(envelope, effective, state, audit, persisted_events, decision.tool)
                 result = self._result(envelope, audit)
                 self._record_run_status(result.status)
                 return result
-            persisted_events = self._persist(envelope, state, audit, persisted_events, closed=closed)
+            persisted_events = self._persist(envelope, effective, state, audit, persisted_events, closed=closed)
             if finished:
                 result = self._result(envelope, audit, migration)
                 self._record_run_status(result.status)
@@ -157,7 +157,7 @@ class AgentHost:
         state.status = "failed"
         state.result = {"error": "step budget exhausted"}
         audit.append("agent.failed", state.result)
-        self._persist(envelope, state, audit, persisted_events, closed=True)
+        self._persist(envelope, effective, state, audit, persisted_events, closed=True)
         result = self._result(envelope, audit)
         self._record_run_status(result.status)
         return result
@@ -378,19 +378,21 @@ class AgentHost:
         return AttestationEvidence(**value)
 
     def _result(self, envelope, audit, migration=None):
+        # No size guard here: _result runs only right after a _persist that already
+        # sized this exact state against the output budget, so a guard here could
+        # never fire -- and if a future call path ever reached it, it would raise out
+        # of run() (the very uncaught-raise EV-010 removed). Persist is the one place
+        # the checkpoint ceiling is enforced.
         checkpoint = asdict(envelope.state)
-        encoded_size = len(canonical_json(checkpoint))
-        if encoded_size > envelope.permit.budget.max_output_bytes:
-            raise SecurityError("checkpoint exceeds output budget")
         return RunResult(envelope.state.status, envelope.state.task_id, envelope.state.result, checkpoint, audit.events, migration)
 
-    def _checkpoint_fits(self, envelope, state) -> bool:
-        # Mirrors the ceiling _persist enforces (envelope.permit.budget), so the loop
-        # can foresee a persist that would refuse the checkpoint and turn it into an
-        # honest terminal event rather than an uncaught raise.
-        return len(canonical_json(asdict(state))) <= envelope.permit.budget.max_output_bytes
+    def _checkpoint_fits(self, effective, state) -> bool:
+        # Mirrors the ceiling _persist enforces (effective.budget = min(permit, host)),
+        # so the loop can foresee a persist that would refuse the checkpoint and turn it
+        # into an honest terminal event rather than an uncaught raise.
+        return len(canonical_json(asdict(state))) <= effective.budget.max_output_bytes
 
-    def _refuse_oversized_checkpoint(self, envelope, state, audit, persisted_events, tool):
+    def _refuse_oversized_checkpoint(self, envelope, effective, state, audit, persisted_events, tool):
         # Collapse the state to a fixed-shape terminal checkpoint that fits by
         # construction: the only growth since the last (passing) persist is this step's
         # tool result, held in memory["tool_results"] and echoed into messages, so
@@ -421,12 +423,12 @@ class AgentHost:
             {
                 "tool": tool,
                 "encoded_size": oversized,
-                "max_output_bytes": envelope.permit.budget.max_output_bytes,
+                "max_output_bytes": effective.budget.max_output_bytes,
                 "effect_status": "unknown",
             },
         )
         audit.append("agent.failed", state.result)
-        return self._persist(envelope, state, audit, persisted_events, closed=True)
+        return self._persist(envelope, effective, state, audit, persisted_events, closed=True)
 
     def _record_run_status(self, status: str) -> None:
         self.metrics.increment(f"runs.{status}")
@@ -478,6 +480,7 @@ class AgentHost:
     def _persist(
         self,
         envelope: AgentEnvelope,
+        effective,
         state,
         audit: AuditLog,
         persisted_events: int,
@@ -486,7 +489,13 @@ class AgentHost:
     ) -> int:
         checkpoint = asdict(state)
         encoded_size = len(canonical_json(checkpoint))
-        if encoded_size > envelope.permit.budget.max_output_bytes:
+        # The checkpoint is host-owned state, and a migration can transport it to a
+        # peer host, so its size ceiling must be the host minimum (effective.budget =
+        # min(permit, host)), not the visitor's permit alone -- otherwise a narrower
+        # host output budget is silently widened to the permit's, against "budgets
+        # take the minimum". The nonce below still binds to envelope.permit, the
+        # incoming permit that minted it.
+        if encoded_size > effective.budget.max_output_bytes:
             raise SecurityError("checkpoint exceeds output budget")
         # Finding EV-008: nonce consumption, audit append, and the checkpoint-generation
         # compare-and-swap all commit or roll back together. save_checkpoint raises on a

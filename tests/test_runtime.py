@@ -1405,6 +1405,48 @@ class RuntimeTests(unittest.TestCase):
                 with reopened.transaction() as transaction:
                     transaction.save_checkpoint(task, envelope.state, envelope.state.checkpoint_generation, closed=False)
 
+    def test_checkpoint_ceiling_is_the_host_minimum_not_the_permit(self):
+        # F1: the checkpoint size ceiling must be effective.budget = min(permit, host),
+        # not the visitor's permit alone -- "budgets take the minimum", and a migration
+        # can transport the checkpoint to a peer host. Here the permit allows a large
+        # output budget but the HOST policy sets a much smaller one. A tool result that
+        # fits the permit's ceiling (and even the invoke cap, which already uses the
+        # host minimum) but whose checkpoint exceeds the host minimum must be refused at
+        # the host number -- proving the ceiling follows the host, and that the guard is
+        # not decorative. Before F1 the checkpoint was sized against the permit, so this
+        # run would have completed.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(path)
+            tools = ToolRegistry()
+            tools.register("big.echo", lambda arguments: {"blob": "y" * 900})
+            host = make_host(store=store)
+            host.tools = tools
+            host_budget = ResourceBudget(max_steps=6, max_tool_calls=2, max_output_bytes=1024)
+            permit_budget = ResourceBudget(max_steps=6, max_tool_calls=2, max_output_bytes=8192)
+            host.policy = HostPolicy(host.host_id, (ToolGrant("big.echo"),), host_budget)
+            host.providers["big"] = OversizedResultProvider()
+            envelope = make_demo_envelope(host, "narrow host budget", "big")
+            object.__setattr__(envelope.manifest, "requested_tools", ("big.echo",))
+            object.__setattr__(envelope.permit, "grants", (ToolGrant("big.echo"),))
+            object.__setattr__(envelope.permit, "budget", permit_budget)
+            host.signer.seal(envelope)
+            task = envelope.state.task_id
+
+            result = host.run(envelope)
+
+            # Refused -- because the host's 1024 is the ceiling, even though the permit
+            # would have allowed the ~1800-byte checkpoint.
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(result.result, {"error": "checkpoint exceeds output budget after tool execution"})
+
+            durable_events = self._read_durable_audit_events(path, task)
+            refused = [event for event in durable_events if event["event"] == "output.refused"]
+            self.assertEqual(len(refused), 1)
+            # The ceiling reported is the host minimum (1024), not the permit's 8192.
+            self.assertEqual(refused[0]["details"]["max_output_bytes"], host_budget.max_output_bytes)
+            self.assertEqual(refused[0]["details"]["effect_status"], "unknown")
+
     def test_host_audits_tool_timeout_and_exception_as_failed_steps(self):
         cases = [
             ("slow.output", lambda arguments: time.sleep(0.1) or {"ok": True}, "tool execution exceeded its deadline", "Empty"),
