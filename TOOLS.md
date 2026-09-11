@@ -200,9 +200,10 @@ fresh Python process (`portmark.tool_subprocess_runner`) that imports the target
 itself. The process talks to the host with one JSON document each way and nothing
 else. What this buys you:
 
-- **Hard-kill at the deadline.** The host kills the whole worker process group, so
+- **Hard-kill at the deadline.** The host kills the whole worker process tree, so
   the tool and anything it spawned stop at the deadline -- the thread path cannot
-  do this.
+  do this. The tree kill uses a POSIX process group on Unix and a Windows Job Object
+  on Windows.
 - **Minimal environment.** The worker inherits only a small allowlist
   (`PYTHONPATH`, `PATH`, locale, `SYSTEMROOT`). Host secrets in the environment
   (API keys, tokens, database URLs) are **not** passed. Add exactly what the tool
@@ -214,13 +215,16 @@ Only an isolated tool may be `side_effecting=True`. A side-effecting tool
 registered on the plain thread path is refused, because that path cannot be
 cancelled.
 
-**Platform support.** The hard-kill guarantee needs process groups, which POSIX
-provides and Windows does not: on Windows a kill reaches only the worker, not a
-grandchild it spawned. So `register_isolated(..., side_effecting=True)` is
-**refused at registration** on a platform without `os.killpg` — the host will not
-promise a guarantee it cannot keep. Non-side-effecting isolated tools still run
-there; the only residual is that a grandchild may outlive the kill, which is a
-resource concern (a leaked process), not an effect-safety one. CI runs on Linux.
+**Platform support.** The hard-kill guarantee needs a primitive that terminates a
+whole process tree as one unit. POSIX provides it with a session + `os.killpg`;
+Windows provides it with a Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`): the
+worker is created suspended, assigned to the job before it can spawn anything, then
+resumed, so a descendant cannot escape, and `TerminateJobObject` reaps the whole
+tree. `register_isolated(..., side_effecting=True)` is therefore supported on both
+POSIX and Windows. It is still **refused at registration** on any platform that has
+neither primitive — the host will not promise a guarantee it cannot keep. CI runs
+the isolated-tool descendant-kill, side-effecting, and kill-audit tests on both
+Linux and Windows.
 
 **One honest limit.** Hard-kill stops any *new* side effect, but it cannot undo
 one already in flight when the deadline fires -- a payment request already sent is
