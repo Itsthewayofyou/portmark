@@ -249,6 +249,14 @@ class AgentHost:
                 )
                 audit.append("agent.failed", state.result)
                 return True, None
+            if not self._is_encodable(result):
+                # An in-process (thread-path) tool can return a live Python object --
+                # a NaN, a reference cycle -- that no JSON transport would have caught.
+                # Storing it would strand the run at the closing _persist; fail closed
+                # here instead. Finding #7. (The side effect, if any, already happened;
+                # the audit records the rejection.)
+                self.metrics.increment("tools.failed")
+                return self._fail_unserializable(state, audit, "tool", decision.tool)
             state.tool_calls += 1
             self.metrics.increment("tools.executed")
             # Record the raw tool result generically, keyed by the tool name, so a
@@ -261,11 +269,15 @@ class AgentHost:
             audit.append("tool.executed", {"tool": decision.tool, "arguments": decision.arguments})
             return False, None
         if decision.kind == "complete":
+            if not self._is_encodable(decision.content):
+                return self._fail_unserializable(state, audit, "complete")
             state.status = "completed"
             state.result = decision.content
             audit.append("agent.completed", {"result": decision.content})
             return True, None
         if decision.kind == "await_input":
+            if not self._is_encodable(decision.content):
+                return self._fail_unserializable(state, audit, "await_input")
             state.status = "awaiting_input"
             state.result = decision.content
             audit.append("agent.awaiting_input", {"request": decision.content})
@@ -316,6 +328,8 @@ class AgentHost:
             )
             self.signer.seal(migrated)
             return True, asdict(migrated)
+        if not self._is_encodable(decision.content):
+            return self._fail_unserializable(state, audit, "failed")
         state.status = "failed"
         state.result = decision.content or {"error": "provider failed"}
         audit.append("agent.failed", {"result": state.result})
@@ -479,6 +493,34 @@ class AgentHost:
         self.metrics.increment(f"runs.{status}")
         if status == "failed":
             self.metrics.increment("runs.failed")
+
+    @staticmethod
+    def _is_encodable(value: Any) -> bool:
+        # A value canonical_json cannot render -- a non-finite float (now that
+        # allow_nan=False, finding #2), a reference cycle, or an unsupported type
+        # (finding #7) -- must never be written into state: it would raise out of
+        # _persist and leave the prior checkpoint status="running" and resumable,
+        # exactly the failure class _terminalize_over_budget was built to eliminate.
+        try:
+            canonical_json(value)
+        except (ValueError, TypeError, RecursionError):
+            return False
+        return True
+
+    def _fail_unserializable(self, state, audit, source: str, tool: str | None = None) -> tuple[bool, None]:
+        # Convert un-encodable provider/tool content into a clean, bounded terminal
+        # failure at the boundary where it would enter state. state.result is a small
+        # fixed dict that always encodes, so the closing _persist succeeds and the
+        # task lands failed+closed instead of raising mid-run. Finding #7.
+        self.metrics.increment("provider.rejected")
+        state.status = "failed"
+        state.result = {"error": "non-serializable content rejected", "source": source}
+        details: dict[str, Any] = {"source": source, "reason": "content is not JSON-encodable"}
+        if tool is not None:
+            details["tool"] = tool
+        audit.append("content.rejected", details)
+        audit.append("agent.failed", state.result)
+        return True, None
 
     @staticmethod
     def _require_nonnegative_counters(state) -> None:

@@ -1558,6 +1558,26 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(calls["n"], 0)
             self.assertIsNone(store.load_checkpoint(envelope.state.task_id))
 
+    def test_non_serializable_provider_content_fails_cleanly_not_stranded(self):
+        # Finding #7 x #2: with canonical_json(allow_nan=False), a provider that
+        # completes with NaN content would raise inside _persist and leave the prior
+        # checkpoint status="running" -- resumable. The host now rejects un-encodable
+        # provider content at the _apply_decision boundary and lands a clean, bounded
+        # terminal failure instead: run() returns failed (never raises), and the
+        # durable checkpoint is closed (failed), not a resumable running one.
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            host = make_host(store=store)
+            host.providers["poison"] = FixedProvider(ProviderDecision("complete", content={"x": float("nan")}))
+            envelope = make_demo_envelope(host, "poison content", "poison")
+            host.signer.seal(envelope)
+            result = host.run(envelope)  # must not raise
+            self.assertEqual(result.status, "failed")
+            self.assertIn("content.rejected", [event["event"] for event in result.audit])
+            checkpoint = store.load_checkpoint(envelope.state.task_id)
+            self.assertIsNotNone(checkpoint)
+            self.assertEqual(checkpoint["status"], "failed")  # closed terminal, not running
+
     def test_checkpoint_ceiling_is_the_host_minimum_not_the_permit(self):
         # F1: the checkpoint size ceiling must be effective.budget = min(permit, host),
         # not the visitor's permit alone -- "budgets take the minimum", and a migration

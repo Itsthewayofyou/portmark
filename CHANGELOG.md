@@ -2,7 +2,32 @@
 
 All notable changes to Portmark are recorded here. Versions follow [semantic versioning](https://semver.org/).
 
-## 0.8.2 — 2026-09-11
+## 0.8.3 — 2026-09-11
+
+Security: non-finite numbers (`NaN`/`Infinity`) and booleans can no longer slip past numeric limits, JSON is now strict, and un-encodable provider content fails cleanly instead of stranding a running task (Codex audit findings #2 and #7).
+
+### Fixed
+
+- **`NaN`/`Infinity` and booleans no longer bypass numeric limits.** Every comparison
+  with `NaN` is false, so a `NaN` argument sailed through `actual > max` and `value <
+  min` / `value > max`; a `bool` is an `int` subclass, so `True` was silently treated as
+  `1`. Both the legacy `max_<arg>` path and the schema `minimum`/`maximum` path now
+  require a real *finite* number (`math.isfinite`, `bool` excluded) on the value **and**
+  the constraint — a non-finite policy bound fails closed as a misconfiguration.
+- **`canonical_json` is now strict (`allow_nan=False`).** `NaN`/`Infinity` are not valid
+  JSON; emitting them broke round-tripping through a strict parser (and therefore the
+  hash-chained audit) and let non-finite values through the limits above. They now raise.
+- **Un-encodable provider content fails cleanly instead of stranding the task.** With
+  strict JSON, a provider that completes/suspends/fails with `NaN` (or a reference cycle,
+  or an unserializable object) would raise inside `_persist` — leaving the prior
+  checkpoint `status="running"` and resumable, the exact class 0.8.1 eliminated for
+  over-budget persists. The host now checks encodability at the `_apply_decision`
+  boundary and, on failure, lands a small bounded terminal failure with a
+  `content.rejected` audit event. In-process tool output is already rejected at the tool
+  boundary (`_checked_output` now raises on non-finite output); the host check is
+  defense in depth for any path that bypasses it.
+
+
 
 Security: fresh-task admission no longer trusts caller-supplied budget counters, closing a budget bypass via negative starting counters (Codex audit finding #3).
 
