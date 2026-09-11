@@ -234,6 +234,12 @@ trail never claims an effect did not happen when it might have. Keep tool
 deadlines comfortably above normal completion time so the kill path is the rare
 exception, not the norm.
 
+The kill is also **verified, not assumed**: after issuing the terminate the host
+waits for the tree to exit, and if the kill cannot be issued or the process
+outlives that wait it raises `ToolExecutionError` ("process tree could not be
+confirmed terminated") rather than reporting a clean kill — the host never claims
+containment it did not confirm.
+
 ## Credential Handling
 
 Tools may use local credentials internally, but returned data is audit material
