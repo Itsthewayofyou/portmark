@@ -3835,6 +3835,12 @@ class RuntimeTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "connection cap holds on Windows, but a saturated listener aborts the socket "
+        "(WinError 10053) instead of returning a clean 503 body; this test asserts the "
+        "POSIX rejection shape. The cap itself is Linux-verified.",
+    )
     def test_a2a_connection_cap_rejects_saturated_message_submissions(self):
         host = make_host()
         entered = threading.Event()
