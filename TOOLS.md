@@ -120,12 +120,15 @@ constraint is narrower.
 thereby turns the set of argument **names** into a whitelist: only the names it
 mentions may reach the tool, and an unknown field (a `recipient` slipped in by a
 prompt injection) is rejected — no `additional_arguments: false` needed. Set
-`additional_arguments: true` to opt a grant back out and admit any name. A grant
-that constrains *nothing* is a pure capability grant and passes arguments through,
-so it never bounds the intersection. (The manifest's requested tools are a name
-filter, not grants of this shape: they gate which tool names may run without
-contributing any argument policy, so every empty grant in the intersection comes
-from a permit or the host policy.) When names are bounded, they are intersected first and every
+`additional_arguments: true` to opt a grant back out and admit any name. A
+constraint set that constrains *nothing* means one of two things by origin: from a
+**host policy** it now denies unnamed arguments (a bare policy grant admits no
+arguments — name them, or set `additional_arguments: true`); from a **permit** it
+stays a pure capability passthrough that never bounds the intersection. (The
+manifest's requested tools are a name filter, not grants of this shape: they gate
+which tool names may run without contributing any argument policy, so every empty
+grant in the intersection comes from a permit or the host policy — and a policy's
+is normalized to an explicit deny at construction.) When names are bounded, they are intersected first and every
 key is gated on the result; a constraint naming an argument the other side would
 have refused drops the grant, because every flat constraint also requires its
 argument to be present, and the combination is then unsatisfiable.

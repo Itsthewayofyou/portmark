@@ -46,25 +46,27 @@ Reviewed areas:
 - The highest remaining review concern is not a known bypass in the current
   code. It is the operational trust boundary around host-loaded Python tools
   and deployment-supplied attestation verifiers.
-- **Argument names are deny-by-default (0.7.0), with one residual by design.** A
-  grant that constrains any argument now rejects undeclared fields, closing the
-  gap where a `{max_amount, allowed_currency}` grant let a `recipient`/`memo`
-  field reach a side-effecting tool. **Still open:** a grant that constrains
-  *nothing* (a host policy that lists a tool with no argument constraints) remains
-  a passthrough and admits any field — the lazy-policy version of the same
-  scenario. The per-grant fix today is `additional_arguments: false` or naming the
-  tool's arguments.
-  **Structural precondition resolved (0.7.4):** the reason "empty means deny" could
-  not simply be flipped was that the manifest turned a bare tool name into an
-  empty-constraint grant, so a global flip would have blocked tool routing. The
-  manifest is now a pure name filter (`intersect_grants(..., allow=)`), separated
-  from constraint intersection, so every empty grant in the intersection now comes
-  from a permit or the host policy. **Still open, now an owner decision:** whether a
-  policy/permit grant that constrains nothing should default to deny-by-default. It
-  is a breaking behavioral change (same class as the 0.7.0 flip), and the secure
-  behavior is already reachable per-grant via `additional_arguments: false`, so this
-  changes only the default. Two shapes to weigh: policy-only (the host's voice, less
-  breakage) or policy-and-permit.
+- **Argument names are deny-by-default (0.7.0), and the lazy-policy residual is now
+  closed for host policy (B-lite, 0.8.0).** 0.7.0 closed the gap for a grant that
+  bounds *some* arguments; a grant that bounded *nothing* (`{"payments.reserve": {}}`)
+  stayed a passthrough and admitted any field — the lazy-policy version of the same
+  scenario. **Structural precondition (0.7.4):** the manifest was made a pure name
+  filter (`intersect_grants(..., allow=)`), separated from constraint intersection,
+  so every empty grant in the intersection now originates from a permit or the host
+  policy — never the manifest. **Resolved for host policy (0.8.0, B-lite):** a bare
+  host-policy grant is normalized at `HostPolicy` construction to
+  `additional_arguments: false`, so it admits no arguments by default; the tool stays
+  callable, but only with arguments the host names (or after an explicit
+  `additional_arguments: true`). One normalized shape is seen by both
+  `effective_permit` and `explain_missing_grant`. A *permit's* bare grant is
+  deliberately left as a passthrough — only the host tightens its own default, the
+  host policy being the ceiling regardless. **Consequence, by design:** because a
+  bare policy grant admits no arguments, an argument a permit legitimately bounds is
+  refused unless the policy also names it — bound arguments belong in one place,
+  usually the policy. **Optional further step (owner decision, not taken):** B-full
+  would extend the same default to a permit's bare grant. It is a larger breaking
+  change with no host-ceiling benefit (the host already bounds everything), so it is
+  left as a deliberate choice, not a pending defect.
 - **Resolved (0.7.3, found during EV-010): the checkpoint output-budget ceiling now
   honors the host minimum.** `_persist`/`_checkpoint_fits` and the `output.refused`
   audit detail sized the checkpoint against `envelope.permit.budget.max_output_bytes`,
