@@ -2,6 +2,29 @@
 
 All notable changes to Portmark are recorded here. Versions follow [semantic versioning](https://semver.org/).
 
+## 0.7.2 — 2026-09-10
+
+Audit honesty: an oversized checkpoint after a tool runs is now a recorded terminal event, not an uncaught raise.
+
+### Fixed
+
+- **A tool result that overflows the checkpoint budget no longer erases the record
+  that the tool ran.** A tool result is capped at invoke time, but it is then
+  recorded in the checkpoint *twice* — under `memory["tool_results"]` and in
+  `messages` — so a result comfortably under the output cap can still push the
+  checkpoint over it. The size check in `_persist` fired *before* the store
+  transaction, so it raised `SecurityError` straight out of `run()`: this step's
+  audit events (including `tool.executed`) were rolled back, and the durable
+  checkpoint was left `status="running"` — resumable, so a resume could re-propose
+  the same tool and land its side effect a second time. The host now detects this
+  case at the loop and records a bounded, terminal, **closed** refusal instead: a
+  durable `output.refused` audit event carrying `effect_status: "unknown"` (the
+  same honesty marker as a hard-killed tool, EV-002), followed by `agent.failed`.
+  `run()` returns a failed `RunResult` rather than raising, and the closed
+  checkpoint can never be resumed. The oversized payload is dropped from durable
+  state (replaced by a small `__refused__` marker); the hash-chained audit, not the
+  checkpoint, is the record of what happened. See EXTERNAL_VALIDATION.md (EV-010).
+
 ## 0.7.1 — 2026-09-10
 
 Cleanup: remove demo residue from the enforcement core.

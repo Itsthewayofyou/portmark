@@ -137,6 +137,17 @@ class LargeToolProvider(ModelProvider):
         return ProviderDecision("complete", content={"large": state.memory["large"]})
 
 
+class OversizedResultProvider(ModelProvider):
+    # Calls one tool, then completes. The tool's result is legal at invoke time but,
+    # once recorded in both memory["tool_results"] and messages, doubles over the
+    # checkpoint output budget.
+    def decide(self, state, available_tools, grants=()):
+        results = state.memory.get("tool_results", {})
+        if "big.echo" not in results:
+            return ProviderDecision("tool", "big.echo", {})
+        return ProviderDecision("complete", content={"done": True})
+
+
 class EchoThenCompleteProvider(ModelProvider):
     def decide(self, state, available_tools, grants=()):
         results = state.memory.get("tool_results", {})
@@ -1320,6 +1331,79 @@ class RuntimeTests(unittest.TestCase):
             self.assertIsNotNone(checkpoint)
             self.assertNotIn("large", checkpoint["memory"])
             self.assertEqual(checkpoint["messages"], [])
+
+    @staticmethod
+    def _read_durable_audit_events(path, task_id):
+        connection = sqlite3.connect(str(path))
+        try:
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute(
+                "SELECT event, details_json FROM audit_events WHERE task_id = ? ORDER BY sequence",
+                (str(task_id),),
+            ).fetchall()
+        finally:
+            connection.close()
+        return [{"event": row["event"], "details": json.loads(row["details_json"])} for row in rows]
+
+    def test_host_records_honest_terminal_refusal_when_checkpoint_exceeds_budget_after_a_tool(self):
+        # A tool result can pass the invoke cap yet still exceed the *checkpoint* budget
+        # once it is recorded in both memory["tool_results"] and messages. The tool has
+        # already run -- its side effect may have landed -- so the host must not silently
+        # roll back this step (erasing the record that it ran) nor leave a resumable
+        # checkpoint (a resume could re-propose the tool and land the effect twice). It
+        # records a bounded, terminal, closed refusal with the effect status unknown,
+        # exactly like a hard-killed tool. Proven against the durable store, because a
+        # test that read the in-memory audit list would pass even if nothing persisted.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(path)
+            tools = ToolRegistry()
+            tools.register("big.echo", lambda arguments: {"blob": "y" * 900})
+            host = make_host(store=store)
+            host.tools = tools
+            budget = ResourceBudget(max_steps=6, max_tool_calls=2, max_output_bytes=1024)
+            host.policy = HostPolicy(host.host_id, (ToolGrant("big.echo"),), budget)
+            host.providers["big"] = OversizedResultProvider()
+            envelope = make_demo_envelope(host, "oversized checkpoint", "big")
+            object.__setattr__(envelope.manifest, "requested_tools", ("big.echo",))
+            object.__setattr__(envelope.permit, "grants", (ToolGrant("big.echo"),))
+            object.__setattr__(envelope.permit, "budget", budget)
+            host.signer.seal(envelope)
+            task = envelope.state.task_id
+
+            result = host.run(envelope)
+
+            # The run fails cleanly -- run() returns a failed result, it does not raise.
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(result.result, {"error": "checkpoint exceeds output budget after tool execution"})
+
+            # The honest record is durable: reopen the store from disk and read the chain.
+            # A bare reopen has no head-signature verifier wired, so the chain reads back
+            # as "unverifiable" (signature unchecked) rather than "valid" -- both mean the
+            # hash chain is present and internally consistent; only "invalid"/"missing" fail.
+            reopened = SQLiteRuntimeStore(path)
+            self.assertIn(reopened.verify_audit_chain_status(task).status, ("valid", "unverifiable"))
+            durable_events = self._read_durable_audit_events(path, task)
+            self.assertEqual([event["event"] for event in durable_events][-2:], ["output.refused", "agent.failed"])
+            refused = [event for event in durable_events if event["event"] == "output.refused"]
+            self.assertEqual(len(refused), 1)
+            self.assertEqual(refused[0]["details"]["effect_status"], "unknown")
+            self.assertEqual(refused[0]["details"]["tool"], "big.echo")
+            # The tool.executed for this step is durable too -- the step was not rolled back.
+            self.assertTrue(any(event["event"] == "tool.executed" for event in durable_events))
+
+            # The durable checkpoint is the bounded terminal state, not the oversized one.
+            checkpoint = reopened.load_checkpoint(task)
+            self.assertIsNotNone(checkpoint)
+            self.assertEqual(checkpoint["status"], "failed")
+            self.assertIn("__refused__", checkpoint["memory"]["tool_results"])
+            self.assertNotIn("big.echo", checkpoint["memory"]["tool_results"])
+
+            # The checkpoint is closed: a resume cannot reopen it, so the tool's side
+            # effect can never be landed a second time.
+            with self.assertRaisesRegex(SecurityError, "closed"):
+                with reopened.transaction() as transaction:
+                    transaction.save_checkpoint(task, envelope.state, envelope.state.checkpoint_generation, closed=False)
 
     def test_host_audits_tool_timeout_and_exception_as_failed_steps(self):
         cases = [
