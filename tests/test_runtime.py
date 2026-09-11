@@ -55,7 +55,7 @@ from portmark.security import (
 )
 from portmark.storage import SQLITE_BUSY_TIMEOUT_MS, SQLITE_SCHEMA_VERSION, InMemoryRuntimeStore, PostgresRuntimeStore, SQLiteRuntimeStore
 from portmark.cli import main as cli_main
-from portmark.tools import ToolRegistry, _CAN_KILL_PROCESS_GROUP
+from portmark.tools import ToolRegistry, _CAN_KILL_PROCESS_GROUP, _can_hard_kill_process_tree
 from examples.tools import http_fetch
 from fuzz_a2a_parser import run_fuzz_cases
 
@@ -944,7 +944,7 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaises(ToolKilledError):
             registry.invoke(permit, "iso.slow", {"seconds": 30})
 
-    @unittest.skipUnless(_CAN_KILL_PROCESS_GROUP, "requires POSIX process groups")
+    @unittest.skipUnless(_can_hard_kill_process_tree(), "requires a process-tree hard-kill primitive")
     def test_isolated_tool_kill_reaches_grandchildren(self):
         # The kill must reach the whole process group, not just the worker: a
         # grandchild the tool spawned would otherwise survive and write a marker.
@@ -988,7 +988,7 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(ToolExecutionError, "output budget"):
             registry.invoke(permit, "iso.big", {"size": 100_000})
 
-    @unittest.skipUnless(_CAN_KILL_PROCESS_GROUP, "requires POSIX process groups")
+    @unittest.skipUnless(_can_hard_kill_process_tree(), "requires a process-tree hard-kill primitive")
     def test_side_effecting_tool_runs_when_registered_isolated(self):
         # The thread path refuses side-effecting tools; the isolated path is the
         # sanctioned way to run one, because the host can hard-kill it. Skipped
@@ -1002,13 +1002,14 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(registry.invoke(permit, "iso.pay", {"amount": 10}), {"echo": {"amount": 10}})
 
     def test_side_effecting_isolated_tool_refused_without_process_group_kill(self):
-        # Fail-closed on a platform (e.g. Windows) that cannot hard-kill a process
-        # group: a side-effecting isolated tool is refused at registration, not
-        # silently run without the guarantee. Patched so this proves the throw on
-        # POSIX CI rather than leaving it unreachable.
+        # Fail-closed on a platform with no process-tree hard-kill primitive: a
+        # side-effecting isolated tool is refused at registration, not silently run
+        # without the guarantee. Patch the capability itself (not just the POSIX flag,
+        # since Windows now has its own Job Object primitive) so this proves the throw
+        # on every CI rather than leaving it unreachable.
         registry = ToolRegistry()
-        with patch("portmark.tools._CAN_KILL_PROCESS_GROUP", False):
-            with self.assertRaisesRegex(SecurityError, "hard-kill|process group"):
+        with patch("portmark.tools._can_hard_kill_process_tree", return_value=False):
+            with self.assertRaisesRegex(SecurityError, "hard-kill|process tree"):
                 registry.register_isolated(
                     "iso.pay", "isolated_tool_fixtures:echo", side_effecting=True, env=self._isolated_env()
                 )
@@ -1018,7 +1019,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("iso.safe", registry.names())
         self.assertNotIn("iso.pay", registry.names())
 
-    @unittest.skipUnless(_CAN_KILL_PROCESS_GROUP, "requires POSIX process groups")
+    @unittest.skipUnless(_can_hard_kill_process_tree(), "requires a process-tree hard-kill primitive")
     def test_host_audits_isolated_tool_kill_as_effect_status_unknown(self):
         # The honest audit trail: a hard-kill stops new effects but cannot prove
         # an in-flight one did not land, so the host records effect status as
@@ -1447,7 +1448,7 @@ class RuntimeTests(unittest.TestCase):
                 with reopened.transaction() as transaction:
                     transaction.save_checkpoint(task, envelope.state, envelope.state.checkpoint_generation, closed=False)
 
-    @unittest.skipUnless(_CAN_KILL_PROCESS_GROUP, "requires POSIX process groups")
+    @unittest.skipUnless(_can_hard_kill_process_tree(), "requires a process-tree hard-kill primitive")
     def test_killed_tool_near_ceiling_terminalizes_and_keeps_kill_reason(self):
         # Finding 1, the dangerous case: a hard-killed side-effecting tool near the
         # checkpoint ceiling. The kill sets a small terminal failure state that tips a

@@ -11,6 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import _windows_job
 from .models import Permit
 from .security import SecurityError, canonical_json, check_constraints
 
@@ -302,11 +303,11 @@ class ToolRegistry:
 
 def _can_hard_kill_process_tree() -> bool:
     # Whether this platform can kill a worker AND every descendant as one unit.
-    # POSIX: a new session (start_new_session) + os.killpg. Windows gains this via the
-    # Job Object executor once that lands; until then it is False and a side-effecting
-    # isolated tool is refused rather than run with a leak. Enforcement reads this, not
-    # a scattered platform check.
-    return _CAN_KILL_PROCESS_GROUP
+    # POSIX: a new session (start_new_session) + os.killpg. Windows: a Job Object with
+    # KILL_ON_JOB_CLOSE (_WindowsJobProcessTree). Enforcement reads this, not a
+    # scattered platform check; a side-effecting isolated tool is refused only where
+    # neither primitive exists.
+    return _CAN_KILL_PROCESS_GROUP or _windows_job.available()
 
 
 def _terminate_posix_process_group(process: subprocess.Popen[bytes]) -> None:
@@ -389,6 +390,57 @@ class _UnmanagedProcessTree(_ProcessTree):
             pass
 
 
+class _WindowsJobProcessTree(_ProcessTree):
+    # A worker created SUSPENDED, assigned to a kill-on-close Job Object before it can
+    # spawn anything (race-free), then resumed. TerminateJobObject reaps the worker and
+    # every descendant as one unit; closing the last job handle is a kill-on-close
+    # safety net if terminate_tree was never called.
+    kills_tree = True
+
+    def __init__(self, process: subprocess.Popen[bytes], job_handle: int) -> None:
+        super().__init__(process)
+        self._job = job_handle
+        self._job_closed = False
+
+    def terminate_tree(self) -> None:
+        _windows_job.terminate_job(self._job)
+
+    def close(self) -> None:
+        super().close()
+        if not self._job_closed:
+            self._job_closed = True
+            _windows_job.close_handle(self._job)
+
+
+def _launch_windows_job_tree(argv: list[str], common: dict[str, Any]) -> _ProcessTree:
+    job = _windows_job.create_kill_on_close_job()
+    try:
+        process = subprocess.Popen(  # nosec B603
+            argv,
+            creationflags=_windows_job.CREATE_SUSPENDED | _windows_job.CREATE_NO_WINDOW,
+            **common,
+        )
+    except OSError:
+        _windows_job.close_handle(job)
+        raise
+    try:
+        # Assign while suspended: the worker cannot have spawned a child yet, so nothing
+        # can escape the job. Then resume. Any failure fails closed -- kill the
+        # suspended worker and the job; NEVER fall back to an unmanaged process.
+        _windows_job.assign_process(job, int(process._handle))
+        if _windows_job.resume_process_main_thread(process.pid) < 1:
+            raise OSError("could not resume the suspended isolated-tool worker")
+    except OSError:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        _windows_job.terminate_job(job)
+        _windows_job.close_handle(job)
+        raise
+    return _WindowsJobProcessTree(process, job)
+
+
 def _launch_process_tree(argv: list[str], env: dict[str, str]) -> _ProcessTree:
     common: dict[str, Any] = {
         "stdin": subprocess.PIPE,
@@ -399,6 +451,8 @@ def _launch_process_tree(argv: list[str], env: dict[str, str]) -> _ProcessTree:
     if _CAN_KILL_PROCESS_GROUP:
         process = subprocess.Popen(argv, start_new_session=True, **common)  # nosec B603
         return _PosixProcessTree(process)
+    if _windows_job.available():
+        return _launch_windows_job_tree(argv, common)
     process = subprocess.Popen(argv, **common)  # nosec B603
     return _UnmanagedProcessTree(process)
 
