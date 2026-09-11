@@ -58,19 +58,21 @@ Reviewed areas:
   separating name-filtering from constraint intersection in `effective_permit`, a
   larger change worth its own review. The per-grant fix today is
   `additional_arguments: false` or naming the tool's arguments.
-- **Open (found during EV-010): the checkpoint output-budget ceiling honors the
-  permit, not the host minimum.** `_persist`/`_result`/`_checkpoint_fits` size the
-  checkpoint against `envelope.permit.budget.max_output_bytes`, but tool output is
-  capped at invoke against `effective.budget.max_output_bytes` (`= min(permit,
-  host)`). When host policy sets a *narrower* output budget than the visiting
-  permit, the checkpoint ceiling follows the looser permit — against the README's
-  "budgets take the minimum / a visitor cannot raise its own limits." Low severity
-  (a checkpoint is not sent to the provider; the tool-output cap already honors the
-  minimum), but it is an inconsistency worth its own fix: size the checkpoint
-  against `effective.budget` too. Not folded into EV-010 to avoid silently changing
-  a ceiling under an audit-honesty change.
-- **Cosmetic (found during EV-010): the size guard in `_result` is unreachable.**
-  `_result` runs only immediately after a `_persist` that passed on the same state
-  object against the same budget field, so its `checkpoint exceeds output budget`
-  raise can never fire. Left in place as defense-in-depth; noted so it is not
-  mistaken for a live guard.
+- **Resolved (0.7.3, found during EV-010): the checkpoint output-budget ceiling now
+  honors the host minimum.** `_persist`/`_checkpoint_fits` and the `output.refused`
+  audit detail sized the checkpoint against `envelope.permit.budget.max_output_bytes`,
+  but tool output is capped at invoke against `effective.budget.max_output_bytes`
+  (`= min(permit, host)`). When host policy set a *narrower* output budget than the
+  visiting permit, the checkpoint ceiling followed the looser permit — against
+  "budgets take the minimum," and material because a migration can transport the
+  checkpoint to a peer host. **Resolved:** all three spots now size against
+  `effective.budget`; the replay nonce still binds to the incoming `envelope.permit`.
+  A regression test proves a checkpoint the permit would allow is refused at the
+  host's smaller number. Kept separate from EV-010 so an audit-honesty change did not
+  silently move a ceiling.
+- **Resolved (0.7.3, found during EV-010): the unreachable size guard in `_result`
+  was removed.** `_result` runs only immediately after a `_persist` that passed on the
+  same state against the same budget, so its raise could never fire — and had a future
+  path reached it, it would have raised out of `run()`, the exact uncaught-raise
+  EV-010 removed. It was a decorative guard, not defense-in-depth; enforcement stays
+  solely in `_persist`.
