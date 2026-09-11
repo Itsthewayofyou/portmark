@@ -1578,6 +1578,39 @@ class RuntimeTests(unittest.TestCase):
             self.assertIsNotNone(checkpoint)
             self.assertEqual(checkpoint["status"], "failed")  # closed terminal, not running
 
+    def test_oversized_migration_close_terminalizes_source_not_strands_it(self):
+        # Finding #1 extended to migration: when the source-close checkpoint overflows
+        # the output budget, the source must still CLOSE (its working state has moved to
+        # the already-sealed migrated envelope), not raise and leave a resumable
+        # status="running" checkpoint alongside that envelope -- which would let the
+        # source resume AND the destination run the same work (double effect).
+        source_signer = EnvelopeSigner.generate("source-key", "host:source", ("host:source", "host:destination"))
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            source = make_host(host_id="host:source", signer=source_signer, store=store)
+            source.policy.migration = MigrationPolicy(allowed=True, destinations=("host:destination",))
+            source.providers["migrator"] = MigrateThenCompleteProvider("host:destination")
+            envelope = make_demo_envelope(source, "M" * 1500, "migrator")
+            object.__setattr__(envelope.permit, "delegation_allowed", True)
+            # Size the ceiling to admit the fresh checkpoint but refuse the migrate-close,
+            # which adds the migration memory and the destination result (~90 bytes).
+            running = asdict(envelope.state)
+            running["status"] = "running"
+            ceiling = len(canonical_json(running)) + 40
+            budget = ResourceBudget(max_steps=6, max_tool_calls=2, max_output_bytes=ceiling)
+            object.__setattr__(envelope.permit, "budget", budget)
+            source.policy.budget = budget
+            source_signer.seal(envelope)
+
+            result = source.run(envelope)  # must not raise
+            self.assertIsNotNone(result.migration_envelope)  # migrated envelope still returned
+            checkpoint = store.load_checkpoint(result.task_id)
+            self.assertIsNotNone(checkpoint)
+            self.assertEqual(checkpoint["status"], "ready")  # closed source, migrated away
+            self.assertEqual(checkpoint["memory"], {})  # working state dropped under budget pressure
+            self.assertIn("checkpoint.terminalized", [event["event"] for event in result.audit])
+            self.assertTrue(store.verify_audit_chain(result.task_id))
+
     def test_checkpoint_ceiling_is_the_host_minimum_not_the_permit(self):
         # F1: the checkpoint size ceiling must be effective.budget = min(permit, host),
         # not the visitor's permit alone -- "budgets take the minimum", and a migration

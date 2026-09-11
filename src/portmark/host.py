@@ -168,11 +168,20 @@ class AgentHost:
             # cannot be shrunk without losing resume state, so those still raise (rare,
             # and neither carries a re-proposal risk here).
             tool_ran = state.tool_calls > tool_calls_before
-            if not self._checkpoint_fits(effective, state) and (tool_ran or state.status in ("completed", "failed")):
+            # Finding #1 (extended to migration): terminalize on any closed persist that
+            # would overflow, not only tool-fail/kill/completion. A `migrate` closes the
+            # source (status="ready", closed) because the working state has moved to the
+            # migrated envelope -- already snapshotted in _apply_decision, so dropping
+            # the source's now-redundant copy is correct. Without this an oversized
+            # source-close raised out of run(), leaving the source checkpoint
+            # status="running" and resumable WHILE a sealed migrated envelope existed:
+            # the source could resume AND the destination run the same work (double
+            # effect). await_input is still excluded (open, not closed).
+            if not self._checkpoint_fits(effective, state) and (tool_ran or closed):
                 persisted_events = self._terminalize_over_budget(
                     envelope, effective, state, audit, persisted_events, decision, tool_ran
                 )
-                result = self._result(envelope, audit)
+                result = self._result(envelope, audit, migration)
                 self._record_run_status(result.status)
                 return result
             persisted_events = self._persist(envelope, effective, state, audit, persisted_events, closed=closed)

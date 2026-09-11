@@ -2,7 +2,28 @@
 
 All notable changes to Portmark are recorded here. Versions follow [semantic versioning](https://semver.org/).
 
-## 0.8.3 — 2026-09-11
+## 0.8.4 — 2026-09-11
+
+Security: an oversized *migration* close now terminalizes the source instead of stranding it, extending the 0.8.1 terminalization guarantee to migration (Codex audit finding #1, migration case).
+
+### Fixed
+
+- **An oversized migration-close no longer strands the source as resumable.** 0.8.1
+  bounded every *terminal* (completed/failed) over-budget persist, but a `migrate` closes
+  the source with `status="ready"` — neither `completed`/`failed` nor a tool step — so it
+  fell through to a raising `_persist`. When the source-close checkpoint (goal + the
+  migration memory + the destination result) tipped over the budget, `run()` raised and
+  left the source checkpoint `status="running"` and resumable **while a sealed migrated
+  envelope already existed** — the source could resume *and* the destination run the same
+  work (double effect). The terminalization trigger now fires on any closed persist
+  (`tool_ran or closed`), so an over-budget migrate-close drops the source's now-redundant
+  working state (it moved to the already-snapshotted migrated envelope) and lands a closed
+  source checkpoint with a `checkpoint.terminalized` audit event; the migrated envelope is
+  still returned. `await_input` remains excluded by design: it is an *open* checkpoint, and
+  approval gates *before* the tool runs, so an oversized suspend is a liveness bug, not a
+  double-effect one.
+
+
 
 Security: non-finite numbers (`NaN`/`Infinity`) and booleans can no longer slip past numeric limits, JSON is now strict, and un-encodable provider content fails cleanly instead of stranding a running task (Codex audit findings #2 and #7).
 
