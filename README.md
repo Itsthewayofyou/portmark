@@ -37,6 +37,12 @@ These are enforced by the host, not requested politely from the agent:
 - **Wasm capsules declaring any import are refused, not sandboxed.** The guest therefore has no
   filesystem, network, process, environment, clock, randomness, or credential access at all.
   ([`wasm_runner.mjs`](https://github.com/Itsthewayofyou/portmark/blob/main/src/portmark/wasm_runner.mjs))
+  This bounds *access*, not *consumption*: on the default Node runner the guest can still grow its
+  own linear memory unbounded and exhaust host RAM before the wall-clock deadline fires — the Node
+  path caps time, not memory. Only the optional native Wasmtime engine bounds guest memory as well
+  (`store.set_limits(memory_size=…)` alongside a fuel budget in
+  [`wasmtime_component_runner.py`](https://github.com/Itsthewayofyou/portmark/blob/main/src/portmark/wasmtime_component_runner.py)).
+  A deployment that must resist a memory-exhaustion capsule should select `--wasm-engine wasmtime`.
 - **Permits can only narrow on migration.** One hop, bound to the named destination, grants and
   budgets cannot increase, and further delegation is disabled. A visiting agent cannot accept a
   narrow permit at your door and widen it on the next hop.
