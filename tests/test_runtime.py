@@ -1623,7 +1623,7 @@ class RuntimeTests(unittest.TestCase):
         # only the declared fields. The demo policy grants catalog.search (id, title),
         # so `score` (returned by the tool) must never reach the provider -- while the
         # host keeps the full result, score included, in its own durable state.
-        seen: dict[str, Any] = {}
+        seen = {}
 
         class RecordingProvider(ModelProvider):
             def decide(self, state, available_tools, grants=()):
@@ -4059,6 +4059,31 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result.result["evidence"], ["checkpoint-observed"])
         self.assertEqual([event["event"] for event in result.audit].count("tool.executed"), 1)
         self.assertEqual(result.checkpoint["messages"][0]["content"][0]["title"], "Result 1 for from capsule checkpoint")
+
+    def test_native_wasmtime_subprocess_env_forwards_os_vars_but_no_secrets(self):
+        # Finding #6: the native Wasmtime child (a Python importing the arch-specific
+        # wasmtime wheel) failed to start on Windows because the parent passed only
+        # PYTHONPATH, dropping SYSTEMROOT and the process/arch vars the C runtime and the
+        # wheel need. The env is now a fixed allowlist of non-secret OS vars -- forwarded
+        # when present, and never a credential-shaped variable.
+        from portmark.providers import _wasmtime_subprocess_env
+
+        fake_env = {
+            "SYSTEMROOT": r"C:\Windows",
+            "PYTHONPATH": "/opt/portmark",
+            "PROCESSOR_ARCHITECTURE": "AMD64",
+            "PATH": "/usr/bin",
+            "AWS_SECRET_ACCESS_KEY": "should-not-leak",
+            "PORTMARK_SIGNING_KEY": "should-not-leak",
+        }
+        with patch.dict(os.environ, fake_env, clear=True):
+            env = _wasmtime_subprocess_env()
+        self.assertEqual(env["SYSTEMROOT"], r"C:\Windows")
+        self.assertEqual(env["PYTHONPATH"], "/opt/portmark")
+        self.assertEqual(env["PROCESSOR_ARCHITECTURE"], "AMD64")
+        self.assertEqual(env["PATH"], "/usr/bin")
+        self.assertNotIn("AWS_SECRET_ACCESS_KEY", env)
+        self.assertNotIn("PORTMARK_SIGNING_KEY", env)
 
     def test_native_wasmtime_provider_uses_component_api_in_isolated_worker(self):
         component = b"native-component"

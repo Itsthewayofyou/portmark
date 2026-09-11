@@ -2,7 +2,23 @@
 
 All notable changes to Portmark are recorded here. Versions follow [semantic versioning](https://semver.org/).
 
-## 0.8.5 — 2026-09-11
+## 0.8.6 — 2026-09-11
+
+Fixed: the native Wasmtime provider now starts on Windows (Codex audit finding #6).
+
+### Fixed
+
+- **Native Wasmtime no longer fails to start on Windows.** The provider launched its
+  child Python (which imports the arch-specific `wasmtime` wheel) with `env={"PYTHONPATH":
+  ...}` only, stripping `SYSTEMROOT`, `PATH`, and the Windows process/arch variables the C
+  runtime and the wheel read at import — so the child could not start. The subprocess now
+  inherits a fixed allowlist of non-secret OS variables (the tool runner's
+  `PYTHONPATH`/`PATH`/locale/`SYSTEMROOT` set plus `SYSTEMDRIVE`, `WINDIR`,
+  `PROCESSOR_ARCHITECTURE`/`PROCESSOR_ARCHITEW6432`, `COMSPEC`, `PATHEXT`,
+  `NUMBER_OF_PROCESSORS`, `TEMP`/`TMP`), forwarded only when present. No credential-shaped
+  variable is forwarded, so the trust boundary is unchanged.
+
+
 
 Security: tool-output projection is now enforced at the host boundary for every provider, not just remote adapters (Codex audit finding #4).
 
