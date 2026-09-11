@@ -257,20 +257,38 @@ class ToolRegistry:
                     pass
             reader.start()
             timed_out = False
+            kill_confirmed = True
             try:
                 tree.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 timed_out = True
-                tree.terminate_tree()
+                # Confirm the whole tree actually exited: the kill may fail to issue
+                # (terminate_tree raises OSError -- a Win32 BOOL returned false) or the
+                # process may outlive the kill (the second wait times out). In either
+                # case do NOT claim a clean kill; fail closed below.
                 try:
+                    tree.terminate_tree()
                     tree.wait(timeout=2.0)
-                except subprocess.TimeoutExpired:
-                    pass
+                except (subprocess.TimeoutExpired, OSError):
+                    kill_confirmed = False
             reader.join(timeout=2.0)
         finally:
-            tree.terminate_tree()
-            tree.close()
+            # Best-effort cleanup: the outcome above is already decided, so a failure
+            # here (a Win32 return, a close error) must not mask it. On Windows close()
+            # also closes the job handle, a KILL_ON_JOB_CLOSE fallback.
+            try:
+                tree.terminate_tree()
+            except OSError:
+                pass
+            try:
+                tree.close()
+            except OSError:
+                pass
 
+        if timed_out and not kill_confirmed:
+            # The deadline fired but the process tree could not be confirmed dead. Do
+            # not report a clean kill -- that would overstate containment.
+            raise ToolExecutionError("isolated tool process tree could not be confirmed terminated")
         if timed_out:
             raise ToolKilledError("isolated tool exceeded its deadline and was killed")
         if overflow.is_set():
@@ -421,7 +439,7 @@ def _launch_windows_job_tree(argv: list[str], common: dict[str, Any]) -> _Proces
             **common,
         )
     except OSError:
-        _windows_job.close_handle(job)
+        _close_job_quietly(job)
         raise
     try:
         # Assign while suspended: the worker cannot have spawned a child yet, so nothing
@@ -431,14 +449,27 @@ def _launch_windows_job_tree(argv: list[str], common: dict[str, Any]) -> _Proces
         if _windows_job.resume_process_main_thread(process.pid) < 1:
             raise OSError("could not resume the suspended isolated-tool worker")
     except OSError:
+        # Reap the suspended worker and the job before re-raising the real failure.
+        # Cleanup is best-effort so a secondary Win32 error cannot mask the primary one;
+        # the job's KILL_ON_JOB_CLOSE also reaps the worker as it closes.
         try:
             process.kill()
         except OSError:
             pass
-        _windows_job.terminate_job(job)
-        _windows_job.close_handle(job)
+        try:
+            _windows_job.terminate_job(job)
+        except OSError:
+            pass
+        _close_job_quietly(job)
         raise
     return _WindowsJobProcessTree(process, job)
+
+
+def _close_job_quietly(job_handle: int) -> None:
+    try:
+        _windows_job.close_handle(job_handle)
+    except OSError:
+        pass
 
 
 def _launch_process_tree(argv: list[str], env: dict[str, str]) -> _ProcessTree:

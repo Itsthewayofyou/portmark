@@ -970,6 +970,58 @@ class RuntimeTests(unittest.TestCase):
             self.assertTrue(os.path.exists(marker + ".started"))
             self.assertFalse(os.path.exists(marker))
 
+    @unittest.skipUnless(_can_hard_kill_process_tree(), "requires a process-tree hard-kill primitive")
+    def test_isolated_tool_kill_not_confirmed_fails_closed(self):
+        # Fail-closed: if the deadline fires but the tree cannot be CONFIRMED dead --
+        # the kill fails to issue, or the process outlives the post-kill wait -- the host
+        # must not report a clean ToolKilledError, because that would overstate
+        # containment. Simulate an ineffective kill by patching the active ProcessTree's
+        # terminate_tree to a no-op, so the (still-sleeping) worker survives the wait.
+        from portmark.tools import ToolExecutionError
+        import portmark.tools as tools_module
+
+        if _CAN_KILL_PROCESS_GROUP:
+            tree_cls = tools_module._PosixProcessTree
+        elif tools_module._windows_job.available():
+            tree_cls = tools_module._WindowsJobProcessTree
+        else:  # pragma: no cover - covered by the skip guard
+            self.skipTest("no tree-kill primitive")
+
+        registry = ToolRegistry()
+        registry.register_isolated(
+            "iso.slow", "isolated_tool_fixtures:slow_then_return", timeout=0.5, env=self._isolated_env()
+        )
+        permit = self._isolated_permit("iso.slow")
+        with patch.object(tree_cls, "terminate_tree", lambda self: None):
+            with self.assertRaisesRegex(ToolExecutionError, "could not be confirmed terminated"):
+                registry.invoke(permit, "iso.slow", {"seconds": 3.0})
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows Job Object launch path")
+    def test_windows_launch_fails_closed_when_resume_fails(self):
+        # A ResumeThread failure (0 threads resumed) must fail the launch closed, never
+        # run the worker unmanaged. Finding: unchecked ResumeThread return.
+        from portmark.tools import ToolExecutionError
+
+        registry = ToolRegistry()
+        registry.register_isolated("iso.echo", "isolated_tool_fixtures:echo", env=self._isolated_env())
+        permit = self._isolated_permit("iso.echo")
+        with patch("portmark.tools._windows_job.resume_process_main_thread", return_value=0):
+            with self.assertRaisesRegex(ToolExecutionError, "could not start isolated tool worker"):
+                registry.invoke(permit, "iso.echo", {})
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows Job Object launch path")
+    def test_windows_launch_fails_closed_when_assignment_fails(self):
+        # An AssignProcessToJobObject failure must reap the suspended worker and fail
+        # closed -- never fall back to an unmanaged (un-killable) process.
+        from portmark.tools import ToolExecutionError
+
+        registry = ToolRegistry()
+        registry.register_isolated("iso.echo", "isolated_tool_fixtures:echo", env=self._isolated_env())
+        permit = self._isolated_permit("iso.echo")
+        with patch("portmark.tools._windows_job.assign_process", side_effect=OSError("assign failed")):
+            with self.assertRaisesRegex(ToolExecutionError, "could not start isolated tool worker"):
+                registry.invoke(permit, "iso.echo", {})
+
     def test_isolated_tool_exception_fails_closed(self):
         from portmark.tools import ToolExecutionError
 

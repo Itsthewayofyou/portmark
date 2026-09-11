@@ -2,6 +2,38 @@
 
 All notable changes to Portmark are recorded here. Versions follow [semantic versioning](https://semver.org/).
 
+## 0.9.1 — 2026-09-11
+
+Security: the Windows Job Object executor no longer overstates containment. Unchecked Win32 return values could let a failed termination pass silently; the kill is now verified and fails closed when it cannot be confirmed.
+
+### Fixed
+
+- **A failed `TerminateJobObject` is no longer ignored.** A raw ctypes call does not raise
+  when a Win32 `BOOL` returns false, so the old `try/except OSError` around
+  `TerminateJobObject` never fired — a failed termination was silent, and the host could
+  report a clean kill it had not achieved. The Win32 return values are now checked
+  explicitly (`TerminateJobObject`, `CloseHandle`, `ResumeThread`), and the isolated
+  executor **verifies** termination: after the deadline kill it waits for the tree to
+  exit, and if the kill cannot be issued or the process outlives the wait it raises
+  `ToolExecutionError("isolated tool process tree could not be confirmed terminated")`
+  instead of a clean `ToolKilledError`. The post-kill wait is no longer swallowed.
+- **`ResumeThread` failure now fails the launch closed.** A `(DWORD)-1` return is no longer
+  miscounted as a successful resume, so a worker that could not be resumed is reaped and
+  the launch fails closed instead of proceeding.
+- **No job-handle leak on a configuration failure.** If `SetInformationJobObject` fails,
+  the newly created job handle is closed before raising. Launch-failure cleanup
+  (`AssignProcessToJobObject` / resume failures) is best-effort so a secondary Win32 error
+  cannot mask the primary one.
+- `Thread32First` / `Thread32Next` argument and return types are declared explicitly, like
+  the other Win32 bindings.
+
+### Added
+
+- Failure-injection tests: a kill that cannot be confirmed fails closed (cross-platform);
+  and on Windows, an injected `ResumeThread` failure and an injected
+  `AssignProcessToJobObject` failure each fail the launch closed rather than running an
+  unmanaged worker.
+
 ## 0.9.0 — 2026-09-11
 
 Feature: real cross-platform process-tree hard-kill. The isolated-tool executor now enforces the same "kill the worker and every descendant at the deadline" guarantee on Windows (via Job Objects) that it already had on POSIX (process groups), so Windows is no longer a weaker execution mode.

@@ -55,10 +55,16 @@ def _kernel32():
     k.CloseHandle.argtypes = [wintypes.HANDLE]
     k.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
     k.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    k.Thread32First.restype = wintypes.BOOL
+    k.Thread32First.argtypes = [wintypes.HANDLE, wintypes.LPVOID]
+    k.Thread32Next.restype = wintypes.BOOL
+    k.Thread32Next.argtypes = [wintypes.HANDLE, wintypes.LPVOID]
     k.OpenThread.restype = wintypes.HANDLE
     k.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     k.ResumeThread.restype = wintypes.DWORD
     k.ResumeThread.argtypes = [wintypes.HANDLE]
+    k.TerminateJobObject.restype = wintypes.BOOL
+    k.CloseHandle.restype = wintypes.BOOL
     _k32 = k
     return _k32
 
@@ -118,13 +124,18 @@ def create_kill_on_close_job() -> int:
     k = _kernel32()
     extended, _ = _structs()
     handle = _check(k.CreateJobObjectW(None, None), "CreateJobObjectW")
-    info = extended()
-    info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-    _check(
-        k.SetInformationJobObject(handle, _JobObjectExtendedLimitInformation,
-                                  ctypes.byref(info), ctypes.sizeof(info)),
-        "SetInformationJobObject",
-    )
+    try:
+        info = extended()
+        info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        _check(
+            k.SetInformationJobObject(handle, _JobObjectExtendedLimitInformation,
+                                      ctypes.byref(info), ctypes.sizeof(info)),
+            "SetInformationJobObject",
+        )
+    except OSError:
+        # Do not leak the job handle if configuring the kill-on-close limit failed.
+        k.CloseHandle(handle)
+        raise
     return handle
 
 
@@ -149,9 +160,14 @@ def resume_process_main_thread(pid: int) -> int:
             if entry.th32OwnerProcessID == pid:
                 thread = k.OpenThread(_THREAD_SUSPEND_RESUME, False, entry.th32ThreadID)
                 if thread:
-                    k.ResumeThread(thread)
-                    k.CloseHandle(thread)
-                    resumed += 1
+                    try:
+                        # ResumeThread returns (DWORD)-1 on failure; count only a real
+                        # resume so a failed one leaves resumed==0 and the caller fails
+                        # closed (kills the suspended worker) instead of running it.
+                        if k.ResumeThread(thread) != 0xFFFFFFFF:
+                            resumed += 1
+                    finally:
+                        k.CloseHandle(thread)
             ok = k.Thread32Next(snapshot, ctypes.byref(entry))
     finally:
         k.CloseHandle(snapshot)
@@ -159,12 +175,14 @@ def resume_process_main_thread(pid: int) -> int:
 
 
 def terminate_job(job_handle: int, exit_code: int = 1) -> None:
-    k = _kernel32()
-    try:
-        k.TerminateJobObject(job_handle, exit_code)
-    except OSError:
-        pass
+    # A raw ctypes call does NOT raise when a Win32 BOOL returns false, so the return
+    # value must be checked explicitly -- otherwise a failed TerminateJobObject is
+    # silent and the caller could claim a kill that never happened. Raise on failure so
+    # the caller (which then waits to confirm exit) treats it as an unconfirmed kill.
+    _check(_kernel32().TerminateJobObject(job_handle, exit_code), "TerminateJobObject")
 
 
 def close_handle(job_handle: int) -> None:
-    _kernel32().CloseHandle(job_handle)
+    # Checked because closing the last job handle is the KILL_ON_JOB_CLOSE fallback:
+    # a false return means the handle did not close and the fallback did not fire.
+    _check(_kernel32().CloseHandle(job_handle), "CloseHandle")
