@@ -487,5 +487,49 @@ class AdditionalArgumentsEmissionTest(unittest.TestCase):
         self.assertTrue(accepts(merged, {"amount": 1}), "the declared argument is still accepted")
 
 
+class ManifestNameFilterTest(unittest.TestCase):
+    """The manifest is a pure name filter (`allow`), never a source of argument policy.
+
+    `effective_permit` used to fold the manifest in as bare `ToolGrant(name)` grants
+    with empty constraints. An empty grant reads as an argument passthrough, so the
+    manifest's role ("this tool may exist") was carried by the same shape that means
+    "any argument is allowed". Passing the manifest as `intersect_grants(..., allow=)`
+    keeps the two apart: `allow` decides membership only, and the argument policy comes
+    entirely from the permit and host grants.
+    """
+
+    def test_allow_filters_membership_only(self):
+        left = (ToolGrant(TOOL, {"max_amount": 5}),)
+        right = (ToolGrant(TOOL, {"max_amount": 5}),)
+        # In the allow-set: kept. Absent, or the set names a different tool: dropped.
+        self.assertEqual(len(intersect_grants(left, right, allow=frozenset({TOOL}))), 1)
+        self.assertEqual(intersect_grants(left, right, allow=frozenset()), ())
+        self.assertEqual(intersect_grants(left, right, allow=frozenset({"other.tool"})), ())
+
+    def test_allow_never_alters_constraints(self):
+        # The surviving grant's constraints are identical with and without the filter:
+        # the manifest name adds a name to the whitelist, never an argument permission.
+        constraints = {"arguments": {"amount": {"type": "number"}}}
+        left = (ToolGrant(TOOL, constraints),)
+        right = (ToolGrant(TOOL, constraints),)
+        with_allow = intersect_grants(left, right, allow=frozenset({TOOL}))
+        without_allow = intersect_grants(left, right)
+        self.assertEqual(with_allow[0].constraints, without_allow[0].constraints)
+
+    def test_a_name_in_allow_cannot_widen_arguments(self):
+        # A tool bounded to `amount` by both grants stays bounded once its name passes
+        # the allow filter: an undeclared field is still rejected (deny-by-default).
+        # The manifest naming the tool does not re-open its argument set.
+        constraints = {"arguments": {"amount": {"type": "number"}}}
+        merged = intersect_grants(
+            (ToolGrant(TOOL, constraints),),
+            (ToolGrant(TOOL, constraints),),
+            allow=frozenset({TOOL}),
+        )
+        self.assertEqual(len(merged), 1)
+        self.assertTrue(accepts(merged[0].constraints, {"amount": 5}))
+        self.assertFalse(accepts(merged[0].constraints, {"amount": 5, "recipient": "x"}))
+
+
 if __name__ == "__main__":
     unittest.main()

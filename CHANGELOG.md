@@ -2,6 +2,26 @@
 
 All notable changes to Portmark are recorded here. Versions follow [semantic versioning](https://semver.org/).
 
+## 0.7.4 — 2026-09-11
+
+Structural: the manifest is now a pure name filter in the permit intersection, separated from argument-constraint merging. No behavior change.
+
+### Changed
+
+- **`effective_permit` no longer folds the manifest in as empty-constraint grants.**
+  It built each requested tool as a bare `ToolGrant(name)` with `{}` constraints and
+  intersected those alongside the permit and policy grants. An empty grant reads as an
+  argument *passthrough*, so the manifest's role ("this tool may exist") travelled on
+  the same shape that means "any argument is allowed" — conflating name-filtering with
+  constraint-intersection. The manifest is now passed as a name filter
+  (`intersect_grants(..., allow=frozenset(requested_tools))`); argument policy comes
+  entirely from the permit and host grants. This matches what `explain_missing_grant`
+  already assumed, and is **behavior-preserving** — the full suite is unchanged, and a
+  new `ManifestNameFilterTest` pins that the `allow` filter changes membership only,
+  never a grant's constraints. It also isolates every empty grant in the intersection
+  to a permit or policy origin, the precondition for a future deny-by-default default
+  on bare policy/permit grants (see EXTERNAL_VALIDATION.md).
+
 ## 0.7.3 — 2026-09-11
 
 Consistency: the checkpoint output ceiling is now the host minimum, and a dead size guard is removed. Both surfaced during the EV-010 review.

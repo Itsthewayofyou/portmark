@@ -121,9 +121,11 @@ thereby turns the set of argument **names** into a whitelist: only the names it
 mentions may reach the tool, and an unknown field (a `recipient` slipped in by a
 prompt injection) is rejected — no `additional_arguments: false` needed. Set
 `additional_arguments: true` to opt a grant back out and admit any name. A grant
-that constrains *nothing* is a pure capability grant — the shape the manifest
-produces from a bare tool name — and passes arguments through, so it never bounds
-the intersection. When names are bounded, they are intersected first and every
+that constrains *nothing* is a pure capability grant and passes arguments through,
+so it never bounds the intersection. (The manifest's requested tools are a name
+filter, not grants of this shape: they gate which tool names may run without
+contributing any argument policy, so every empty grant in the intersection comes
+from a permit or the host policy.) When names are bounded, they are intersected first and every
 key is gated on the result; a constraint naming an argument the other side would
 have refused drops the grant, because every flat constraint also requires its
 argument to be present, and the combination is then unsatisfiable.

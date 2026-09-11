@@ -945,7 +945,19 @@ def _merge_additional_arguments(left: dict[str, Any], right: dict[str, Any]) -> 
     return (left_open and right_open), None
 
 
-def intersect_grants(*grant_sets: tuple[ToolGrant, ...]) -> tuple[ToolGrant, ...]:
+def intersect_grants(*grant_sets: tuple[ToolGrant, ...], allow: frozenset[str] | None = None) -> tuple[ToolGrant, ...]:
+    """Intersect constraint-bearing grant sets, optionally filtered to `allow` names.
+
+    `allow` is a pure name filter (the manifest's role): a tool survives only if it
+    appears in every grant set AND in `allow`. It is kept separate from the grant
+    sets on purpose. A grant's argument-name policy is derived from its own keys, so
+    a bare `ToolGrant(name)` with empty constraints does not merely name a tool — it
+    reads as an argument passthrough and would flow into the merge as one. Passing the
+    manifest as `allow` instead of as a set of empty grants keeps name-filtering and
+    constraint-intersection from being conflated, which is what lets a policy or permit
+    later choose deny-by-default for its own bare grants without the manifest's bare
+    names being caught by it.
+    """
     if not grant_sets:
         return ()
     current = {grant.name: grant for grant in grant_sets[0]}
@@ -961,6 +973,8 @@ def intersect_grants(*grant_sets: tuple[ToolGrant, ...]) -> tuple[ToolGrant, ...
                     _projection_intersection(current[name].output_projection, incoming[name].output_projection),
                 )
         current = next_current
+    if allow is not None:
+        current = {name: grant for name, grant in current.items() if name in allow}
     return tuple(current[name] for name in sorted(current))
 
 
@@ -1042,7 +1056,14 @@ class HostPolicy:
             raise SecurityError("permit is not intended for this host")
         if permit.expires_at <= current_time:
             raise SecurityError("permit has expired")
-        requested = tuple(ToolGrant(name) for name in manifest.requested_tools)
+        # The manifest is a pure name filter, not a set of empty-constraint grants.
+        # A bare ToolGrant(name) reads as an argument passthrough (its empty
+        # constraints declare no argument policy), so folding it into the merge
+        # conflates "this tool may exist" with "any argument is allowed". Passed as
+        # `allow`, it only gates names -- matching what explain_missing_grant already
+        # assumes, and leaving every empty grant in the merge to come from a policy or
+        # permit, never the manifest.
+        allowed_names = frozenset(manifest.requested_tools)
         # Finding #1: an omitted host-policy output_projection parses to None, and
         # _projection_intersection treats None as "defer to the other side", so an
         # incoming permit granting ["*"] could widen the effective projection to
@@ -1057,7 +1078,7 @@ class HostPolicy:
             else ToolGrant(grant.name, grant.constraints, ())
             for grant in self.grants
         )
-        grants = intersect_grants(requested, permit.grants, policy_grants)
+        grants = intersect_grants(permit.grants, policy_grants, allow=allowed_names)
         return Permit(
             issuer=permit.issuer,
             subject=permit.subject,
