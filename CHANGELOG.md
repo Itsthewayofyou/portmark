@@ -2,7 +2,33 @@
 
 All notable changes to Portmark are recorded here. Versions follow [semantic versioning](https://semver.org/).
 
-## 0.8.4 — 2026-09-11
+## 0.8.5 — 2026-09-11
+
+Security: tool-output projection is now enforced at the host boundary for every provider, not just remote adapters (Codex audit finding #4).
+
+### Fixed
+
+- **A grant's `output_projection` is now enforced for in-process providers too.**
+  Projection was applied only on the adapter path (`provider_state` / projected
+  messages), so an in-process provider that read `state.memory["tool_results"]`
+  directly saw the full, un-projected tool result — including fields the grant
+  deliberately withheld (the demo `catalog.search` grant declares `id, title`, but the
+  raw result also carried `score`; an `http.fetch` grant that declared
+  `url, status, content_type` still leaked the response `body`). The host now builds a
+  projected copy of the state — reducing `memory["tool_results"]` and messages to each
+  effective grant's `output_projection` — and passes that to `provider.decide`, so no
+  provider sees more than the policy granted. The host keeps the full result in its own
+  durable state; only the provider's view is reduced. Host policy remains the ceiling:
+  an omitted policy projection shares nothing.
+
+### Note for provider authors
+
+- The projected `tool_results` keeps each tool's **key** with a reduced value, so a
+  `"tool" not in results` guard still fires exactly once. A value projected to `{}`/`[]`
+  is falsy, though — test key **presence**, not truthiness, or a `if not
+  results.get("tool")` re-proposal guard can loop. See TOOLS.md.
+
+
 
 Security: an oversized *migration* close now terminalizes the source instead of stranding it, extending the 0.8.1 terminalization guarantee to migration (Codex audit finding #1, migration case).
 

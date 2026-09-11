@@ -1221,7 +1221,13 @@ class RuntimeTests(unittest.TestCase):
 
         self.assertEqual(result.status, "completed")
         self.assertEqual(result.result["fetch"]["status"], 200)
-        self.assertEqual(result.result["fetch"]["body"], "hello")
+        # Finding #4: the policy grants output_projection ["url", "status",
+        # "content_type"] and deliberately WITHHOLDS "body". The in-process fetch
+        # provider used to read the un-projected result from memory and leak the body;
+        # host-enforced projection now feeds it only the granted fields, so the body it
+        # completes with is gone.
+        self.assertNotIn("body", result.result["fetch"])
+        self.assertEqual(result.result["fetch"]["url"], "https://allowed.example/resource")
         self.assertEqual(response.read_size, http_fetch.MAX_RESPONSE_BYTES + 1)
         self.assertEqual(opened.call_count, 1)
 
@@ -1611,6 +1617,38 @@ class RuntimeTests(unittest.TestCase):
             self.assertIn("checkpoint.terminalized", [event["event"] for event in result.audit])
             self.assertTrue(store.verify_audit_chain(result.task_id))
 
+    def test_host_enforced_projection_hides_undeclared_fields_from_in_process_provider(self):
+        # Finding #4: a grant's output_projection is enforced at the host boundary, so
+        # an in-process provider that reads state.memory["tool_results"] directly sees
+        # only the declared fields. The demo policy grants catalog.search (id, title),
+        # so `score` (returned by the tool) must never reach the provider -- while the
+        # host keeps the full result, score included, in its own durable state.
+        seen: dict[str, Any] = {}
+
+        class RecordingProvider(ModelProvider):
+            def decide(self, state, available_tools, grants=()):
+                results = state.memory.get("tool_results", {})
+                if "catalog.search" not in results:
+                    return ProviderDecision("tool", "catalog.search", {"query": state.goal, "limit": 2})
+                seen["view"] = results["catalog.search"]
+                return ProviderDecision("complete", content={"evidence": results["catalog.search"]})
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            host = make_host(store=store)  # demo policy: catalog.search -> (id, title)
+            host.providers["recorder"] = RecordingProvider()
+            envelope = make_demo_envelope(host, "search", "recorder")
+            host.signer.seal(envelope)
+            result = host.run(envelope)
+            self.assertEqual(result.status, "completed")
+            # The provider saw only the declared fields -- no score.
+            self.assertTrue(seen["view"])
+            for item in seen["view"]:
+                self.assertEqual(set(item), {"id", "title"})
+            # The host's own durable state still holds the full result, score included.
+            stored = store.load_checkpoint(result.task_id)["memory"]["tool_results"]["catalog.search"]
+            self.assertTrue(any("score" in item for item in stored))
+
     def test_checkpoint_ceiling_is_the_host_minimum_not_the_permit(self):
         # F1: the checkpoint size ceiling must be effective.budget = min(permit, host),
         # not the visitor's permit alone -- "budgets take the minimum", and a migration
@@ -1712,7 +1750,13 @@ class RuntimeTests(unittest.TestCase):
         authority = ApprovalAuthority.generate()
         policy = HostPolicy(
             "host:local-demo",
-            (ToolGrant("payments.reserve", {"max_amount": 100, "currency": "USD"}),),
+            # Finding #4: the host policy is the projection ceiling and an omitted
+            # projection shares nothing, so a policy that wants the provider to confirm
+            # the reservation must DECLARE the field it exposes -- here just "reserved"
+            # (least privilege; amount/currency stay withheld). Host-enforced projection
+            # then feeds the provider exactly that field, whether it reads memory or
+            # messages.
+            (ToolGrant("payments.reserve", {"max_amount": 100, "currency": "USD"}, ("reserved",)),),
             ResourceBudget(),
             "policy-v1",
             "policy-hash",

@@ -8,6 +8,7 @@ from typing import Any
 
 from .metrics import RuntimeMetrics
 from .models import AgentEnvelope, ApprovalToken, AttestationEvidence, ProviderDecision, RunResult
+from .projection import project_state_for_provider
 from .providers import ModelProvider
 from .security import AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, SecurityError, arguments_hash, audit_head_payload, canonical_json
 from .storage import InMemoryRuntimeStore, RuntimeStore
@@ -142,8 +143,14 @@ class AgentHost:
 
         while state.step < effective.budget.max_steps:
             decision_started = time.monotonic()
+            # Finding #4: hand the provider a host-projected copy of the state, so tool
+            # outputs are reduced to each grant's output_projection before any provider
+            # -- in-process or a remote adapter -- can read them. Projection is enforced
+            # here, not trusted to the adapter. The provider only reads the state to
+            # decide; the host mutates the real state via _apply_decision below.
+            projected_state = project_state_for_provider(state, effective.grants)
             try:
-                decision = provider.decide(state, tool_names, effective.grants)
+                decision = provider.decide(projected_state, tool_names, effective.grants)
             finally:
                 self.metrics.observe_duration("provider_decision_duration_seconds", time.monotonic() - decision_started)
             self.metrics.increment("provider.decisions")
