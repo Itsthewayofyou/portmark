@@ -156,23 +156,34 @@ the host's error names the key that failed to combine.
 
 ## Output Projection
 
-Tool return values are stored in the local checkpoint, but remote providers do
-not automatically receive that full checkpoint. Provider context is built from
-projected tool messages:
+Tool return values are stored in the full local checkpoint, but the host applies
+the grant's `output_projection` before the state reaches **any** provider — a
+remote adapter and an in-process provider alike. A provider reading
+`state.memory["tool_results"]` therefore sees only the projected fields, never
+the full stored result:
 
 - omit `output_projection`, or set it to `[]`, to share no tool output
 - use field names such as `["id", "title"]` for dict outputs or lists of dicts
 - use `["*"]` only when the full output is acceptable provider input
 
 Projection is configured in host policy because the operator, not the agent,
-owns the data-sharing decision.
+owns the data-sharing decision. Host policy is the ceiling: a policy grant that
+omits `output_projection` shares nothing, regardless of what the permit requests.
+
+**Provider authors:** the projected `tool_results` keeps each tool's key with a
+reduced value, so `"tool" not in results` remains a correct "have I run this yet"
+check. But a value projected to `{}` (or `[]`) is *falsy* — test key **presence**,
+not truthiness, or a re-proposal guard like `if not results.get("tool")` can loop.
 
 ## Isolated Tools (Hard-Kill Executor)
 
 By default a tool runs in-process on a worker thread. That path cannot cancel a
 tool once it has started: if the deadline fires, the host records failure but the
-thread keeps running. For untrusted tools, or any tool with a side effect,
-register it isolated instead:
+thread keeps running. To keep such leaked threads bounded, `ToolRegistry` caps how
+many thread-path executions may be in flight at once (`max_inflight_threaded`,
+default 64); beyond the cap a tool invocation fails closed. For untrusted tools,
+any tool with a side effect, or any tool that may run long, register it isolated
+instead:
 
 ```python
 tools.register_isolated(

@@ -2,6 +2,157 @@
 
 All notable changes to Portmark are recorded here. Versions follow [semantic versioning](https://semver.org/).
 
+## 0.8.7 — 2026-09-11
+
+Hardening: the thread-timeout tool path now caps in-flight executions so a timed-out tool cannot leak unbounded threads (Codex audit finding #5).
+
+### Fixed
+
+- **A timed-out thread-path tool can no longer leak unbounded daemon threads.** The
+  thread + queue-timeout path cannot cancel a tool once it starts, so a tool that exceeds
+  its deadline leaves its daemon thread running. `ToolRegistry` now holds a bounded
+  semaphore (`max_inflight_threaded`, default 64): a slot is acquired before the worker
+  thread starts and released only when that thread actually finishes — so a leaked,
+  timed-out thread keeps its slot. Once the cap fills with leaked threads, a new
+  invocation fails closed with a clear error instead of spawning another leak. The error
+  points operators at `register_isolated`, whose process-based executor the host *can*
+  hard-kill; long-running or side-effecting tools belong there.
+
+
+
+Fixed: the native Wasmtime provider now starts on Windows (Codex audit finding #6).
+
+### Fixed
+
+- **Native Wasmtime no longer fails to start on Windows.** The provider launched its
+  child Python (which imports the arch-specific `wasmtime` wheel) with `env={"PYTHONPATH":
+  ...}` only, stripping `SYSTEMROOT`, `PATH`, and the Windows process/arch variables the C
+  runtime and the wheel read at import — so the child could not start. The subprocess now
+  inherits a fixed allowlist of non-secret OS variables (the tool runner's
+  `PYTHONPATH`/`PATH`/locale/`SYSTEMROOT` set plus `SYSTEMDRIVE`, `WINDIR`,
+  `PROCESSOR_ARCHITECTURE`/`PROCESSOR_ARCHITEW6432`, `COMSPEC`, `PATHEXT`,
+  `NUMBER_OF_PROCESSORS`, `TEMP`/`TMP`), forwarded only when present. No credential-shaped
+  variable is forwarded, so the trust boundary is unchanged.
+
+
+
+Security: tool-output projection is now enforced at the host boundary for every provider, not just remote adapters (Codex audit finding #4).
+
+### Fixed
+
+- **A grant's `output_projection` is now enforced for in-process providers too.**
+  Projection was applied only on the adapter path (`provider_state` / projected
+  messages), so an in-process provider that read `state.memory["tool_results"]`
+  directly saw the full, un-projected tool result — including fields the grant
+  deliberately withheld (the demo `catalog.search` grant declares `id, title`, but the
+  raw result also carried `score`; an `http.fetch` grant that declared
+  `url, status, content_type` still leaked the response `body`). The host now builds a
+  projected copy of the state — reducing `memory["tool_results"]` and messages to each
+  effective grant's `output_projection` — and passes that to `provider.decide`, so no
+  provider sees more than the policy granted. The host keeps the full result in its own
+  durable state; only the provider's view is reduced. Host policy remains the ceiling:
+  an omitted policy projection shares nothing.
+
+### Note for provider authors
+
+- The projected `tool_results` keeps each tool's **key** with a reduced value, so a
+  `"tool" not in results` guard still fires exactly once. A value projected to `{}`/`[]`
+  is falsy, though — test key **presence**, not truthiness, or a `if not
+  results.get("tool")` re-proposal guard can loop. See TOOLS.md.
+
+
+
+Security: an oversized *migration* close now terminalizes the source instead of stranding it, extending the 0.8.1 terminalization guarantee to migration (Codex audit finding #1, migration case).
+
+### Fixed
+
+- **An oversized migration-close no longer strands the source as resumable.** 0.8.1
+  bounded every *terminal* (completed/failed) over-budget persist, but a `migrate` closes
+  the source with `status="ready"` — neither `completed`/`failed` nor a tool step — so it
+  fell through to a raising `_persist`. When the source-close checkpoint (goal + the
+  migration memory + the destination result) tipped over the budget, `run()` raised and
+  left the source checkpoint `status="running"` and resumable **while a sealed migrated
+  envelope already existed** — the source could resume *and* the destination run the same
+  work (double effect). The terminalization trigger now fires on any closed persist
+  (`tool_ran or closed`), so an over-budget migrate-close drops the source's now-redundant
+  working state (it moved to the already-snapshotted migrated envelope) and lands a closed
+  source checkpoint with a `checkpoint.terminalized` audit event; the migrated envelope is
+  still returned. `await_input` remains excluded by design: it is an *open* checkpoint, and
+  approval gates *before* the tool runs, so an oversized suspend is a liveness bug, not a
+  double-effect one.
+
+
+
+Security: non-finite numbers (`NaN`/`Infinity`) and booleans can no longer slip past numeric limits, JSON is now strict, and un-encodable provider content fails cleanly instead of stranding a running task (Codex audit findings #2 and #7).
+
+### Fixed
+
+- **`NaN`/`Infinity` and booleans no longer bypass numeric limits.** Every comparison
+  with `NaN` is false, so a `NaN` argument sailed through `actual > max` and `value <
+  min` / `value > max`; a `bool` is an `int` subclass, so `True` was silently treated as
+  `1`. Both the legacy `max_<arg>` path and the schema `minimum`/`maximum` path now
+  require a real *finite* number (`math.isfinite`, `bool` excluded) on the value **and**
+  the constraint — a non-finite policy bound fails closed as a misconfiguration.
+- **`canonical_json` is now strict (`allow_nan=False`).** `NaN`/`Infinity` are not valid
+  JSON; emitting them broke round-tripping through a strict parser (and therefore the
+  hash-chained audit) and let non-finite values through the limits above. They now raise.
+- **Un-encodable provider content fails cleanly instead of stranding the task.** With
+  strict JSON, a provider that completes/suspends/fails with `NaN` (or a reference cycle,
+  or an unserializable object) would raise inside `_persist` — leaving the prior
+  checkpoint `status="running"` and resumable, the exact class 0.8.1 eliminated for
+  over-budget persists. The host now checks encodability at the `_apply_decision`
+  boundary and, on failure, lands a small bounded terminal failure with a
+  `content.rejected` audit event. In-process tool output is already rejected at the tool
+  boundary (`_checked_output` now raises on non-finite output); the host check is
+  defense in depth for any path that bypasses it.
+
+
+
+Security: fresh-task admission no longer trusts caller-supplied budget counters, closing a budget bypass via negative starting counters (Codex audit finding #3).
+
+### Fixed
+
+- **A fresh task can no longer be admitted with a negative (or `bool`/`float`) step or
+  tool-call counter.** Budget accounting (`max_steps` / `max_tool_calls`) trusted the
+  `step` and `tool_calls` on the incoming state, so a fresh envelope that started at
+  `tool_calls=-3` under a 1-call budget executed the tool four times (`-3, -2, -1, 0`)
+  before the counter climbed to the limit. Admission now rejects a non-nonnegative-`int`
+  counter at the door — before the loop runs a single tool call and before anything
+  durable is written. Only the counter's type and sign are constrained: a fresh
+  admission legitimately carries *positive* counters (a suspended `awaiting_input`
+  envelope resumes by presenting its own signed wire state; a migration arrives with the
+  source run's counters). On a **local resume** the exact `step`/`tool_calls` are now
+  re-bound from the durable checkpoint, so a captured resume envelope cannot under-report
+  consumed budget to win extra calls. `state.memory` stays caller-visible on resume by
+  design — approval input is injected there and is already treated as untrusted wire
+  state (approvals are consumed via a namespaced store nonce, EV-005).
+
+
+
+Security: every post-admission terminal-checkpoint persist is now bounded, generalizing the EV-010 fix so a killed side-effecting tool near the ceiling can no longer leave a resumable checkpoint.
+
+### Fixed
+
+- **A terminal failure near the output-budget ceiling no longer leaves a resumable
+  checkpoint.** The 0.7.2 EV-010 handling only collapsed the checkpoint when a tool
+  had *succeeded* (`tool_calls` incremented). A tool exception, a hard
+  `ToolKilledError`, step-exhaustion, or an oversized completion does **not**
+  increment `tool_calls`, so when the small terminal-failure state tipped a
+  near-ceiling checkpoint over the budget, `_persist` raised out of `run()` and the
+  durable checkpoint stayed `status="running"` — resumable. For a **killed
+  side-effecting tool** that meant the effect may have landed *and* the provider
+  could re-propose it on resume. Every closed (terminal) persist that would exceed
+  the budget is now collapsed to a bounded terminal tombstone (memory and messages
+  dropped; result kept when it fits, else nulled) that is provably ≤ the admitted
+  checkpoint, so it always lands `closed`. The cause survives in the audit chain —
+  `tool.killed` with `effect_status: "unknown"` is preserved — and a new
+  `checkpoint.terminalized` event records that working state was dropped under budget
+  pressure. `await_input` and `migrate` are deliberately excluded: an open or
+  relocating checkpoint cannot be shrunk without losing resume state, so those still
+  raise. Admission itself is unchanged — a fresh task whose first checkpoint already
+  exceeds the budget still raises and commits nothing (nothing to resume). See
+  EXTERNAL_VALIDATION.md (EV-011).
+
 ## 0.8.0 — 2026-09-11
 
 Security: a host-policy grant that constrains no argument now denies unnamed arguments by default (B-lite). **Breaking** behavioral change. Builds on the 0.7.4 name-filter separation.

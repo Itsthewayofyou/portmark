@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import secrets
 import subprocess  # nosec B404
 import tempfile
@@ -70,7 +71,20 @@ def audit_head_payload(task_id: str, host_id: str, head_hash: str, sequence: int
 
 
 def canonical_json(value: Any) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    # allow_nan=False: NaN/Infinity are not valid JSON and, if emitted, would not
+    # round-trip through a strict parser or survive re-canonicalization -- breaking
+    # the hash-chained audit and letting non-finite values slip past numeric limits
+    # (Codex audit finding #2). A non-finite value now raises ValueError here; the
+    # host boundary (host._apply_decision) rejects provider/tool content that cannot
+    # be encoded, so this never strands a running task.
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()
+
+
+def _finite_number(value: Any) -> bool:
+    # A real, comparable number for a numeric limit: a bool is an int subclass
+    # (True == 1) and NaN/Infinity defeat every `<`/`>` bound (all comparisons with
+    # NaN are False), so exclude both. Finding #2.
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 def _b64url_encode(value: bytes) -> str:
@@ -1319,7 +1333,11 @@ def check_constraints(constraints: dict[str, Any], arguments: dict[str, Any]) ->
         if name.startswith("max_"):
             argument = name[4:]
             actual = arguments.get(argument)
-            if actual is None or not isinstance(actual, (int, float)) or actual > expected:
+            # Finding #2: a NaN argument defeats `actual > expected` (NaN comparisons
+            # are all False) and a bool is silently treated as 0/1, so both slipped
+            # past this ceiling. Require a real finite number on both sides; a
+            # non-finite policy limit is a misconfiguration and fails closed.
+            if not _finite_number(actual) or not _finite_number(expected) or actual > expected:
                 raise SecurityError(f"argument {argument!r} exceeds its permitted maximum")
         elif name.startswith("allowed_"):
             # `expected` must be a collection. A scalar string would make `in` a
@@ -1417,14 +1435,17 @@ def _check_argument_schema(name: str, value: Any, spec: dict[str, Any]) -> None:
         if value not in enum:
             raise SecurityError(f"argument {name!r} is outside its allowed set")
     if "minimum" in spec:
-        if not isinstance(spec["minimum"], (int, float)) or isinstance(spec["minimum"], bool):
+        # Finding #2: a NaN value defeats `value < minimum` (all NaN comparisons are
+        # False), so a finite check on the value -- not just int/float/non-bool -- is
+        # what actually enforces the bound. The constraint itself must also be finite.
+        if not _finite_number(spec["minimum"]):
             raise SecurityError(f"argument {name!r} minimum constraint must be numeric")
-        if not isinstance(value, (int, float)) or isinstance(value, bool) or value < spec["minimum"]:
+        if not _finite_number(value) or value < spec["minimum"]:
             raise SecurityError(f"argument {name!r} is below its permitted minimum")
     if "maximum" in spec:
-        if not isinstance(spec["maximum"], (int, float)) or isinstance(spec["maximum"], bool):
+        if not _finite_number(spec["maximum"]):
             raise SecurityError(f"argument {name!r} maximum constraint must be numeric")
-        if not isinstance(value, (int, float)) or isinstance(value, bool) or value > spec["maximum"]:
+        if not _finite_number(value) or value > spec["maximum"]:
             raise SecurityError(f"argument {name!r} exceeds its permitted maximum")
     if "min_length" in spec:
         if not isinstance(spec["min_length"], int) or isinstance(spec["min_length"], bool) or spec["min_length"] < 0:

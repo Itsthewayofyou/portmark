@@ -21,6 +21,7 @@ from portmark.security import (
     TrustedIdentity,
     TrustRegistry,
     audit_head_payload,
+    canonical_json,
     check_constraints,
     load_trust_registry,
     validate_constraints,
@@ -292,11 +293,34 @@ class SecurityGuardTests(unittest.TestCase):
             ({"arguments": {"url": {"allowed_schemes": ["https"]}}}, {"url": "http://example.com"}, "argument 'url' URL scheme is outside its allowed set"),
             ({"arguments": {"url": {"allowed_domains": ["example.com"]}}}, {"url": "https://notexample.com"}, "argument 'url' domain is outside its allowed set"),
             ({"arguments": {"url": {"scheme": "https"}}}, {"url": 1}, "argument 'url' URL must be a string"),
+            # Finding #2: NaN/Infinity defeat every `<`/`>` bound (all NaN comparisons
+            # are False) and a bool is silently treated as 0/1, so both slipped past
+            # numeric limits. Now rejected on both the legacy max_ path and the schema
+            # minimum/maximum path.
+            ({"max_amount": 20}, {"amount": float("nan")}, "argument 'amount' exceeds its permitted maximum"),
+            ({"max_amount": 20}, {"amount": float("inf")}, "argument 'amount' exceeds its permitted maximum"),
+            ({"max_amount": 20}, {"amount": True}, "argument 'amount' exceeds its permitted maximum"),
+            ({"arguments": {"count": {"maximum": 5}}}, {"count": float("nan")}, "argument 'count' exceeds its permitted maximum"),
+            ({"arguments": {"count": {"minimum": 1}}}, {"count": float("nan")}, "argument 'count' is below its permitted minimum"),
+            ({"arguments": {"count": {"maximum": 5}}}, {"count": True}, "argument 'count' exceeds its permitted maximum"),
+            # A non-finite numeric *constraint* is a policy misconfiguration -> fail closed.
+            ({"arguments": {"count": {"maximum": float("inf")}}}, {"count": 3}, "argument 'count' maximum constraint must be numeric"),
         ]
         for constraints, arguments, message in cases:
             with self.subTest(message=message):
                 with self.assertRaisesRegex(SecurityError, message):
                     check_constraints(constraints, arguments)
+
+    def test_canonical_json_rejects_non_finite_floats(self):
+        # Finding #2: NaN/Infinity are not valid JSON. If canonical_json emitted them
+        # they would not round-trip through a strict parser, breaking the hash-chained
+        # audit and letting non-finite values through numeric limits. They must raise.
+        for bad in (float("nan"), float("inf"), -float("inf")):
+            with self.subTest(value=bad):
+                with self.assertRaises(ValueError):
+                    canonical_json({"x": bad})
+        # A finite payload still encodes.
+        self.assertEqual(canonical_json({"x": 1}), b'{"x":1}')
 
     def test_attestation_evidence_guards_are_table_driven(self):
         authority = AttestationAuthority.generate()

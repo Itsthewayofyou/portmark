@@ -30,6 +30,12 @@ _RESPONSE_ENVELOPE_SLACK = 65_536
 # for the worker to import portmark and the tool module at all.
 _INHERITED_ENV_KEYS = ("PYTHONPATH", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "SYSTEMROOT")
 
+# Finding #5: the thread-timeout path cannot cancel a tool, so a timed-out tool leaks a
+# running daemon thread. Cap how many thread-path executions may be in flight at once so
+# leaked threads cannot accumulate without bound; beyond the cap a tool invocation fails
+# closed. Long or side-effecting tools belong on the isolated (hard-killable) path.
+DEFAULT_MAX_INFLIGHT_THREADED_TOOLS = 64
+
 # The isolated executor's hard-kill guarantee rests on two things being true
 # together: the worker became its own session leader (start_new_session) and the
 # platform can signal a whole process group (os.killpg). On Windows both are
@@ -61,7 +67,12 @@ class _IsolatedSpec:
 
 
 class ToolRegistry:
-    def __init__(self, default_timeout: float = 5.0, max_output_bytes: int = 65_536) -> None:
+    def __init__(
+        self,
+        default_timeout: float = 5.0,
+        max_output_bytes: int = 65_536,
+        max_inflight_threaded: int = DEFAULT_MAX_INFLIGHT_THREADED_TOOLS,
+    ) -> None:
         self._tools: dict[str, Tool] = {}
         self._isolated: dict[str, _IsolatedSpec] = {}
         self._timeouts: dict[str, float] = {}
@@ -69,6 +80,14 @@ class ToolRegistry:
         self._side_effecting: set[str] = set()
         self.default_timeout = default_timeout
         self.max_output_bytes = max_output_bytes
+        # Finding #5: the thread-timeout path cannot cancel a tool once it starts, so a
+        # tool that exceeds its deadline leaves its daemon thread running. This bounded
+        # semaphore caps how many such executions can be in flight at once. A slot is held
+        # for the whole lifetime of the worker thread -- including a leaked, timed-out one
+        # (it is released in the worker's `finally`, when the thread actually finishes),
+        # so leaked threads cannot grow without bound: once the cap is reached a new
+        # invocation fails closed instead of spawning another leak.
+        self._inflight_threaded = threading.BoundedSemaphore(max_inflight_threaded)
 
     def register(self, name: str, tool: Tool, timeout: float | None = None, side_effecting: bool = False) -> None:
         self._tools[name] = tool
@@ -159,6 +178,16 @@ class ToolRegistry:
         return self._invoke_threaded(self._tools[name], arguments, timeout, cap)
 
     def _invoke_threaded(self, tool: Tool, arguments: dict[str, Any], timeout: float, cap: int) -> Any:
+        # Finding #5: acquire an in-flight slot BEFORE spawning. A leaked (timed-out)
+        # thread keeps its slot until it actually finishes (released in run_tool's
+        # finally), so if leaked threads fill the cap a new invocation fails closed here
+        # instead of adding another unbounded leak.
+        if not self._inflight_threaded.acquire(blocking=False):
+            raise ToolExecutionError(
+                "too many in-flight thread-path tool executions; a prior tool likely "
+                "exceeded its deadline and is still running. Register long or "
+                "side-effecting tools with register_isolated so the host can hard-kill them."
+            )
         result_queue: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
 
         def run_tool() -> None:
@@ -166,9 +195,16 @@ class ToolRegistry:
                 result_queue.put((True, tool(arguments)))
             except Exception as error:  # noqa: BLE001 - reported as a failed tool
                 result_queue.put((False, error))
+            finally:
+                self._inflight_threaded.release()
 
         thread = threading.Thread(target=run_tool, daemon=True)
-        thread.start()
+        try:
+            thread.start()
+        except RuntimeError:
+            # The OS refused a new thread; release the slot we reserved and fail closed.
+            self._inflight_threaded.release()
+            raise ToolExecutionError("could not start a worker thread for the tool")
         try:
             succeeded, value = result_queue.get(timeout=timeout)
         except queue.Empty as error:

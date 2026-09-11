@@ -858,6 +858,36 @@ class RuntimeTests(unittest.TestCase):
         # A tool not marked side-effecting still runs on the normal path.
         self.assertEqual(registry.invoke(permit, "catalog.search", {}), {"ok": True})
 
+    def test_thread_path_caps_inflight_executions_and_fails_closed(self):
+        # Finding #5: a thread-path tool that exceeds its deadline leaks a daemon thread
+        # (the queue-timeout path cannot cancel it). A bounded semaphore caps how many can
+        # be in flight; a leaked thread holds its slot until it actually finishes, so once
+        # the cap fills with leaked threads a new invocation fails closed instead of
+        # spawning another unbounded leak.
+        from portmark.tools import ToolExecutionError
+
+        release = threading.Event()
+        registry = ToolRegistry(max_inflight_threaded=2)
+        registry.register("hang", lambda arguments: release.wait(10) or {"ok": True}, timeout=0.05)
+        permit = Permit(
+            issuer="issuer",
+            subject="agent",
+            audience="host",
+            expires_at=int(time.time()) + 60,
+            nonce="nonce-cap",
+            grants=(ToolGrant("hang"),),
+        )
+        try:
+            # Two timed-out invocations leak their still-running threads; each holds a slot.
+            for _ in range(2):
+                with self.assertRaisesRegex(ToolExecutionError, "deadline"):
+                    registry.invoke(permit, "hang", {})
+            # Both slots held by the leaked threads -> the next invocation fails closed.
+            with self.assertRaisesRegex(ToolExecutionError, "in-flight"):
+                registry.invoke(permit, "hang", {})
+        finally:
+            release.set()  # let the leaked threads finish and release their slots
+
     def _isolated_env(self):
         # The worker runs in a fresh process, so it must be able to import both
         # portmark (from src) and the fixture module (from tests). Absolute paths
@@ -1221,7 +1251,13 @@ class RuntimeTests(unittest.TestCase):
 
         self.assertEqual(result.status, "completed")
         self.assertEqual(result.result["fetch"]["status"], 200)
-        self.assertEqual(result.result["fetch"]["body"], "hello")
+        # Finding #4: the policy grants output_projection ["url", "status",
+        # "content_type"] and deliberately WITHHOLDS "body". The in-process fetch
+        # provider used to read the un-projected result from memory and leak the body;
+        # host-enforced projection now feeds it only the granted fields, so the body it
+        # completes with is gone.
+        self.assertNotIn("body", result.result["fetch"])
+        self.assertEqual(result.result["fetch"]["url"], "https://allowed.example/resource")
         self.assertEqual(response.read_size, http_fetch.MAX_RESPONSE_BYTES + 1)
         self.assertEqual(opened.call_count, 1)
 
@@ -1395,18 +1431,253 @@ class RuntimeTests(unittest.TestCase):
             # The tool.executed for this step is durable too -- the step was not rolled back.
             self.assertTrue(any(event["event"] == "tool.executed" for event in durable_events))
 
-            # The durable checkpoint is the bounded terminal state, not the oversized one.
+            # The durable checkpoint is the bounded terminal tombstone: the working
+            # state (memory + messages) is dropped so it fits by construction, and the
+            # oversized tool result is not in it. The record of what happened lives in
+            # the audit chain (output.refused, above), not the checkpoint.
             checkpoint = reopened.load_checkpoint(task)
             self.assertIsNotNone(checkpoint)
             self.assertEqual(checkpoint["status"], "failed")
-            self.assertIn("__refused__", checkpoint["memory"]["tool_results"])
-            self.assertNotIn("big.echo", checkpoint["memory"]["tool_results"])
+            self.assertEqual(checkpoint["memory"], {})
+            self.assertEqual(checkpoint["messages"], [])
 
             # The checkpoint is closed: a resume cannot reopen it, so the tool's side
             # effect can never be landed a second time.
             with self.assertRaisesRegex(SecurityError, "closed"):
                 with reopened.transaction() as transaction:
                     transaction.save_checkpoint(task, envelope.state, envelope.state.checkpoint_generation, closed=False)
+
+    @unittest.skipUnless(_CAN_KILL_PROCESS_GROUP, "requires POSIX process groups")
+    def test_killed_tool_near_ceiling_terminalizes_and_keeps_kill_reason(self):
+        # Finding 1, the dangerous case: a hard-killed side-effecting tool near the
+        # checkpoint ceiling. The kill sets a small terminal failure state that tips a
+        # near-ceiling checkpoint over the budget. tool_calls does NOT increment on a
+        # kill, so the original EV-010 guard did not fire: _persist raised out of run()
+        # and the durable checkpoint stayed status="running" -- resumable, so a resume
+        # could re-propose the killed effect and land it twice. The generalized
+        # terminalization now closes it, and the tool.killed record (effect_status
+        # "unknown") survives in the durable audit.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(path)
+            tools = ToolRegistry()
+            tools.register_isolated(
+                "slow.side",
+                "isolated_tool_fixtures:slow_then_return",
+                timeout=1.0,
+                side_effecting=True,
+                env=self._isolated_env(),
+            )
+            host = make_host(store=store)
+            host.tools = tools
+            budget = ResourceBudget(max_steps=6, max_tool_calls=2, max_output_bytes=32768)
+            host.policy = HostPolicy(
+                host.host_id,
+                (ToolGrant("slow.side", {"arguments": {"seconds": {"type": "number"}}}),),
+                budget,
+            )
+            host.providers["kill"] = FixedProvider(ProviderDecision("tool", "slow.side", {"seconds": 30}))
+            # A goal that lands the initial (running) checkpoint just under the ceiling,
+            # so the small kill-failure terminal state tips it over.
+            envelope = make_demo_envelope(host, "x" * 32600, "kill")
+            object.__setattr__(envelope.manifest, "requested_tools", ("slow.side",))
+            object.__setattr__(envelope.permit, "grants", (ToolGrant("slow.side"),))
+            object.__setattr__(envelope.permit, "budget", budget)
+            host.signer.seal(envelope)
+            task = envelope.state.task_id
+
+            result = host.run(envelope)  # returns, does not raise
+
+            self.assertEqual(result.status, "failed")
+            durable_events = self._read_durable_audit_events(path, task)
+            killed = [event for event in durable_events if event["event"] == "tool.killed"]
+            self.assertEqual(len(killed), 1)
+            self.assertEqual(killed[0]["details"]["effect_status"], "unknown")
+            self.assertTrue(any(event["event"] == "checkpoint.terminalized" for event in durable_events))
+
+            reopened = SQLiteRuntimeStore(path)
+            checkpoint = reopened.load_checkpoint(task)
+            self.assertIsNotNone(checkpoint)
+            self.assertEqual(checkpoint["status"], "failed")
+            # Closed: a resume is refused, so the killed effect can never be re-proposed.
+            with self.assertRaisesRegex(SecurityError, "closed"):
+                with reopened.transaction() as transaction:
+                    transaction.save_checkpoint(task, envelope.state, envelope.state.checkpoint_generation, closed=False)
+
+    def test_admission_failure_over_budget_leaves_nothing_durable(self):
+        # The safe boundary the fix must NOT terminalize: a fresh task whose very first
+        # (admission) checkpoint already exceeds the budget. Admission is the gate --
+        # nothing was committed, so nothing is resumable. run() must keep raising and
+        # leave no durable checkpoint or audit head; a too-eager fallback that committed
+        # here would admit a task the budget rejected.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(path)
+            tools = ToolRegistry()
+            tools.register("noop", lambda arguments: {"ok": True})
+            host = make_host(store=store)
+            host.tools = tools
+            budget = ResourceBudget(max_steps=6, max_tool_calls=2, max_output_bytes=32768)
+            host.policy = HostPolicy(host.host_id, (ToolGrant("noop", {"arguments": {"n": {"type": "number"}}}),), budget)
+            host.providers["big"] = OversizedResultProvider()  # never reached; admission fails first
+            envelope = make_demo_envelope(host, "x" * 33000, "big")  # goal alone exceeds the ceiling
+            object.__setattr__(envelope.manifest, "requested_tools", ("noop",))
+            object.__setattr__(envelope.permit, "grants", (ToolGrant("noop"),))
+            object.__setattr__(envelope.permit, "budget", budget)
+            host.signer.seal(envelope)
+            task = envelope.state.task_id
+
+            with self.assertRaisesRegex(SecurityError, "checkpoint exceeds output budget"):
+                host.run(envelope)
+
+            self.assertIsNone(store.load_checkpoint(task))
+            self.assertIsNone(store.audit_head(task))
+
+    def _counting_tool_host(self, store, calls, budget):
+        # A host whose one tool tallies each execution, so a budget-bypass test can
+        # assert exactly how many times the tool actually ran.
+        tools = ToolRegistry()
+
+        def counting(arguments):
+            calls["n"] += 1
+            return {"ok": True}
+
+        tools.register("noop", counting)
+        host = make_host(store=store)
+        host.tools = tools
+        host.policy = HostPolicy(host.host_id, (ToolGrant("noop", {"arguments": {"n": {"type": "number"}}}),), budget)
+        host.providers["always"] = FixedProvider(ProviderDecision("tool", "noop", {"n": 1}))
+        return host
+
+    def test_negative_starting_counter_is_rejected_before_any_tool_runs(self):
+        # Finding #3: budget accounting (max_tool_calls) trusts the caller-supplied
+        # state.tool_calls. A fresh task that starts at tool_calls=-3 under a 1-call
+        # budget runs the tool four times (-3,-2,-1,0) before the counter climbs to the
+        # limit. Admission must reject the negative counter, and reject it BEFORE the
+        # loop executes a single tool call, so nothing durable is left behind either.
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            calls = {"n": 0}
+            budget = ResourceBudget(max_steps=10, max_tool_calls=1, max_output_bytes=32768)
+            host = self._counting_tool_host(store, calls, budget)
+            envelope = make_demo_envelope(host, "negative counter", "always")
+            object.__setattr__(envelope.manifest, "requested_tools", ("noop",))
+            object.__setattr__(envelope.permit, "grants", (ToolGrant("noop"),))
+            object.__setattr__(envelope.permit, "budget", budget)
+            object.__setattr__(envelope.state, "tool_calls", -3)
+            host.signer.seal(envelope)
+            with self.assertRaisesRegex(SecurityError, "invalid tool_calls counter"):
+                host.run(envelope)
+            self.assertEqual(calls["n"], 0)  # rejected before any tool executed
+            self.assertIsNone(store.load_checkpoint(envelope.state.task_id))
+
+    def test_crafted_migration_envelope_cannot_inject_negative_counter(self):
+        # A migration accepted onto a fresh local chain legitimately carries the source
+        # run's non-zero counters, so the fresh-admission guard cannot simply demand
+        # zero. But a crafted migration-shaped envelope (a forged previous_audit_hash)
+        # must not smuggle in a negative counter either: the counter guard runs at
+        # admission -- before the audit head is even checked -- so the tool never runs.
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            calls = {"n": 0}
+            budget = ResourceBudget(max_steps=10, max_tool_calls=1, max_output_bytes=32768)
+            host = self._counting_tool_host(store, calls, budget)
+            envelope = make_demo_envelope(host, "crafted migration", "always")
+            object.__setattr__(envelope.manifest, "requested_tools", ("noop",))
+            object.__setattr__(envelope.permit, "grants", (ToolGrant("noop"),))
+            object.__setattr__(envelope.permit, "budget", budget)
+            object.__setattr__(envelope.state, "tool_calls", -3)
+            object.__setattr__(envelope, "previous_audit_hash", "forged-head")
+            host.signer.seal(envelope)
+            with self.assertRaisesRegex(SecurityError, "invalid tool_calls counter"):
+                host.run(envelope)
+            self.assertEqual(calls["n"], 0)
+            self.assertIsNone(store.load_checkpoint(envelope.state.task_id))
+
+    def test_non_serializable_provider_content_fails_cleanly_not_stranded(self):
+        # Finding #7 x #2: with canonical_json(allow_nan=False), a provider that
+        # completes with NaN content would raise inside _persist and leave the prior
+        # checkpoint status="running" -- resumable. The host now rejects un-encodable
+        # provider content at the _apply_decision boundary and lands a clean, bounded
+        # terminal failure instead: run() returns failed (never raises), and the
+        # durable checkpoint is closed (failed), not a resumable running one.
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            host = make_host(store=store)
+            host.providers["poison"] = FixedProvider(ProviderDecision("complete", content={"x": float("nan")}))
+            envelope = make_demo_envelope(host, "poison content", "poison")
+            host.signer.seal(envelope)
+            result = host.run(envelope)  # must not raise
+            self.assertEqual(result.status, "failed")
+            self.assertIn("content.rejected", [event["event"] for event in result.audit])
+            checkpoint = store.load_checkpoint(envelope.state.task_id)
+            self.assertIsNotNone(checkpoint)
+            self.assertEqual(checkpoint["status"], "failed")  # closed terminal, not running
+
+    def test_oversized_migration_close_terminalizes_source_not_strands_it(self):
+        # Finding #1 extended to migration: when the source-close checkpoint overflows
+        # the output budget, the source must still CLOSE (its working state has moved to
+        # the already-sealed migrated envelope), not raise and leave a resumable
+        # status="running" checkpoint alongside that envelope -- which would let the
+        # source resume AND the destination run the same work (double effect).
+        source_signer = EnvelopeSigner.generate("source-key", "host:source", ("host:source", "host:destination"))
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            source = make_host(host_id="host:source", signer=source_signer, store=store)
+            source.policy.migration = MigrationPolicy(allowed=True, destinations=("host:destination",))
+            source.providers["migrator"] = MigrateThenCompleteProvider("host:destination")
+            envelope = make_demo_envelope(source, "M" * 1500, "migrator")
+            object.__setattr__(envelope.permit, "delegation_allowed", True)
+            # Size the ceiling to admit the fresh checkpoint but refuse the migrate-close,
+            # which adds the migration memory and the destination result (~90 bytes).
+            running = asdict(envelope.state)
+            running["status"] = "running"
+            ceiling = len(canonical_json(running)) + 40
+            budget = ResourceBudget(max_steps=6, max_tool_calls=2, max_output_bytes=ceiling)
+            object.__setattr__(envelope.permit, "budget", budget)
+            source.policy.budget = budget
+            source_signer.seal(envelope)
+
+            result = source.run(envelope)  # must not raise
+            self.assertIsNotNone(result.migration_envelope)  # migrated envelope still returned
+            checkpoint = store.load_checkpoint(result.task_id)
+            self.assertIsNotNone(checkpoint)
+            self.assertEqual(checkpoint["status"], "ready")  # closed source, migrated away
+            self.assertEqual(checkpoint["memory"], {})  # working state dropped under budget pressure
+            self.assertIn("checkpoint.terminalized", [event["event"] for event in result.audit])
+            self.assertTrue(store.verify_audit_chain(result.task_id))
+
+    def test_host_enforced_projection_hides_undeclared_fields_from_in_process_provider(self):
+        # Finding #4: a grant's output_projection is enforced at the host boundary, so
+        # an in-process provider that reads state.memory["tool_results"] directly sees
+        # only the declared fields. The demo policy grants catalog.search (id, title),
+        # so `score` (returned by the tool) must never reach the provider -- while the
+        # host keeps the full result, score included, in its own durable state.
+        seen = {}
+
+        class RecordingProvider(ModelProvider):
+            def decide(self, state, available_tools, grants=()):
+                results = state.memory.get("tool_results", {})
+                if "catalog.search" not in results:
+                    return ProviderDecision("tool", "catalog.search", {"query": state.goal, "limit": 2})
+                seen["view"] = results["catalog.search"]
+                return ProviderDecision("complete", content={"evidence": results["catalog.search"]})
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            host = make_host(store=store)  # demo policy: catalog.search -> (id, title)
+            host.providers["recorder"] = RecordingProvider()
+            envelope = make_demo_envelope(host, "search", "recorder")
+            host.signer.seal(envelope)
+            result = host.run(envelope)
+            self.assertEqual(result.status, "completed")
+            # The provider saw only the declared fields -- no score.
+            self.assertTrue(seen["view"])
+            for item in seen["view"]:
+                self.assertEqual(set(item), {"id", "title"})
+            # The host's own durable state still holds the full result, score included.
+            stored = store.load_checkpoint(result.task_id)["memory"]["tool_results"]["catalog.search"]
+            self.assertTrue(any("score" in item for item in stored))
 
     def test_checkpoint_ceiling_is_the_host_minimum_not_the_permit(self):
         # F1: the checkpoint size ceiling must be effective.budget = min(permit, host),
@@ -1509,7 +1780,13 @@ class RuntimeTests(unittest.TestCase):
         authority = ApprovalAuthority.generate()
         policy = HostPolicy(
             "host:local-demo",
-            (ToolGrant("payments.reserve", {"max_amount": 100, "currency": "USD"}),),
+            # Finding #4: the host policy is the projection ceiling and an omitted
+            # projection shares nothing, so a policy that wants the provider to confirm
+            # the reservation must DECLARE the field it exposes -- here just "reserved"
+            # (least privilege; amount/currency stay withheld). Host-enforced projection
+            # then feeds the provider exactly that field, whether it reads memory or
+            # messages.
+            (ToolGrant("payments.reserve", {"max_amount": 100, "currency": "USD"}, ("reserved",)),),
             ResourceBudget(),
             "policy-v1",
             "policy-hash",
@@ -3812,6 +4089,35 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result.result["evidence"], ["checkpoint-observed"])
         self.assertEqual([event["event"] for event in result.audit].count("tool.executed"), 1)
         self.assertEqual(result.checkpoint["messages"][0]["content"][0]["title"], "Result 1 for from capsule checkpoint")
+
+    def test_native_wasmtime_subprocess_env_forwards_os_vars_but_no_secrets(self):
+        # Finding #6: the native Wasmtime child (a Python importing the arch-specific
+        # wasmtime wheel) failed to start on Windows because the parent passed only
+        # PYTHONPATH, dropping SYSTEMROOT and the process/arch vars the C runtime and the
+        # wheel need. The env is now a fixed allowlist of non-secret OS vars -- forwarded
+        # when present, and never a credential-shaped variable.
+        from portmark.providers import _wasmtime_subprocess_env
+
+        # A non-literal value for the secret-named keys, so this fixture (whose whole
+        # point is that secret-named vars are NOT forwarded) does not itself trip the
+        # hardcoded-secret scanner.
+        filtered = "filtered-out-value"
+        fake_env = {
+            "SYSTEMROOT": r"C:\Windows",
+            "PYTHONPATH": "/opt/portmark",
+            "PROCESSOR_ARCHITECTURE": "AMD64",
+            "PATH": "/usr/bin",
+            "AWS_SECRET_ACCESS_KEY": filtered,
+            "PORTMARK_SIGNING_KEY": filtered,
+        }
+        with patch.dict(os.environ, fake_env, clear=True):
+            env = _wasmtime_subprocess_env()
+        self.assertEqual(env["SYSTEMROOT"], r"C:\Windows")
+        self.assertEqual(env["PYTHONPATH"], "/opt/portmark")
+        self.assertEqual(env["PROCESSOR_ARCHITECTURE"], "AMD64")
+        self.assertEqual(env["PATH"], "/usr/bin")
+        self.assertNotIn("AWS_SECRET_ACCESS_KEY", env)
+        self.assertNotIn("PORTMARK_SIGNING_KEY", env)
 
     def test_native_wasmtime_provider_uses_component_api_in_isolated_worker(self):
         component = b"native-component"

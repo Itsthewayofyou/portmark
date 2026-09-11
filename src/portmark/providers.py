@@ -24,6 +24,24 @@ DEFAULT_MAX_WASM_COMPONENT_BYTES = 10_000_000
 DEFAULT_WASM_FUEL = 1_000_000_000
 DEFAULT_WASM_MEMORY_BYTES = 256 * 1024 * 1024
 
+# Finding #6: the native Wasmtime provider launches a child Python that imports the
+# arch-specific `wasmtime` wheel. Passing env={PYTHONPATH only} stripped SYSTEMROOT,
+# PATH and the Windows process/arch vars the C runtime and the wheel read at import, so
+# the child failed to start on Windows. Forward a fixed allowlist of non-secret OS vars
+# instead -- the tool runner's set (see tools._INHERITED_ENV_KEYS: PYTHONPATH, PATH,
+# locale, SYSTEMROOT) plus the Windows process/arch vars a native extension needs. No
+# credential-shaped variable is forwarded, so this does not widen the trust boundary.
+_WASMTIME_SUBPROCESS_ENV_KEYS = (
+    "PYTHONPATH", "PATH", "LANG", "LC_ALL", "LC_CTYPE",
+    "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT",
+    "PROCESSOR_ARCHITECTURE", "PROCESSOR_ARCHITEW6432", "NUMBER_OF_PROCESSORS",
+    "TEMP", "TMP",
+)
+
+
+def _wasmtime_subprocess_env() -> dict[str, str]:
+    return {key: os.environ[key] for key in _WASMTIME_SUBPROCESS_ENV_KEYS if key in os.environ}
+
 
 class ModelProvider(ABC):
     @abstractmethod
@@ -226,10 +244,7 @@ class NativeWasmtimeComponentProvider(ModelProvider):
     ) -> ProviderDecision:
         context_json = encode_component_input(component_context(state, available_tools, grants))
         checkpoint_json = encode_component_input(component_checkpoint(state, grants))
-        environment = {}
-        python_path = os.environ.get("PYTHONPATH")
-        if python_path:
-            environment["PYTHONPATH"] = python_path
+        environment = _wasmtime_subprocess_env()
         try:
             process = subprocess.run(  # nosec B603
                 [sys.executable, "-m", "portmark.wasmtime_component_runner"],

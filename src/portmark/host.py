@@ -8,6 +8,7 @@ from typing import Any
 
 from .metrics import RuntimeMetrics
 from .models import AgentEnvelope, ApprovalToken, AttestationEvidence, ProviderDecision, RunResult
+from .projection import project_state_for_provider
 from .providers import ModelProvider
 from .security import AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, SecurityError, arguments_hash, audit_head_payload, canonical_json
 from .storage import InMemoryRuntimeStore, RuntimeStore
@@ -100,8 +101,30 @@ class AgentHost:
         if stored is None:
             if state.checkpoint_generation != 0:
                 raise SecurityError("new task has invalid checkpoint generation")
+            # Finding #3: budget accounting (max_steps / max_tool_calls) trusts the
+            # step/tool_calls counters on the incoming state. A fresh admission with
+            # caller-supplied NEGATIVE (or bool/float) counters -- e.g. tool_calls=-3
+            # under a 1-call budget -- runs the tool several extra times before the
+            # counter climbs to the limit. Reject non-nonnegative-int counters at the
+            # door. Only their type/sign is constrained here, not their value: a fresh
+            # admission legitimately carries POSITIVE counters and populated memory --
+            # a suspended `awaiting_input` envelope resumes by presenting its own
+            # signed wire state (its memory holds the injected approval), and a
+            # migration arrives with the source run's counters. The exact values are
+            # re-bound from the durable checkpoint on a local resume (below), which is
+            # where a captured envelope could otherwise under-report consumed budget.
+            self._require_nonnegative_counters(state)
             consume_nonce: str | None = envelope.permit.nonce
         else:
+            # Local resume: the durable checkpoint is the sole authority on how much
+            # budget has been spent. Rebind the counters from the store so a resume
+            # envelope cannot under-report step/tool_calls to win extra budget.
+            # memory/messages/result stay caller-visible on purpose -- an
+            # awaiting_input resume injects approval input into state.memory before
+            # re-running, and that wire state is already treated as untrusted
+            # (approvals are consumed via a namespaced store nonce, not memory).
+            state.step = int(stored["step"])
+            state.tool_calls = int(stored["tool_calls"])
             consume_nonce = None
         state.status = "running"
         previous_hash, start_sequence, migration_anchor = self._audit_start(envelope)
@@ -120,8 +143,14 @@ class AgentHost:
 
         while state.step < effective.budget.max_steps:
             decision_started = time.monotonic()
+            # Finding #4: hand the provider a host-projected copy of the state, so tool
+            # outputs are reduced to each grant's output_projection before any provider
+            # -- in-process or a remote adapter -- can read them. Projection is enforced
+            # here, not trusted to the adapter. The provider only reads the state to
+            # decide; the host mutates the real state via _apply_decision below.
+            projected_state = project_state_for_provider(state, effective.grants)
             try:
-                decision = provider.decide(state, tool_names, effective.grants)
+                decision = provider.decide(projected_state, tool_names, effective.grants)
             finally:
                 self.metrics.observe_duration("provider_decision_duration_seconds", time.monotonic() - decision_started)
             self.metrics.increment("provider.decisions")
@@ -133,19 +162,33 @@ class AgentHost:
             # (completed/failed) or migrates away, so it can never be resumed here
             # again (finding EV-008). An awaiting_input suspend stays open.
             closed = migration is not None or state.status in ("completed", "failed")
-            if state.tool_calls > tool_calls_before and not self._checkpoint_fits(effective, state):
-                # EV-002 class: a tool executed this step and its side effect may have
-                # landed, but the resulting checkpoint exceeds the output budget. A
-                # legal-sized tool result is recorded both in memory["tool_results"] and
-                # in messages, so a result under the invoke cap can still double over the
-                # checkpoint ceiling. Persisting the full checkpoint is impossible, and
-                # raising here would roll back this step's transaction -- erasing the
-                # durable record that the tool ran, and leaving the checkpoint "running"
-                # (resumable, so a resume could re-propose the tool and land the effect
-                # twice). Record an honest, bounded, terminal refusal instead, closing
-                # the lineage. The effect status is unknown, exactly like tool.killed.
-                persisted_events = self._refuse_oversized_checkpoint(envelope, effective, state, audit, persisted_events, decision.tool)
-                result = self._result(envelope, audit)
+            # Terminalization guarantee (generalizes EV-010): an admitted task must
+            # always reach a durable CLOSED checkpoint. A closed persist that would
+            # exceed the output budget is collapsed to a bounded terminal tombstone
+            # instead of raising out of run() and leaving the prior checkpoint
+            # resumable. Covers a successful tool whose result overflowed AND a tool
+            # exception, a hard kill, step-exhaustion, or an oversized completion whose
+            # small terminal state tipped a near-ceiling checkpoint over. The killed
+            # side-effecting-tool case is the dangerous one: a resumable pre-tool
+            # checkpoint would let the provider re-propose the effect. await_input and
+            # migrate are deliberately excluded -- an open or relocating checkpoint
+            # cannot be shrunk without losing resume state, so those still raise (rare,
+            # and neither carries a re-proposal risk here).
+            tool_ran = state.tool_calls > tool_calls_before
+            # Finding #1 (extended to migration): terminalize on any closed persist that
+            # would overflow, not only tool-fail/kill/completion. A `migrate` closes the
+            # source (status="ready", closed) because the working state has moved to the
+            # migrated envelope -- already snapshotted in _apply_decision, so dropping
+            # the source's now-redundant copy is correct. Without this an oversized
+            # source-close raised out of run(), leaving the source checkpoint
+            # status="running" and resumable WHILE a sealed migrated envelope existed:
+            # the source could resume AND the destination run the same work (double
+            # effect). await_input is still excluded (open, not closed).
+            if not self._checkpoint_fits(effective, state) and (tool_ran or closed):
+                persisted_events = self._terminalize_over_budget(
+                    envelope, effective, state, audit, persisted_events, decision, tool_ran
+                )
+                result = self._result(envelope, audit, migration)
                 self._record_run_status(result.status)
                 return result
             persisted_events = self._persist(envelope, effective, state, audit, persisted_events, closed=closed)
@@ -157,7 +200,12 @@ class AgentHost:
         state.status = "failed"
         state.result = {"error": "step budget exhausted"}
         audit.append("agent.failed", state.result)
-        self._persist(envelope, effective, state, audit, persisted_events, closed=True)
+        # Same terminalization guarantee as the loop: if the step-exhaustion tombstone
+        # tips a near-ceiling checkpoint over the budget, bound it rather than raise.
+        if self._checkpoint_fits(effective, state):
+            self._persist(envelope, effective, state, audit, persisted_events, closed=True)
+        else:
+            self._terminalize_over_budget(envelope, effective, state, audit, persisted_events, None, False)
         result = self._result(envelope, audit)
         self._record_run_status(result.status)
         return result
@@ -217,6 +265,14 @@ class AgentHost:
                 )
                 audit.append("agent.failed", state.result)
                 return True, None
+            if not self._is_encodable(result):
+                # An in-process (thread-path) tool can return a live Python object --
+                # a NaN, a reference cycle -- that no JSON transport would have caught.
+                # Storing it would strand the run at the closing _persist; fail closed
+                # here instead. Finding #7. (The side effect, if any, already happened;
+                # the audit records the rejection.)
+                self.metrics.increment("tools.failed")
+                return self._fail_unserializable(state, audit, "tool", decision.tool)
             state.tool_calls += 1
             self.metrics.increment("tools.executed")
             # Record the raw tool result generically, keyed by the tool name, so a
@@ -229,11 +285,15 @@ class AgentHost:
             audit.append("tool.executed", {"tool": decision.tool, "arguments": decision.arguments})
             return False, None
         if decision.kind == "complete":
+            if not self._is_encodable(decision.content):
+                return self._fail_unserializable(state, audit, "complete")
             state.status = "completed"
             state.result = decision.content
             audit.append("agent.completed", {"result": decision.content})
             return True, None
         if decision.kind == "await_input":
+            if not self._is_encodable(decision.content):
+                return self._fail_unserializable(state, audit, "await_input")
             state.status = "awaiting_input"
             state.result = decision.content
             audit.append("agent.awaiting_input", {"request": decision.content})
@@ -284,6 +344,8 @@ class AgentHost:
             )
             self.signer.seal(migrated)
             return True, asdict(migrated)
+        if not self._is_encodable(decision.content):
+            return self._fail_unserializable(state, audit, "failed")
         state.status = "failed"
         state.result = decision.content or {"error": "provider failed"}
         audit.append("agent.failed", {"result": state.result})
@@ -392,48 +454,99 @@ class AgentHost:
         # into an honest terminal event rather than an uncaught raise.
         return len(canonical_json(asdict(state))) <= effective.budget.max_output_bytes
 
-    def _refuse_oversized_checkpoint(self, envelope, effective, state, audit, persisted_events, tool):
-        # Collapse the state to a fixed-shape terminal checkpoint that fits by
-        # construction: the only growth since the last (passing) persist is this step's
-        # tool result, held in memory["tool_results"] and echoed into messages, so
-        # replacing both with a small marker returns the checkpoint to roughly its prior
-        # size regardless of how large the refused output was. The full result is
-        # deliberately dropped from durable state -- the hash-chained audit, not the
-        # checkpoint, is the record of what happened.
+    def _terminalize_over_budget(self, envelope, effective, state, audit, persisted_events, decision, tool_ran):
+        # Collapse an over-budget terminal state to a bounded closed tombstone that is
+        # provably <= the admitted checkpoint, so the closed persist always lands. The
+        # admitted checkpoint already held the goal plus this working state, so goal +
+        # empty memory + empty messages + a null result cannot exceed it -- and the
+        # audit chain, not the checkpoint, is the durable record of what happened.
+        ceiling = effective.budget.max_output_bytes
         oversized = len(canonical_json(asdict(state)))
-        refused_tools = sorted(state.memory.get("tool_results", {}).keys())
-        state.memory["tool_results"] = {
-            "__refused__": {"reason": "checkpoint output budget exceeded", "tools": refused_tools}
-        }
-        state.messages = [
-            {
-                "role": "system",
-                "name": "portmark",
-                "content": "checkpoint output refused: exceeded output budget after tool execution",
-            }
-        ]
-        state.status = "failed"
-        state.result = {"error": "checkpoint exceeds output budget after tool execution"}
-        self.metrics.increment("tools.output_refused")
-        # effect_status is "unknown" because the tool ran before the checkpoint was
-        # sized: any side effect it performed has already landed and cannot be undone
-        # from here, exactly as with a hard-killed tool (tool.killed, EV-002).
-        audit.append(
-            "output.refused",
-            {
-                "tool": tool,
-                "encoded_size": oversized,
-                "max_output_bytes": effective.budget.max_output_bytes,
-                "effect_status": "unknown",
-            },
-        )
-        audit.append("agent.failed", state.result)
+        state.memory = {}
+        state.messages = []
+        if tool_ran and state.status == "running":
+            # A successful tool's result overflowed the checkpoint and no failure has
+            # been recorded yet (EV-010). The tool ran, so the effect status is unknown,
+            # exactly as for a hard kill: a resume must not re-propose it.
+            state.status = "failed"
+            state.result = {"error": "checkpoint exceeds output budget after tool execution"}
+            audit.append(
+                "output.refused",
+                {
+                    "tool": decision.tool if decision is not None else None,
+                    "encoded_size": oversized,
+                    "max_output_bytes": ceiling,
+                    "effect_status": "unknown",
+                },
+            )
+            audit.append("agent.failed", state.result)
+        else:
+            # The state is already terminal (a tool exception or hard kill, an oversized
+            # completion, or step-exhaustion). Its cause -- including tool.killed with
+            # effect_status "unknown" -- is already in the audit; keep the status and
+            # the result when they fit, and record that the checkpoint was terminalized
+            # under budget pressure with its working state dropped.
+            audit.append(
+                "checkpoint.terminalized",
+                {
+                    "status": state.status,
+                    "encoded_size": oversized,
+                    "max_output_bytes": ceiling,
+                    "dropped": ["memory", "messages"],
+                },
+            )
+        self.metrics.increment("checkpoints.terminalized")
+        # Guarantee fit: with memory and messages emptied the checkpoint is the admitted
+        # one minus its working state plus this result. If the result still tips it over
+        # (a large kill reason or an oversized completion payload), drop it to null --
+        # goal + empty memory + empty messages + null result is <= the admitted
+        # checkpoint, which admitted under the ceiling with the goal already present.
+        if len(canonical_json(asdict(state))) > ceiling:
+            state.result = None
         return self._persist(envelope, effective, state, audit, persisted_events, closed=True)
 
     def _record_run_status(self, status: str) -> None:
         self.metrics.increment(f"runs.{status}")
         if status == "failed":
             self.metrics.increment("runs.failed")
+
+    @staticmethod
+    def _is_encodable(value: Any) -> bool:
+        # A value canonical_json cannot render -- a non-finite float (now that
+        # allow_nan=False, finding #2), a reference cycle, or an unsupported type
+        # (finding #7) -- must never be written into state: it would raise out of
+        # _persist and leave the prior checkpoint status="running" and resumable,
+        # exactly the failure class _terminalize_over_budget was built to eliminate.
+        try:
+            canonical_json(value)
+        except (ValueError, TypeError, RecursionError):
+            return False
+        return True
+
+    def _fail_unserializable(self, state, audit, source: str, tool: str | None = None) -> tuple[bool, None]:
+        # Convert un-encodable provider/tool content into a clean, bounded terminal
+        # failure at the boundary where it would enter state. state.result is a small
+        # fixed dict that always encodes, so the closing _persist succeeds and the
+        # task lands failed+closed instead of raising mid-run. Finding #7.
+        self.metrics.increment("provider.rejected")
+        state.status = "failed"
+        state.result = {"error": "non-serializable content rejected", "source": source}
+        details: dict[str, Any] = {"source": source, "reason": "content is not JSON-encodable"}
+        if tool is not None:
+            details["tool"] = tool
+        audit.append("content.rejected", details)
+        audit.append("agent.failed", state.result)
+        return True, None
+
+    @staticmethod
+    def _require_nonnegative_counters(state) -> None:
+        # A bool is an int subclass and a float slips past a bare `>= 0` while still
+        # arithmetic-working through `+= 1`, so exclude both -- same root cause as the
+        # numeric-limit fix (Finding #2), kept consistent here.
+        for name in ("step", "tool_calls"):
+            value = getattr(state, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise SecurityError(f"migrated state has invalid {name} counter")
 
     def _audit_start(self, envelope: AgentEnvelope) -> tuple[str, int, dict[str, Any] | None]:
         stored = self.store.audit_head(envelope.state.task_id)
