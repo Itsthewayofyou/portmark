@@ -550,5 +550,68 @@ class SecurityGuardTests(unittest.TestCase):
                         load_trust_registry(trust_path)
 
 
+class PolicyEmptyGrantDenyByDefaultTest(unittest.TestCase):
+    """B-lite: a host-policy grant that constrains no argument denies unnamed
+    arguments by default; a permit's empty grant stays a passthrough.
+
+    The distinction is deliberate and load-bearing (B-lite, not B-full): only the
+    host tightens its own default. These pin both halves so a later accidental
+    widening to permit-side deny would fail here.
+    """
+
+    def _effective_echo_constraints(self, policy_constraints, permit_constraints):
+        manifest = AgentManifest("agent:demo", "1.0.0", "deterministic", ("echo",))
+        permit = Permit(
+            issuer="user:alice",
+            subject="agent:demo",
+            audience="host:local-demo",
+            expires_at=NOW + 300,
+            nonce="permit-nonce",
+            grants=(ToolGrant("echo", permit_constraints),),
+            budget=ResourceBudget(),
+        )
+        policy = HostPolicy("host:local-demo", (ToolGrant("echo", policy_constraints),), ResourceBudget())
+        effective = policy.effective_permit(manifest, permit, now=NOW)
+        return next(grant for grant in effective.grants if grant.name == "echo").constraints
+
+    def test_bare_policy_grant_is_normalized_to_explicit_deny(self):
+        # The normalization happens once at HostPolicy construction, so every reader
+        # of self.grants (effective_permit and explain_missing_grant) sees one shape.
+        policy = HostPolicy("host:local-demo", (ToolGrant("echo"),), ResourceBudget())
+        self.assertEqual(policy.grants[0].constraints, {"additional_arguments": False})
+
+    def test_policy_declaring_arguments_is_left_unchanged(self):
+        policy = HostPolicy("host:local-demo", (ToolGrant("echo", {"arguments": {"a": {}}}),), ResourceBudget())
+        self.assertEqual(policy.grants[0].constraints, {"arguments": {"a": {}}})
+
+    def test_explicit_additional_arguments_true_on_policy_is_not_overwritten(self):
+        policy = HostPolicy("host:local-demo", (ToolGrant("echo", {"additional_arguments": True}),), ResourceBudget())
+        self.assertEqual(policy.grants[0].constraints, {"additional_arguments": True})
+
+    def test_policy_empty_grant_denies_unnamed_arguments(self):
+        # policy {} (now deny) + permit {} (passthrough) -> the tool stays callable
+        # with no arguments, but an unnamed field is rejected. The grant was bounded,
+        # not dropped.
+        constraints = self._effective_echo_constraints({}, {})
+        check_constraints(constraints, {})  # empty call still works
+        with self.assertRaisesRegex(SecurityError, "unsupported fields"):
+            check_constraints(constraints, {"recipient": "attacker"})
+
+    def test_permit_empty_grant_still_passes_arguments_through(self):
+        # policy explicitly open + permit {} -> an extra field is admitted. Under
+        # B-full (permit {} = deny) this would be rejected, so accepting it pins
+        # that B-lite left permits alone.
+        constraints = self._effective_echo_constraints({"additional_arguments": True}, {})
+        check_constraints(constraints, {"recipient": "anyone"})
+
+    def test_policy_empty_grant_bounds_even_a_permit_that_names_the_argument(self):
+        # Case 3, stated deliberately: policy {} denies all arguments (the host is the
+        # ceiling), so even an argument the permit legitimately bounds is refused. A
+        # host that wants to allow it must name it in policy or opt out.
+        constraints = self._effective_echo_constraints({}, {"arguments": {"amount": {"type": "number"}}})
+        with self.assertRaisesRegex(SecurityError, "unsupported fields"):
+            check_constraints(constraints, {"amount": 5})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1005,7 +1005,10 @@ class RuntimeTests(unittest.TestCase):
             )
             host = make_host(store=store)
             host.tools = tools
-            host.policy = HostPolicy(host.host_id, (ToolGrant("slow.side"),), ResourceBudget())
+            # Under B-lite the host policy must name the argument it allows; a bare
+            # policy grant now denies unnamed arguments. This test is about the kill
+            # audit, not argument policy, so the grant declares `seconds` explicitly.
+            host.policy = HostPolicy(host.host_id, (ToolGrant("slow.side", {"arguments": {"seconds": {"type": "number"}}}),), ResourceBudget())
             host.providers["kill"] = FixedProvider(ProviderDecision("tool", "slow.side", {"seconds": 30}))
             envelope = make_demo_envelope(host, "slow side kill", "kill")
             object.__setattr__(envelope.manifest, "requested_tools", ("slow.side",))
