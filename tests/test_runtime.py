@@ -996,31 +996,84 @@ class RuntimeTests(unittest.TestCase):
             with self.assertRaisesRegex(ToolExecutionError, "could not be confirmed terminated"):
                 registry.invoke(permit, "iso.slow", {"seconds": 3.0})
 
+    def test_process_tree_close_reaps_worker_and_closes_pipes(self):
+        # close() is the resource-release contract the launch-failure and timeout
+        # cleanup paths rely on: it must kill a still-running worker, REAP it (collect
+        # exit status -- an un-waited Popen warns "subprocess ... is still running" and
+        # leaves a zombie), close both pipes, and be idempotent. Cross-platform.
+        import portmark.tools as tools_module
+
+        tree = tools_module._launch_process_tree(
+            [sys.executable, "-c", "import sys; sys.stdin.read()"],
+            dict(os.environ),
+        )
+        process = tree._process
+        self.assertIsNone(process.poll())  # worker is alive, blocked on stdin
+        tree.close()
+        self.assertIsNotNone(process.poll())  # reaped, not leaked
+        self.assertTrue(process.stdin.closed)
+        self.assertTrue(process.stdout.closed)
+        tree.close()  # idempotent: a second close must not raise
+
     @unittest.skipUnless(sys.platform == "win32", "Windows Job Object launch path")
     def test_windows_launch_fails_closed_when_resume_fails(self):
         # A ResumeThread failure (0 threads resumed) must fail the launch closed, never
-        # run the worker unmanaged. Finding: unchecked ResumeThread return.
+        # run the worker unmanaged. Finding: unchecked ResumeThread return. The failed
+        # launch must also reap the suspended worker and close its pipes -- no leak.
         from portmark.tools import ToolExecutionError
+        import portmark.tools as tools_module
+
+        created = []
+        real_popen = tools_module.subprocess.Popen
+
+        def capture(*args, **kwargs):
+            proc = real_popen(*args, **kwargs)
+            created.append(proc)
+            return proc
 
         registry = ToolRegistry()
         registry.register_isolated("iso.echo", "isolated_tool_fixtures:echo", env=self._isolated_env())
         permit = self._isolated_permit("iso.echo")
-        with patch("portmark.tools._windows_job.resume_process_main_thread", return_value=0):
+        with patch("portmark.tools.subprocess.Popen", side_effect=capture), patch(
+            "portmark.tools._windows_job.resume_process_main_thread", return_value=0
+        ):
             with self.assertRaisesRegex(ToolExecutionError, "could not start isolated tool worker"):
                 registry.invoke(permit, "iso.echo", {})
+        self.assertEqual(len(created), 1)
+        worker = created[0]
+        self.assertIsNotNone(worker.poll())  # reaped, not leaked
+        self.assertTrue(worker.stdin.closed)
+        self.assertTrue(worker.stdout.closed)
 
     @unittest.skipUnless(sys.platform == "win32", "Windows Job Object launch path")
     def test_windows_launch_fails_closed_when_assignment_fails(self):
         # An AssignProcessToJobObject failure must reap the suspended worker and fail
-        # closed -- never fall back to an unmanaged (un-killable) process.
+        # closed -- never fall back to an unmanaged (un-killable) process -- and must
+        # leave no leaked Popen or open pipe behind.
         from portmark.tools import ToolExecutionError
+        import portmark.tools as tools_module
+
+        created = []
+        real_popen = tools_module.subprocess.Popen
+
+        def capture(*args, **kwargs):
+            proc = real_popen(*args, **kwargs)
+            created.append(proc)
+            return proc
 
         registry = ToolRegistry()
         registry.register_isolated("iso.echo", "isolated_tool_fixtures:echo", env=self._isolated_env())
         permit = self._isolated_permit("iso.echo")
-        with patch("portmark.tools._windows_job.assign_process", side_effect=OSError("assign failed")):
+        with patch("portmark.tools.subprocess.Popen", side_effect=capture), patch(
+            "portmark.tools._windows_job.assign_process", side_effect=OSError("assign failed")
+        ):
             with self.assertRaisesRegex(ToolExecutionError, "could not start isolated tool worker"):
                 registry.invoke(permit, "iso.echo", {})
+        self.assertEqual(len(created), 1)
+        worker = created[0]
+        self.assertIsNotNone(worker.poll())  # reaped, not leaked
+        self.assertTrue(worker.stdin.closed)
+        self.assertTrue(worker.stdout.closed)
 
     def test_isolated_tool_exception_fails_closed(self):
         from portmark.tools import ToolExecutionError
