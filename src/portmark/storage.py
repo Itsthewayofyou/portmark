@@ -16,8 +16,16 @@ from .models import AgentState
 from .security import AUDIT_HASH_VERSION, AuditHeadVerifier, SecurityError, audit_event_record, audit_head_payload, canonical_json
 
 
-SQLITE_SCHEMA_VERSION = 4
-POSTGRES_SCHEMA_VERSION = 2
+SQLITE_SCHEMA_VERSION = 5
+POSTGRES_SCHEMA_VERSION = 3
+
+
+def _advisory_lock_key(name: str) -> int:
+    # A stable 64-bit signed key for pg_advisory_lock(bigint), derived Python-side so
+    # it does not depend on a server function (hashtextextended is PG 11+); blake2b is
+    # deterministic across processes and versions. Range fits a Postgres bigint.
+    digest = hashlib.blake2b(name.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "big", signed=True)
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 AuditHeadSigner = Callable[[str, int], tuple[str, str]]
 AuditVerificationStatus = Literal["valid", "invalid", "unverifiable"]
@@ -59,6 +67,16 @@ class RuntimeTransaction(Protocol):
         """
         ...
 
+    def enqueue_migration(self, task_id: str, destination: str, sealed_envelope_json: str) -> None:
+        """Record a sealed destination envelope for durable delivery (section 1 #2).
+
+        Written in the same transaction that closes the source checkpoint, so the
+        migration cannot vanish if the process dies before the caller delivers it.
+        Idempotent per task_id: a second enqueue for the same closed source is a
+        no-op (the row already exists).
+        """
+        ...
+
 
 class RuntimeStore(Protocol):
     def transaction(self) -> AbstractContextManager[RuntimeTransaction]:
@@ -79,6 +97,20 @@ class RuntimeStore(Protocol):
     def verify_audit_chain(self, task_id: str) -> bool:
         ...
 
+    def list_pending_migrations(self) -> list[dict[str, Any]]:
+        """Migration-outbox rows still awaiting delivery, oldest first (section 1 #2).
+
+        A delivery dispatcher enumerates these, ships the sealed envelope to the
+        destination, and calls `mark_migration_delivered` on acknowledgement.
+        """
+        ...
+
+    def mark_migration_delivered(self, task_id: str) -> None:
+        ...
+
+    def record_migration_attempt(self, task_id: str) -> None:
+        ...
+
 
 class InMemoryRuntimeStore:
     def __init__(self) -> None:
@@ -87,6 +119,7 @@ class InMemoryRuntimeStore:
         self._checkpoints: dict[str, dict[str, Any]] = {}
         self._audit_events: dict[str, list[dict[str, Any]]] = {}
         self._audit_heads: dict[str, dict[str, Any]] = {}
+        self._outbox: dict[str, dict[str, Any]] = {}
         self._audit_head_verifier: AuditHeadVerifier | None = None
 
     def set_audit_head_verifier(self, verifier: AuditHeadVerifier) -> None:
@@ -94,6 +127,24 @@ class InMemoryRuntimeStore:
 
     def transaction(self) -> AbstractContextManager[RuntimeTransaction]:
         return _InMemoryTransaction(self)
+
+    def list_pending_migrations(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = [dict(row) for row in self._outbox.values() if row["status"] == "pending"]
+        rows.sort(key=lambda row: (row["created_at"], row["task_id"]))
+        return rows
+
+    def mark_migration_delivered(self, task_id: str) -> None:
+        with self._lock:
+            row = self._outbox.get(task_id)
+            if row is not None:
+                row["status"] = "delivered"
+
+    def record_migration_attempt(self, task_id: str) -> None:
+        with self._lock:
+            row = self._outbox.get(task_id)
+            if row is not None:
+                row["attempt_count"] = int(row["attempt_count"]) + 1
 
     def consumed_nonce_exists(self, nonce: str) -> bool:
         with self._lock:
@@ -139,7 +190,7 @@ class InMemoryRuntimeStore:
 class _InMemoryTransaction:
     def __init__(self, store: InMemoryRuntimeStore) -> None:
         self._store = store
-        self._snapshots: tuple[dict[str, Any], dict[str, Any], dict[str, list[dict[str, Any]]], dict[str, dict[str, Any]]] | None = None
+        self._snapshots: tuple[dict[str, Any], dict[str, Any], dict[str, list[dict[str, Any]]], dict[str, dict[str, Any]], dict[str, dict[str, Any]]] | None = None
 
     def __enter__(self) -> "_InMemoryTransaction":
         self._store._lock.acquire()
@@ -148,12 +199,19 @@ class _InMemoryTransaction:
             json.loads(json.dumps(self._store._checkpoints)),
             json.loads(json.dumps(self._store._audit_events)),
             json.loads(json.dumps(self._store._audit_heads)),
+            json.loads(json.dumps(self._store._outbox)),
         )
         return self
 
     def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: TracebackType | None) -> None:
         if exc_type is not None and self._snapshots is not None:
-            self._store._nonces, self._store._checkpoints, self._store._audit_events, self._store._audit_heads = self._snapshots
+            (
+                self._store._nonces,
+                self._store._checkpoints,
+                self._store._audit_events,
+                self._store._audit_heads,
+                self._store._outbox,
+            ) = self._snapshots
         self._store._lock.release()
 
     def consume_nonce(self, nonce: str, subject: str, audience: str, task_id: str) -> None:
@@ -210,6 +268,18 @@ class _InMemoryTransaction:
         }
         return new_generation
 
+    def enqueue_migration(self, task_id: str, destination: str, sealed_envelope_json: str) -> None:
+        if task_id in self._store._outbox:
+            return
+        self._store._outbox[task_id] = {
+            "task_id": task_id,
+            "destination": destination,
+            "sealed_envelope_json": sealed_envelope_json,
+            "status": "pending",
+            "attempt_count": 0,
+            "created_at": int(time.time()),
+        }
+
 
 class SQLiteRuntimeStore:
     def __init__(self, path: str | Path, audit_head_verifier: AuditHeadVerifier | None = None) -> None:
@@ -260,6 +330,7 @@ class SQLiteRuntimeStore:
             1: self._migrate_to_v2,
             2: self._migrate_to_v3,
             3: self._migrate_to_v4,
+            4: self._migrate_to_v5,
         }
         migration = migrations.get(version)
         if migration is None:
@@ -353,8 +424,44 @@ class SQLiteRuntimeStore:
             """
         )
 
+    def _migrate_to_v5(self, connection: sqlite3.Connection) -> None:
+        # Section 1, finding #2: durable migration delivery. The sealed destination
+        # envelope is written in the SAME transaction that closes the source
+        # checkpoint, so a crash after the source closes cannot lose the migration;
+        # a dispatcher recovers it from this outbox. Duplicate delivery is safe
+        # (destination nonce/CAS reject a replay).
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS migration_outbox (
+                task_id TEXT PRIMARY KEY,
+                destination TEXT NOT NULL,
+                sealed_envelope_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            );
+            PRAGMA user_version = 5;
+            """
+        )
+
     def transaction(self) -> AbstractContextManager[RuntimeTransaction]:
         return _SQLiteTransaction(self)
+
+    def list_pending_migrations(self) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT task_id, destination, sealed_envelope_json, status, attempt_count, created_at "
+                "FROM migration_outbox WHERE status = 'pending' ORDER BY created_at, task_id"
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def mark_migration_delivered(self, task_id: str) -> None:
+        with self._connection() as connection:
+            connection.execute("UPDATE migration_outbox SET status = 'delivered' WHERE task_id = ?", (task_id,))
+
+    def record_migration_attempt(self, task_id: str) -> None:
+        with self._connection() as connection:
+            connection.execute("UPDATE migration_outbox SET attempt_count = attempt_count + 1 WHERE task_id = ?", (task_id,))
 
     def consumed_nonce_exists(self, nonce: str) -> bool:
         with self._connection() as connection:
@@ -427,8 +534,7 @@ class PostgresRuntimeStore:
         self.dsn = dsn
         self.schema = schema
         self._audit_head_verifier = audit_head_verifier
-        self._ensure_schema()
-        self._initialize()
+        self._initialize_schema()
 
     def set_audit_head_verifier(self, verifier: AuditHeadVerifier) -> None:
         self._audit_head_verifier = verifier
@@ -441,10 +547,25 @@ class PostgresRuntimeStore:
             return False
         return True
 
-    def _ensure_schema(self) -> None:
-        psycopg, _, sql, _ = _postgres_modules()
-        with psycopg.connect(self.dsn, autocommit=True) as connection:
+    def _initialize_schema(self) -> None:
+        # Section 1, finding #1: concurrent cold init is not race-safe. CREATE SCHEMA
+        # and CREATE TABLE IF NOT EXISTS are NOT atomic against concurrent DDL -- two
+        # processes opening the same new schema race on the pg_namespace / pg_type
+        # unique indexes, and one crashes with a UniqueViolation on portmark_schema's
+        # rowtype. Serialize the whole DDL block behind a session-level advisory lock
+        # derived from the schema name, on ONE connection, acquired BEFORE CREATE
+        # SCHEMA (schema creation itself can race). The lock is released implicitly
+        # when the connection closes -- we do NOT hand-roll pg_advisory_unlock: a
+        # failed DDL leaves the connection in an aborted transaction where the unlock
+        # would itself raise (InFailedSqlTransaction) and mask the real error.
+        psycopg, rows, sql, _ = _postgres_modules()
+        lock_key = _advisory_lock_key("portmark-schema:" + self.schema)
+        with psycopg.connect(self.dsn, row_factory=rows.dict_row) as connection:
+            connection.execute("SELECT pg_advisory_lock(%s)", (lock_key,))
             connection.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(self.schema)))
+            connection.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(self.schema)))
+            self._initialize(connection)
+            connection.commit()
 
     def _connect(self):
         psycopg, rows, sql, _ = _postgres_modules()
@@ -452,27 +573,26 @@ class PostgresRuntimeStore:
         connection.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(self.schema)))
         return connection
 
-    def _initialize(self) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS portmark_schema (
-                    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
-                    version INTEGER NOT NULL
-                )
-                """
+    def _initialize(self, connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS portmark_schema (
+                singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+                version INTEGER NOT NULL
             )
-            row = connection.execute("SELECT version FROM portmark_schema WHERE singleton = TRUE").fetchone()
-            if row is None:
-                connection.execute("INSERT INTO portmark_schema (singleton, version) VALUES (TRUE, %s)", (POSTGRES_SCHEMA_VERSION,))
-                version = POSTGRES_SCHEMA_VERSION
-            else:
-                version = int(row["version"])
-            if version > POSTGRES_SCHEMA_VERSION:
-                raise RuntimeError(
-                    f"Postgres store schema version {version} is newer than supported version {POSTGRES_SCHEMA_VERSION}"
-                )
-            self._migrate_to_v1(connection)
+            """
+        )
+        row = connection.execute("SELECT version FROM portmark_schema WHERE singleton = TRUE").fetchone()
+        if row is None:
+            connection.execute("INSERT INTO portmark_schema (singleton, version) VALUES (TRUE, %s)", (POSTGRES_SCHEMA_VERSION,))
+            version = POSTGRES_SCHEMA_VERSION
+        else:
+            version = int(row["version"])
+        if version > POSTGRES_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Postgres store schema version {version} is newer than supported version {POSTGRES_SCHEMA_VERSION}"
+            )
+        self._migrate_to_v1(connection)
 
     def _migrate_to_v1(self, connection) -> None:
         connection.execute(
@@ -535,6 +655,23 @@ class PostgresRuntimeStore:
             )
             """
         )
+        # Section 1, finding #2: durable migration delivery. The sealed destination
+        # envelope is written here in the SAME transaction that closes the source
+        # checkpoint, so a crash after the source closes cannot lose the migration --
+        # a dispatcher recovers it from this outbox. Duplicate delivery is safe
+        # (destination nonce/CAS reject a replay).
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS migration_outbox (
+                task_id TEXT PRIMARY KEY,
+                destination TEXT NOT NULL,
+                sealed_envelope_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                created_at BIGINT NOT NULL
+            )
+            """
+        )
         connection.execute(
             """
             INSERT INTO portmark_schema (singleton, version)
@@ -546,6 +683,22 @@ class PostgresRuntimeStore:
 
     def transaction(self) -> AbstractContextManager[RuntimeTransaction]:
         return _PostgresTransaction(self)
+
+    def list_pending_migrations(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT task_id, destination, sealed_envelope_json, status, attempt_count, created_at "
+                "FROM migration_outbox WHERE status = 'pending' ORDER BY created_at, task_id"
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def mark_migration_delivered(self, task_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute("UPDATE migration_outbox SET status = 'delivered' WHERE task_id = %s", (task_id,))
+
+    def record_migration_attempt(self, task_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute("UPDATE migration_outbox SET attempt_count = attempt_count + 1 WHERE task_id = %s", (task_id,))
 
     def consumed_nonce_exists(self, nonce: str) -> bool:
         with self._connect() as connection:
@@ -733,6 +886,18 @@ class _PostgresTransaction:
             raise SecurityError("stale checkpoint generation")
         return new_generation
 
+    def enqueue_migration(self, task_id: str, destination: str, sealed_envelope_json: str) -> None:
+        if self._connection is None:
+            raise RuntimeError("Postgres transaction was not opened")
+        self._connection.execute(
+            """
+            INSERT INTO migration_outbox (task_id, destination, sealed_envelope_json, status, attempt_count, created_at)
+            VALUES (%s, %s, %s, 'pending', 0, %s)
+            ON CONFLICT (task_id) DO NOTHING
+            """,
+            (task_id, destination, sealed_envelope_json, int(time.time())),
+        )
+
     @staticmethod
     def _checkpoint_json(state: AgentState, generation: int) -> str:
         blob = asdict(state)
@@ -881,6 +1046,18 @@ class _SQLiteTransaction:
         if cursor.rowcount != 1:
             raise SecurityError("stale checkpoint generation")
         return new_generation
+
+    def enqueue_migration(self, task_id: str, destination: str, sealed_envelope_json: str) -> None:
+        if self._connection is None:
+            raise RuntimeError("SQLite transaction was not opened")
+        self._connection.execute(
+            """
+            INSERT INTO migration_outbox (task_id, destination, sealed_envelope_json, status, attempt_count, created_at)
+            VALUES (?, ?, ?, 'pending', 0, ?)
+            ON CONFLICT(task_id) DO NOTHING
+            """,
+            (task_id, destination, sealed_envelope_json, int(time.time())),
+        )
 
     @staticmethod
     def _checkpoint_json(state: AgentState, generation: int) -> str:

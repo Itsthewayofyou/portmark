@@ -2330,6 +2330,186 @@ class RuntimeTests(unittest.TestCase):
                     # The anchor ties this chain to the source's actual head hash.
                     self.assertEqual(anchor["previous_audit_hash"], first.audit[-1]["hash"])
 
+    def test_migration_writes_sealed_envelope_to_outbox_atomically(self):
+        # Section 1, finding #2: the sealed destination envelope is stored durably in
+        # the source store's migration_outbox in the SAME commit that closes the source
+        # checkpoint, so a crash before the caller delivers RunResult.migration_envelope
+        # cannot lose the migration. The stored envelope is exactly the one returned.
+        source_signer = EnvelopeSigner.generate("outbox-source-key", "host:source", ("host:source", "host:destination"))
+        for context in self._store_case_contexts():
+            with context as (backend, store):
+                with self.subTest(backend=backend):
+                    source = make_host(host_id="host:source", signer=source_signer, store=store)
+                    source.policy.migration = MigrationPolicy(allowed=True, destinations=("host:destination",))
+                    source.providers["migrator"] = MigrateThenCompleteProvider("host:destination")
+                    envelope = make_demo_envelope(source, f"{backend} outbox", "migrator")
+                    object.__setattr__(envelope.permit, "delegation_allowed", True)
+                    source_signer.seal(envelope)
+
+                    result = source.run(envelope)
+                    self.assertIsNotNone(result.migration_envelope)
+                    self.assertEqual(store.load_checkpoint(result.task_id)["status"], "ready")
+
+                    pending = store.list_pending_migrations()
+                    self.assertEqual(len(pending), 1)
+                    row = pending[0]
+                    self.assertEqual(row["task_id"], result.task_id)
+                    self.assertEqual(row["destination"], "host:destination")
+                    self.assertEqual(row["status"], "pending")
+                    self.assertEqual(row["attempt_count"], 0)
+                    # The durable copy is the canonical serialization of the returned
+                    # sealed envelope (byte-for-byte); JSON turns the dataclass tuples
+                    # into lists, so compare the canonical encodings, not the raw dict.
+                    self.assertEqual(row["sealed_envelope_json"], canonical_json(result.migration_envelope).decode("utf-8"))
+
+                    # Delivery API: attempts increment; delivery clears it from pending.
+                    store.record_migration_attempt(result.task_id)
+                    self.assertEqual(store.list_pending_migrations()[0]["attempt_count"], 1)
+                    store.mark_migration_delivered(result.task_id)
+                    self.assertEqual(store.list_pending_migrations(), [])
+
+    def test_completed_run_writes_no_outbox_row(self):
+        # The outbox is written ONLY on a migration close, never on an ordinary run.
+        for context in self._store_case_contexts():
+            with context as (backend, store):
+                with self.subTest(backend=backend):
+                    host = make_host(store=store)
+                    result = host.run(make_demo_envelope(host, f"{backend} no-migration"))
+                    self.assertEqual(result.status, "completed")
+                    self.assertEqual(store.list_pending_migrations(), [])
+
+    def test_oversized_migration_close_still_writes_outbox(self):
+        # Section 1, finding #2 x the terminalization path: an over-budget migration
+        # closes the source through _terminalize_over_budget (the OTHER close path), not
+        # the normal _persist. The outbox write must ride that close too, or the exact
+        # data-loss hole reopens on the terminalize branch. (Mirrors the oversized
+        # terminalization test's budget setup.)
+        source_signer = EnvelopeSigner.generate("outbox-oversize-key", "host:source", ("host:source", "host:destination"))
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            source = make_host(host_id="host:source", signer=source_signer, store=store)
+            source.policy.migration = MigrationPolicy(allowed=True, destinations=("host:destination",))
+            source.providers["migrator"] = MigrateThenCompleteProvider("host:destination")
+            envelope = make_demo_envelope(source, "M" * 1500, "migrator")
+            object.__setattr__(envelope.permit, "delegation_allowed", True)
+            running = asdict(envelope.state)
+            running["status"] = "running"
+            ceiling = len(canonical_json(running)) + 40
+            budget = ResourceBudget(max_steps=6, max_tool_calls=2, max_output_bytes=ceiling)
+            object.__setattr__(envelope.permit, "budget", budget)
+            source.policy.budget = budget
+            source_signer.seal(envelope)
+
+            result = source.run(envelope)  # must not raise
+            self.assertIsNotNone(result.migration_envelope)
+            self.assertEqual(store.load_checkpoint(result.task_id)["status"], "ready")
+            self.assertIn("checkpoint.terminalized", [event["event"] for event in result.audit])
+            pending = store.list_pending_migrations()
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending[0]["destination"], "host:destination")
+            self.assertEqual(pending[0]["sealed_envelope_json"], canonical_json(result.migration_envelope).decode("utf-8"))
+
+    def test_migration_outbox_and_source_close_are_atomic(self):
+        # Both-or-neither: if the outbox write fails inside the closing transaction, the
+        # source-checkpoint close rolls back with it, so the source stays resumable
+        # rather than closing (un-resumable) while the migration was never recorded.
+        import portmark.storage as storage_module
+
+        source_signer = EnvelopeSigner.generate("outbox-atomic-key", "host:source", ("host:source", "host:destination"))
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            source = make_host(host_id="host:source", signer=source_signer, store=store)
+            source.policy.migration = MigrationPolicy(allowed=True, destinations=("host:destination",))
+            source.providers["migrator"] = MigrateThenCompleteProvider("host:destination")
+            envelope = make_demo_envelope(source, "atomic outbox", "migrator")
+            object.__setattr__(envelope.permit, "delegation_allowed", True)
+            source_signer.seal(envelope)
+
+            def boom(self, task_id, destination, sealed_envelope_json):
+                raise RuntimeError("simulated outbox write failure")
+
+            with patch.object(storage_module._SQLiteTransaction, "enqueue_migration", boom):
+                with self.assertRaises(RuntimeError):
+                    source.run(envelope)
+
+            # Neither effect landed: no outbox row, and the source checkpoint was NOT
+            # closed by the rolled-back migrate persist. The accept-persist committed
+            # first, so a checkpoint exists and is still open (not "ready"/migrated),
+            # so the source can still be recovered rather than lost.
+            self.assertEqual(store.list_pending_migrations(), [])
+            checkpoint = store.load_checkpoint(envelope.state.task_id)
+            self.assertIsNotNone(checkpoint)
+            self.assertNotEqual(checkpoint["status"], "ready")
+
+    @unittest.skipUnless(
+        os.environ.get("PORTMARK_TEST_POSTGRES_DSN") and PostgresRuntimeStore.available(),
+        "requires a real PostgreSQL",
+    )
+    def test_concurrent_cold_initialization_is_race_safe(self):
+        # Section 1, finding #1: many independent OS processes opening the same NEW
+        # schema at once must ALL succeed. CREATE SCHEMA / CREATE TABLE IF NOT EXISTS
+        # are not atomic against concurrent DDL (they race on pg_namespace / pg_type
+        # unique indexes); the schema-name advisory lock serialises cold init. Proven
+        # only where the postgres-store CI job runs -- skipped otherwise.
+        import subprocess  # nosec B404
+
+        dsn = os.environ["PORTMARK_TEST_POSTGRES_DSN"]
+        schema = "portmark_race_" + secrets.token_hex(8)
+        worker = (
+            "import sys;"
+            "from portmark.storage import PostgresRuntimeStore;"
+            "PostgresRuntimeStore(sys.argv[1], schema=sys.argv[2]);"
+            "print('OK')"
+        )
+        try:
+            processes = [
+                subprocess.Popen(  # nosec B603
+                    [sys.executable, "-c", worker, dsn, schema],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                for _ in range(16)
+            ]
+            failures = []
+            for process in processes:
+                out, err = process.communicate(timeout=60)
+                if process.returncode != 0:
+                    failures.append(err.decode("utf-8", "replace"))
+            self.assertEqual(failures, [], msg="\n".join(failures))
+        finally:
+            self._drop_postgres_schema(dsn, schema)
+
+    @unittest.skipUnless(
+        os.environ.get("PORTMARK_TEST_POSTGRES_DSN") and PostgresRuntimeStore.available(),
+        "requires a real PostgreSQL",
+    )
+    def test_postgres_store_upgrades_v2_to_v3_adds_migration_outbox(self):
+        # An existing pre-outbox (schema v2) deployment must gain migration_outbox and
+        # advance to v3 when reopened with this code -- the in-place upgrade path for
+        # finding #2, which the fresh-schema tests do not exercise.
+        import psycopg
+        from psycopg import sql
+
+        dsn = os.environ["PORTMARK_TEST_POSTGRES_DSN"]
+        schema = "portmark_upgrade_" + secrets.token_hex(8)
+        try:
+            PostgresRuntimeStore(dsn, schema=schema)  # fresh store at the current version
+            # Simulate a v2 deployment that predates the outbox.
+            with psycopg.connect(dsn, autocommit=True) as connection:
+                connection.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(schema)))
+                connection.execute("DROP TABLE migration_outbox")
+                connection.execute("UPDATE portmark_schema SET version = 2")
+            # Reopening must restore the outbox table and bring the version current.
+            PostgresRuntimeStore(dsn, schema=schema)
+            with psycopg.connect(dsn, autocommit=True) as connection:
+                connection.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(schema)))
+                version = connection.execute("SELECT version FROM portmark_schema WHERE singleton = TRUE").fetchone()[0]
+                regclass = connection.execute("SELECT to_regclass(%s)", (schema + ".migration_outbox",)).fetchone()[0]
+            self.assertEqual(version, 3)
+            self.assertIsNotNone(regclass)
+        finally:
+            self._drop_postgres_schema(dsn, schema)
+
     def test_sqlite_store_rejects_replay_after_host_restart(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runtime.sqlite"
