@@ -362,6 +362,7 @@ class _ProcessTree:
 
     def __init__(self, process: subprocess.Popen[bytes]) -> None:
         self._process = process
+        self._closed = False
 
     @property
     def stdin(self) -> Any:
@@ -381,8 +382,32 @@ class _ProcessTree:
         raise NotImplementedError
 
     def close(self) -> None:
-        if self._process.stdout is not None:
-            self._process.stdout.close()
+        # Release the worker fully and idempotently: kill it if still alive, reap it
+        # (collect exit status -- an un-waited Popen warns "subprocess ... is still
+        # running" and leaves a zombie), then close both pipes. On the normal path the
+        # root has already exited so the kill is skipped; the executor's finally has
+        # already issued the tree-kill (on Windows the CI-proven TerminateJobObject),
+        # so the kill here is the launch-failure / standalone-close safety net, not a
+        # replacement for it.
+        if self._closed:
+            return
+        self._closed = True
+        process = self._process
+        if process.poll() is None:
+            try:
+                self.terminate_tree()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            pass
+        for stream in (process.stdin, process.stdout):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
 
 
 class _PosixProcessTree(_ProcessTree):
@@ -461,6 +486,20 @@ def _launch_windows_job_tree(argv: list[str], common: dict[str, Any]) -> _Proces
         except OSError:
             pass
         _close_job_quietly(job)
+        # Reap the suspended worker and close its pipes so a failed launch leaks
+        # neither a Popen nor open handles. Best-effort: a secondary error here
+        # (a broken pipe on a worker that never ran) must not mask the primary
+        # launch failure being re-raised.
+        try:
+            process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            pass
+        for stream in (process.stdin, process.stdout):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
         raise
     return _WindowsJobProcessTree(process, job)
 

@@ -2,6 +2,28 @@
 
 All notable changes to Portmark are recorded here. Versions follow [semantic versioning](https://semver.org/).
 
+## 0.9.2 — 2026-09-12
+
+Reliability: the isolated-tool executor now releases its worker fully on every exit path. Containment (the hard-kill) was already correct; this fixes parent-side resource cleanup so a killed or failed launch cannot leak a `Popen` or open pipe handles.
+
+### Fixed
+
+- **A terminated worker is now reaped, not just killed.** `_ProcessTree.close()` previously
+  closed only stdout: the `Popen` was never `wait()`ed (leaving a zombie and a
+  `ResourceWarning: subprocess ... is still running`) and stdin stayed open. `close()` now
+  kills the worker if still alive, reaps it with a bounded `wait()`, closes both pipes, and
+  is idempotent. Observed on the unconfirmed-kill path, which is cross-platform.
+- **A failed Windows launch no longer leaks the suspended worker.** When
+  `AssignProcessToJobObject` or `ResumeThread` fails, the cleanup path now also reaps the
+  process and closes its pipes (best-effort, so a secondary error cannot mask the primary
+  launch failure) instead of leaving the killed worker un-`wait()`ed.
+
+### Notes
+
+- The normal-completion and timeout paths still issue the tree-kill through the executor's
+  own `finally` (on Windows the CI-proven `TerminateJobObject`); `close()`'s kill-if-alive
+  is the launch-failure / standalone-close safety net, not a replacement for it.
+
 ## 0.9.1 — 2026-09-11
 
 Security: the Windows Job Object executor no longer overstates containment. Unchecked Win32 return values could let a failed termination pass silently; the kill is now verified and fails closed when it cannot be confirmed.
