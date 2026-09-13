@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import secrets
+import shlex
 import sys
 from dataclasses import asdict
 
@@ -14,9 +15,19 @@ from .logging_config import configure_logging
 from .tool_loading import ToolLoaderError, load_tools
 
 
+def _reject_control_characters(parser: argparse.ArgumentParser, name: str, value: str | None) -> None:
+    # Control characters and newlines cannot be safely rendered on a single shell export
+    # line even when quoted, and have no legitimate place in a key id or issuer. Reject
+    # them; everything else is made safe by shlex.quote below (finding #4).
+    if value and any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+        parser.error(f"{name} must not contain control characters or newlines")
+
+
 def _run_keygen(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     from .security import generate_signing_material
 
+    _reject_control_characters(parser, "--key-id", args.key_id)
+    _reject_control_characters(parser, "--issuer", args.issuer)
     if args.out_registry and os.path.exists(args.out_registry) and not args.force:
         parser.error(f"{args.out_registry} already exists; pass --force to overwrite this trust registry")
     material = generate_signing_material(args.key_id, args.issuer, tuple(args.audience or ("*",)))
@@ -25,10 +36,14 @@ def _run_keygen(parser: argparse.ArgumentParser, args: argparse.Namespace) -> No
             json.dump(material["trust_registry"], handle, indent=2)
         print(f"wrote trust registry to {args.out_registry}", file=sys.stderr)
     if args.format == "env":
-        # Exported together so the issuer and key id can never drift from the key itself.
-        print(f"export PORTMARK_ED25519_PRIVATE_KEY_B64={material['private_key_b64']}")
-        print(f"export PORTMARK_SIGNING_KEY_ID={material['key_id']}")
-        print(f"export PORTMARK_SIGNING_ISSUER={material['issuer']}")
+        # shlex.quote every value so an operator-chosen key id / issuer cannot inject
+        # shell when the output is eval'd (finding #4). shlex.quote is POSIX only, so we
+        # say so: on PowerShell/cmd the value must be set another way. Exported together
+        # so the issuer and key id can never drift from the key itself.
+        print("# POSIX sh/bash only -- on PowerShell/cmd set these manually or use --format json / --out-registry", file=sys.stderr)
+        print(f"export PORTMARK_ED25519_PRIVATE_KEY_B64={shlex.quote(material['private_key_b64'])}")
+        print(f"export PORTMARK_SIGNING_KEY_ID={shlex.quote(material['key_id'])}")
+        print(f"export PORTMARK_SIGNING_ISSUER={shlex.quote(material['issuer'])}")
     else:
         print(json.dumps(material, indent=2))
 

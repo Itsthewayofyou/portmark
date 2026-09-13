@@ -4,13 +4,19 @@ Each test class maps to an audit finding (see SECTION3_SIGNING_KEY_LIFECYCLE_PLA
 Tests are written to FAIL against the pre-fix code and pass once the fix lands.
 """
 
+import io
 import json
 import secrets
+import subprocess  # nosec B404
+import sys
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
+from portmark.cli import main as cli_main
 from portmark.factory import make_host
 from portmark.models import AgentEnvelope, AgentManifest, AgentState, Permit, ResourceBudget, ToolGrant
 from portmark.security import (
@@ -185,6 +191,66 @@ class EffectiveRevocationTests(unittest.TestCase):
             second = _agent_envelope(agent, "host:local-demo")
             with self.assertRaisesRegex(SecurityError, "changed on disk"):
                 host.run(second)
+
+
+# ---------------------------------------------------------------------------
+# Finding #4 — keygen --format env must not emit shell-injectable exports.
+# ---------------------------------------------------------------------------
+class KeygenExportTests(unittest.TestCase):
+    def _env_output(self, key_id: str, issuer: str) -> str:
+        buffer = io.StringIO()
+        argv = ["portmark", "keygen", "--format", "env", "--key-id", key_id, "--issuer", issuer]
+        with patch.object(sys, "argv", argv):
+            with redirect_stdout(buffer), redirect_stderr(io.StringIO()):
+                try:
+                    cli_main()
+                except SystemExit:
+                    pass
+        return buffer.getvalue()
+
+    def test_keygen_injection_env_output_is_inert_when_sourced(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker_semi = Path(directory) / "PWNED_SEMI"
+            marker_sub = Path(directory) / "PWNED_SUB"
+            payloads = {
+                "semicolon": f"safe; touch {marker_semi}",
+                "command-substitution": f"x$(touch {marker_sub})",
+            }
+            for name, issuer in payloads.items():
+                with self.subTest(case=name):
+                    exports = self._env_output("agent-key", issuer)
+                    subprocess.run(  # nosec B603 B607 -- deliberately sourcing keygen output in a throwaway shell
+                        ["/bin/sh", "-c", exports + "\n:"], cwd=directory, capture_output=True, timeout=10
+                    )
+            self.assertFalse(marker_semi.exists(), "semicolon payload executed when sourced")
+            self.assertFalse(marker_sub.exists(), "command-substitution payload executed when sourced")
+
+    def test_keygen_injection_value_roundtrips_through_shell(self):
+        issuer = "weird; value $with (chars) `here`"
+        exports = self._env_output("agent-key", issuer)
+        result = subprocess.run(  # nosec B603 B607
+            ["/bin/sh", "-c", exports + '\nprintf "%s" "$PORTMARK_SIGNING_ISSUER"'],
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.stdout, issuer)
+
+    def test_issuer_uri_allowed(self):
+        for issuer in ("user:portmark", "https://example.com/agents/portmark"):
+            with self.subTest(issuer=issuer):
+                exports = self._env_output("agent-key", issuer)
+                self.assertIn("PORTMARK_SIGNING_ISSUER=", exports)
+                result = subprocess.run(  # nosec B603 B607
+                    ["/bin/sh", "-c", exports + '\nprintf "%s" "$PORTMARK_SIGNING_ISSUER"'],
+                    capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(result.stdout, issuer)
+
+    def test_keygen_rejects_control_characters_in_identifiers(self):
+        # Newlines/control chars can't be safely single-lined even quoted; reject them.
+        with patch.object(sys, "argv", ["portmark", "keygen", "--format", "env", "--issuer", "a\nb"]):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    cli_main()
 
 
 if __name__ == "__main__":
