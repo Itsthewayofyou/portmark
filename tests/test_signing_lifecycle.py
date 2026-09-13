@@ -37,7 +37,7 @@ from portmark.storage import InMemoryRuntimeStore, SQLiteRuntimeStore
 # The keygen env-export shell tests source output in a POSIX shell; skip them where none
 # exists (Windows CI) so they don't fail with WinError 2. Platform-independent coverage
 # (JSON output, shlex-quoting as a string check, control-char rejection) runs everywhere.
-_HAS_POSIX_SH = os.path.exists("/bin/sh")
+_HAS_POSIX_SH = os.path.exists("/bin/sh") and not os.environ.get("PORTMARK_TEST_NO_POSIX_SH")
 
 
 def _write_registry(path: Path, signer: EnvelopeSigner, audiences=("*",), revoked: bool = False) -> None:

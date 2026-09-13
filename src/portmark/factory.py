@@ -28,6 +28,11 @@ def signer_from_environment(
     # fail-closed source (finding #2 -- two independent loads would let one verifier
     # keep trusting a key the other has stopped trusting). Fall back to loading a
     # fail-closed TrustSource from the path for direct callers (CLI, tests).
+    # NOTE: the fallback source is for SINGLE-verifier use (a signer whose registry is the
+    # only verifier). Do NOT pair a signer built this way with a store whose audit verifier
+    # came from a separate load -- that recreates the two-source split this fix exists to
+    # prevent. In make_host, pass the shared `trust` instead; make_host also refuses an
+    # explicit signer combined with a trust_registry_path for exactly this reason.
     if trust is not None:
         registry: "TrustRegistry | TrustSource | None" = trust
     elif trust_registry_path:
