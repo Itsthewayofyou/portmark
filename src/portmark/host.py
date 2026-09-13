@@ -186,12 +186,12 @@ class AgentHost:
             # effect). await_input is still excluded (open, not closed).
             if not self._checkpoint_fits(effective, state) and (tool_ran or closed):
                 persisted_events = self._terminalize_over_budget(
-                    envelope, effective, state, audit, persisted_events, decision, tool_ran
+                    envelope, effective, state, audit, persisted_events, decision, tool_ran, migration
                 )
                 result = self._result(envelope, audit, migration)
                 self._record_run_status(result.status)
                 return result
-            persisted_events = self._persist(envelope, effective, state, audit, persisted_events, closed=closed)
+            persisted_events = self._persist(envelope, effective, state, audit, persisted_events, closed=closed, migration=migration)
             if finished:
                 result = self._result(envelope, audit, migration)
                 self._record_run_status(result.status)
@@ -454,7 +454,7 @@ class AgentHost:
         # into an honest terminal event rather than an uncaught raise.
         return len(canonical_json(asdict(state))) <= effective.budget.max_output_bytes
 
-    def _terminalize_over_budget(self, envelope, effective, state, audit, persisted_events, decision, tool_ran):
+    def _terminalize_over_budget(self, envelope, effective, state, audit, persisted_events, decision, tool_ran, migration=None):
         # Collapse an over-budget terminal state to a bounded closed tombstone that is
         # provably <= the admitted checkpoint, so the closed persist always lands. The
         # admitted checkpoint already held the goal plus this working state, so goal +
@@ -503,7 +503,10 @@ class AgentHost:
         # checkpoint, which admitted under the ceiling with the goal already present.
         if len(canonical_json(asdict(state))) > ceiling:
             state.result = None
-        return self._persist(envelope, effective, state, audit, persisted_events, closed=True)
+        # Pass `migration` through: an over-budget migration closes the source via
+        # this branch (host.py comment above), so the outbox write must ride the same
+        # close here too, or the exact data-loss hole reopens on the terminalize path.
+        return self._persist(envelope, effective, state, audit, persisted_events, closed=True, migration=migration)
 
     def _record_run_status(self, status: str) -> None:
         self.metrics.increment(f"runs.{status}")
@@ -599,6 +602,7 @@ class AgentHost:
         persisted_events: int,
         consume_nonce: str | None = None,
         closed: bool = False,
+        migration: dict[str, Any] | None = None,
     ) -> int:
         checkpoint = asdict(state)
         encoded_size = len(canonical_json(checkpoint))
@@ -626,5 +630,16 @@ class AgentHost:
                 lambda head_hash, sequence: (self.signer.key_id, self.signer.sign_audit_head(state.task_id, self.host_id, head_hash, sequence)),
             )
             new_generation = transaction.save_checkpoint(state.task_id, state, state.checkpoint_generation, closed)
+            # Section 1, finding #2: a migration's sealed destination envelope is
+            # written to the outbox in the SAME transaction that closes the source
+            # checkpoint. Either both commit or both roll back, so the source can
+            # never be closed (un-resumable) while the migration is lost. The sealed
+            # envelope was snapshotted in _apply_decision, so terminalizing the
+            # source's own checkpoint here does not alter it. A dispatcher delivers it
+            # later; duplicate delivery is safe (destination nonce/CAS reject replays).
+            if migration is not None and closed:
+                transaction.enqueue_migration(
+                    state.task_id, migration["permit"]["audience"], canonical_json(migration).decode("utf-8")
+                )
         state.checkpoint_generation = new_generation
         return len(audit.events)

@@ -2,6 +2,35 @@
 
 All notable changes to Portmark are recorded here. Versions follow [semantic versioning](https://semver.org/).
 
+## Unreleased
+
+External-audit section 1 — PostgreSQL under real failure conditions. Held unreleased (no version bump / tag) until the full audit is complete.
+
+### Fixed
+
+- **Concurrent cold initialization is now race-safe (section 1, finding #1).** Many
+  processes opening the same new schema at once could crash with a `UniqueViolation`
+  because `CREATE SCHEMA` / `CREATE TABLE IF NOT EXISTS` are not atomic against
+  concurrent DDL. Cold init now runs the whole DDL block on one connection behind a
+  session-level advisory lock derived from the schema name, acquired **before**
+  `CREATE SCHEMA` (schema creation itself races). The lock releases when the
+  connection closes — no hand-rolled `pg_advisory_unlock` that could mask a DDL error
+  in an aborted transaction. Verified: 16 independent processes against a fresh schema
+  all succeed; with the lock removed the race reproduces every run.
+
+### Added
+
+- **Durable migration delivery via a transactional outbox (section 1, finding #2).** A
+  migration's sealed destination envelope is now written to a `migration_outbox` row
+  in the **same transaction** that closes the source checkpoint, so a crash after the
+  source closes can no longer lose the migration (previously it lived only in the
+  returned `RunResult`). Covers both close paths — the normal persist and the
+  over-budget terminalization. New store API — `list_pending_migrations()`,
+  `mark_migration_delivered(task_id)`, `record_migration_attempt(task_id)` — lets a
+  delivery dispatcher retry and acknowledge; duplicate delivery is safe (destination
+  nonce/CAS reject replays). The delivery loop/transport remains the embedder's
+  responsibility. SQLite schema v5, Postgres schema v3 (both upgrade in place).
+
 ## 0.9.2 — 2026-09-12
 
 Reliability: the isolated-tool executor now releases its worker fully on every exit path. Containment (the hard-kill) was already correct; this fixes parent-side resource cleanup so a killed or failed launch cannot leak a `Popen` or open pipe handles.
