@@ -28,8 +28,11 @@ External-audit section 1 — PostgreSQL under real failure conditions. Held unre
   over-budget terminalization. New store API — `list_pending_migrations()`,
   `mark_migration_delivered(task_id)`, `record_migration_attempt(task_id)` — lets a
   delivery dispatcher retry and acknowledge; duplicate delivery is safe (destination
-  nonce/CAS reject replays). The delivery loop/transport remains the embedder's
-  responsibility. SQLite schema v5, Postgres schema v3 (both upgrade in place).
+  nonce/CAS reject replays). SQLite schema v5, Postgres schema v3 (both upgrade in
+  place). **Scope:** this provides the durable outbox and its state API, **not a
+  running dispatcher** — production delivery still requires the embedder to run one
+  (enumerate pending rows, retry, record attempts, mark acknowledgement). Without a
+  dispatcher a migration stays durably pending and is never delivered.
 
 ## 0.9.2 — 2026-09-12
 

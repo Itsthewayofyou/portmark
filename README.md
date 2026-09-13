@@ -316,7 +316,16 @@ The default runnable Node WebAssembly adapter uses the JSON-lowered WIT binding 
 [WASM_COMPONENTS.md](https://github.com/Itsthewayofyou/portmark/blob/main/WASM_COMPONENTS.md). An optional native Wasmtime provider can execute
 the signed Component Model artifact in a short-lived Python worker when `portmark[wasmtime]` is
 installed. Strong migration is implemented as checkpoint-and-resume: native stacks, threads,
-sockets, and file descriptors never cross hosts.
+sockets, and file descriptors never cross hosts. A migration's sealed destination
+envelope is written to a durable `migration_outbox` in the same transaction that
+closes the source checkpoint, so it survives a crash after the source closes.
+Portmark provides the outbox and its state API (`list_pending_migrations`,
+`record_migration_attempt`, `mark_migration_delivered`) but **does not run a
+delivery dispatcher**: production delivery requires the embedder to run one that
+enumerates pending rows, retries delivery, records attempts, and marks
+acknowledgement. Without a dispatcher a migration stays durably pending and is never
+delivered. Duplicate delivery is safe — the destination's nonce/CAS enforcement
+rejects a replay.
 
 ## Production status
 
