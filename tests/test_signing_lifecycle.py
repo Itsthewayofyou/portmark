@@ -18,10 +18,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from portmark.cli import main as cli_main
-from portmark.factory import make_host
+from portmark.factory import make_host, signer_from_environment
 from portmark.models import AgentEnvelope, AgentManifest, AgentState, Permit, ResourceBudget, ToolGrant
 from portmark.security import (
     EnvelopeSigner,
+    HmacEnvelopeSigner,
     SecurityError,
     TrustedIdentity,
     TrustRegistry,
@@ -31,6 +32,12 @@ from portmark.security import (
     audit_head_payload,
 )
 from portmark.storage import InMemoryRuntimeStore, SQLiteRuntimeStore
+
+
+# The keygen env-export shell tests source output in a POSIX shell; skip them where none
+# exists (Windows CI) so they don't fail with WinError 2. Platform-independent coverage
+# (JSON output, shlex-quoting as a string check, control-char rejection) runs everywhere.
+_HAS_POSIX_SH = os.path.exists("/bin/sh")
 
 
 def _write_registry(path: Path, signer: EnvelopeSigner, audiences=("*",), revoked: bool = False) -> None:
@@ -211,6 +218,7 @@ class KeygenExportTests(unittest.TestCase):
                     pass
         return buffer.getvalue()
 
+    @unittest.skipUnless(_HAS_POSIX_SH, "requires a POSIX shell at /bin/sh")
     def test_keygen_injection_env_output_is_inert_when_sourced(self):
         with tempfile.TemporaryDirectory() as directory:
             marker_semi = Path(directory) / "PWNED_SEMI"
@@ -228,6 +236,7 @@ class KeygenExportTests(unittest.TestCase):
             self.assertFalse(marker_semi.exists(), "semicolon payload executed when sourced")
             self.assertFalse(marker_sub.exists(), "command-substitution payload executed when sourced")
 
+    @unittest.skipUnless(_HAS_POSIX_SH, "requires a POSIX shell at /bin/sh")
     def test_keygen_injection_value_roundtrips_through_shell(self):
         issuer = "weird; value $with (chars) `here`"
         exports = self._env_output("agent-key", issuer)
@@ -237,6 +246,7 @@ class KeygenExportTests(unittest.TestCase):
         )
         self.assertEqual(result.stdout, issuer)
 
+    @unittest.skipUnless(_HAS_POSIX_SH, "requires a POSIX shell at /bin/sh")
     def test_issuer_uri_allowed(self):
         for issuer in ("user:portmark", "https://example.com/agents/portmark"):
             with self.subTest(issuer=issuer):
@@ -247,6 +257,38 @@ class KeygenExportTests(unittest.TestCase):
                     capture_output=True, text=True, timeout=10,
                 )
                 self.assertEqual(result.stdout, issuer)
+
+    def _json_output(self, key_id: str, issuer: str) -> dict:
+        buffer = io.StringIO()
+        argv = ["portmark", "keygen", "--format", "json", "--key-id", key_id, "--issuer", issuer]
+        with patch.object(sys, "argv", argv):
+            with redirect_stdout(buffer), redirect_stderr(io.StringIO()):
+                try:
+                    cli_main()
+                except SystemExit:
+                    pass
+        return json.loads(buffer.getvalue())
+
+    def test_keygen_json_output_is_platform_independent(self):
+        # No shell involved — safe everywhere including Windows. JSON escaping (not shell
+        # quoting) carries the values, so a metacharacter issuer round-trips verbatim.
+        material = self._json_output("agent-key", "safe; touch PWNED $(id)")
+        self.assertEqual(material["key_id"], "agent-key")
+        self.assertEqual(material["issuer"], "safe; touch PWNED $(id)")
+        self.assertIn("private_key_b64", material)
+
+    def test_keygen_env_output_is_shell_quoted_string_check(self):
+        # Platform-independent injection check: the export line quotes the value so the
+        # payload is a single shell token, without needing to run a shell to prove it.
+        exports = self._env_output("agent-key", "safe; touch PWNED")
+        issuer_line = next(l for l in exports.splitlines() if l.startswith("export PORTMARK_SIGNING_ISSUER="))
+        self.assertIn("'safe; touch PWNED'", issuer_line)  # shlex.quote wraps the whole value
+
+    def test_issuer_uri_accepted_platform_independent(self):
+        for issuer in ("user:portmark", "https://example.com/agents/portmark"):
+            with self.subTest(issuer=issuer):
+                material = self._json_output("agent-key", issuer)
+                self.assertEqual(material["issuer"], issuer)
 
     def test_keygen_rejects_control_characters_in_identifiers(self):
         # Newlines/control chars can't be safely single-lined even quoted; reject them.
@@ -264,7 +306,7 @@ class DurableKeyCustodyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = SQLiteRuntimeStore(str(Path(directory) / "store.sqlite"))
             with patch.dict(os.environ, {}, clear=True):
-                with self.assertRaisesRegex(ValueError, "durable store requires a stable"):
+                with self.assertRaisesRegex(ValueError, "durable store requires"):
                     make_host(store=store)
 
     def test_durable_requires_key_allows_ephemeral_with_explicit_optin(self):
@@ -394,6 +436,49 @@ class DuplicateIdRejectionTests(unittest.TestCase):
     def test_duplicate_id_rejected_in_trust_registry_constructor(self):
         with self.assertRaisesRegex(ValueError, "duplicate"):
             TrustRegistry((self._identity("dup"), self._identity("dup")))
+
+
+# ---------------------------------------------------------------------------
+# Auditor follow-up on PR #58 — merge blockers + hardening.
+# ---------------------------------------------------------------------------
+class FollowupAuditTests(unittest.TestCase):
+    def test_signer_with_trust_registry_path_is_rejected(self):
+        # Blocker: a caller-supplied signer keeps its own in-memory registry, so a
+        # file-backed TrustSource built from trust_registry_path would be orphaned and
+        # revocation via that file would not take effect. Reject the combination.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trust.json"
+            agent = EnvelopeSigner.generate("k", "user:a", ("host:local-demo",))
+            _write_registry(path, agent, audiences=("host:local-demo",))
+            signer = EnvelopeSigner.generate("host-key", "host:local-demo", ("*",))
+            with self.assertRaisesRegex(ValueError, "either an explicit signer OR"):
+                make_host(host_id="host:local-demo", signer=signer, trust_registry_path=str(path))
+
+    def test_env_private_key_uses_strict_decoder(self):
+        # #6: PORTMARK_ED25519_PRIVATE_KEY_B64 must go through the strict decoder too.
+        noncanonical = _b64url_encode(bytes(32)) + "="  # valid 32 bytes leniently, padding is non-canonical
+        env = {"PORTMARK_ED25519_PRIVATE_KEY_B64": noncanonical, "PORTMARK_SIGNING_ISSUER": "host:x"}
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(ValueError):
+                signer_from_environment("host:x")
+
+    def test_durable_refuses_signer_without_affirmative_stability_marker(self):
+        # #5b: stability must be affirmative. A signer that does not declare ephemeral=False
+        # (e.g. a randomly-generated HMAC signer) is not presumed stable.
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(str(Path(directory) / "store.sqlite"))
+            signer = HmacEnvelopeSigner.generate()
+            with self.assertRaisesRegex(ValueError, "durable store requires"):
+                make_host(signer=signer, store=store)
+
+    def test_durable_stable_env_key_signer_is_accepted(self):
+        # Control: an affirmatively-stable key (from_private_key_bytes) runs on a durable store.
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(str(Path(directory) / "store.sqlite"))
+            raw = EnvelopeSigner.generate().private_key_bytes()
+            signer = EnvelopeSigner.from_private_key_bytes("env-ed25519-key", "host:local-demo", raw)
+            host = make_host(host_id="host:local-demo", signer=signer, store=store)
+            self.assertIsNotNone(host)
 
 
 if __name__ == "__main__":

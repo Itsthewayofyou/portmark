@@ -11,7 +11,7 @@ from .metrics import RuntimeMetrics
 from .models import AgentEnvelope, AgentManifest, AgentState, Permit, ResourceBudget, ToolGrant
 from .policy import load_host_policy
 from .providers import DeterministicProvider, GenericHttpProvider, ModelProvider, NativeWasmtimeComponentProvider, WasmDecisionProvider
-from .security import AttestationPolicy, EnvelopeSigner, EnvelopeSigningIdentity, ExternalAttestationVerifier, HmacEnvelopeSigner, HostPolicy, TrustRegistry, TrustSource, validate_constraints
+from .security import AttestationPolicy, EnvelopeSigner, EnvelopeSigningIdentity, ExternalAttestationVerifier, HmacEnvelopeSigner, HostPolicy, TrustRegistry, TrustSource, _b64url_decode, validate_constraints
 from .storage import RuntimeStore, create_runtime_store
 from .tools import ToolRegistry, demo_registry
 
@@ -36,10 +36,9 @@ def signer_from_environment(
         registry = None
     raw_private_key = os.environ.get("PORTMARK_ED25519_PRIVATE_KEY_B64")
     if raw_private_key:
-        import base64
-
-        padding = "=" * (-len(raw_private_key) % 4)
-        private_key = base64.urlsafe_b64decode(raw_private_key + padding)
+        # Strict canonical Base64URL, the same decoder used for signatures and public
+        # keys (finding #6) -- a private key from the environment is a key decoder site too.
+        private_key = _b64url_decode(raw_private_key)
         return EnvelopeSigner.from_private_key_bytes(
             os.environ.get("PORTMARK_SIGNING_KEY_ID", "env-ed25519-key"),
             os.environ.get("PORTMARK_SIGNING_ISSUER", host_id),
@@ -132,6 +131,19 @@ def make_host(
                 required_for_migration=required,
                 external_verifier=verifier,
             )
+    # A caller-supplied signer keeps its OWN trust registry, so a file-backed TrustSource
+    # built from trust_registry_path would be constructed and then orphaned -- admission
+    # and audit verification would keep using the signer's stale in-memory registry, and a
+    # revocation deployed to the file would never take effect. Reject the ambiguous combo;
+    # the caller should build the signer already bound to the registry (or omit the signer).
+    if signer is not None and configured_trust_registry_path:
+        raise ValueError(
+            "pass either an explicit signer OR a trust_registry_path, not both: a supplied "
+            "signer keeps its own trust registry, so the file-backed trust source would be "
+            "ignored and a revocation deployed to that file would not take effect. Build the "
+            "signer bound to the registry via signer_from_environment(host_id, trust_registry_path), "
+            "or omit the signer and let make_host construct it."
+        )
     host_signer = signer or signer_from_environment(host_id, configured_trust_registry_path, trust=trust_source)
     signing_issuer = getattr(host_signer, "issuer", host_id)
     if signing_issuer != host_id:
@@ -148,13 +160,19 @@ def make_host(
     # signing key -- audit heads signed before a restart would no longer verify, and
     # checkpoint continuation can break. Durability comes from the store's own
     # declaration, not a path/env heuristic. Ephemeral demo/test use must opt in.
-    if getattr(configured_store, "is_durable", False) and getattr(host_signer, "ephemeral", False) and not allow_ephemeral_signing_key:
+    # Stability must be AFFIRMATIVE: only a signer that declares ephemeral=False (a key
+    # loaded from stable bytes via from_private_key_bytes) counts as stable. A generated
+    # key (ephemeral=True) OR any signer that does not declare its stability (e.g. a
+    # randomly-generated HMAC or custom signer, ephemeral absent) is NOT presumed stable,
+    # so a durable store refuses it unless the caller explicitly opts in.
+    signer_is_stable = getattr(host_signer, "ephemeral", None) is False
+    if getattr(configured_store, "is_durable", False) and not signer_is_stable and not allow_ephemeral_signing_key:
         raise ValueError(
-            "a durable store requires a stable host signing key: set "
-            "PORTMARK_ED25519_PRIVATE_KEY_B64 (and add the host public key to the trust "
-            "registry), or pass allow_ephemeral_signing_key=True for ephemeral demo/test "
-            "use. A generated key changes on every restart, so audit heads signed before "
-            "a restart would no longer verify."
+            "a durable store requires a signing key with proven stability (loaded from stable "
+            "bytes, e.g. PORTMARK_ED25519_PRIVATE_KEY_B64, with the host public key in the trust "
+            "registry). A generated key, or a signer that does not declare its key stable, is "
+            "refused because such a key can change across restarts and orphan previously-signed "
+            "audit heads; pass allow_ephemeral_signing_key=True for ephemeral demo/test use."
         )
     return AgentHost(
         host_id,

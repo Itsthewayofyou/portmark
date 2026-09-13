@@ -23,9 +23,13 @@ The host verifier uses a `TrustRegistry` containing `TrustedIdentity` records:
 - `expires_at`: optional expiration time.
 - `revoked`: hard-disable flag for compromised or retired keys.
 - `usages` (optional): permitted key purposes, e.g. `["envelope"]`, `["audit"]`, or
-  `["envelope", "migration", "audit"]`. A key is rejected for any purpose it does not list — an
-  envelope-signing key cannot sign an audit head, and vice versa. Absent/empty means unrestricted
-  (backward compatible). Use it to give audit-signing and online envelope-signing separate keys.
+  `["envelope", "migration", "audit"]`. Enforced today for the `envelope` purpose (envelope
+  verification) and the `audit` purpose (audit-head verification): an envelope-signing key cannot
+  sign an audit head, and vice versa. Absent/empty means unrestricted (backward compatible), and the
+  host's own self-registered key is unrestricted. **Not yet enforced:** the `migration` purpose (a
+  migration-proposing envelope is still verified only as `envelope`), and truly separate host
+  audit/migration keys — deferred with the historical-audit work (#3-B). Treat `usages` today as a
+  schema/enforcement primitive, not full key separation.
 
 Verification fails if the key ID is unknown, revoked, inactive, expired, used for the wrong issuer,
 used for the wrong audience, lacks the required usage, or the signature bytes do not verify. The

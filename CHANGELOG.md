@@ -15,7 +15,12 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   SQLite/Postgres are durable, in-memory is not) unless a stable key is configured
   (`PORTMARK_ED25519_PRIVATE_KEY_B64`) — or `allow_ephemeral_signing_key=True` is passed for
   demo/test use. Generated key ids are now derived from the public-key fingerprint
-  (`ed25519:<digest>`) so two generated keys can never collide.
+  (`ed25519:<digest>`) so two generated keys can never collide. Stability is affirmative: only a key
+  loaded from stable bytes (`from_private_key_bytes`) counts as stable, so a randomly-generated
+  custom/HMAC signer is refused on a durable store rather than presumed stable. `make_host` also
+  rejects an explicit `signer` combined with a `trust_registry_path`, because the supplied signer
+  keeps its own registry and the file-backed trust source (hence revocation via that file) would be
+  silently ignored.
 - **Deployed key revocation now takes effect without trusting a stale registry (finding #2, release blocker).**
   The trust registry was loaded once at boot, so a revocation file deployed to a running host was
   not applied until restart while `/readyz` still reported ready. The signer and the store's audit
@@ -29,13 +34,17 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   key id or issuer cannot execute shell when the output is eval'd. The output is labelled POSIX-only;
   on PowerShell/cmd use `--format json` / `--out-registry` or set the variables manually. URI-style
   issuers (`user:portmark`, `https://…`) are still accepted.
-- **Trust identities can declare permitted key usages (finding #5).** A registry entry may list
-  `usages` (e.g. `envelope`, `migration`, `audit`); a key valid for one purpose is rejected for
-  another it does not list (an envelope key cannot sign an audit head). Empty/absent = unrestricted
-  (backward compatible).
+- **Key-purpose usages primitive added (finding #5 — primitive only, not full key separation).** A
+  registry entry may list `usages`; the `envelope` purpose is enforced in envelope verification and
+  the `audit` purpose in audit-head verification, so an envelope-only key cannot sign an audit head.
+  Empty/absent `usages` = unrestricted (backward compatible), and the host's own self-registered key
+  is unrestricted, so existing registries and the default host still allow one key to span purposes.
+  **Not yet enforced:** the `migration` purpose (a migration-proposing envelope is still verified only
+  as `envelope`), and separate host audit/migration signing keys — these are deferred with #3-B.
 - **Stricter Base64URL and trust-registry parsing (findings #6, #15).** Signature and public-key
   decoding is now strict canonical Base64URL — non-alphabet characters, added padding, and
-  non-canonical trailing bits are rejected at every decoder site. Registry `not_before`/`expires_at`
+  non-canonical trailing bits are rejected at every decoder site, including the
+  `PORTMARK_ED25519_PRIVATE_KEY_B64` environment key. Registry `not_before`/`expires_at`
   must be real integers (a boolean is rejected, not coerced) and `revoked` a real boolean; a
   duplicate key id in a `TrustRegistry` is rejected rather than silently collapsed.
 
