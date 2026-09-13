@@ -176,7 +176,11 @@ def _identity_unusable_reason(identity: Any, now: int) -> str | None:
 
 class TrustRegistry:
     def __init__(self, identities: tuple[TrustedIdentity, ...] = ()) -> None:
-        self._identities = {identity.key_id: identity for identity in identities}
+        # Build via add() rather than a dict comprehension so a duplicate key id in the
+        # input is REJECTED, not silently collapsed to the last entry (finding #15).
+        self._identities: dict[str, TrustedIdentity] = {}
+        for identity in identities:
+            self.add(identity)
 
     def is_usable(self, key_id: str, now: int | None = None) -> bool:
         """True only if the key is trusted AND currently valid. `has_key` (membership)
@@ -263,13 +267,27 @@ def _parse_trust_registry(value: Any) -> TrustRegistry:
                 issuer=_required_string(item, "issuer", "trust registry"),
                 public_key=_decode_raw_key(_required_string(item, "public_key_b64", "trust registry"), "Ed25519 public keys"),
                 allowed_audiences=_string_tuple(item.get("allowed_audiences", ("*",)), "trust registry allowed_audiences"),
-                not_before=int(item.get("not_before", 0)),
-                expires_at=int(item["expires_at"]) if item.get("expires_at") is not None else None,
-                revoked=bool(item.get("revoked", False)),
+                not_before=_strict_int(item.get("not_before", 0), "trust registry not_before"),
+                expires_at=None if item.get("expires_at") is None else _strict_int(item["expires_at"], "trust registry expires_at"),
+                revoked=_strict_bool(item.get("revoked", False), "trust registry revoked"),
                 usages=_usages_tuple(item.get("usages", ())),
             )
         )
     return registry
+
+
+def _strict_int(value: Any, label: str) -> int:
+    # bool is an int subclass, so `isinstance(value, int)` alone would accept True/False
+    # as 1/0 (finding #15). Reject bools and every non-int type; do not coerce.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{label} must be an integer")
+    return value
+
+
+def _strict_bool(value: Any, label: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{label} must be a boolean")
+    return value
 
 
 def _usages_tuple(value: Any) -> tuple[str, ...]:

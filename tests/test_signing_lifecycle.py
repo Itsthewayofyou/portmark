@@ -349,5 +349,52 @@ class KeyUsageTests(unittest.TestCase):
         registry.require_identity(_agent_envelope(signer, self.HOST))  # no raise
 
 
+# ---------------------------------------------------------------------------
+# Additional lifecycle limitations — #15: strict typing (bool is an int subclass)
+# and duplicate-id rejection on every registry construction path.
+# ---------------------------------------------------------------------------
+class RegistryStrictTypingTests(unittest.TestCase):
+    def _write(self, path: Path, identity_extra: dict) -> None:
+        entry = {"key_id": "k", "issuer": "user:a", "public_key_b64": _b64url_encode(bytes(32))}
+        entry.update(identity_extra)
+        path.write_text(json.dumps({"identities": [entry]}), encoding="utf-8")
+
+    def test_strict_typing_rejects_bool_and_non_int_timestamps(self):
+        from portmark.security import load_trust_registry
+
+        cases = {
+            "bool-not_before": {"not_before": True},
+            "float-not_before": {"not_before": 1.5},
+            "str-expires_at": {"expires_at": "later"},
+            "bool-expires_at": {"expires_at": False},
+            "str-revoked": {"revoked": "yes"},
+        }
+        for name, extra in cases.items():
+            with self.subTest(case=name):
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "trust.json"
+                    self._write(path, extra)
+                    with self.assertRaises(ValueError):
+                        load_trust_registry(path)
+
+    def test_strict_typing_accepts_plain_ints_and_bools(self):
+        from portmark.security import load_trust_registry
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trust.json"
+            self._write(path, {"not_before": 10, "expires_at": 20, "revoked": True})
+            registry = load_trust_registry(path)
+            self.assertTrue(registry.has_key("k"))
+
+
+class DuplicateIdRejectionTests(unittest.TestCase):
+    def _identity(self, key_id: str) -> TrustedIdentity:
+        return TrustedIdentity(key_id=key_id, issuer="user:a", public_key=bytes(32), allowed_audiences=("*",))
+
+    def test_duplicate_id_rejected_in_trust_registry_constructor(self):
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            TrustRegistry((self._identity("dup"), self._identity("dup")))
+
+
 if __name__ == "__main__":
     unittest.main()
