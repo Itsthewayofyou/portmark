@@ -27,6 +27,10 @@ def _advisory_lock_key(name: str) -> int:
     digest = hashlib.blake2b(name.encode("utf-8"), digest_size=8).digest()
     return int.from_bytes(digest, "big", signed=True)
 SQLITE_BUSY_TIMEOUT_MS = 30_000
+# Readiness (/readyz) must be quick to fail, not wait the full transactional budget
+# (section 2, finding #1 follow-up): a dedicated short connect + busy/statement bound.
+READINESS_CONNECT_TIMEOUT_SECONDS = 2
+SQLITE_READINESS_BUSY_TIMEOUT_MS = 2_000
 AuditHeadSigner = Callable[[str, int], tuple[str, str]]
 AuditVerificationStatus = Literal["valid", "invalid", "unverifiable"]
 
@@ -116,6 +120,15 @@ class RuntimeStore(Protocol):
     def record_migration_attempt(self, task_id: str) -> None:
         ...
 
+    def check_ready(self) -> None:
+        """Lightweight, bounded liveness probe for /readyz (section 2, finding #4).
+
+        A single cheap query plus a schema-version sanity check, with a short
+        database timeout -- NOT schema construction or migration. Raises on an
+        unreachable store or an unsupported (newer) schema version.
+        """
+        ...
+
 
 class InMemoryRuntimeStore:
     def __init__(self) -> None:
@@ -150,6 +163,10 @@ class InMemoryRuntimeStore:
             row = self._outbox.get(task_id)
             if row is not None:
                 row["attempt_count"] = int(row["attempt_count"]) + 1
+
+    def check_ready(self) -> None:
+        # In-memory: no external dependency to probe, always ready.
+        return None
 
     def consumed_nonce_exists(self, nonce: str) -> bool:
         with self._lock:
@@ -468,6 +485,25 @@ class SQLiteRuntimeStore:
         with self._connection() as connection:
             connection.execute("UPDATE migration_outbox SET attempt_count = attempt_count + 1 WHERE task_id = ?", (task_id,))
 
+    def check_ready(self) -> None:
+        # Bounded liveness only (section 2, findings #4 + follow-ups). Two hardenings
+        # beyond a cheap query: (1) open the EXISTING file read-write via a mode=rw
+        # URI, so a deleted/absent database fails readiness closed instead of being
+        # silently recreated empty and reported ready; (2) require the EXACT current
+        # schema version -- an empty (version 0), older, or incomplete schema is NOT
+        # ready. The version is set only after each migration step completes, so it is
+        # the authoritative "migrated" marker. Short busy timeout, not the 30s budget.
+        db_uri = Path(self.path).resolve().as_uri() + "?mode=rw"
+        connection = sqlite3.connect(db_uri, uri=True, timeout=READINESS_CONNECT_TIMEOUT_SECONDS, isolation_level=None)
+        try:
+            connection.execute(f"PRAGMA busy_timeout = {SQLITE_READINESS_BUSY_TIMEOUT_MS}")
+            connection.execute("SELECT 1").fetchone()
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        finally:
+            connection.close()
+        if version != SQLITE_SCHEMA_VERSION:
+            raise RuntimeError(f"SQLite store schema version {version} is not the supported version {SQLITE_SCHEMA_VERSION}")
+
     def consumed_nonce_exists(self, nonce: str) -> bool:
         with self._connection() as connection:
             row = connection.execute("SELECT 1 FROM consumed_nonces WHERE nonce = ?", (nonce,)).fetchone()
@@ -704,6 +740,34 @@ class PostgresRuntimeStore:
     def record_migration_attempt(self, task_id: str) -> None:
         with self._connect() as connection:
             connection.execute("UPDATE migration_outbox SET attempt_count = attempt_count + 1 WHERE task_id = %s", (task_id,))
+
+    def check_ready(self) -> None:
+        # Bounded liveness only (section 2, finding #4 + #1 follow-up). Two separate
+        # bounds are needed: connect_timeout caps CONNECTION establishment (a
+        # blackholed host, DNS stall, or dead route would otherwise hang for the OS
+        # default, which statement_timeout cannot help because it only applies once
+        # connected); SET LOCAL statement_timeout then caps the query (transaction-
+        # scoped -- this dedicated connection is non-autocommit, so the implicit
+        # transaction gives it effect; outside a transaction it is a silent no-op).
+        # A cheap query plus a schema sanity check -- never schema construction.
+        psycopg, rows, sql, _ = _postgres_modules()
+        connection = psycopg.connect(
+            self.dsn, row_factory=rows.dict_row, connect_timeout=READINESS_CONNECT_TIMEOUT_SECONDS
+        )
+        try:
+            connection.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(self.schema)))
+            connection.execute("SET LOCAL statement_timeout = '2000ms'")
+            connection.execute("SELECT 1").fetchone()
+            row = connection.execute("SELECT version FROM portmark_schema WHERE singleton = TRUE").fetchone()
+            connection.commit()
+        finally:
+            connection.close()
+        # Require the EXACT current version. A missing portmark_schema table makes the
+        # SELECT raise (fails closed); an EMPTY table gives row=None -> version 0, which
+        # is likewise rejected here rather than passing as "ready" (finding follow-up).
+        version = int(row["version"]) if row is not None else 0
+        if version != POSTGRES_SCHEMA_VERSION:
+            raise RuntimeError(f"Postgres store schema version {version} is not the supported version {POSTGRES_SCHEMA_VERSION}")
 
     def consumed_nonce_exists(self, nonce: str) -> bool:
         with self._connect() as connection:

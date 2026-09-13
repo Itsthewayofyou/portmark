@@ -4,7 +4,43 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 ## Unreleased
 
-External-audit section 1 — PostgreSQL under real failure conditions. Held unreleased (no version bump / tag) until the full audit is complete.
+External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
+
+### Section 2 — A2A network boundary
+
+- **Agent execution no longer blocks the ASGI event loop (finding #1, release blocker).**
+  `POST /message:send` ran `host.run()` synchronously on the event-loop thread, so one
+  slow provider, database call, approval, or agent run stalled every endpoint including
+  health probes. Message dispatch now runs off the loop in a bounded worker pool sized to
+  the concurrency guard, with the admission permit held across it; `/readyz` also runs off
+  the loop. Health and other endpoints stay responsive during a long run.
+- **The public Agent Card URL is now configurable (finding #2, release blocker).**
+  `PORTMARK_A2A_PUBLIC_BASE_URL` / `--a2a-public-base-url` (validated absolute `https://`,
+  host present, no credentials) is now plumbed through the config, ASGI entrypoint, CLI,
+  and `serve()`. Without it a reverse-proxied card advertised the forwarded loopback origin.
+- **Per-client rate limiting is proxy-aware (finding #3).** `PORTMARK_A2A_TRUSTED_PROXIES` /
+  `--a2a-trusted-proxies` (CIDRs) makes the per-IP window key on the real forwarded client
+  when the direct peer is a trusted proxy (rightmost untrusted `X-Forwarded-For`).
+  `X-Forwarded-For` from any non-trusted peer is ignored, so it cannot be spoofed; unset
+  keeps the prior peer-only behaviour. Previously all users behind a proxy shared one window.
+  A malformed forwarded hop (not a syntactically valid IP) is skipped, never returned as a
+  raw rate-limit identity.
+- **Readiness is a bounded probe, not schema initialization (finding #4).** `/readyz` no
+  longer calls `create_runtime_store()` (DDL + advisory locking) on every refresh. A new
+  `store.check_ready()` does a cheap query plus a schema-version check, off the event loop;
+  startup still performs migration once. It is fully time-bounded: Postgres uses
+  `connect_timeout` for connection establishment (a blackholed host cannot hang past it)
+  plus `statement_timeout` for the query; SQLite uses a short readiness busy timeout, not
+  the 30s transactional budget. Readiness also fails closed on a missing or incomplete
+  store: it requires the EXACT current schema version (an empty version-0 or older schema
+  is not ready), and the SQLite probe opens the existing file read-write (`mode=rw`) so a
+  deleted database is not silently recreated empty and reported ready.
+- **ASGI body framing and JSON-RPC ids are enforced (finding #5).** A body that crosses or
+  falls short of the declared `Content-Length` is rejected (400) rather than executed; the
+  absolute 1 MiB cap is retained. A present-but-malformed JSON-RPC id (bool, float, array,
+  object) now rejects the request as invalid rather than being coerced to null and processed.
+
+### Section 1 — PostgreSQL under real failure conditions
 
 ### Fixed
 

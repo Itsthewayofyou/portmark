@@ -28,6 +28,8 @@ class RuntimeConfig:
     require_attestation: bool = False
     a2a_token: str | None = None
     a2a_adapter: str = "local"
+    a2a_public_base_url: str | None = None
+    a2a_trusted_proxies: str | None = None
     log_level: str = "INFO"
     log_json: bool = False
     enable_hsts: bool = False
@@ -54,6 +56,8 @@ class RuntimeConfig:
             require_attestation=os.environ.get("PORTMARK_REQUIRE_ATTESTATION") == "1",
             a2a_token=os.environ.get("PORTMARK_A2A_TOKEN"),
             a2a_adapter=os.environ.get("PORTMARK_A2A_ADAPTER", "local"),
+            a2a_public_base_url=os.environ.get("PORTMARK_A2A_PUBLIC_BASE_URL"),
+            a2a_trusted_proxies=os.environ.get("PORTMARK_A2A_TRUSTED_PROXIES"),
             log_level=os.environ.get("PORTMARK_LOG_LEVEL", "INFO"),
             log_json=os.environ.get("PORTMARK_LOG_JSON") == "1",
             enable_hsts=os.environ.get("PORTMARK_ENABLE_HSTS") == "1",
@@ -86,6 +90,8 @@ class RuntimeConfig:
             require_attestation=bool(getattr(args, "require_attestation", False) or self.require_attestation),
             a2a_token=getattr(args, "a2a_token", None) or self.a2a_token,
             a2a_adapter=getattr(args, "a2a_adapter", None) or self.a2a_adapter,
+            a2a_public_base_url=getattr(args, "a2a_public_base_url", None) or self.a2a_public_base_url,
+            a2a_trusted_proxies=getattr(args, "a2a_trusted_proxies", None) or self.a2a_trusted_proxies,
             log_level=args.log_level or self.log_level,
             log_json=bool(args.log_json or self.log_json),
             enable_hsts=bool(args.enable_hsts or self.enable_hsts),
