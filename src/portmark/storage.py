@@ -100,8 +100,13 @@ class RuntimeStore(Protocol):
     def list_pending_migrations(self) -> list[dict[str, Any]]:
         """Migration-outbox rows still awaiting delivery, oldest first (section 1 #2).
 
-        A delivery dispatcher enumerates these, ships the sealed envelope to the
-        destination, and calls `mark_migration_delivered` on acknowledgement.
+        Portmark stores the sealed envelope durably but does NOT run a dispatcher:
+        production delivery requires the embedder to run one that enumerates these
+        rows, ships the sealed envelope to the destination, calls
+        `record_migration_attempt` on each try, and `mark_migration_delivered` on
+        acknowledgement. Without a dispatcher a migration stays pending and is never
+        delivered. Duplicate delivery is safe -- the destination's nonce/CAS
+        enforcement rejects a replay.
         """
         ...
 
