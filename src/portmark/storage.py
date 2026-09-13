@@ -111,6 +111,15 @@ class RuntimeStore(Protocol):
     def record_migration_attempt(self, task_id: str) -> None:
         ...
 
+    def check_ready(self) -> None:
+        """Lightweight, bounded liveness probe for /readyz (section 2, finding #4).
+
+        A single cheap query plus a schema-version sanity check, with a short
+        database timeout -- NOT schema construction or migration. Raises on an
+        unreachable store or an unsupported (newer) schema version.
+        """
+        ...
+
 
 class InMemoryRuntimeStore:
     def __init__(self) -> None:
@@ -145,6 +154,10 @@ class InMemoryRuntimeStore:
             row = self._outbox.get(task_id)
             if row is not None:
                 row["attempt_count"] = int(row["attempt_count"]) + 1
+
+    def check_ready(self) -> None:
+        # In-memory: no external dependency to probe, always ready.
+        return None
 
     def consumed_nonce_exists(self, nonce: str) -> bool:
         with self._lock:
@@ -463,6 +476,15 @@ class SQLiteRuntimeStore:
         with self._connection() as connection:
             connection.execute("UPDATE migration_outbox SET attempt_count = attempt_count + 1 WHERE task_id = ?", (task_id,))
 
+    def check_ready(self) -> None:
+        # Bounded liveness only (section 2, finding #4): a cheap query plus a schema
+        # sanity check -- never schema construction/migration on the readiness path.
+        with self._connection() as connection:
+            connection.execute("SELECT 1").fetchone()
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if version > SQLITE_SCHEMA_VERSION:
+            raise RuntimeError(f"SQLite store schema version {version} is newer than supported version {SQLITE_SCHEMA_VERSION}")
+
     def consumed_nonce_exists(self, nonce: str) -> bool:
         with self._connection() as connection:
             row = connection.execute("SELECT 1 FROM consumed_nonces WHERE nonce = ?", (nonce,)).fetchone()
@@ -699,6 +721,20 @@ class PostgresRuntimeStore:
     def record_migration_attempt(self, task_id: str) -> None:
         with self._connect() as connection:
             connection.execute("UPDATE migration_outbox SET attempt_count = attempt_count + 1 WHERE task_id = %s", (task_id,))
+
+    def check_ready(self) -> None:
+        # Bounded liveness only (section 2, finding #4): SET LOCAL statement_timeout
+        # (transaction-scoped -- _connect() is non-autocommit, so the implicit
+        # transaction gives it effect; outside a transaction SET LOCAL is a silent
+        # no-op) then a cheap query plus a schema sanity check. Never schema
+        # construction/migration on the readiness path. A hung database raises.
+        with self._connect() as connection:
+            connection.execute("SET LOCAL statement_timeout = '2000ms'")
+            connection.execute("SELECT 1").fetchone()
+            row = connection.execute("SELECT version FROM portmark_schema WHERE singleton = TRUE").fetchone()
+        version = int(row["version"]) if row is not None else 0
+        if version > POSTGRES_SCHEMA_VERSION:
+            raise RuntimeError(f"Postgres store schema version {version} is newer than supported version {POSTGRES_SCHEMA_VERSION}")
 
     def consumed_nonce_exists(self, nonce: str) -> bool:
         with self._connect() as connection:

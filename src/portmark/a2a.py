@@ -10,12 +10,14 @@ import secrets
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from collections.abc import Callable
 from typing import Any, Iterator
+from urllib.parse import urlsplit
 
 from .a2a_types import A2ARequestError, error_response, make_agent_card, parse_jsonrpc_request, success_response, task_from_run_result
 from .host import AgentHost
@@ -39,6 +41,65 @@ DEFAULT_AGENT_CARD_RATE_LIMIT_PER_IP = 240
 DEFAULT_AGENT_CARD_RATE_LIMIT_WINDOW_SECONDS = 60
 DEFAULT_RATE_LIMIT_TRACKED_CLIENTS = 8192
 DEFAULT_READY_CACHE_SECONDS = 2.0
+
+
+def validate_public_base_url(url: str) -> str:
+    """Validate a configured public base URL (section 2, finding #2).
+
+    The Agent Card advertises this to peers, so it must be an absolute https URL
+    with a host and no embedded credentials -- a wrong or credential-bearing value
+    would be published to every caller. Returns the URL with any trailing slash
+    stripped; raises ValueError on anything invalid.
+    """
+    parts = urlsplit(url)
+    if parts.scheme != "https":
+        raise ValueError("public base URL must use https://")
+    if not parts.hostname:
+        raise ValueError("public base URL must include a host")
+    if parts.username or parts.password:
+        raise ValueError("public base URL must not embed credentials")
+    if parts.query or parts.fragment:
+        raise ValueError("public base URL must not include a query or fragment")
+    return url.rstrip("/")
+
+
+def parse_trusted_proxies(value: str | None) -> tuple[ipaddress._BaseNetwork, ...]:
+    """Parse a comma/space-separated list of trusted-proxy CIDRs (section 2, #3).
+
+    Empty/None yields an empty tuple, which keeps the default behaviour: the direct
+    peer address is the client identity and X-Forwarded-For is ignored entirely.
+    """
+    if not value or not value.strip():
+        return ()
+    networks = []
+    for token in value.replace(",", " ").split():
+        networks.append(ipaddress.ip_network(token, strict=False))
+    return tuple(networks)
+
+
+def _ip_in_networks(ip: str, networks: tuple[ipaddress._BaseNetwork, ...]) -> bool:
+    try:
+        address = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(address in network for network in networks)
+
+
+def resolve_client_ip(peer_ip: str, forwarded_for: str, trusted_proxies: tuple[ipaddress._BaseNetwork, ...]) -> str:
+    """Resolve the rate-limiting client identity (section 2, finding #3).
+
+    Only trust X-Forwarded-For when the DIRECT peer is a configured trusted proxy;
+    then walk the header right-to-left and return the first address that is not
+    itself a trusted proxy (the real client the edge saw). Otherwise -- no trusted
+    proxies configured, or a peer that is not one -- ignore X-Forwarded-For and use
+    the peer, so an arbitrary client can never spoof its rate-limit identity.
+    """
+    if not trusted_proxies or not _ip_in_networks(peer_ip, trusted_proxies):
+        return peer_ip
+    for candidate in reversed([token.strip() for token in forwarded_for.split(",") if token.strip()]):
+        if not _ip_in_networks(candidate, trusted_proxies):
+            return candidate
+    return peer_ip
 A2A_ADAPTERS = ("local", "sdk")
 BUSY_RESPONSE = (
     b"HTTP/1.1 503 Service Unavailable\r\n"
@@ -531,6 +592,10 @@ def make_handler(host: AgentHost, auth: A2AAuthConfig | None = None, enable_hsts
     application; both share the router above, so the security logic has one
     implementation.
     """
+    # trusted_proxies is an ASGI transport concern (section 2, finding #3). The
+    # reference handler is loopback-dev only and keeps peer-only client identity, so
+    # accept-and-ignore the kwarg rather than letting it reach A2ARouter as an error.
+    kwargs.pop("trusted_proxies", None)
     router = A2ARouter(host, auth, enable_hsts, **kwargs)
 
     class A2AHandler(BaseHTTPRequestHandler):
@@ -613,7 +678,9 @@ def default_readiness_check(host: AgentHost) -> None:
     active_policy = host._active_policy()
     if active_policy.audience != host.host_id:
         raise RuntimeError("policy audience does not match host")
-    host.store.consumed_nonce_exists("__portmark_readyz__")
+    # Bounded liveness probe (section 2, finding #4): a cheap query + schema sanity
+    # with a short timeout -- never store construction or schema migration.
+    host.store.check_ready()
     verifier = getattr(host.signer, "registry", None)
     key_id = getattr(host.signer, "key_id", None)
     if verifier is not None and key_id is not None and not verifier.has_key(key_id):
@@ -633,7 +700,17 @@ def make_asgi_app(host: AgentHost, auth: A2AAuthConfig | None = None, enable_hst
     buffered before per-IP rate limiting applies; uvicorn's own concurrency limit
     is the outer bound.
     """
+    # Transport-level, not a router concern: which peers may speak for a client via
+    # X-Forwarded-For (section 2, finding #3). Popped so it does not reach A2ARouter.
+    trusted_proxies = kwargs.pop("trusted_proxies", ())
+    max_workers = kwargs.get("max_concurrent_requests", DEFAULT_MAX_CONCURRENT_REQUESTS)
     router = A2ARouter(host, auth, enable_hsts, **kwargs)
+    # dispatch_post runs host.run() synchronously; execute it OFF the event loop in a
+    # bounded pool sized to the concurrency guard, so one slow agent run cannot block
+    # health probes or any other endpoint (section 2, finding #1). This pool is used
+    # ONLY for dispatch_post -- routing health/readiness through it would reintroduce
+    # the blocking. The permit from admit_post is held across the off-loop run.
+    run_executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="portmark-a2a-run")
 
     def _header(scope: dict[str, Any], name: bytes) -> str:
         for key, value in scope.get("headers", ()):
@@ -641,11 +718,14 @@ def make_asgi_app(host: AgentHost, auth: A2AAuthConfig | None = None, enable_hst
                 return value.decode("latin-1")
         return ""
 
-    def _client_ip(scope: dict[str, Any]) -> str:
+    def _peer_ip(scope: dict[str, Any]) -> str:
         client = scope.get("client")
         if isinstance(client, (tuple, list)) and client:
             return str(client[0])
         return "unknown"
+
+    def _client_ip(scope: dict[str, Any]) -> str:
+        return resolve_client_ip(_peer_ip(scope), _header(scope, b"x-forwarded-for"), trusted_proxies)
 
     async def _send(send, response: HttpResponse) -> None:
         await send({
@@ -662,21 +742,26 @@ def make_asgi_app(host: AgentHost, auth: A2AAuthConfig | None = None, enable_hst
                 if message["type"] == "lifespan.startup":
                     await send({"type": "lifespan.startup.complete"})
                 elif message["type"] == "lifespan.shutdown":
+                    run_executor.shutdown(wait=False)
                     await send({"type": "lifespan.shutdown.complete"})
                     return
             return
         if scope["type"] != "http":
             return
+        loop = asyncio.get_running_loop()
         path, method = scope.get("path", ""), scope.get("method", "GET").upper()
         client_ip = _client_ip(scope)
         if method == "GET":
-            response = router.handle_get(
-                path,
-                _header(scope, b"host"),
-                client_ip,
-                _header(scope, b"authorization"),
-                _header(scope, b"accept"),
-            )
+            get_args = (path, _header(scope, b"host"), client_ip, _header(scope, b"authorization"), _header(scope, b"accept"))
+            if path == "/readyz":
+                # Readiness can touch the database (finding #4); run it off the event
+                # loop on the DEFAULT pool so it never blocks the loop and never
+                # borrows a dispatch worker. handle_get's own cache bounds DB load.
+                response = await loop.run_in_executor(None, lambda: router.handle_get(*get_args))
+            else:
+                # healthz, agent card, metrics are cheap and must NOT queue behind
+                # agent work, so they stay on the loop and off the dispatch pool.
+                response = router.handle_get(*get_args)
             await _send(send, response)
             return
         if method != "POST":
@@ -696,6 +781,7 @@ def make_asgi_app(host: AgentHost, auth: A2AAuthConfig | None = None, enable_hst
                     await _send(send, rejection)
                     return
                 body = bytearray()
+                framing_error = False
                 while len(body) < size:
                     message = await receive()
                     if message["type"] == "http.disconnect":
@@ -705,9 +791,24 @@ def make_asgi_app(host: AgentHost, auth: A2AAuthConfig | None = None, enable_hst
                         router.host.metrics.increment_refusal("invalid_request")
                         await _send(send, router.response(413, error_response(None, -32600, "invalid request")))
                         return
+                    if len(body) > size:
+                        # Body crosses the declared Content-Length (finding #5): the
+                        # declared frame is a lie, so reject rather than trust either
+                        # length. Do not run an agent on an unframed body.
+                        framing_error = True
+                        break
                     if not message.get("more_body", False):
                         break
-                response = router.dispatch_post(bytes(body))
+                if framing_error or len(body) != size:
+                    # Crossed the declared length, or early EOF (fewer bytes than
+                    # declared) -- the ASGI body did not match its Content-Length.
+                    router.host.metrics.increment_refusal("invalid_request")
+                    await _send(send, router.response(400, error_response(None, -32600, "invalid request")))
+                    return
+                # host.run() is synchronous and can be slow; run it OFF the loop while
+                # the admission permit is still held (finding #1), so /healthz and
+                # every other endpoint stay responsive during a long agent run.
+                response = await loop.run_in_executor(run_executor, router.dispatch_post, bytes(body))
             await _send(send, response)
         finally:
             router.host.metrics.observe_duration("a2a_request_duration_seconds", time.monotonic() - started)
@@ -729,6 +830,8 @@ def serve(
     agent_card_rate_limit_window_seconds: int = DEFAULT_AGENT_CARD_RATE_LIMIT_WINDOW_SECONDS,
     allow_direct_a2a: bool = False,
     a2a_adapter: str = "local",
+    public_base_url: str | None = None,
+    trusted_proxies: str | None = None,
 ) -> None:
     """Serve the A2A boundary on uvicorn.
 
@@ -764,6 +867,8 @@ def serve(
         agent_card_rate_limit_per_ip=agent_card_rate_limit_per_ip,
         agent_card_rate_limit_window_seconds=agent_card_rate_limit_window_seconds,
         a2a_adapter=a2a_adapter,
+        public_base_url=validate_public_base_url(public_base_url) if public_base_url else None,
+        trusted_proxies=parse_trusted_proxies(trusted_proxies),
         # The loopback bind enforced above is the compensating control, so a
         # tokenless loopback server is an acknowledged configuration here.
         allow_anonymous=True,

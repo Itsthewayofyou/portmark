@@ -3654,6 +3654,227 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(payload), {"status": "ready"})
 
+    def test_asgi_health_stays_responsive_while_dispatch_blocks(self):
+        # Section 2, finding #1 (release blocker): host.run() (via dispatch_post) runs
+        # OFF the event loop, so a slow agent run cannot block other endpoints. Park a
+        # POST inside a blocking dispatch and prove /healthz still answers promptly.
+        import threading
+
+        app = make_asgi_app(make_host(), allow_anonymous=True)
+        router = app.a2a_router
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocking_dispatch(body):
+            entered.set()
+            release.wait(5)
+            return router.response(200, {"blocked": True})
+
+        router.dispatch_post = blocking_dispatch
+
+        async def drive(method, path, headers=None, body=b""):
+            scope = {
+                "type": "http",
+                "method": method,
+                "path": path,
+                "client": ("203.0.113.9", 5555),
+                "headers": [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()],
+            }
+            sent = []
+
+            async def receive():
+                return {"type": "http.request", "body": body, "more_body": False}
+
+            async def send(message):
+                sent.append(message)
+
+            await app(scope, receive, send)
+            return next(m["status"] for m in sent if m["type"] == "http.response.start")
+
+        async def scenario():
+            body = b'{"jsonrpc":"2.0"}'
+            headers = {"Content-Type": "application/json", "Content-Length": str(len(body))}
+            post = asyncio.create_task(drive("POST", "/message:send", headers, body))
+            # Wait until dispatch is actually executing off-loop.
+            await asyncio.to_thread(entered.wait, 2)
+            self.assertTrue(entered.is_set())
+            # If the loop were blocked by the run, this could not complete until the
+            # POST finished; it must answer within the timeout while dispatch is stuck.
+            status = await asyncio.wait_for(drive("GET", "/healthz"), timeout=1.5)
+            self.assertEqual(status, 200)
+            release.set()
+            self.assertEqual(await post, 200)
+
+        asyncio.run(scenario())
+
+    def test_asgi_rejects_body_that_crosses_declared_content_length(self):
+        # Section 2, finding #5: a body longer than the declared Content-Length must be
+        # rejected, never executed (auditor: declared 1, actual 1299 -> HTTP 200).
+        host = make_host()
+        app = make_asgi_app(host, allow_anonymous=True)
+        body = self._a2a_request_body(host, "framing overflow")
+        status, _, payload = self._asgi_call(
+            app,
+            "POST",
+            "/message:send",
+            {"Content-Type": "application/json", "Content-Length": "1"},
+            body,
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(payload)["error"]["message"], "invalid request")
+
+    def test_asgi_rejects_body_shorter_than_declared_content_length(self):
+        # Section 2, finding #5: an early EOF (fewer bytes than declared) must be
+        # rejected rather than executed on a truncated body.
+        host = make_host()
+        app = make_asgi_app(host, allow_anonymous=True)
+        body = self._a2a_request_body(host, "framing underflow")
+        status, _, payload = self._asgi_call(
+            app,
+            "POST",
+            "/message:send",
+            {"Content-Type": "application/json", "Content-Length": str(len(body) + 50)},
+            body,
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(payload)["error"]["message"], "invalid request")
+
+    def test_jsonrpc_request_id_rejects_boolean(self):
+        # Section 2, finding #5: bool is not a valid JSON-RPC id; isinstance(True, int)
+        # would otherwise let it through and be echoed back as the id.
+        from portmark.a2a_types import _valid_request_id
+
+        self.assertIsNone(_valid_request_id(True))
+        self.assertIsNone(_valid_request_id(False))
+        self.assertEqual(_valid_request_id(7), 7)
+        self.assertEqual(_valid_request_id("abc"), "abc")
+        self.assertIsNone(_valid_request_id(None))
+
+    def test_validate_public_base_url(self):
+        # Section 2, finding #2: the advertised Agent Card URL must be an absolute
+        # https URL with a host and no credentials.
+        from portmark.a2a import validate_public_base_url
+
+        self.assertEqual(validate_public_base_url("https://agents.example.com/"), "https://agents.example.com")
+        for bad in ["http://agents.example.com", "https://user:pw@agents.example.com", "https:///nohost", "ftp://x"]:
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    validate_public_base_url(bad)
+
+    def test_runtime_config_reads_public_base_url_and_trusted_proxies(self):
+        # Section 2, findings #2/#3: the ASGI entrypoint's config must surface both.
+        env = {
+            "PORTMARK_A2A_PUBLIC_BASE_URL": "https://agents.example.com",
+            "PORTMARK_A2A_TRUSTED_PROXIES": "10.0.0.0/8, 127.0.0.1",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            config = RuntimeConfig.from_environment()
+        self.assertEqual(config.a2a_public_base_url, "https://agents.example.com")
+        self.assertEqual(config.a2a_trusted_proxies, "10.0.0.0/8, 127.0.0.1")
+
+    def test_resolve_client_ip_honours_trusted_proxies_only(self):
+        # Section 2, finding #3: X-Forwarded-For is trusted ONLY when the direct peer
+        # is a configured trusted proxy; then use the rightmost untrusted address.
+        from portmark.a2a import parse_trusted_proxies, resolve_client_ip
+
+        trusted = parse_trusted_proxies("127.0.0.0/8")
+        # No trusted proxies configured: always the peer, XFF ignored.
+        self.assertEqual(resolve_client_ip("203.0.113.9", "1.2.3.4", ()), "203.0.113.9")
+        # Peer is a trusted proxy: the real client is the rightmost non-proxy address.
+        self.assertEqual(resolve_client_ip("127.0.0.1", "9.9.9.9", trusted), "9.9.9.9")
+        self.assertEqual(resolve_client_ip("127.0.0.1", "9.9.9.9, 127.0.0.5", trusted), "9.9.9.9")
+        # Peer is NOT trusted: ignore a spoofed XFF entirely.
+        self.assertEqual(resolve_client_ip("203.0.113.9", "9.9.9.9", trusted), "203.0.113.9")
+        # All forwarded hops are trusted proxies: fall back to the peer.
+        self.assertEqual(resolve_client_ip("127.0.0.1", "127.0.0.5", trusted), "127.0.0.1")
+
+    def test_asgi_rate_limit_is_per_forwarded_client_behind_trusted_proxy(self):
+        # Section 2, finding #3: behind a trusted proxy, the per-client window keys on
+        # the forwarded client, so one client exhausting its quota does not 429 another.
+        from portmark.a2a import parse_trusted_proxies
+
+        host = make_host()
+        app = make_asgi_app(
+            host,
+            allow_anonymous=True,
+            rate_limit_per_ip=2,
+            rate_limit_window_seconds=60,
+            trusted_proxies=parse_trusted_proxies("127.0.0.0/8"),
+        )
+
+        def post(xff):
+            status, _, _ = self._asgi_call(
+                app,
+                "POST",
+                "/message:send",
+                {"Content-Type": "application/json", "Content-Length": "2", "X-Forwarded-For": xff},
+                b"{}",
+                client=("127.0.0.1", 5555),
+            )
+            return status
+
+        self.assertNotEqual(post("9.9.9.9"), 429)
+        self.assertNotEqual(post("9.9.9.9"), 429)
+        self.assertEqual(post("9.9.9.9"), 429)  # third from this client is limited
+        self.assertNotEqual(post("8.8.8.8"), 429)  # a different client has its own window
+
+    def test_asgi_rate_limit_ignores_forwarded_for_from_untrusted_peer(self):
+        # Section 2, finding #3: with no trusted proxies, X-Forwarded-For is ignored, so
+        # a client cannot rotate the header to escape its own per-peer window.
+        host = make_host()
+        app = make_asgi_app(host, allow_anonymous=True, rate_limit_per_ip=2, rate_limit_window_seconds=60)
+
+        def post(xff):
+            status, _, _ = self._asgi_call(
+                app,
+                "POST",
+                "/message:send",
+                {"Content-Type": "application/json", "Content-Length": "2", "X-Forwarded-For": xff},
+                b"{}",
+                client=("203.0.113.9", 5555),
+            )
+            return status
+
+        self.assertNotEqual(post("1.1.1.1"), 429)
+        self.assertNotEqual(post("2.2.2.2"), 429)
+        self.assertEqual(post("3.3.3.3"), 429)  # keyed on the peer, not the rotated XFF
+
+    def test_store_check_ready_is_lightweight_and_version_checked(self):
+        # Section 2, finding #4: check_ready is a cheap probe + schema sanity, and it
+        # fails when the stored schema is newer than supported.
+        from portmark.storage import SQLITE_SCHEMA_VERSION
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(path)
+            store.check_ready()  # healthy store: no raise
+            with self._raw_sqlite(path) as connection:
+                connection.execute(f"PRAGMA user_version = {SQLITE_SCHEMA_VERSION + 1}")
+            with self.assertRaisesRegex(RuntimeError, "newer than supported"):
+                store.check_ready()
+
+    @unittest.skipUnless(
+        os.environ.get("PORTMARK_TEST_POSTGRES_DSN") and PostgresRuntimeStore.available(),
+        "requires a real PostgreSQL",
+    )
+    def test_postgres_check_ready_is_bounded_by_statement_timeout(self):
+        # Section 2, finding #4: readiness on Postgres is a cheap probe (no schema
+        # init) AND its SET LOCAL statement_timeout genuinely applies -- outside a
+        # transaction SET LOCAL is a silent no-op, so prove it bounds a slow query.
+        import psycopg
+
+        dsn = os.environ["PORTMARK_TEST_POSTGRES_DSN"]
+        schema = "portmark_ready_" + secrets.token_hex(8)
+        try:
+            store = PostgresRuntimeStore(dsn, schema=schema)
+            store.check_ready()  # healthy store: no raise
+            with store._connect() as connection:
+                connection.execute("SET LOCAL statement_timeout = '300ms'")
+                with self.assertRaises(psycopg.errors.QueryCanceled):
+                    connection.execute("SELECT pg_sleep(3)")
+        finally:
+            self._drop_postgres_schema(dsn, schema)
+
     def test_asgi_readyz_fails_generically_when_policy_or_store_config_is_invalid(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

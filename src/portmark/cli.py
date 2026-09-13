@@ -111,6 +111,8 @@ def main() -> None:
     server.add_argument("--port", type=int, default=8080)
     server.add_argument("--a2a-adapter", choices=("local", "sdk"), help="A2A type adapter for Agent Card and request validation")
     server.add_argument("--a2a-token", help="require this bearer token for A2A message/send requests")
+    server.add_argument("--a2a-public-base-url", help="absolute https:// base URL to advertise in the Agent Card behind a reverse proxy")
+    server.add_argument("--a2a-trusted-proxies", help="comma/space-separated CIDRs whose X-Forwarded-For is trusted for per-client rate limiting")
     server.add_argument("--a2a-max-concurrent-requests", type=int, help="maximum concurrent A2A message/send requests")
     server.add_argument("--a2a-rate-limit-per-ip", type=int, help="maximum A2A message/send requests per client IP window")
     server.add_argument("--a2a-rate-limit-window-seconds", type=int, help="A2A per-IP rate limit window in seconds")
@@ -197,6 +199,8 @@ def main() -> None:
                 agent_card_rate_limit_window_seconds=config.a2a_agent_card_rate_limit_window_seconds,
                 allow_direct_a2a=config.allow_direct_a2a,
                 a2a_adapter=config.a2a_adapter,
+                public_base_url=config.a2a_public_base_url,
+                trusted_proxies=config.a2a_trusted_proxies,
             )
         except ValueError as exc:
             parser.error(str(exc))

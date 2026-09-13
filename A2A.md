@@ -90,6 +90,28 @@ cannot be left unbounded. The legacy `--allow-direct-a2a` flag and
 `PORTMARK_ALLOW_DIRECT_A2A=1` environment variable are compatibility no-ops and
 do not permit public direct binds.
 
+When fronted by a reverse proxy you MUST configure two settings, or the boundary
+misbehaves in production:
+
+- `PORTMARK_A2A_PUBLIC_BASE_URL` / `--a2a-public-base-url`: the absolute
+  `https://` base URL to advertise in the Agent Card (validated: https, has a
+  host, no embedded credentials). Without it the card falls back to the local
+  origin the proxy forwards (e.g. `http://127.0.0.1/message:send`), which is not
+  reachable by peers.
+- `PORTMARK_A2A_TRUSTED_PROXIES` / `--a2a-trusted-proxies`: comma/space-separated
+  CIDRs of the proxy peers (e.g. `127.0.0.1/32` for a loopback Nginx). Only then
+  is `X-Forwarded-For` honoured, and the per-client rate-limit window keys on the
+  real forwarded client rather than the proxy address — otherwise every public
+  user shares one window. `X-Forwarded-For` from any peer NOT in this list is
+  ignored, so it cannot be spoofed. The proxy's own per-IP limiter still applies
+  as the outer bound. Leave it unset to key strictly on the direct peer.
+
+`POST /message:send` runs the agent (`host.run()`) off the event loop in a
+bounded worker pool, so a slow provider, database call, or agent run cannot block
+health probes or other requests. `GET /readyz` performs a bounded liveness probe
+(a cheap query plus a schema-version check with a short database timeout) off the
+event loop — it does not construct the store or run schema migrations.
+
 `GET /.well-known/agent-card.json` is bounded independently:
 
 - `PORTMARK_A2A_AGENT_CARD_RATE_LIMIT_PER_IP` /

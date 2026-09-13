@@ -61,8 +61,10 @@ Do not attempt to expose it directly with `0.0.0.0`; Portmark rejects that mode.
 {"status": "ok"}
 ```
 
-`GET /readyz` verifies the configured policy, trust registry, SQLite store, and
-host readiness path can be used. It returns:
+`GET /readyz` re-validates the configured policy and trust registry and runs a
+bounded store liveness probe (a cheap query plus a schema-version check with a
+short database timeout) off the event loop. It does NOT construct the store or
+run schema migrations — those happen once at startup. It returns:
 
 ```json
 {"status": "ready"}
@@ -100,6 +102,8 @@ Set secrets through your orchestrator's secret store, not the image or
 Dockerfile. Common configuration:
 
 - `PORTMARK_A2A_TOKEN`: bearer token for `/message:send` and `/metrics`
+- `PORTMARK_A2A_PUBLIC_BASE_URL`: absolute `https://` base URL advertised in the Agent Card behind a reverse proxy (required for a correct public card)
+- `PORTMARK_A2A_TRUSTED_PROXIES`: comma/space-separated CIDRs of proxy peers whose `X-Forwarded-For` is trusted for per-client rate limiting (e.g. `127.0.0.1/32`); unset ignores `X-Forwarded-For`
 - `PORTMARK_ED25519_PRIVATE_KEY_B64`: host signing key
 - `PORTMARK_SIGNING_KEY_ID`: signing key identifier
 - `PORTMARK_SIGNING_ISSUER`: host signing issuer

@@ -264,6 +264,13 @@ def _optional_string(value: Any, name: str) -> str | None:
 
 
 def _valid_request_id(value: Any) -> str | int | None:
+    # A JSON-RPC id is a string, a number, or null. `bool` is excluded explicitly:
+    # `isinstance(True, int)` is True, so without this a Boolean id would slip
+    # through and be echoed back as-is (section 2, finding #5). Other non-conforming
+    # types (float, array, object) normalize to null rather than being rejected --
+    # a deliberate, documented interop leniency, not accepted as the id.
+    if isinstance(value, bool):
+        return None
     if value is None or isinstance(value, (str, int)):
         return value
     return None
