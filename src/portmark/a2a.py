@@ -97,6 +97,13 @@ def resolve_client_ip(peer_ip: str, forwarded_for: str, trusted_proxies: tuple[i
     if not trusted_proxies or not _ip_in_networks(peer_ip, trusted_proxies):
         return peer_ip
     for candidate in reversed([token.strip() for token in forwarded_for.split(",") if token.strip()]):
+        # Only a syntactically valid IP may become a rate-limit identity (finding #2
+        # follow-up): a malformed hop (e.g. "garbage") is skipped, never returned as
+        # raw header text, so it cannot be rotated to evade the per-client limiter.
+        try:
+            ipaddress.ip_address(candidate)
+        except ValueError:
+            continue
         if not _ip_in_networks(candidate, trusted_proxies):
             return candidate
     return peer_ip
@@ -459,7 +466,6 @@ class A2ARouter:
         authorization: str = "",
         accept: str = "",
     ) -> HttpResponse:
-        base_url = self._agent_card_base_url(host_header)
         if path == "/healthz":
             return self.response(200, {"status": "ok"})
         if path == "/readyz":
@@ -475,6 +481,11 @@ class A2ARouter:
                     error_response(None, -32002, "rate limit exceeded"),
                     {"Retry-After": str(self.agent_card_rate_limit_window_seconds)},
                 )
+            # Compute the card base URL only for an admitted card request, not on every
+            # GET: _agent_card_base_url logs a warning for any non-loopback Host when no
+            # public_base_url is set, so evaluating it for /healthz or a rate-limited
+            # card request amplified logs (operational finding).
+            base_url = self._agent_card_base_url(host_header)
             if self.a2a_adapter == "sdk":
                 return self.response(200, make_sdk_agent_card(base_url, self.auth_config.required))
             return self.response(200, make_agent_card(base_url, self.auth_config.required))

@@ -27,6 +27,10 @@ def _advisory_lock_key(name: str) -> int:
     digest = hashlib.blake2b(name.encode("utf-8"), digest_size=8).digest()
     return int.from_bytes(digest, "big", signed=True)
 SQLITE_BUSY_TIMEOUT_MS = 30_000
+# Readiness (/readyz) must be quick to fail, not wait the full transactional budget
+# (section 2, finding #1 follow-up): a dedicated short connect + busy/statement bound.
+READINESS_CONNECT_TIMEOUT_SECONDS = 2
+SQLITE_READINESS_BUSY_TIMEOUT_MS = 2_000
 AuditHeadSigner = Callable[[str, int], tuple[str, str]]
 AuditVerificationStatus = Literal["valid", "invalid", "unverifiable"]
 
@@ -479,9 +483,16 @@ class SQLiteRuntimeStore:
     def check_ready(self) -> None:
         # Bounded liveness only (section 2, finding #4): a cheap query plus a schema
         # sanity check -- never schema construction/migration on the readiness path.
-        with self._connection() as connection:
+        # Uses a dedicated connection with a SHORT busy timeout, not the normal 30s
+        # transactional budget, so a locked database fails readiness fast rather than
+        # tying up a worker (finding #1 follow-up).
+        connection = sqlite3.connect(self.path, timeout=READINESS_CONNECT_TIMEOUT_SECONDS, isolation_level=None)
+        try:
+            connection.execute(f"PRAGMA busy_timeout = {SQLITE_READINESS_BUSY_TIMEOUT_MS}")
             connection.execute("SELECT 1").fetchone()
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        finally:
+            connection.close()
         if version > SQLITE_SCHEMA_VERSION:
             raise RuntimeError(f"SQLite store schema version {version} is newer than supported version {SQLITE_SCHEMA_VERSION}")
 
@@ -723,15 +734,26 @@ class PostgresRuntimeStore:
             connection.execute("UPDATE migration_outbox SET attempt_count = attempt_count + 1 WHERE task_id = %s", (task_id,))
 
     def check_ready(self) -> None:
-        # Bounded liveness only (section 2, finding #4): SET LOCAL statement_timeout
-        # (transaction-scoped -- _connect() is non-autocommit, so the implicit
-        # transaction gives it effect; outside a transaction SET LOCAL is a silent
-        # no-op) then a cheap query plus a schema sanity check. Never schema
-        # construction/migration on the readiness path. A hung database raises.
-        with self._connect() as connection:
+        # Bounded liveness only (section 2, finding #4 + #1 follow-up). Two separate
+        # bounds are needed: connect_timeout caps CONNECTION establishment (a
+        # blackholed host, DNS stall, or dead route would otherwise hang for the OS
+        # default, which statement_timeout cannot help because it only applies once
+        # connected); SET LOCAL statement_timeout then caps the query (transaction-
+        # scoped -- this dedicated connection is non-autocommit, so the implicit
+        # transaction gives it effect; outside a transaction it is a silent no-op).
+        # A cheap query plus a schema sanity check -- never schema construction.
+        psycopg, rows, sql, _ = _postgres_modules()
+        connection = psycopg.connect(
+            self.dsn, row_factory=rows.dict_row, connect_timeout=READINESS_CONNECT_TIMEOUT_SECONDS
+        )
+        try:
+            connection.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(self.schema)))
             connection.execute("SET LOCAL statement_timeout = '2000ms'")
             connection.execute("SELECT 1").fetchone()
             row = connection.execute("SELECT version FROM portmark_schema WHERE singleton = TRUE").fetchone()
+            connection.commit()
+        finally:
+            connection.close()
         version = int(row["version"]) if row is not None else 0
         if version > POSTGRES_SCHEMA_VERSION:
             raise RuntimeError(f"Postgres store schema version {version} is newer than supported version {POSTGRES_SCHEMA_VERSION}")

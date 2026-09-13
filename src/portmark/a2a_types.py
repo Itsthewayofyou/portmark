@@ -264,16 +264,15 @@ def _optional_string(value: Any, name: str) -> str | None:
 
 
 def _valid_request_id(value: Any) -> str | int | None:
-    # A JSON-RPC id is a string, a number, or null. `bool` is excluded explicitly:
-    # `isinstance(True, int)` is True, so without this a Boolean id would slip
-    # through and be echoed back as-is (section 2, finding #5). Other non-conforming
-    # types (float, array, object) normalize to null rather than being rejected --
-    # a deliberate, documented interop leniency, not accepted as the id.
-    if isinstance(value, bool):
-        return None
-    if value is None or isinstance(value, (str, int)):
+    # A JSON-RPC id is a string, an integer, or null (absent is treated as null).
+    # A present-but-malformed id -- bool (isinstance(True, int) is True), float,
+    # array, or object -- is a malformed request, not a null id, so reject the whole
+    # request rather than silently dropping the id (section 2, finding #5 follow-up).
+    if value is None or isinstance(value, str):
         return value
-    return None
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    raise A2ARequestError(-32600, "invalid request")
 
 
 def _task_state(status: str) -> str:

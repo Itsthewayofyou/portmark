@@ -23,13 +23,19 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   when the direct peer is a trusted proxy (rightmost untrusted `X-Forwarded-For`).
   `X-Forwarded-For` from any non-trusted peer is ignored, so it cannot be spoofed; unset
   keeps the prior peer-only behaviour. Previously all users behind a proxy shared one window.
+  A malformed forwarded hop (not a syntactically valid IP) is skipped, never returned as a
+  raw rate-limit identity.
 - **Readiness is a bounded probe, not schema initialization (finding #4).** `/readyz` no
   longer calls `create_runtime_store()` (DDL + advisory locking) on every refresh. A new
-  `store.check_ready()` does a cheap query plus a schema-version check with a short database
-  timeout, off the event loop; startup still performs migration once.
-- **ASGI body framing is enforced (finding #5).** A body that crosses or falls short of the
-  declared `Content-Length` is rejected (400) rather than executed; the absolute 1 MiB cap
-  is retained. Boolean JSON-RPC ids are no longer accepted as ids (`isinstance(True, int)`).
+  `store.check_ready()` does a cheap query plus a schema-version check, off the event loop;
+  startup still performs migration once. It is fully time-bounded: Postgres uses
+  `connect_timeout` for connection establishment (a blackholed host cannot hang past it)
+  plus `statement_timeout` for the query; SQLite uses a short readiness busy timeout, not
+  the 30s transactional budget.
+- **ASGI body framing and JSON-RPC ids are enforced (finding #5).** A body that crosses or
+  falls short of the declared `Content-Length` is rejected (400) rather than executed; the
+  absolute 1 MiB cap is retained. A present-but-malformed JSON-RPC id (bool, float, array,
+  object) now rejects the request as invalid rather than being coerced to null and processed.
 
 ### Section 1 — PostgreSQL under real failure conditions
 

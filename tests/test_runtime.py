@@ -3739,16 +3739,40 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(json.loads(payload)["error"]["message"], "invalid request")
 
-    def test_jsonrpc_request_id_rejects_boolean(self):
-        # Section 2, finding #5: bool is not a valid JSON-RPC id; isinstance(True, int)
-        # would otherwise let it through and be echoed back as the id.
-        from portmark.a2a_types import _valid_request_id
+    def test_jsonrpc_request_id_rejects_invalid_types(self):
+        # Section 2, finding #5 follow-up: a present-but-malformed id (bool, float,
+        # array, object) is a malformed request and must be REJECTED, not coerced to
+        # null. String, integer, and null/absent are valid.
+        from portmark.a2a_types import A2ARequestError, _valid_request_id
 
-        self.assertIsNone(_valid_request_id(True))
-        self.assertIsNone(_valid_request_id(False))
         self.assertEqual(_valid_request_id(7), 7)
         self.assertEqual(_valid_request_id("abc"), "abc")
         self.assertIsNone(_valid_request_id(None))
+        for bad in [True, False, 1.5, [1], {"a": 1}]:
+            with self.subTest(bad=bad):
+                with self.assertRaises(A2ARequestError):
+                    _valid_request_id(bad)
+
+    def test_asgi_rejects_request_with_invalid_jsonrpc_id(self):
+        # Section 2, finding #5 follow-up: the HTTP request itself must be rejected
+        # (400 invalid request), not just have its id dropped. The invalid id is not
+        # echoed back.
+        host = make_host()
+        app = make_asgi_app(host, allow_anonymous=True)
+        for bad_id in ["true", "1.5", "[1]", '{"x":1}']:
+            body = ('{"jsonrpc":"2.0","id":%s,"method":"message/send","params":{}}' % bad_id).encode()
+            status, _, payload = self._asgi_call(
+                app,
+                "POST",
+                "/message:send",
+                {"Content-Type": "application/json", "Content-Length": str(len(body))},
+                body,
+            )
+            with self.subTest(bad_id=bad_id):
+                self.assertEqual(status, 400)
+                decoded = json.loads(payload)
+                self.assertEqual(decoded["error"]["message"], "invalid request")
+                self.assertIsNone(decoded["id"])
 
     def test_validate_public_base_url(self):
         # Section 2, finding #2: the advertised Agent Card URL must be an absolute
@@ -3787,6 +3811,10 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(resolve_client_ip("203.0.113.9", "9.9.9.9", trusted), "203.0.113.9")
         # All forwarded hops are trusted proxies: fall back to the peer.
         self.assertEqual(resolve_client_ip("127.0.0.1", "127.0.0.5", trusted), "127.0.0.1")
+        # A malformed forwarded entry is skipped, never returned as raw text (finding
+        # #2 follow-up): the real address to its left is used instead.
+        self.assertEqual(resolve_client_ip("127.0.0.1", "198.51.100.3, garbage", trusted), "198.51.100.3")
+        self.assertEqual(resolve_client_ip("127.0.0.1", "garbage", trusted), "127.0.0.1")
 
     def test_asgi_rate_limit_is_per_forwarded_client_behind_trusted_proxy(self):
         # Section 2, finding #3: behind a trusted proxy, the per-client window keys on
@@ -3874,6 +3902,24 @@ class RuntimeTests(unittest.TestCase):
                     connection.execute("SELECT pg_sleep(3)")
         finally:
             self._drop_postgres_schema(dsn, schema)
+
+    @unittest.skipUnless(PostgresRuntimeStore.available(), "requires psycopg")
+    def test_postgres_check_ready_bounds_connection_establishment(self):
+        # Section 2, finding #1 follow-up: statement_timeout only applies AFTER connect
+        # succeeds. A blackholed address must be bounded by connect_timeout, not left to
+        # hang for the OS default. 192.0.2.1 is TEST-NET-1 (RFC 5737), never routed, so
+        # the connect stalls and connect_timeout must fire well under the OS default.
+        # Uses __new__ to avoid __init__ dialing the blackhole at construction time.
+        store = PostgresRuntimeStore.__new__(PostgresRuntimeStore)
+        store.dsn = "postgresql://postgres@192.0.2.1:5432/portmark"
+        store.schema = "public"
+        store._audit_head_verifier = None
+        start = time.monotonic()
+        with self.assertRaises(Exception):
+            store.check_ready()
+        elapsed = time.monotonic() - start
+        # connect_timeout is 2s; allow generous margin but far below an OS-default hang.
+        self.assertLess(elapsed, 10.0)
 
     def test_asgi_readyz_fails_generically_when_policy_or_store_config_is_invalid(self):
         with tempfile.TemporaryDirectory() as directory:
