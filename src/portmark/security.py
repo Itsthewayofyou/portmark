@@ -688,33 +688,43 @@ def _register_own_identity(
         raise SecurityError(f"trust registry key id {key_id!r} holds a different public key")
 
 
+def _fingerprint_key_id(public_key: bytes) -> str:
+    """Namespaced, collision-resistant id for a generated key (finding #1): the
+    algorithm plus a fingerprint of the public key, so two generated keys never share
+    an id and the id changes iff the key does."""
+    return f"ed25519:{hashlib.blake2b(public_key, digest_size=16).hexdigest()}"
+
+
 class EnvelopeSigner:
     """Ed25519 envelope signer and verifier backed by a trust registry."""
 
-    def __init__(self, key_id: str, issuer: str, private_key: Ed25519PrivateKey, registry: "TrustRegistry | TrustSource") -> None:
+    def __init__(self, key_id: str, issuer: str, private_key: Ed25519PrivateKey, registry: "TrustRegistry | TrustSource", ephemeral: bool = False) -> None:
         self.key_id = key_id
         self.issuer = issuer
         self._private_key = private_key
         self.registry = registry
+        # A generated key lives only in this process; it changes on every restart, so a
+        # durable store must refuse it (finding #1). A key loaded from bytes (env/file) is
+        # stable and clears this flag.
+        self.ephemeral = ephemeral
 
     @classmethod
     def generate(
         cls,
-        key_id: str = "demo-ed25519-key",
+        key_id: str | None = None,
         issuer: str = "user:demo",
         allowed_audiences: tuple[str, ...] = ("*",),
         registry: "TrustRegistry | TrustSource | None" = None,
     ) -> "EnvelopeSigner":
         private_key = Ed25519PrivateKey.generate()
+        public_key = private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+        # Default key id is derived from the public-key fingerprint and namespaced by
+        # algorithm (finding #1) so two independently generated keys can never share an
+        # id -- the old constant "demo-ed25519-key" collided across every generated key.
+        resolved_key_id = key_id if key_id is not None else _fingerprint_key_id(public_key)
         trust = registry if registry is not None else TrustRegistry()
-        _register_own_identity(
-            trust,
-            key_id,
-            issuer,
-            private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw),
-            allowed_audiences,
-        )
-        return cls(key_id, issuer, private_key, trust)
+        _register_own_identity(trust, resolved_key_id, issuer, public_key, allowed_audiences)
+        return cls(resolved_key_id, issuer, private_key, trust, ephemeral=True)
 
     @classmethod
     def from_private_key_bytes(

@@ -6,6 +6,7 @@ Tests are written to FAIL against the pre-fix code and pass once the fix lands.
 
 import io
 import json
+import os
 import secrets
 import subprocess  # nosec B404
 import sys
@@ -27,7 +28,9 @@ from portmark.security import (
     TrustSource,
     _b64url_decode,
     _b64url_encode,
+    audit_head_payload,
 )
+from portmark.storage import InMemoryRuntimeStore, SQLiteRuntimeStore
 
 
 def _write_registry(path: Path, signer: EnvelopeSigner, audiences=("*",), revoked: bool = False) -> None:
@@ -251,6 +254,55 @@ class KeygenExportTests(unittest.TestCase):
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit):
                     cli_main()
+
+
+# ---------------------------------------------------------------------------
+# Finding #1 — a durable store must not run on an ephemeral (per-restart) key.
+# ---------------------------------------------------------------------------
+class DurableKeyCustodyTests(unittest.TestCase):
+    def test_durable_requires_key_refuses_ephemeral_generated_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(str(Path(directory) / "store.sqlite"))
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(ValueError, "durable store requires a stable"):
+                    make_host(store=store)
+
+    def test_durable_requires_key_allows_ephemeral_with_explicit_optin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(str(Path(directory) / "store.sqlite"))
+            with patch.dict(os.environ, {}, clear=True):
+                host = make_host(store=store, allow_ephemeral_signing_key=True)
+            self.assertIsNotNone(host)
+
+    def test_durable_requires_key_in_memory_store_is_not_durable(self):
+        with patch.dict(os.environ, {}, clear=True):
+            host = make_host(store=InMemoryRuntimeStore())
+        self.assertIsNotNone(host)
+
+
+class FingerprintKeyIdTests(unittest.TestCase):
+    def test_fingerprint_key_id_is_namespaced_and_unique(self):
+        first = EnvelopeSigner.generate()
+        second = EnvelopeSigner.generate()
+        self.assertTrue(first.key_id.startswith("ed25519:"), first.key_id)
+        self.assertNotEqual(first.key_id, second.key_id)
+
+    def test_fingerprint_key_id_explicit_id_is_preserved(self):
+        self.assertEqual(EnvelopeSigner.generate("my-explicit-key").key_id, "my-explicit-key")
+
+
+class KeyIdContinuityTests(unittest.TestCase):
+    def test_key_id_continuity_stable_signer_keeps_its_id_and_verifies(self):
+        # A stable (from_private_key_bytes) signer keeps its caller-chosen id and is not
+        # ephemeral, so the generated-id fingerprint scheme does not orphan audit heads
+        # stored under ids like "env-ed25519-key" (finding #1 must not reintroduce itself).
+        raw = EnvelopeSigner.generate().private_key_bytes()
+        signer = EnvelopeSigner.from_private_key_bytes("env-ed25519-key", "host:x", raw)
+        self.assertEqual(signer.key_id, "env-ed25519-key")
+        self.assertFalse(signer.ephemeral)
+        payload = audit_head_payload("task", "host:x", "deadbeef", 0)
+        signature = signer.sign_audit_head("task", "host:x", "deadbeef", 0)
+        signer.registry.verify_audit_head("env-ed25519-key", payload, signature)  # resolves by stored id
 
 
 if __name__ == "__main__":

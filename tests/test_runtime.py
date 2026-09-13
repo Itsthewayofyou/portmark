@@ -1139,7 +1139,7 @@ class RuntimeTests(unittest.TestCase):
                 side_effecting=True,
                 env=self._isolated_env(),
             )
-            host = make_host(store=store)
+            host = make_host(store=store, allow_ephemeral_signing_key=True)
             host.tools = tools
             # Under B-lite the host policy must name the argument it allows; a bare
             # policy grant now denies unnamed arguments. This test is about the kill
@@ -1456,7 +1456,7 @@ class RuntimeTests(unittest.TestCase):
             store = SQLiteRuntimeStore(path)
             tools = ToolRegistry()
             tools.register("large.output", lambda arguments: {"payload": "x" * 2048})
-            host = make_host(store=store)
+            host = make_host(store=store, allow_ephemeral_signing_key=True)
             host.tools = tools
             host.policy = HostPolicy(host.host_id, (ToolGrant("large.output"),), ResourceBudget(max_steps=6, max_tool_calls=2, max_output_bytes=1024))
             host.providers["large"] = LargeToolProvider()
@@ -1504,7 +1504,7 @@ class RuntimeTests(unittest.TestCase):
             store = SQLiteRuntimeStore(path)
             tools = ToolRegistry()
             tools.register("big.echo", lambda arguments: {"blob": "y" * 900})
-            host = make_host(store=store)
+            host = make_host(store=store, allow_ephemeral_signing_key=True)
             host.tools = tools
             budget = ResourceBudget(max_steps=6, max_tool_calls=2, max_output_bytes=1024)
             host.policy = HostPolicy(host.host_id, (ToolGrant("big.echo"),), budget)
@@ -1574,7 +1574,7 @@ class RuntimeTests(unittest.TestCase):
                 side_effecting=True,
                 env=self._isolated_env(),
             )
-            host = make_host(store=store)
+            host = make_host(store=store, allow_ephemeral_signing_key=True)
             host.tools = tools
             budget = ResourceBudget(max_steps=6, max_tool_calls=2, max_output_bytes=32768)
             host.policy = HostPolicy(
@@ -1621,7 +1621,7 @@ class RuntimeTests(unittest.TestCase):
             store = SQLiteRuntimeStore(path)
             tools = ToolRegistry()
             tools.register("noop", lambda arguments: {"ok": True})
-            host = make_host(store=store)
+            host = make_host(store=store, allow_ephemeral_signing_key=True)
             host.tools = tools
             budget = ResourceBudget(max_steps=6, max_tool_calls=2, max_output_bytes=32768)
             host.policy = HostPolicy(host.host_id, (ToolGrant("noop", {"arguments": {"n": {"type": "number"}}}),), budget)
@@ -1649,7 +1649,7 @@ class RuntimeTests(unittest.TestCase):
             return {"ok": True}
 
         tools.register("noop", counting)
-        host = make_host(store=store)
+        host = make_host(store=store, allow_ephemeral_signing_key=True)
         host.tools = tools
         host.policy = HostPolicy(host.host_id, (ToolGrant("noop", {"arguments": {"n": {"type": "number"}}}),), budget)
         host.providers["always"] = FixedProvider(ProviderDecision("tool", "noop", {"n": 1}))
@@ -1709,7 +1709,7 @@ class RuntimeTests(unittest.TestCase):
         # durable checkpoint is closed (failed), not a resumable running one.
         with tempfile.TemporaryDirectory() as directory:
             store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
-            host = make_host(store=store)
+            host = make_host(store=store, allow_ephemeral_signing_key=True)
             host.providers["poison"] = FixedProvider(ProviderDecision("complete", content={"x": float("nan")}))
             envelope = make_demo_envelope(host, "poison content", "poison")
             host.signer.seal(envelope)
@@ -1729,7 +1729,7 @@ class RuntimeTests(unittest.TestCase):
         source_signer = EnvelopeSigner.generate("source-key", "host:source", ("host:source", "host:destination"))
         with tempfile.TemporaryDirectory() as directory:
             store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
-            source = make_host(host_id="host:source", signer=source_signer, store=store)
+            source = make_host(host_id="host:source", signer=source_signer, store=store, allow_ephemeral_signing_key=True)
             source.policy.migration = MigrationPolicy(allowed=True, destinations=("host:destination",))
             source.providers["migrator"] = MigrateThenCompleteProvider("host:destination")
             envelope = make_demo_envelope(source, "M" * 1500, "migrator")
@@ -1771,7 +1771,7 @@ class RuntimeTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
-            host = make_host(store=store)  # demo policy: catalog.search -> (id, title)
+            host = make_host(store=store, allow_ephemeral_signing_key=True)  # demo policy: catalog.search -> (id, title)
             host.providers["recorder"] = RecordingProvider()
             envelope = make_demo_envelope(host, "search", "recorder")
             host.signer.seal(envelope)
@@ -1800,7 +1800,7 @@ class RuntimeTests(unittest.TestCase):
             store = SQLiteRuntimeStore(path)
             tools = ToolRegistry()
             tools.register("big.echo", lambda arguments: {"blob": "y" * 900})
-            host = make_host(store=store)
+            host = make_host(store=store, allow_ephemeral_signing_key=True)
             host.tools = tools
             host_budget = ResourceBudget(max_steps=6, max_tool_calls=2, max_output_bytes=1024)
             permit_budget = ResourceBudget(max_steps=6, max_tool_calls=2, max_output_bytes=8192)
@@ -1838,7 +1838,7 @@ class RuntimeTests(unittest.TestCase):
                     store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
                     tools = ToolRegistry(default_timeout=0.01)
                     tools.register(tool_name, tool)
-                    host = make_host(store=store)
+                    host = make_host(store=store, allow_ephemeral_signing_key=True)
                     host.tools = tools
                     host.policy = HostPolicy(host.host_id, (ToolGrant(tool_name),), ResourceBudget())
                     host.providers["tool-failure"] = FixedProvider(ProviderDecision("tool", tool_name, {}))
@@ -2204,7 +2204,7 @@ class RuntimeTests(unittest.TestCase):
         for context in self._store_case_contexts(signer):
             with context as (backend, store):
                 with self.subTest(backend=backend):
-                    host = make_host(signer=signer, store=store)
+                    host = make_host(signer=signer, store=store, allow_ephemeral_signing_key=True)
                     result = host.run(make_demo_envelope(host, f"{backend} contract"))
                     checkpoint = store.load_checkpoint(result.task_id)
                     self.assertIsNotNone(checkpoint)
@@ -2222,12 +2222,12 @@ class RuntimeTests(unittest.TestCase):
         for context in self._store_case_contexts(signer):
             with context as (backend, store):
                 with self.subTest(backend=backend):
-                    host = make_host(signer=signer, store=store)
+                    host = make_host(signer=signer, store=store, allow_ephemeral_signing_key=True)
                     envelope = make_demo_envelope(host, f"{backend} race")
 
                     def run_once():
                         local_store = self._reopen_store(backend, store, signer)
-                        local_host = make_host(signer=signer, store=local_store)
+                        local_host = make_host(signer=signer, store=local_store, allow_ephemeral_signing_key=True)
                         return local_host.run(copy.deepcopy(envelope)).status
 
                     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
@@ -2247,7 +2247,7 @@ class RuntimeTests(unittest.TestCase):
         for context in self._store_case_contexts(signer):
             with context as (backend, store):
                 with self.subTest(backend=backend):
-                    host = make_host(signer=signer, store=store)
+                    host = make_host(signer=signer, store=store, allow_ephemeral_signing_key=True)
                     result = host.run(make_demo_envelope(host, f"{backend} corrupt"))
                     self.assertTrue(store.verify_audit_chain(result.task_id))
                     self._corrupt_store_audit(store, result.task_id, backend)
@@ -2264,7 +2264,7 @@ class RuntimeTests(unittest.TestCase):
         for context in self._store_case_contexts(signer):
             with context as (backend, store):
                 with self.subTest(backend=backend):
-                    host = make_host(signer=signer, store=store)
+                    host = make_host(signer=signer, store=store, allow_ephemeral_signing_key=True)
                     result = host.run(make_demo_envelope(host, f"{backend} host tamper"))
                     self.assertTrue(store.verify_audit_chain(result.task_id))
                     self._tamper_store_host_id(store, result.task_id, backend)
@@ -2299,8 +2299,8 @@ class RuntimeTests(unittest.TestCase):
         for context in self._dual_store_case_contexts(source_signer, destination_signer):
             with context as (backend, source_store, destination_store):
                 with self.subTest(backend=backend):
-                    source = make_host(host_id="host:source", signer=source_signer, store=source_store)
-                    destination = make_host(host_id="host:destination", signer=destination_signer, store=destination_store)
+                    source = make_host(host_id="host:source", signer=source_signer, store=source_store, allow_ephemeral_signing_key=True)
+                    destination = make_host(host_id="host:destination", signer=destination_signer, store=destination_store, allow_ephemeral_signing_key=True)
                     source.policy.migration = MigrationPolicy(allowed=True, destinations=(destination.host_id,))
                     provider = MigrateThenCompleteProvider(destination.host_id)
                     source.providers["migrator"] = provider
@@ -2339,7 +2339,7 @@ class RuntimeTests(unittest.TestCase):
         for context in self._store_case_contexts():
             with context as (backend, store):
                 with self.subTest(backend=backend):
-                    source = make_host(host_id="host:source", signer=source_signer, store=store)
+                    source = make_host(host_id="host:source", signer=source_signer, store=store, allow_ephemeral_signing_key=True)
                     source.policy.migration = MigrationPolicy(allowed=True, destinations=("host:destination",))
                     source.providers["migrator"] = MigrateThenCompleteProvider("host:destination")
                     envelope = make_demo_envelope(source, f"{backend} outbox", "migrator")
@@ -2373,7 +2373,7 @@ class RuntimeTests(unittest.TestCase):
         for context in self._store_case_contexts():
             with context as (backend, store):
                 with self.subTest(backend=backend):
-                    host = make_host(store=store)
+                    host = make_host(store=store, allow_ephemeral_signing_key=True)
                     result = host.run(make_demo_envelope(host, f"{backend} no-migration"))
                     self.assertEqual(result.status, "completed")
                     self.assertEqual(store.list_pending_migrations(), [])
@@ -2387,7 +2387,7 @@ class RuntimeTests(unittest.TestCase):
         source_signer = EnvelopeSigner.generate("outbox-oversize-key", "host:source", ("host:source", "host:destination"))
         with tempfile.TemporaryDirectory() as directory:
             store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
-            source = make_host(host_id="host:source", signer=source_signer, store=store)
+            source = make_host(host_id="host:source", signer=source_signer, store=store, allow_ephemeral_signing_key=True)
             source.policy.migration = MigrationPolicy(allowed=True, destinations=("host:destination",))
             source.providers["migrator"] = MigrateThenCompleteProvider("host:destination")
             envelope = make_demo_envelope(source, "M" * 1500, "migrator")
@@ -2418,7 +2418,7 @@ class RuntimeTests(unittest.TestCase):
         source_signer = EnvelopeSigner.generate("outbox-atomic-key", "host:source", ("host:source", "host:destination"))
         with tempfile.TemporaryDirectory() as directory:
             store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
-            source = make_host(host_id="host:source", signer=source_signer, store=store)
+            source = make_host(host_id="host:source", signer=source_signer, store=store, allow_ephemeral_signing_key=True)
             source.policy.migration = MigrationPolicy(allowed=True, destinations=("host:destination",))
             source.providers["migrator"] = MigrateThenCompleteProvider("host:destination")
             envelope = make_demo_envelope(source, "atomic outbox", "migrator")
@@ -2514,12 +2514,12 @@ class RuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runtime.sqlite"
             signer = EnvelopeSigner.generate("store-key", "host:local-demo", ("host:local-demo",))
-            first_host = make_host(signer=signer, store=SQLiteRuntimeStore(path))
+            first_host = make_host(signer=signer, store=SQLiteRuntimeStore(path), allow_ephemeral_signing_key=True)
             envelope = make_demo_envelope(first_host, "durable replay")
             result = first_host.run(envelope)
             self.assertEqual(result.status, "completed")
 
-            second_host = make_host(signer=signer, store=SQLiteRuntimeStore(path))
+            second_host = make_host(signer=signer, store=SQLiteRuntimeStore(path), allow_ephemeral_signing_key=True)
             replay = copy.deepcopy(envelope)
             replay.state.status = "ready"
             signer.seal(replay)
@@ -2541,7 +2541,7 @@ class RuntimeTests(unittest.TestCase):
             with context as (backend, store):
                 with self.subTest(backend=backend):
                     provider = AlwaysSuspendProvider()
-                    host = make_host(signer=signer, store=store, providers={"suspender": provider})
+                    host = make_host(signer=signer, store=store, providers={"suspender": provider}, allow_ephemeral_signing_key=True)
                     env = make_demo_envelope(host, f"{backend} adversarial", "suspender")
                     signer.seal(env)
 
@@ -2645,7 +2645,7 @@ class RuntimeTests(unittest.TestCase):
     def test_sqlite_store_persists_checkpoint_and_audit_chain(self):
         with tempfile.TemporaryDirectory() as directory:
             store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
-            host = make_host(store=store)
+            host = make_host(store=store, allow_ephemeral_signing_key=True)
             result = host.run(make_demo_envelope(host, "persist me"))
             checkpoint = store.load_checkpoint(result.task_id)
             self.assertIsNotNone(checkpoint)
@@ -2664,7 +2664,7 @@ class RuntimeTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
-            host = make_host(store=store)
+            host = make_host(store=store, allow_ephemeral_signing_key=True)
             result = host.run(make_demo_envelope(host, "leak check"))
 
             opened: list[sqlite_module.Connection] = []
@@ -2787,8 +2787,8 @@ class RuntimeTests(unittest.TestCase):
             signer = EnvelopeSigner.generate("v1-migration-key", "host:local-demo", ("host:local-demo",))
             store = SQLiteRuntimeStore(path)
             self.assertEqual(store.audit_head("missing"), None)
-            first = make_host(signer=signer, store=store)
-            second = make_host(signer=signer, store=SQLiteRuntimeStore(path))
+            first = make_host(signer=signer, store=store, allow_ephemeral_signing_key=True)
+            second = make_host(signer=signer, store=SQLiteRuntimeStore(path), allow_ephemeral_signing_key=True)
             self.assertEqual(first.run(make_demo_envelope(first, "first migrated task")).status, "completed")
             self.assertEqual(second.run(make_demo_envelope(second, "second migrated task")).status, "completed")
             with self._raw_sqlite(path) as connection:
@@ -2815,7 +2815,7 @@ class RuntimeTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as directory:
                     path = Path(directory) / "runtime.sqlite"
                     store = SQLiteRuntimeStore(path)
-                    host = make_host(store=store)
+                    host = make_host(store=store, allow_ephemeral_signing_key=True)
                     result = host.run(make_demo_envelope(host, f"audit tamper {name}"))
                     self.assertTrue(store.verify_audit_chain(result.task_id))
                     with self._raw_sqlite(path) as connection:
@@ -2879,7 +2879,7 @@ class RuntimeTests(unittest.TestCase):
 
             self.assertFalse(store.verify_audit_chain("task-forged"))
 
-            host = make_host(signer=signer, store=store)
+            host = make_host(signer=signer, store=store, allow_ephemeral_signing_key=True)
             result = host.run(make_demo_envelope(host, "signed history"))
             self.assertTrue(store.verify_audit_chain(result.task_id))
             with self._raw_sqlite(path) as connection:
@@ -2892,7 +2892,7 @@ class RuntimeTests(unittest.TestCase):
             path = Path(directory) / "runtime.sqlite"
             signer = EnvelopeSigner.generate("audit-status-key", "host:local-demo", ("host:local-demo",))
             signing_store = SQLiteRuntimeStore(path, signer)
-            host = make_host(signer=signer, store=signing_store)
+            host = make_host(signer=signer, store=signing_store, allow_ephemeral_signing_key=True)
             result = host.run(make_demo_envelope(host, "operator audit without registry"))
 
             verified = SQLiteRuntimeStore(path, signer).verify_audit_chain_status(result.task_id)
@@ -2911,7 +2911,7 @@ class RuntimeTests(unittest.TestCase):
             signer = EnvelopeSigner.generate("cli-audit-key", "host:local-demo", ("host:local-demo",))
             registry_path = self._write_trust_registry(directory, signer)
             store = SQLiteRuntimeStore(path)
-            host = make_host(signer=signer, store=store)
+            host = make_host(signer=signer, store=store, allow_ephemeral_signing_key=True)
             result = host.run(make_demo_envelope(host, "operator audit"))
 
             output = io.StringIO()
@@ -3028,7 +3028,7 @@ class RuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
             signer = EnvelopeSigner.generate("audit-head-key", "host:local-demo", ("host:local-demo",))
-            host = make_host(signer=signer, store=store)
+            host = make_host(signer=signer, store=store, allow_ephemeral_signing_key=True)
             result = host.run(make_demo_envelope(host, "stored head"))
             envelope = make_demo_envelope(host, "bad head")
             envelope.state.task_id = result.task_id
@@ -3065,8 +3065,8 @@ class RuntimeTests(unittest.TestCase):
             destination_signer = trust_signer(EnvelopeSigner.generate("destination-key", "host:destination", ("host:destination",)), source_signer)
             source_store = SQLiteRuntimeStore(Path(directory) / "source.sqlite")
             destination_store = SQLiteRuntimeStore(Path(directory) / "destination.sqlite")
-            source = make_host(host_id="host:source", signer=source_signer, store=source_store)
-            destination = make_host(host_id="host:destination", signer=destination_signer, store=destination_store)
+            source = make_host(host_id="host:source", signer=source_signer, store=source_store, allow_ephemeral_signing_key=True)
+            destination = make_host(host_id="host:destination", signer=destination_signer, store=destination_store, allow_ephemeral_signing_key=True)
             source.policy.migration = MigrationPolicy(allowed=True, destinations=(destination.host_id,))
             provider = MigrateThenCompleteProvider(destination.host_id)
             source.providers["migrator"] = provider
@@ -3094,11 +3094,11 @@ class RuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runtime.sqlite"
             signer = EnvelopeSigner.generate("concurrent-key", "host:local-demo", ("host:local-demo",))
-            host = make_host(signer=signer, store=SQLiteRuntimeStore(path))
+            host = make_host(signer=signer, store=SQLiteRuntimeStore(path), allow_ephemeral_signing_key=True)
             envelope = make_demo_envelope(host, "race")
 
             def run_once():
-                local_host = make_host(signer=signer, store=SQLiteRuntimeStore(path))
+                local_host = make_host(signer=signer, store=SQLiteRuntimeStore(path), allow_ephemeral_signing_key=True)
                 return local_host.run(copy.deepcopy(envelope)).status
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
@@ -3118,11 +3118,11 @@ class RuntimeTests(unittest.TestCase):
             signer = EnvelopeSigner.generate("parallel-key", "host:local-demo", ("host:local-demo",))
             envelopes = []
             for index in range(8):
-                host = make_host(signer=signer, store=SQLiteRuntimeStore(path))
+                host = make_host(signer=signer, store=SQLiteRuntimeStore(path), allow_ephemeral_signing_key=True)
                 envelopes.append(copy.deepcopy(make_demo_envelope(host, f"parallel {index}")))
 
             def run_envelope(envelope):
-                local_host = make_host(signer=signer, store=SQLiteRuntimeStore(path))
+                local_host = make_host(signer=signer, store=SQLiteRuntimeStore(path), allow_ephemeral_signing_key=True)
                 return local_host.run(envelope)
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:

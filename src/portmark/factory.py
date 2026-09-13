@@ -73,6 +73,7 @@ def make_host(
     reload_policy: bool = False,
     tools: ToolRegistry | None = None,
     providers: dict[str, ModelProvider] | None = None,
+    allow_ephemeral_signing_key: bool = False,
 ) -> AgentHost:
     # Note the asymmetry with `tools`, which REPLACES the demo registry.
     # Providers merge over the constructed defaults instead, so passing an
@@ -142,6 +143,18 @@ def make_host(
             f"host signing issuer {signing_issuer!r} must equal host id {host_id!r}; "
             "unset PORTMARK_SIGNING_ISSUER/PORTMARK_ED25519_PRIVATE_KEY_B64 for the host process, "
             "or start it with --host-id matching the signing issuer"
+        )
+    # Finding #1: a durable store must not run on an ephemeral (generated, per-restart)
+    # signing key -- audit heads signed before a restart would no longer verify, and
+    # checkpoint continuation can break. Durability comes from the store's own
+    # declaration, not a path/env heuristic. Ephemeral demo/test use must opt in.
+    if getattr(configured_store, "is_durable", False) and getattr(host_signer, "ephemeral", False) and not allow_ephemeral_signing_key:
+        raise ValueError(
+            "a durable store requires a stable host signing key: set "
+            "PORTMARK_ED25519_PRIVATE_KEY_B64 (and add the host public key to the trust "
+            "registry), or pass allow_ephemeral_signing_key=True for ephemeral demo/test "
+            "use. A generated key changes on every restart, so audit heads signed before "
+            "a restart would no longer verify."
         )
     return AgentHost(
         host_id,
