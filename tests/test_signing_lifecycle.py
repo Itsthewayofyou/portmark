@@ -305,5 +305,49 @@ class KeyIdContinuityTests(unittest.TestCase):
         signer.registry.verify_audit_head("env-ed25519-key", payload, signature)  # resolves by stored id
 
 
+# ---------------------------------------------------------------------------
+# Finding #5 — key-purpose separation: a valid key lacking the required usage
+# must be rejected (an envelope key cannot sign an audit head, and vice versa).
+# ---------------------------------------------------------------------------
+class KeyUsageTests(unittest.TestCase):
+    HOST = "host:usage"
+
+    def _registry_for(self, signer: EnvelopeSigner, usages: tuple[str, ...]) -> TrustRegistry:
+        registry = TrustRegistry()
+        registry.add(
+            TrustedIdentity(
+                key_id=signer.key_id,
+                issuer=signer.issuer,
+                public_key=signer.public_key_bytes(),
+                allowed_audiences=("*",),
+                usages=usages,
+            )
+        )
+        return registry
+
+    def test_key_usage_envelope_only_key_cannot_sign_audit_head(self):
+        signer = EnvelopeSigner.generate("k", self.HOST)
+        registry = self._registry_for(signer, ("envelope",))
+        payload = audit_head_payload("t", self.HOST, "hash", 0)
+        signature = signer.sign_audit_head("t", self.HOST, "hash", 0)
+        with self.assertRaisesRegex(SecurityError, "usage"):
+            registry.verify_audit_head("k", payload, signature)
+
+    def test_key_usage_audit_only_key_cannot_verify_envelope(self):
+        signer = EnvelopeSigner.generate("k", self.HOST)
+        registry = self._registry_for(signer, ("audit",))
+        envelope = _agent_envelope(signer, self.HOST)
+        with self.assertRaisesRegex(SecurityError, "usage"):
+            registry.require_identity(envelope)
+
+    def test_key_usage_unrestricted_key_allows_both(self):
+        signer = EnvelopeSigner.generate("k", self.HOST)
+        registry = self._registry_for(signer, ())  # empty = no restriction (backward compat)
+        payload = audit_head_payload("t", self.HOST, "hash", 0)
+        signature = signer.sign_audit_head("t", self.HOST, "hash", 0)
+        registry.verify_audit_head("k", payload, signature)  # no raise
+        registry.require_identity(_agent_envelope(signer, self.HOST))  # no raise
+
+
 if __name__ == "__main__":
     unittest.main()

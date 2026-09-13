@@ -129,6 +129,14 @@ class TrustedIdentity:
     not_before: int = 0
     expires_at: int | None = None
     revoked: bool = False
+    # Permitted key purposes (finding #5): e.g. "envelope", "migration", "audit". Empty
+    # means unrestricted (backward compatible with registries written before usages
+    # existed). A key valid for one purpose cannot be used for another it does not list.
+    usages: tuple[str, ...] = ()
+
+
+def _identity_permits(identity: TrustedIdentity, usage: str) -> bool:
+    return not identity.usages or usage in identity.usages
 
 
 @dataclass(frozen=True)
@@ -204,6 +212,8 @@ class TrustRegistry:
             raise SecurityError("audit head signing key is not active yet")
         if reason == "expired":
             raise SecurityError("audit head signing key has expired")
+        if not _identity_permits(identity, "audit"):
+            raise SecurityError("audit head signing key lacks the required 'audit' usage")
         if payload.get("host_id") != identity.issuer:
             raise SecurityError("audit head signer identity does not match host")
         try:
@@ -228,6 +238,8 @@ class TrustRegistry:
             raise SecurityError("agent envelope signing key is not active yet")
         if reason == "expired":
             raise SecurityError("agent envelope signing key has expired")
+        if not _identity_permits(identity, "envelope"):
+            raise SecurityError("agent envelope signing key lacks the required 'envelope' usage")
         if not _issuer_matches(identity.issuer, envelope.permit.issuer):
             raise SecurityError("agent envelope signing key cannot sign for this issuer")
         if "*" not in identity.allowed_audiences and envelope.permit.audience not in identity.allowed_audiences:
@@ -254,9 +266,25 @@ def _parse_trust_registry(value: Any) -> TrustRegistry:
                 not_before=int(item.get("not_before", 0)),
                 expires_at=int(item["expires_at"]) if item.get("expires_at") is not None else None,
                 revoked=bool(item.get("revoked", False)),
+                usages=_usages_tuple(item.get("usages", ())),
             )
         )
     return registry
+
+
+def _usages_tuple(value: Any) -> tuple[str, ...]:
+    # Optional. Absent/empty means unrestricted. When present, every entry must be a
+    # non-empty string (a key purpose such as "envelope"/"migration"/"audit").
+    if value in ((), None):
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("trust registry usages must be a list")
+    usages: list[str] = []
+    for entry in value:
+        if not isinstance(entry, str) or not entry:
+            raise ValueError("trust registry usages must be non-empty strings")
+        usages.append(entry)
+    return tuple(usages)
 
 
 def load_trust_registry(path: str | Path) -> TrustRegistry:
