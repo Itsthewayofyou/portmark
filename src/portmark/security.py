@@ -9,6 +9,8 @@ import subprocess  # nosec B404
 import tempfile
 import time
 import base64
+import binascii
+import string
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -91,9 +93,31 @@ def _b64url_encode(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
 
 
+_B64URL_ALPHABET = frozenset(string.ascii_letters + string.digits + "-_")
+
+
 def _b64url_decode(value: str) -> bytes:
+    # Strict, canonical unpadded Base64URL only (Codex audit finding #6). The lenient
+    # form accepted non-alphabet characters, added padding and non-canonical trailing
+    # bits, so byte-for-byte-different strings decoded to the same signature/key bytes
+    # and could evade a naive tamper check or signature-string cache. We reject anything
+    # that does not re-encode to exactly the input. Raises ValueError so the existing
+    # (InvalidSignature, ValueError) handlers at every verify call site convert it to a
+    # SecurityError, and load_trust_registry surfaces it as a validation error.
+    if not isinstance(value, str):
+        raise ValueError("base64url value must be a string")
+    if len(value) % 4 == 1:
+        raise ValueError("base64url value has an impossible length")
+    if any(ch not in _B64URL_ALPHABET for ch in value):
+        raise ValueError("base64url value contains a non-alphabet character")
     padding = "=" * (-len(value) % 4)
-    return base64.urlsafe_b64decode(value + padding)
+    try:
+        decoded = base64.urlsafe_b64decode(value + padding)
+    except (binascii.Error, ValueError) as error:
+        raise ValueError("base64url value is not decodable") from error
+    if _b64url_encode(decoded) != value:
+        raise ValueError("base64url value is not canonically encoded")
+    return decoded
 
 
 @dataclass(frozen=True)
@@ -127,9 +151,33 @@ class TrustedApprover:
     revoked: bool = False
 
 
+def _identity_unusable_reason(identity: Any, now: int) -> str | None:
+    """Single validity predicate (finding #2): the four checks that decide whether a
+    trusted key may be used RIGHT NOW, in one place, so readiness, admission and audit
+    verification cannot drift apart. Returns None when usable, else a short reason code
+    each caller maps to its own domain message. Works for any identity carrying
+    revoked/not_before/expires_at (TrustedIdentity, authorities)."""
+    if identity.revoked:
+        return "revoked"
+    if identity.not_before > now:
+        return "not-yet-active"
+    if identity.expires_at is not None and identity.expires_at <= now:
+        return "expired"
+    return None
+
+
 class TrustRegistry:
     def __init__(self, identities: tuple[TrustedIdentity, ...] = ()) -> None:
         self._identities = {identity.key_id: identity for identity in identities}
+
+    def is_usable(self, key_id: str, now: int | None = None) -> bool:
+        """True only if the key is trusted AND currently valid. `has_key` (membership)
+        is NOT sufficient — it ignores revocation/expiry, which is the bug behind #2."""
+        identity = self._identities.get(key_id)
+        if identity is None:
+            return False
+        current_time = int(time.time()) if now is None else now
+        return _identity_unusable_reason(identity, current_time) is None
 
     def add(self, identity: TrustedIdentity) -> None:
         if identity.key_id in self._identities:
@@ -149,11 +197,12 @@ class TrustRegistry:
         if identity is None:
             raise SecurityError("audit head signing key is not trusted")
         current_time = int(time.time()) if now is None else now
-        if identity.revoked:
+        reason = _identity_unusable_reason(identity, current_time)
+        if reason == "revoked":
             raise SecurityError("audit head signing key has been revoked")
-        if identity.not_before > current_time:
+        if reason == "not-yet-active":
             raise SecurityError("audit head signing key is not active yet")
-        if identity.expires_at is not None and identity.expires_at <= current_time:
+        if reason == "expired":
             raise SecurityError("audit head signing key has expired")
         if payload.get("host_id") != identity.issuer:
             raise SecurityError("audit head signer identity does not match host")
@@ -171,12 +220,13 @@ class TrustRegistry:
         identity = self._identities.get(envelope.signature_key_id)
         if identity is None:
             raise SecurityError("agent envelope signature key id is not trusted")
-        if identity.revoked:
-            raise SecurityError("agent envelope signing key has been revoked")
         current_time = int(time.time()) if now is None else now
-        if identity.not_before > current_time:
+        reason = _identity_unusable_reason(identity, current_time)
+        if reason == "revoked":
+            raise SecurityError("agent envelope signing key has been revoked")
+        if reason == "not-yet-active":
             raise SecurityError("agent envelope signing key is not active yet")
-        if identity.expires_at is not None and identity.expires_at <= current_time:
+        if reason == "expired":
             raise SecurityError("agent envelope signing key has expired")
         if not _issuer_matches(identity.issuer, envelope.permit.issuer):
             raise SecurityError("agent envelope signing key cannot sign for this issuer")
@@ -185,9 +235,7 @@ class TrustRegistry:
         return identity
 
 
-def load_trust_registry(path: str | Path) -> TrustRegistry:
-    with open(path, "rb") as file:
-        value = json.load(file)
+def _parse_trust_registry(value: Any) -> TrustRegistry:
     if not isinstance(value, dict):
         raise ValueError("trust registry root must be an object")
     identities = value.get("identities")
@@ -209,6 +257,96 @@ def load_trust_registry(path: str | Path) -> TrustRegistry:
             )
         )
     return registry
+
+
+def load_trust_registry(path: str | Path) -> TrustRegistry:
+    with open(path, "rb") as file:
+        return _parse_trust_registry(json.load(file))
+
+
+def _registry_digest(data: bytes) -> str:
+    return hashlib.blake2b(data).hexdigest()
+
+
+class TrustSource:
+    """Fail-closed, file-backed trust registry (finding #2).
+
+    Holds the immutable registry parsed from `path` at load time plus the digest of the
+    file bytes observed then. Every verification re-reads the file and FAILS CLOSED
+    (raises SecurityError) if it changed on disk, so a redeployed revocation stops the
+    live host from accepting the key: admission and audit verification reject until the
+    host is restarted with the new file. The changed bytes are never adopted -- they are
+    unauthenticated and unversioned, so silently swapping them in would build the
+    registry-rollback attack surface (finding #13) before its defense exists. Safe
+    hot-reload is a follow-up, once a signed/versioned registry with a floor lands.
+
+    A small in-memory overlay carries identities the host registers at boot (its own
+    generated or env-supplied signing key) that are not part of the on-disk file. The
+    overlay is host-local and not subject to the on-disk change check.
+    """
+
+    def __init__(self, path: str | Path, registry: TrustRegistry, digest: str) -> None:
+        self._path = str(path)
+        self._file_registry = registry
+        self._digest = digest
+        self._overlay = TrustRegistry()
+
+    @classmethod
+    def from_path(cls, path: str | Path) -> "TrustSource":
+        with open(path, "rb") as file:
+            data = file.read()
+        return cls(path, _parse_trust_registry(json.loads(data)), _registry_digest(data))
+
+    @property
+    def digest(self) -> str:
+        return self._digest
+
+    def _verified_file(self) -> TrustRegistry:
+        try:
+            with open(self._path, "rb") as file:
+                data = file.read()
+        except OSError as error:
+            raise SecurityError("trust registry file is unavailable; restart the host to reload it") from error
+        if _registry_digest(data) != self._digest:
+            raise SecurityError("trust registry changed on disk; restart the host to adopt the new registry")
+        return self._file_registry
+
+    # -- boot-time overlay management (mutates the host-local overlay only) -------------
+    def identity_at_boot(self, key_id: str) -> TrustedIdentity | None:
+        return self._overlay.identity(key_id) or self._file_registry.identity(key_id)
+
+    def add(self, identity: TrustedIdentity) -> None:
+        if self.identity_at_boot(identity.key_id) is not None:
+            raise ValueError(f"duplicate signing key id {identity.key_id!r}")
+        self._overlay.add(identity)
+
+    # -- verification interface (fails closed on any on-disk change) --------------------
+    def identity(self, key_id: str) -> TrustedIdentity | None:
+        registry = self._verified_file()
+        return self._overlay.identity(key_id) or registry.identity(key_id)
+
+    def has_key(self, key_id: str) -> bool:
+        registry = self._verified_file()
+        return self._overlay.has_key(key_id) or registry.has_key(key_id)
+
+    def is_usable(self, key_id: str, now: int | None = None) -> bool:
+        registry = self._verified_file()
+        if self._overlay.has_key(key_id):
+            return self._overlay.is_usable(key_id, now)
+        return registry.is_usable(key_id, now)
+
+    def require_identity(self, envelope: AgentEnvelope, now: int | None = None) -> TrustedIdentity:
+        registry = self._verified_file()
+        if envelope.signature_key_id and self._overlay.has_key(envelope.signature_key_id):
+            return self._overlay.require_identity(envelope, now)
+        return registry.require_identity(envelope, now)
+
+    def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None) -> None:
+        registry = self._verified_file()
+        if self._overlay.has_key(key_id):
+            self._overlay.verify_audit_head(key_id, payload, signature, now)
+        else:
+            registry.verify_audit_head(key_id, payload, signature, now)
 
 
 def _issuer_matches(signing_issuer: str, permit_issuer: str) -> bool:
@@ -522,7 +660,7 @@ def generate_signing_material(
 
 
 def _register_own_identity(
-    registry: TrustRegistry,
+    registry: "TrustRegistry | TrustSource",
     key_id: str,
     issuer: str,
     public_key: bytes,
@@ -553,7 +691,7 @@ def _register_own_identity(
 class EnvelopeSigner:
     """Ed25519 envelope signer and verifier backed by a trust registry."""
 
-    def __init__(self, key_id: str, issuer: str, private_key: Ed25519PrivateKey, registry: TrustRegistry) -> None:
+    def __init__(self, key_id: str, issuer: str, private_key: Ed25519PrivateKey, registry: "TrustRegistry | TrustSource") -> None:
         self.key_id = key_id
         self.issuer = issuer
         self._private_key = private_key
@@ -565,7 +703,7 @@ class EnvelopeSigner:
         key_id: str = "demo-ed25519-key",
         issuer: str = "user:demo",
         allowed_audiences: tuple[str, ...] = ("*",),
-        registry: TrustRegistry | None = None,
+        registry: "TrustRegistry | TrustSource | None" = None,
     ) -> "EnvelopeSigner":
         private_key = Ed25519PrivateKey.generate()
         trust = registry if registry is not None else TrustRegistry()
@@ -585,7 +723,7 @@ class EnvelopeSigner:
         issuer: str,
         private_key_bytes: bytes,
         allowed_audiences: tuple[str, ...] = ("*",),
-        registry: TrustRegistry | None = None,
+        registry: "TrustRegistry | TrustSource | None" = None,
     ) -> "EnvelopeSigner":
         if len(private_key_bytes) != 32:
             raise ValueError("Ed25519 private keys must be 32 raw bytes")

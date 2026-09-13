@@ -11,7 +11,7 @@ from .metrics import RuntimeMetrics
 from .models import AgentEnvelope, AgentManifest, AgentState, Permit, ResourceBudget, ToolGrant
 from .policy import load_host_policy
 from .providers import DeterministicProvider, GenericHttpProvider, ModelProvider, NativeWasmtimeComponentProvider, WasmDecisionProvider
-from .security import AttestationPolicy, EnvelopeSigner, EnvelopeSigningIdentity, ExternalAttestationVerifier, HmacEnvelopeSigner, HostPolicy, load_trust_registry, validate_constraints
+from .security import AttestationPolicy, EnvelopeSigner, EnvelopeSigningIdentity, ExternalAttestationVerifier, HmacEnvelopeSigner, HostPolicy, TrustRegistry, TrustSource, validate_constraints
 from .storage import RuntimeStore, create_runtime_store
 from .tools import ToolRegistry, demo_registry
 
@@ -19,8 +19,21 @@ from .tools import ToolRegistry, demo_registry
 HOST_ID = "host:local-demo"
 
 
-def signer_from_environment(host_id: str = HOST_ID, trust_registry_path: str | None = None) -> EnvelopeSigningIdentity:
-    registry = load_trust_registry(trust_registry_path) if trust_registry_path else None
+def signer_from_environment(
+    host_id: str = HOST_ID,
+    trust_registry_path: str | None = None,
+    trust: "TrustRegistry | TrustSource | None" = None,
+) -> EnvelopeSigningIdentity:
+    # Prefer a caller-supplied trust object so the signer and the store share ONE
+    # fail-closed source (finding #2 -- two independent loads would let one verifier
+    # keep trusting a key the other has stopped trusting). Fall back to loading a
+    # fail-closed TrustSource from the path for direct callers (CLI, tests).
+    if trust is not None:
+        registry: "TrustRegistry | TrustSource | None" = trust
+    elif trust_registry_path:
+        registry = TrustSource.from_path(trust_registry_path)
+    else:
+        registry = None
     raw_private_key = os.environ.get("PORTMARK_ED25519_PRIVATE_KEY_B64")
     if raw_private_key:
         import base64
@@ -80,6 +93,10 @@ def make_host(
         configured_providers.update(providers)
     configured_policy_path = policy_path or os.environ.get("PORTMARK_POLICY_PATH")
     configured_trust_registry_path = trust_registry_path or os.environ.get("PORTMARK_TRUST_REGISTRY_PATH")
+    # One fail-closed trust source shared by the signer AND the store's audit verifier
+    # (finding #2). Two independent loads would let one verifier keep trusting a key the
+    # other has stopped trusting, and would not fail closed together on an on-disk change.
+    trust_source = TrustSource.from_path(configured_trust_registry_path) if configured_trust_registry_path else None
     policy_loader = (lambda: load_host_policy(configured_policy_path, host_id)) if configured_policy_path else None
     policy = policy_loader() if policy_loader else HostPolicy(
         host_id,
@@ -96,7 +113,7 @@ def make_host(
     )
     configured_store = store
     if configured_store is None and os.environ.get("PORTMARK_STORE_PATH"):
-        audit_verifier = load_trust_registry(configured_trust_registry_path) if configured_trust_registry_path else None
+        audit_verifier = trust_source
         configured_store = create_runtime_store(
             os.environ.get("PORTMARK_STORE_BACKEND", "sqlite"),
             os.environ["PORTMARK_STORE_PATH"],
@@ -114,7 +131,7 @@ def make_host(
                 required_for_migration=required,
                 external_verifier=verifier,
             )
-    host_signer = signer or signer_from_environment(host_id, configured_trust_registry_path)
+    host_signer = signer or signer_from_environment(host_id, configured_trust_registry_path, trust=trust_source)
     signing_issuer = getattr(host_signer, "issuer", host_id)
     if signing_issuer != host_id:
         # Every run signs an audit head with the host id as issuer, so this config

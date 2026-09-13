@@ -545,7 +545,8 @@ class SecurityGuardTests(unittest.TestCase):
                 ({"version": "v1", "tools": {"catalog.search": {"output_projection": "*"}}}, "output_projection must be a list"),
                 ({"version": "v1", "tools": {"catalog.search": {"output_projection": ["*", "id"]}}}, "output_projection cannot mix"),
                 ({"version": "v1", "tools": {"catalog.search": {}}, "approval_authorities": {}}, "approval_authorities must be a list"),
-                ({"version": "v1", "tools": {"catalog.search": {}}, "approval_authorities": [{"key_id": "k", "approver": "a", "public_key_b64": "bad"}]}, "approval public keys must be 32 raw bytes"),
+                ({"version": "v1", "tools": {"catalog.search": {}}, "approval_authorities": [{"key_id": "k", "approver": "a", "public_key_b64": _b64(b"short")}]}, "approval public keys must be 32 raw bytes"),
+                ({"version": "v1", "tools": {"catalog.search": {}}, "approval_authorities": [{"key_id": "k", "approver": "a", "public_key_b64": "bad"}]}, "base64url value is not canonically encoded"),
                 ({"version": "v1", "tools": {"catalog.search": {}}, "approval_required_impacts": ["root"]}, "approval_required_impacts contains an invalid impact"),
             ]
             for value, message in policy_cases:
@@ -560,7 +561,9 @@ class SecurityGuardTests(unittest.TestCase):
                 ({"identities": ["bad"]}, "trust registry identity entries must be objects"),
                 ({"identities": [{"issuer": "user:alice", "public_key_b64": _b64(signer.public_key_bytes())}]}, "trust registry key_id must be a non-empty string"),
                 ({"identities": [{"key_id": "agent-key", "public_key_b64": _b64(signer.public_key_bytes())}]}, "trust registry issuer must be a non-empty string"),
-                ({"identities": [{"key_id": "agent-key", "issuer": "user:alice", "public_key_b64": "bad"}]}, "Ed25519 public keys must be 32 raw bytes"),
+                ({"identities": [{"key_id": "agent-key", "issuer": "user:alice", "public_key_b64": _b64(b"short")}]}, "Ed25519 public keys must be 32 raw bytes"),
+                ({"identities": [{"key_id": "agent-key", "issuer": "user:alice", "public_key_b64": "bad"}]}, "base64url value is not canonically encoded"),
+                ({"identities": [{"key_id": "agent-key", "issuer": "user:alice", "public_key_b64": _b64(bytes(32)) + "="}]}, "base64url value contains a non-alphabet character"),
                 ({"identities": [{"key_id": "agent-key", "issuer": "user:alice", "public_key_b64": _b64(signer.public_key_bytes()), "allowed_audiences": []}]}, "allowed_audiences must be a non-empty list"),
                 ({"identities": [
                     {"key_id": "agent-key", "issuer": "user:alice", "public_key_b64": _b64(signer.public_key_bytes())},
