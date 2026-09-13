@@ -481,20 +481,23 @@ class SQLiteRuntimeStore:
             connection.execute("UPDATE migration_outbox SET attempt_count = attempt_count + 1 WHERE task_id = ?", (task_id,))
 
     def check_ready(self) -> None:
-        # Bounded liveness only (section 2, finding #4): a cheap query plus a schema
-        # sanity check -- never schema construction/migration on the readiness path.
-        # Uses a dedicated connection with a SHORT busy timeout, not the normal 30s
-        # transactional budget, so a locked database fails readiness fast rather than
-        # tying up a worker (finding #1 follow-up).
-        connection = sqlite3.connect(self.path, timeout=READINESS_CONNECT_TIMEOUT_SECONDS, isolation_level=None)
+        # Bounded liveness only (section 2, findings #4 + follow-ups). Two hardenings
+        # beyond a cheap query: (1) open the EXISTING file read-write via a mode=rw
+        # URI, so a deleted/absent database fails readiness closed instead of being
+        # silently recreated empty and reported ready; (2) require the EXACT current
+        # schema version -- an empty (version 0), older, or incomplete schema is NOT
+        # ready. The version is set only after each migration step completes, so it is
+        # the authoritative "migrated" marker. Short busy timeout, not the 30s budget.
+        db_uri = Path(self.path).resolve().as_uri() + "?mode=rw"
+        connection = sqlite3.connect(db_uri, uri=True, timeout=READINESS_CONNECT_TIMEOUT_SECONDS, isolation_level=None)
         try:
             connection.execute(f"PRAGMA busy_timeout = {SQLITE_READINESS_BUSY_TIMEOUT_MS}")
             connection.execute("SELECT 1").fetchone()
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
         finally:
             connection.close()
-        if version > SQLITE_SCHEMA_VERSION:
-            raise RuntimeError(f"SQLite store schema version {version} is newer than supported version {SQLITE_SCHEMA_VERSION}")
+        if version != SQLITE_SCHEMA_VERSION:
+            raise RuntimeError(f"SQLite store schema version {version} is not the supported version {SQLITE_SCHEMA_VERSION}")
 
     def consumed_nonce_exists(self, nonce: str) -> bool:
         with self._connection() as connection:
@@ -754,9 +757,12 @@ class PostgresRuntimeStore:
             connection.commit()
         finally:
             connection.close()
+        # Require the EXACT current version. A missing portmark_schema table makes the
+        # SELECT raise (fails closed); an EMPTY table gives row=None -> version 0, which
+        # is likewise rejected here rather than passing as "ready" (finding follow-up).
         version = int(row["version"]) if row is not None else 0
-        if version > POSTGRES_SCHEMA_VERSION:
-            raise RuntimeError(f"Postgres store schema version {version} is newer than supported version {POSTGRES_SCHEMA_VERSION}")
+        if version != POSTGRES_SCHEMA_VERSION:
+            raise RuntimeError(f"Postgres store schema version {version} is not the supported version {POSTGRES_SCHEMA_VERSION}")
 
     def consumed_nonce_exists(self, nonce: str) -> bool:
         with self._connect() as connection:

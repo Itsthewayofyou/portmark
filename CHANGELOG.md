@@ -31,7 +31,10 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   startup still performs migration once. It is fully time-bounded: Postgres uses
   `connect_timeout` for connection establishment (a blackholed host cannot hang past it)
   plus `statement_timeout` for the query; SQLite uses a short readiness busy timeout, not
-  the 30s transactional budget.
+  the 30s transactional budget. Readiness also fails closed on a missing or incomplete
+  store: it requires the EXACT current schema version (an empty version-0 or older schema
+  is not ready), and the SQLite probe opens the existing file read-write (`mode=rw`) so a
+  deleted database is not silently recreated empty and reported ready.
 - **ASGI body framing and JSON-RPC ids are enforced (finding #5).** A body that crosses or
   falls short of the declared `Content-Length` is rejected (400) rather than executed; the
   absolute 1 MiB cap is retained. A present-but-malformed JSON-RPC id (bool, float, array,

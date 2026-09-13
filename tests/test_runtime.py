@@ -3878,7 +3878,33 @@ class RuntimeTests(unittest.TestCase):
             store.check_ready()  # healthy store: no raise
             with self._raw_sqlite(path) as connection:
                 connection.execute(f"PRAGMA user_version = {SQLITE_SCHEMA_VERSION + 1}")
-            with self.assertRaisesRegex(RuntimeError, "newer than supported"):
+            with self.assertRaisesRegex(RuntimeError, "not the supported version"):
+                store.check_ready()
+
+    def test_sqlite_check_ready_rejects_missing_or_incomplete_schema(self):
+        # Section 2 follow-up: readiness must fail closed on a missing or incomplete
+        # store, never silently recreate an empty database and report it ready.
+        from portmark.storage import SQLITE_SCHEMA_VERSION
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(path)
+            store.check_ready()  # healthy
+            os.remove(path)
+            with self.assertRaises(Exception):
+                store.check_ready()
+            self.assertFalse(path.exists())  # readiness did NOT recreate the database
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "old.sqlite"
+            store = SQLiteRuntimeStore(path)
+            with self._raw_sqlite(path) as connection:
+                connection.execute("PRAGMA user_version = 1")  # older/incomplete schema
+            with self.assertRaisesRegex(RuntimeError, "not the supported version"):
+                store.check_ready()
+            with self._raw_sqlite(path) as connection:
+                connection.execute("PRAGMA user_version = 0")  # empty schema
+            with self.assertRaisesRegex(RuntimeError, "not the supported version"):
                 store.check_ready()
 
     @unittest.skipUnless(
@@ -3920,6 +3946,36 @@ class RuntimeTests(unittest.TestCase):
         elapsed = time.monotonic() - start
         # connect_timeout is 2s; allow generous margin but far below an OS-default hang.
         self.assertLess(elapsed, 10.0)
+
+    @unittest.skipUnless(
+        os.environ.get("PORTMARK_TEST_POSTGRES_DSN") and PostgresRuntimeStore.available(),
+        "requires a real PostgreSQL",
+    )
+    def test_postgres_check_ready_rejects_incomplete_schema(self):
+        # Section 2 follow-up: an empty portmark_schema (row=None -> version 0) or an
+        # older version must fail readiness, not pass as "ready".
+        import psycopg
+        from psycopg import sql
+
+        dsn = os.environ["PORTMARK_TEST_POSTGRES_DSN"]
+        schema = "portmark_incomplete_" + secrets.token_hex(8)
+        try:
+            store = PostgresRuntimeStore(dsn, schema=schema)
+            store.check_ready()  # healthy: no raise
+
+            def set_version_sql(statement):
+                with psycopg.connect(dsn, autocommit=True) as connection:
+                    connection.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(schema)))
+                    connection.execute(statement)
+
+            set_version_sql("UPDATE portmark_schema SET version = 1")  # older
+            with self.assertRaisesRegex(RuntimeError, "not the supported version"):
+                store.check_ready()
+            set_version_sql("DELETE FROM portmark_schema")  # empty version table -> 0
+            with self.assertRaisesRegex(RuntimeError, "not the supported version"):
+                store.check_ready()
+        finally:
+            self._drop_postgres_schema(dsn, schema)
 
     def test_asgi_readyz_fails_generically_when_policy_or_store_config_is_invalid(self):
         with tempfile.TemporaryDirectory() as directory:
