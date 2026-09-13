@@ -22,8 +22,18 @@ The host verifier uses a `TrustRegistry` containing `TrustedIdentity` records:
 - `not_before`: optional activation time.
 - `expires_at`: optional expiration time.
 - `revoked`: hard-disable flag for compromised or retired keys.
+- `usages` (optional): permitted key purposes, e.g. `["envelope"]`, `["audit"]`, or
+  `["envelope", "migration", "audit"]`. A key is rejected for any purpose it does not list — an
+  envelope-signing key cannot sign an audit head, and vice versa. Absent/empty means unrestricted
+  (backward compatible). Use it to give audit-signing and online envelope-signing separate keys.
 
-Verification fails if the key ID is unknown, revoked, inactive, expired, used for the wrong issuer, used for the wrong audience, or the signature bytes do not verify.
+Verification fails if the key ID is unknown, revoked, inactive, expired, used for the wrong issuer,
+used for the wrong audience, lacks the required usage, or the signature bytes do not verify. The
+same validity predicate (trusted AND not-revoked AND active AND not-expired) gates admission and
+`/readyz`; key-id lookup alone is never treated as "usable".
+
+`not_before`/`expires_at` must be integers (a JSON boolean is rejected, not coerced) and `revoked`
+must be a boolean; a duplicate `key_id` in a registry is rejected, not silently collapsed.
 
 ## Generate A Key
 
@@ -36,8 +46,11 @@ eval "$(portmark keygen --issuer user:alice --out-registry trust.json --format e
 
 That writes `trust.json` (public only, hand this to the host) and exports
 `PORTMARK_ED25519_PRIVATE_KEY_B64`, `PORTMARK_SIGNING_KEY_ID`, and `PORTMARK_SIGNING_ISSUER`
-as one consistent set. Drop `--format env` to get the same material as JSON on stdout.
-`--out-registry` refuses to overwrite an existing file unless `--force` is passed. Restrict
+as one consistent set. Every exported value is shell-quoted, so a key id or issuer containing
+shell metacharacters cannot inject commands when the line is eval'd. **The `env` format is POSIX
+sh/bash only** — on PowerShell/cmd, use `--format json` (or `--out-registry`) and set the variables
+manually rather than eval'ing this output. Drop `--format env` to get the same material as JSON on
+stdout. `--out-registry` refuses to overwrite an existing file unless `--force` is passed. Restrict
 which hosts a key may target with one or more `--audience` flags; the default is any.
 
 To generate a signer programmatically instead:
@@ -85,6 +98,22 @@ Production deployments should load private keys from a secret manager, workload 
 5. Generate a replacement key if the issuer still needs to sign envelopes.
 
 Revocation is intentionally checked before signature verification so compromised keys fail with a clear internal cause.
+
+**A running host fails closed on any on-disk registry change and must be restarted to adopt it.**
+The signer and the store's audit verifier share one trust source that re-reads the registry file on
+every verification: when the file's contents change (a revocation, a rotation, any edit) or the file
+is removed, the host rejects admission and audit verification — it does not silently keep trusting
+the old registry, and it does not adopt the new, unauthenticated bytes mid-process. So a revocation
+takes effect immediately as a *refusal to serve*, and the host must be restarted with the reviewed
+new registry to resume. `/readyz` reports not-ready in the same situation. (Authenticated,
+versioned hot-reload without a restart is planned; until then, restart is the adopt step.)
+
+**A durable store requires a stable, configured signing key.** Because a generated key changes on
+every restart and would orphan previously-signed audit heads, a host backed by a durable store
+(SQLite/Postgres) refuses to start unless `PORTMARK_ED25519_PRIVATE_KEY_B64` is set (and the host's
+public key is in the trust registry). Ephemeral demo/test hosts may pass
+`allow_ephemeral_signing_key=True` to opt out. Generated key ids are derived from the public-key
+fingerprint (`ed25519:<digest>`), so two generated keys never share an id.
 
 ## Bootstrap Trust
 
