@@ -13,11 +13,11 @@ from types import TracebackType
 from typing import Any, Callable, Literal, Protocol
 
 from .models import AgentState
-from .security import AUDIT_HASH_VERSION, AuditHeadVerifier, SecurityError, audit_event_record, audit_head_payload, canonical_json
+from .security import AUDIT_HASH_VERSION, AuditHeadVerifier, SecurityError, _audit_head_payload_for, audit_event_record, canonical_json
 
 
-SQLITE_SCHEMA_VERSION = 5
-POSTGRES_SCHEMA_VERSION = 3
+SQLITE_SCHEMA_VERSION = 6
+POSTGRES_SCHEMA_VERSION = 4
 
 
 def _advisory_lock_key(name: str) -> int:
@@ -31,14 +31,20 @@ SQLITE_BUSY_TIMEOUT_MS = 30_000
 # (section 2, finding #1 follow-up): a dedicated short connect + busy/statement bound.
 READINESS_CONNECT_TIMEOUT_SECONDS = 2
 SQLITE_READINESS_BUSY_TIMEOUT_MS = 2_000
-AuditHeadSigner = Callable[[str, int], tuple[str, str]]
+# sign_head(head_hash, sequence) -> (signature_key_id, signature, signed_at). signed_at is
+# the epoch seconds embedded in the signed v2 payload (None => a v1 head, no signing time).
+AuditHeadSigner = Callable[[str, int], tuple[str, str, "int | None"]]
 AuditVerificationStatus = Literal["valid", "invalid", "unverifiable"]
 
 
 @dataclass(frozen=True)
 class AuditVerificationResult:
+    # `status` stays the coarse three-way outcome that drives CLI exit codes; `head_status`
+    # carries the precise historical verdict (finding #3 four-way: valid / valid-key-expired
+    # / valid-key-revoked / signed-after-revocation, plus legacy/untrusted/etc.).
     status: AuditVerificationStatus
     reason: str
+    head_status: str = ""
 
     @property
     def valid(self) -> bool:
@@ -267,13 +273,14 @@ class _InMemoryTransaction:
             current.append(json.loads(json.dumps({**event, "host_id": host_id})))
             hashes.add(event["hash"])
             sequence = event["sequence"] + 1
-            signature_key_id, signature = sign_head(event["hash"], sequence) if sign_head is not None else ("", "")
+            signature_key_id, signature, signed_at = sign_head(event["hash"], sequence) if sign_head is not None else ("", "", None)
             self._store._audit_heads[task_id] = {
                 "head_hash": event["hash"],
                 "sequence": sequence,
                 "host_id": host_id,
                 "signature_key_id": signature_key_id,
                 "signature": signature,
+                "signed_at": signed_at,
             }
 
     def save_checkpoint(self, task_id: str, state: AgentState, expected_generation: int, closed: bool = False) -> int:
@@ -362,6 +369,7 @@ class SQLiteRuntimeStore:
             2: self._migrate_to_v3,
             3: self._migrate_to_v4,
             4: self._migrate_to_v5,
+            5: self._migrate_to_v6,
         }
         migration = migrations.get(version)
         if migration is None:
@@ -475,6 +483,16 @@ class SQLiteRuntimeStore:
             """
         )
 
+    def _migrate_to_v6(self, connection: sqlite3.Connection) -> None:
+        # Finding #3 (Option B): audit heads gain a nullable signed_at so verification can be
+        # judged at signing time. NULL marks a legacy v1 head (no attested signing time).
+        connection.executescript(
+            """
+            ALTER TABLE audit_heads ADD COLUMN signed_at INTEGER;
+            PRAGMA user_version = 6;
+            """
+        )
+
     def transaction(self) -> AbstractContextManager[RuntimeTransaction]:
         return _SQLiteTransaction(self)
 
@@ -535,7 +553,7 @@ class SQLiteRuntimeStore:
                 (task_id,),
             ).fetchall()
             head = connection.execute(
-                "SELECT head_hash, sequence, host_id, signature_key_id, signature FROM audit_heads WHERE task_id = ?",
+                "SELECT head_hash, sequence, host_id, signature_key_id, signature, signed_at FROM audit_heads WHERE task_id = ?",
                 (task_id,),
             ).fetchone()
         if not rows or head is None:
@@ -568,6 +586,7 @@ class SQLiteRuntimeStore:
                 "host_id": head["host_id"],
                 "signature_key_id": head["signature_key_id"],
                 "signature": head["signature"],
+                "signed_at": head["signed_at"],
             },
         )
 
@@ -707,6 +726,9 @@ class PostgresRuntimeStore:
             )
             """
         )
+        # Finding #3 (Option B), schema v4: nullable signed_at for verify-at-signing-time.
+        # ADD COLUMN IF NOT EXISTS upgrades an existing (v3) store idempotently.
+        connection.execute("ALTER TABLE audit_heads ADD COLUMN IF NOT EXISTS signed_at BIGINT")
         # Section 1, finding #2: durable migration delivery. The sealed destination
         # envelope is written here in the SAME transaction that closes the source
         # checkpoint, so a crash after the source closes cannot lose the migration --
@@ -802,7 +824,7 @@ class PostgresRuntimeStore:
                 (task_id,),
             ).fetchall()
             head = connection.execute(
-                "SELECT head_hash, sequence, host_id, signature_key_id, signature FROM audit_heads WHERE task_id = %s",
+                "SELECT head_hash, sequence, host_id, signature_key_id, signature, signed_at FROM audit_heads WHERE task_id = %s",
                 (task_id,),
             ).fetchone()
         if not rows or head is None:
@@ -835,6 +857,7 @@ class PostgresRuntimeStore:
                 "host_id": head["host_id"],
                 "signature_key_id": head["signature_key_id"],
                 "signature": head["signature"],
+                "signed_at": head["signed_at"],
             },
         )
 
@@ -912,20 +935,21 @@ class _PostgresTransaction:
             except errors.UniqueViolation as error:
                 raise SecurityError("audit event already exists") from error
             sequence = event["sequence"] + 1
-            signature_key_id, signature = sign_head(event["hash"], sequence) if sign_head is not None else ("", "")
+            signature_key_id, signature, signed_at = sign_head(event["hash"], sequence) if sign_head is not None else ("", "", None)
             self._connection.execute(
                 """
-                INSERT INTO audit_heads (task_id, head_hash, sequence, host_id, signature_key_id, signature, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO audit_heads (task_id, head_hash, sequence, host_id, signature_key_id, signature, signed_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT(task_id) DO UPDATE SET
                     head_hash = EXCLUDED.head_hash,
                     sequence = EXCLUDED.sequence,
                     host_id = EXCLUDED.host_id,
                     signature_key_id = EXCLUDED.signature_key_id,
                     signature = EXCLUDED.signature,
+                    signed_at = EXCLUDED.signed_at,
                     updated_at = EXCLUDED.updated_at
                 """,
-                (task_id, event["hash"], sequence, host_id, signature_key_id, signature, int(time.time())),
+                (task_id, event["hash"], sequence, host_id, signature_key_id, signature, signed_at, int(time.time())),
             )
 
     def save_checkpoint(self, task_id: str, state: AgentState, expected_generation: int, closed: bool = False) -> int:
@@ -1075,20 +1099,21 @@ class _SQLiteTransaction:
             except sqlite3.IntegrityError as error:
                 raise SecurityError("audit event already exists") from error
             sequence = event["sequence"] + 1
-            signature_key_id, signature = sign_head(event["hash"], sequence) if sign_head is not None else ("", "")
+            signature_key_id, signature, signed_at = sign_head(event["hash"], sequence) if sign_head is not None else ("", "", None)
             self._connection.execute(
                 """
-                INSERT INTO audit_heads (task_id, head_hash, sequence, host_id, signature_key_id, signature, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO audit_heads (task_id, head_hash, sequence, host_id, signature_key_id, signature, signed_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(task_id) DO UPDATE SET
                     head_hash = excluded.head_hash,
                     sequence = excluded.sequence,
                     host_id = excluded.host_id,
                     signature_key_id = excluded.signature_key_id,
                     signature = excluded.signature,
+                    signed_at = excluded.signed_at,
                     updated_at = excluded.updated_at
                 """,
-                (task_id, event["hash"], sequence, host_id, signature_key_id, signature, int(time.time())),
+                (task_id, event["hash"], sequence, host_id, signature_key_id, signature, signed_at, int(time.time())),
             )
 
     def save_checkpoint(self, task_id: str, state: AgentState, expected_generation: int, closed: bool = False) -> int:
@@ -1169,19 +1194,24 @@ def _audit_event_hash_matches(
 
 def _verify_head_signature(verifier: AuditHeadVerifier | None, task_id: str, head: dict[str, Any]) -> AuditVerificationResult:
     if verifier is None:
-        return AuditVerificationResult("unverifiable", "trust registry is not configured")
+        return AuditVerificationResult("unverifiable", "trust registry is not configured", head_status="unverifiable")
     if not head.get("signature_key_id") or not head.get("signature") or not head.get("host_id"):
-        return AuditVerificationResult("invalid", "signed audit head is missing")
+        return AuditVerificationResult("invalid", "signed audit head is missing", head_status="incomplete")
     try:
         sequence = int(head["sequence"])
     except (TypeError, ValueError):
-        return AuditVerificationResult("invalid", "signed audit head sequence is malformed")
+        return AuditVerificationResult("invalid", "signed audit head sequence is malformed", head_status="malformed")
+    # Reconstruct the exact signed payload: a stored signed_at means a v2 head verified at
+    # signing time (finding #3); NULL/absent means a legacy v1 head. evaluate_audit_head
+    # returns a precise historical verdict; the coarse `status` (for CLI exit codes) is just
+    # ok/not-ok, but the four-way outcome is preserved in `head_status`.
+    signed_at = head.get("signed_at")
+    payload = _audit_head_payload_for(task_id, head["host_id"], head["head_hash"], sequence, signed_at)
     try:
-        verifier.verify_audit_head(
-            head["signature_key_id"],
-            audit_head_payload(task_id, head["host_id"], head["head_hash"], sequence),
-            head["signature"],
-        )
-    except SecurityError:
-        return AuditVerificationResult("invalid", "audit head signature is invalid or untrusted")
-    return AuditVerificationResult("valid", "audit chain and signed head verified")
+        evaluation = verifier.evaluate_audit_head(head["signature_key_id"], payload, head["signature"])
+    except SecurityError as error:
+        # A fail-closed TrustSource raises if its on-disk registry changed; report it rather
+        # than crash the read path.
+        return AuditVerificationResult("unverifiable", str(error), head_status="registry-unavailable")
+    status: AuditVerificationStatus = "valid" if evaluation.ok else "invalid"
+    return AuditVerificationResult(status, evaluation.detail, head_status=evaluation.head_status)
