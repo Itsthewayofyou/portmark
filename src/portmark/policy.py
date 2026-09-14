@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 from pathlib import Path
 from typing import Any
 
 from .models import ResourceBudget, ToolGrant
-from .security import HostPolicy, MigrationPolicy, TrustedApprover, canonical_json, validate_constraints
+from .security import HostPolicy, MigrationPolicy, TrustedApprover, _b64url_decode as _strict_b64url_decode, canonical_json, validate_constraints
 
 
 VALID_IMPACTS = {"low", "medium", "high", "destructive", "external-payment", "credentialed", "data-exfiltration"}
@@ -158,8 +157,10 @@ def _required_object(value: dict[str, Any], name: str) -> dict[str, Any]:
 
 
 def _b64url_decode(value: str) -> bytes:
-    padding = "=" * (-len(value) % 4)
-    decoded = base64.urlsafe_b64decode(value + padding)
+    # Strict, canonical Base64URL (finding #6) — the same decoder used for signatures
+    # and trust-registry keys, so an approval/attestation public key cannot slip in via
+    # a non-canonical encoding either.
+    decoded = _strict_b64url_decode(value)
     if len(decoded) != 32:
         raise ValueError("approval public keys must be 32 raw bytes")
     return decoded

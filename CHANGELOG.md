@@ -6,6 +6,53 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Section 3 — Signing and key lifecycle
+
+- **A durable store now refuses to start on an ephemeral signing key (finding #1, release blocker).**
+  When no operator key was configured, the host generated a fresh Ed25519 key on every start but
+  reused a constant key id, so after a restart a durable store's previously-signed audit heads no
+  longer verified. `make_host()` now refuses a durable store (the store declares `is_durable`;
+  SQLite/Postgres are durable, in-memory is not) unless a stable key is configured
+  (`PORTMARK_ED25519_PRIVATE_KEY_B64`) — or `allow_ephemeral_signing_key=True` is passed for
+  demo/test use. Generated key ids are now derived from the public-key fingerprint
+  (`ed25519:<digest>`) so two generated keys can never collide. Stability is affirmative: only a key
+  loaded from stable bytes (`from_private_key_bytes`) counts as stable, so a randomly-generated
+  custom/HMAC signer is refused on a durable store rather than presumed stable. `make_host` also
+  rejects an explicit `signer` combined with a `trust_registry_path`, because the supplied signer
+  keeps its own registry and the file-backed trust source (hence revocation via that file) would be
+  silently ignored.
+- **Deployed key revocation now takes effect without trusting a stale registry (finding #2, release blocker).**
+  The trust registry was loaded once at boot, so a revocation file deployed to a running host was
+  not applied until restart while `/readyz` still reported ready. The signer and the store's audit
+  verifier now share ONE fail-closed trust source: every verification re-reads the on-disk registry
+  and, if it changed (or was removed), rejects admission and audit verification until the host is
+  restarted with the new file — it never adopts the unauthenticated new bytes. Readiness now applies
+  the full validity predicate (trusted AND not-revoked AND active AND not-expired), not bare key
+  membership.
+- **`keygen --format env` output is shell-injection-safe (finding #4).** Every exported value is
+  `shlex.quote`d and control characters/newlines in `--key-id`/`--issuer` are rejected, so a crafted
+  key id or issuer cannot execute shell when the output is eval'd. The output is labelled POSIX-only;
+  on PowerShell/cmd use `--format json` / `--out-registry` or set the variables manually. URI-style
+  issuers (`user:portmark`, `https://…`) are still accepted.
+- **Key-purpose usages primitive added (finding #5 — primitive only, not full key separation).** A
+  registry entry may list `usages`; the `envelope` purpose is enforced in envelope verification and
+  the `audit` purpose in audit-head verification, so an envelope-only key cannot sign an audit head.
+  Empty/absent `usages` = unrestricted (backward compatible), and the host's own self-registered key
+  is unrestricted, so existing registries and the default host still allow one key to span purposes.
+  **Not yet enforced:** the `migration` purpose (a migration-proposing envelope is still verified only
+  as `envelope`), and separate host audit/migration signing keys — these are deferred with #3-B.
+- **Stricter Base64URL and trust-registry parsing (findings #6, #15).** Signature and public-key
+  decoding is now strict canonical Base64URL — non-alphabet characters, added padding, and
+  non-canonical trailing bits are rejected at every decoder site, including the
+  `PORTMARK_ED25519_PRIVATE_KEY_B64` environment key. Registry `not_before`/`expires_at`
+  must be real integers (a boolean is rejected, not coerced) and `revoked` a real boolean; a
+  duplicate key id in a `TrustRegistry` is rejected rather than silently collapsed.
+
+Deferred within Section 3 (tracked for a follow-up, needs its own auditor review): historical
+audit-head validity under Option B (`audit-head.v2` with a signed `signed_at`, verify-at-signing-time,
+a public-key archive with validity intervals, and a four-way verification status), the
+transparency-log anchor, the registry rollback floor, and the atomic `keygen --force` rotation merge.
+
 ### Section 2 — A2A network boundary
 
 - **Agent execution no longer blocks the ASGI event loop (finding #1, release blocker).**

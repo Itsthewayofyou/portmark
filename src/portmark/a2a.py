@@ -694,8 +694,12 @@ def default_readiness_check(host: AgentHost) -> None:
     host.store.check_ready()
     verifier = getattr(host.signer, "registry", None)
     key_id = getattr(host.signer, "key_id", None)
-    if verifier is not None and key_id is not None and not verifier.has_key(key_id):
-        raise RuntimeError("host signing key is not trusted")
+    # is_usable (not has_key): a revoked/expired host key must fail readiness, and a
+    # file-backed TrustSource raises here if the on-disk registry changed, so /readyz
+    # goes not-ready after a redeployed revocation (finding #2). Admission enforces the
+    # same source, so this is an honest signal, not the enforcement itself.
+    if verifier is not None and key_id is not None and not verifier.is_usable(key_id):
+        raise RuntimeError("host signing key is not trusted or no longer valid")
 
 
 def make_asgi_app(host: AgentHost, auth: A2AAuthConfig | None = None, enable_hsts: bool = False, **kwargs: Any):

@@ -11,7 +11,7 @@ from .metrics import RuntimeMetrics
 from .models import AgentEnvelope, AgentManifest, AgentState, Permit, ResourceBudget, ToolGrant
 from .policy import load_host_policy
 from .providers import DeterministicProvider, GenericHttpProvider, ModelProvider, NativeWasmtimeComponentProvider, WasmDecisionProvider
-from .security import AttestationPolicy, EnvelopeSigner, EnvelopeSigningIdentity, ExternalAttestationVerifier, HmacEnvelopeSigner, HostPolicy, load_trust_registry, validate_constraints
+from .security import AttestationPolicy, EnvelopeSigner, EnvelopeSigningIdentity, ExternalAttestationVerifier, HmacEnvelopeSigner, HostPolicy, TrustRegistry, TrustSource, _b64url_decode, validate_constraints
 from .storage import RuntimeStore, create_runtime_store
 from .tools import ToolRegistry, demo_registry
 
@@ -19,14 +19,31 @@ from .tools import ToolRegistry, demo_registry
 HOST_ID = "host:local-demo"
 
 
-def signer_from_environment(host_id: str = HOST_ID, trust_registry_path: str | None = None) -> EnvelopeSigningIdentity:
-    registry = load_trust_registry(trust_registry_path) if trust_registry_path else None
+def signer_from_environment(
+    host_id: str = HOST_ID,
+    trust_registry_path: str | None = None,
+    trust: "TrustRegistry | TrustSource | None" = None,
+) -> EnvelopeSigningIdentity:
+    # Prefer a caller-supplied trust object so the signer and the store share ONE
+    # fail-closed source (finding #2 -- two independent loads would let one verifier
+    # keep trusting a key the other has stopped trusting). Fall back to loading a
+    # fail-closed TrustSource from the path for direct callers (CLI, tests).
+    # NOTE: the fallback source is for SINGLE-verifier use (a signer whose registry is the
+    # only verifier). Do NOT pair a signer built this way with a store whose audit verifier
+    # came from a separate load -- that recreates the two-source split this fix exists to
+    # prevent. In make_host, pass the shared `trust` instead; make_host also refuses an
+    # explicit signer combined with a trust_registry_path for exactly this reason.
+    if trust is not None:
+        registry: "TrustRegistry | TrustSource | None" = trust
+    elif trust_registry_path:
+        registry = TrustSource.from_path(trust_registry_path)
+    else:
+        registry = None
     raw_private_key = os.environ.get("PORTMARK_ED25519_PRIVATE_KEY_B64")
     if raw_private_key:
-        import base64
-
-        padding = "=" * (-len(raw_private_key) % 4)
-        private_key = base64.urlsafe_b64decode(raw_private_key + padding)
+        # Strict canonical Base64URL, the same decoder used for signatures and public
+        # keys (finding #6) -- a private key from the environment is a key decoder site too.
+        private_key = _b64url_decode(raw_private_key)
         return EnvelopeSigner.from_private_key_bytes(
             os.environ.get("PORTMARK_SIGNING_KEY_ID", "env-ed25519-key"),
             os.environ.get("PORTMARK_SIGNING_ISSUER", host_id),
@@ -60,6 +77,7 @@ def make_host(
     reload_policy: bool = False,
     tools: ToolRegistry | None = None,
     providers: dict[str, ModelProvider] | None = None,
+    allow_ephemeral_signing_key: bool = False,
 ) -> AgentHost:
     # Note the asymmetry with `tools`, which REPLACES the demo registry.
     # Providers merge over the constructed defaults instead, so passing an
@@ -80,6 +98,10 @@ def make_host(
         configured_providers.update(providers)
     configured_policy_path = policy_path or os.environ.get("PORTMARK_POLICY_PATH")
     configured_trust_registry_path = trust_registry_path or os.environ.get("PORTMARK_TRUST_REGISTRY_PATH")
+    # One fail-closed trust source shared by the signer AND the store's audit verifier
+    # (finding #2). Two independent loads would let one verifier keep trusting a key the
+    # other has stopped trusting, and would not fail closed together on an on-disk change.
+    trust_source = TrustSource.from_path(configured_trust_registry_path) if configured_trust_registry_path else None
     policy_loader = (lambda: load_host_policy(configured_policy_path, host_id)) if configured_policy_path else None
     policy = policy_loader() if policy_loader else HostPolicy(
         host_id,
@@ -96,7 +118,7 @@ def make_host(
     )
     configured_store = store
     if configured_store is None and os.environ.get("PORTMARK_STORE_PATH"):
-        audit_verifier = load_trust_registry(configured_trust_registry_path) if configured_trust_registry_path else None
+        audit_verifier = trust_source
         configured_store = create_runtime_store(
             os.environ.get("PORTMARK_STORE_BACKEND", "sqlite"),
             os.environ["PORTMARK_STORE_PATH"],
@@ -114,7 +136,20 @@ def make_host(
                 required_for_migration=required,
                 external_verifier=verifier,
             )
-    host_signer = signer or signer_from_environment(host_id, configured_trust_registry_path)
+    # A caller-supplied signer keeps its OWN trust registry, so a file-backed TrustSource
+    # built from trust_registry_path would be constructed and then orphaned -- admission
+    # and audit verification would keep using the signer's stale in-memory registry, and a
+    # revocation deployed to the file would never take effect. Reject the ambiguous combo;
+    # the caller should build the signer already bound to the registry (or omit the signer).
+    if signer is not None and configured_trust_registry_path:
+        raise ValueError(
+            "pass either an explicit signer OR a trust_registry_path, not both: a supplied "
+            "signer keeps its own trust registry, so the file-backed trust source would be "
+            "ignored and a revocation deployed to that file would not take effect. Build the "
+            "signer bound to the registry via signer_from_environment(host_id, trust_registry_path), "
+            "or omit the signer and let make_host construct it."
+        )
+    host_signer = signer or signer_from_environment(host_id, configured_trust_registry_path, trust=trust_source)
     signing_issuer = getattr(host_signer, "issuer", host_id)
     if signing_issuer != host_id:
         # Every run signs an audit head with the host id as issuer, so this config
@@ -125,6 +160,24 @@ def make_host(
             f"host signing issuer {signing_issuer!r} must equal host id {host_id!r}; "
             "unset PORTMARK_SIGNING_ISSUER/PORTMARK_ED25519_PRIVATE_KEY_B64 for the host process, "
             "or start it with --host-id matching the signing issuer"
+        )
+    # Finding #1: a durable store must not run on an ephemeral (generated, per-restart)
+    # signing key -- audit heads signed before a restart would no longer verify, and
+    # checkpoint continuation can break. Durability comes from the store's own
+    # declaration, not a path/env heuristic. Ephemeral demo/test use must opt in.
+    # Stability must be AFFIRMATIVE: only a signer that declares ephemeral=False (a key
+    # loaded from stable bytes via from_private_key_bytes) counts as stable. A generated
+    # key (ephemeral=True) OR any signer that does not declare its stability (e.g. a
+    # randomly-generated HMAC or custom signer, ephemeral absent) is NOT presumed stable,
+    # so a durable store refuses it unless the caller explicitly opts in.
+    signer_is_stable = getattr(host_signer, "ephemeral", None) is False
+    if getattr(configured_store, "is_durable", False) and not signer_is_stable and not allow_ephemeral_signing_key:
+        raise ValueError(
+            "a durable store requires a signing key with proven stability (loaded from stable "
+            "bytes, e.g. PORTMARK_ED25519_PRIVATE_KEY_B64, with the host public key in the trust "
+            "registry). A generated key, or a signer that does not declare its key stable, is "
+            "refused because such a key can change across restarts and orphan previously-signed "
+            "audit heads; pass allow_ephemeral_signing_key=True for ephemeral demo/test use."
         )
     return AgentHost(
         host_id,

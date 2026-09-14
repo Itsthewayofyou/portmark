@@ -83,6 +83,11 @@ class RuntimeTransaction(Protocol):
 
 
 class RuntimeStore(Protocol):
+    # Whether checkpoints/audit heads survive a process restart. A durable store must
+    # refuse an ephemeral (per-restart) signing key (finding #1); the store declares
+    # this rather than callers inferring it from a path or env var.
+    is_durable: bool
+
     def transaction(self) -> AbstractContextManager[RuntimeTransaction]:
         ...
 
@@ -131,6 +136,8 @@ class RuntimeStore(Protocol):
 
 
 class InMemoryRuntimeStore:
+    is_durable = False
+
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._nonces: dict[str, dict[str, Any]] = {}
@@ -304,6 +311,8 @@ class _InMemoryTransaction:
 
 
 class SQLiteRuntimeStore:
+    is_durable = True
+
     def __init__(self, path: str | Path, audit_head_verifier: AuditHeadVerifier | None = None) -> None:
         self.path = str(path)
         self._lock = threading.RLock()
@@ -567,6 +576,8 @@ class SQLiteRuntimeStore:
 
 
 class PostgresRuntimeStore:
+    is_durable = True
+
     def __init__(self, dsn: str, audit_head_verifier: AuditHeadVerifier | None = None, schema: str = "public") -> None:
         if not dsn:
             raise ValueError("Postgres DSN must not be empty")
