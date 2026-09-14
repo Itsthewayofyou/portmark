@@ -40,6 +40,24 @@ from portmark.storage import InMemoryRuntimeStore, SQLiteRuntimeStore
 _HAS_POSIX_SH = os.path.exists("/bin/sh") and not os.environ.get("PORTMARK_TEST_NO_POSIX_SH")
 
 
+def _has_registry_lock() -> bool:
+    # The cross-process registry lock uses fcntl on POSIX and msvcrt on Windows; the
+    # concurrency test is meaningful wherever EITHER primitive exists (verified on real
+    # Windows Python: msvcrt.locking serializes 12+ concurrent threads, keeping every key,
+    # where the unlocked path drops ~11/12 and raises WinError 5 on the racing os.replace).
+    try:
+        import fcntl  # noqa: F401
+
+        return True
+    except ImportError:
+        try:
+            import msvcrt  # noqa: F401
+
+            return True
+        except ImportError:
+            return False
+
+
 def _write_registry(path: Path, signer: EnvelopeSigner, audiences=("*",), revoked: bool = False) -> None:
     entry = {
         "key_id": signer.key_id,
@@ -479,6 +497,492 @@ class FollowupAuditTests(unittest.TestCase):
             signer = EnvelopeSigner.from_private_key_bytes("env-ed25519-key", "host:local-demo", raw)
             host = make_host(host_id="host:local-demo", signer=signer, store=store)
             self.assertIsNotNone(host)
+
+
+# ---------------------------------------------------------------------------
+# Part 2 / Phase A — audit-head.v2 + signed_at.
+# ---------------------------------------------------------------------------
+class AuditHeadV2PayloadTests(unittest.TestCase):
+    def test_audit_head_v2_payload_shape(self):
+        from portmark.security import audit_head_payload, audit_head_payload_v2
+
+        v1 = audit_head_payload("t", "host:x", "hash", 0)
+        self.assertEqual(v1["type"], "portmark.audit-head.v1")
+        self.assertNotIn("signed_at", v1)
+
+        v2 = audit_head_payload_v2("t", "host:x", "hash", 0, 12345)
+        self.assertEqual(v2["type"], "portmark.audit-head.v2")
+        self.assertEqual(v2["signed_at"], 12345)
+        self.assertEqual(v2["head_hash"], "hash")
+
+    def test_audit_head_v2_sign_emits_v2_when_signed_at_given(self):
+        from portmark.security import audit_head_payload, audit_head_payload_v2
+
+        signer = EnvelopeSigner.generate("k", "host:x")
+        sig2 = signer.sign_audit_head("t", "host:x", "hash", 0, signed_at=999)
+        # verifies against the v2 payload, not the v1 payload
+        signer.registry.verify_audit_head("k", audit_head_payload_v2("t", "host:x", "hash", 0, 999), sig2)
+        with self.assertRaises(SecurityError):
+            signer.registry.verify_audit_head("k", audit_head_payload("t", "host:x", "hash", 0), sig2)
+
+    def test_audit_head_v2_sign_without_signed_at_is_v1(self):
+        from portmark.security import audit_head_payload
+
+        signer = EnvelopeSigner.generate("k", "host:x")
+        sig1 = signer.sign_audit_head("t", "host:x", "hash", 0)
+        signer.registry.verify_audit_head("k", audit_head_payload("t", "host:x", "hash", 0), sig1)  # v1 unchanged
+
+
+class SignedAtMigrationTests(unittest.TestCase):
+    def test_signed_at_migration_adds_column_and_bumps_version(self):
+        import sqlite3
+
+        from portmark.storage import SQLITE_SCHEMA_VERSION, SQLiteRuntimeStore
+
+        self.assertGreaterEqual(SQLITE_SCHEMA_VERSION, 6)
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "store.sqlite")
+            store = SQLiteRuntimeStore(path)
+            store.check_ready()  # exact-version readiness still passes at the new version
+            connection = sqlite3.connect(path)
+            try:
+                cols = [row[1] for row in connection.execute("PRAGMA table_info(audit_heads)")]
+            finally:
+                connection.close()
+            self.assertIn("signed_at", cols)
+
+    def test_signed_at_migration_upgrades_an_existing_v5_store(self):
+        import sqlite3
+
+        from portmark.storage import SQLITE_SCHEMA_VERSION, SQLiteRuntimeStore
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "store.sqlite")
+            SQLiteRuntimeStore(path)  # build current schema
+            # Simulate an OLD (pre-signed_at) store: drop the column and roll user_version back.
+            connection = sqlite3.connect(path)
+            try:
+                connection.execute("ALTER TABLE audit_heads DROP COLUMN signed_at")
+                connection.execute("PRAGMA user_version = 5")
+                connection.commit()
+            finally:
+                connection.close()
+            # Reopening runs the v6 migration rather than failing readiness.
+            store = SQLiteRuntimeStore(path)
+            store.check_ready()
+            connection = sqlite3.connect(path)
+            try:
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+                cols = [row[1] for row in connection.execute("PRAGMA table_info(audit_heads)")]
+            finally:
+                connection.close()
+            self.assertEqual(version, SQLITE_SCHEMA_VERSION)
+            self.assertIn("signed_at", cols)
+
+
+class EvaluateAuditHeadTests(unittest.TestCase):
+    HOST = "host:eval"
+
+    def _v2(self, signer: EnvelopeSigner, signed_at: int, seq: int = 0):
+        from portmark.security import audit_head_payload_v2
+
+        sig = signer.sign_audit_head("t", self.HOST, "hash", seq, signed_at=signed_at)
+        return audit_head_payload_v2("t", self.HOST, "hash", seq, signed_at), sig
+
+    def _registry(self, signer: EnvelopeSigner, **identity_kwargs) -> TrustRegistry:
+        registry = TrustRegistry()
+        registry.add(
+            TrustedIdentity(key_id=signer.key_id, issuer=self.HOST, public_key=signer.public_key_bytes(), allowed_audiences=("*",), **identity_kwargs)
+        )
+        return registry
+
+    # PA3 -----------------------------------------------------------------
+    def test_verify_at_signing_time_expired_key_still_verifies_old_head(self):
+        signer = EnvelopeSigner.generate("k", self.HOST)
+        payload, sig = self._v2(signer, signed_at=1000)
+        registry = self._registry(signer, expires_at=1500)  # expired long after signing
+        evaluation = registry.evaluate_audit_head("k", payload, sig, now=5000)
+        self.assertTrue(evaluation.ok)
+        self.assertEqual(evaluation.head_status, "valid-key-expired")
+
+    def test_verify_at_signing_time_currently_valid_key_is_plain_valid(self):
+        signer = EnvelopeSigner.generate("k", self.HOST)
+        payload, sig = self._v2(signer, signed_at=1000)
+        registry = self._registry(signer)  # no expiry/revocation
+        evaluation = registry.evaluate_audit_head("k", payload, sig, now=5000)
+        self.assertTrue(evaluation.ok)
+        self.assertEqual(evaluation.head_status, "valid")
+
+    # PA4 -----------------------------------------------------------------
+    def test_four_way_status_outcomes_are_distinct(self):
+        signer = EnvelopeSigner.generate("k", self.HOST)
+        payload, sig = self._v2(signer, signed_at=1000)
+
+        # 1. signature invalid
+        bad = self._registry(signer)
+        ev = bad.evaluate_audit_head("k", payload, sig[:-2] + ("AA" if not sig.endswith("AA") else "BB"), now=5000)
+        self.assertFalse(ev.ok)
+        self.assertEqual(ev.head_status, "signature-invalid")
+
+        # 2. valid, key later expired
+        ev = self._registry(signer, expires_at=1500).evaluate_audit_head("k", payload, sig, now=5000)
+        self.assertEqual((ev.ok, ev.head_status), (True, "valid-key-expired"))
+
+        # 3. valid, key later revoked (revoked AFTER signing)
+        ev = self._registry(signer, revoked=True, revoked_at=1500).evaluate_audit_head("k", payload, sig, now=5000)
+        self.assertEqual((ev.ok, ev.head_status), (True, "valid-key-revoked"))
+
+        # 4. signed after revocation
+        ev = self._registry(signer, revoked=True, revoked_at=500).evaluate_audit_head("k", payload, sig, now=5000)
+        self.assertEqual((ev.ok, ev.head_status), (False, "signed-after-revocation"))
+
+    def test_four_way_status_revocation_takes_precedence_over_expiry(self):
+        # A v2 head signed while valid, on a key that is now BOTH expired and later-revoked:
+        # revocation is the more serious fact and wins the reported status.
+        signer = EnvelopeSigner.generate("k", self.HOST)
+        payload, sig = self._v2(signer, signed_at=1000)
+        registry = self._registry(signer, expires_at=1500, revoked=True, revoked_at=2000)
+        evaluation = registry.evaluate_audit_head("k", payload, sig, now=5000)
+        self.assertEqual((evaluation.ok, evaluation.head_status), (True, "valid-key-revoked"))
+
+    # PA5 -----------------------------------------------------------------
+    def test_v1_legacy_policy_valid_and_revoked_suspect(self):
+        from portmark.security import audit_head_payload
+
+        signer = EnvelopeSigner.generate("k", self.HOST)
+        v1_sig = signer.sign_audit_head("t", self.HOST, "hash", 0)  # v1, no signed_at
+        v1_payload = audit_head_payload("t", self.HOST, "hash", 0)
+
+        ev = self._registry(signer).evaluate_audit_head("k", v1_payload, v1_sig, now=5000)
+        self.assertEqual((ev.ok, ev.head_status), (True, "valid-legacy-v1"))
+
+        # v1 head + now-revoked key: cannot establish pre-compromise without a signing time.
+        ev = self._registry(signer, revoked=True).evaluate_audit_head("k", v1_payload, v1_sig, now=5000)
+        self.assertEqual((ev.ok, ev.head_status), (False, "revoked-key-legacy-v1"))
+
+        # v1 head + expired key: benign expiry is NOT applied retroactively.
+        ev = self._registry(signer, expires_at=1).evaluate_audit_head("k", v1_payload, v1_sig, now=5000)
+        self.assertTrue(ev.ok)
+
+    # PA6 -----------------------------------------------------------------
+    def test_revocation_effective_time_distinguishes_before_and_after(self):
+        signer = EnvelopeSigner.generate("k", self.HOST)
+        payload, sig = self._v2(signer, signed_at=1000)
+
+        before = self._registry(signer, revoked=True, revoked_at=2000).evaluate_audit_head("k", payload, sig, now=5000)
+        self.assertEqual((before.ok, before.head_status), (True, "valid-key-revoked"))
+
+        after = self._registry(signer, revoked=True, revoked_at=1000).evaluate_audit_head("k", payload, sig, now=5000)
+        self.assertEqual((after.ok, after.head_status), (False, "signed-after-revocation"))
+
+        # revoked with NO effective time => no pre-revocation trust
+        no_time = self._registry(signer, revoked=True).evaluate_audit_head("k", payload, sig, now=5000)
+        self.assertEqual((no_time.ok, no_time.head_status), (False, "signed-after-revocation"))
+
+    # Auditor finding #1 (HIGH) -------------------------------------------
+    def test_precedence_expired_then_revoked_stays_invalid(self):
+        # Key expires at 1500; head signed at 1600 (AFTER expiry => invalid); key later
+        # revoked effective 2000. A later revocation must NOT upgrade a post-expiry head
+        # into accepted evidence: expiry-at-signing is checked before the revocation branch.
+        signer = EnvelopeSigner.generate("k", self.HOST)
+        payload, sig = self._v2(signer, signed_at=1600)
+        registry = self._registry(signer, expires_at=1500, revoked=True, revoked_at=2000)
+        evaluation = registry.evaluate_audit_head("k", payload, sig, now=3000)
+        self.assertFalse(evaluation.ok)
+        self.assertEqual(evaluation.head_status, "signed-after-expiry")
+
+    # Auditor finding #3 (MED) --------------------------------------------
+    def test_signed_in_future_beyond_skew_is_rejected(self):
+        from portmark.security import AUDIT_HEAD_CLOCK_SKEW_SECONDS
+
+        signer = EnvelopeSigner.generate("k", self.HOST)
+        now = 1000
+
+        # exactly at now + skew: still accepted (within allowance)
+        payload, sig = self._v2(signer, signed_at=now + AUDIT_HEAD_CLOCK_SKEW_SECONDS)
+        ev = self._registry(signer).evaluate_audit_head("k", payload, sig, now=now)
+        self.assertEqual((ev.ok, ev.head_status), (True, "valid"))
+
+        # one second beyond skew: rejected as future-dated
+        payload, sig = self._v2(signer, signed_at=now + AUDIT_HEAD_CLOCK_SKEW_SECONDS + 1)
+        ev = self._registry(signer).evaluate_audit_head("k", payload, sig, now=now)
+        self.assertEqual((ev.ok, ev.head_status), (False, "signed-in-future"))
+
+        # extremely large timestamp: rejected
+        payload, sig = self._v2(signer, signed_at=9999999999)
+        ev = self._registry(signer).evaluate_audit_head("k", payload, sig, now=now)
+        self.assertFalse(ev.ok)
+        self.assertEqual(ev.head_status, "signed-in-future")
+
+        # negative timestamp: rejected (malformed, never valid)
+        payload, sig = self._v2(signer, signed_at=-5)
+        ev = self._registry(signer).evaluate_audit_head("k", payload, sig, now=now)
+        self.assertFalse(ev.ok)
+
+    def test_evaluate_rejection_branches_are_distinct(self):
+        signer = EnvelopeSigner.generate("k", self.HOST)
+        payload, sig = self._v2(signer, signed_at=1000)
+
+        # untrusted key id
+        ev = TrustRegistry().evaluate_audit_head("k", payload, sig, now=5000)
+        self.assertEqual((ev.ok, ev.head_status), (False, "untrusted"))
+
+        # key present but not authorized for the audit purpose
+        ev = self._registry(signer, usages=("envelope",)).evaluate_audit_head("k", payload, sig, now=5000)
+        self.assertEqual((ev.ok, ev.head_status), (False, "usage-violation"))
+
+        # host_id in the payload does not match the trusted identity's issuer (checked
+        # before signature verification, so the signature value is irrelevant here)
+        from portmark.security import audit_head_payload_v2
+
+        mismatch = audit_head_payload_v2("t", "host:other", "hash", 0, 1000)
+        ev = self._registry(signer).evaluate_audit_head("k", mismatch, "AA", now=5000)
+        self.assertEqual((ev.ok, ev.head_status), (False, "host-mismatch"))
+
+        # signed_at is a bool (int subclass) -> malformed, not silently accepted as 0/1
+        bad_payload = dict(payload)
+        bad_payload["signed_at"] = True
+        ev = self._registry(signer).evaluate_audit_head("k", bad_payload, sig, now=5000)
+        self.assertEqual((ev.ok, ev.head_status), (False, "signature-invalid"))
+
+        # signed before the key's activation time
+        ev = self._registry(signer, not_before=2000).evaluate_audit_head("k", payload, sig, now=5000)
+        self.assertEqual((ev.ok, ev.head_status), (False, "signed-before-activation"))
+
+
+class HostAuditKeyEnforcementTests(unittest.TestCase):
+    """Auditor finding #2 (HIGH): a host must not start with, or keep signing under, an
+    audit-signing key it could not itself accept. Enforcement, not readiness."""
+
+    HOST = "host:enforce"
+
+    def _write_host_registry(self, path: Path, host_pub_b64: str, **entry_extra) -> None:
+        entry = {
+            "key_id": "env-ed25519-key",
+            "issuer": self.HOST,
+            "public_key_b64": host_pub_b64,
+            "allowed_audiences": [self.HOST],
+            **entry_extra,
+        }
+        path.write_text(json.dumps({"identities": [entry]}), encoding="utf-8")
+
+    def _make_with_host_key_entry(self, directory: str, **entry_extra):
+        host_signer = EnvelopeSigner.generate("env-ed25519-key", self.HOST, (self.HOST,))
+        path = Path(directory) / "trust.json"
+        self._write_host_registry(path, _b64url_encode(host_signer.public_key_bytes()), **entry_extra)
+        store = SQLiteRuntimeStore(str(Path(directory) / "store.sqlite"))
+        env = {
+            "PORTMARK_ED25519_PRIVATE_KEY_B64": host_signer.private_key_b64(),
+            "PORTMARK_SIGNING_KEY_ID": "env-ed25519-key",
+            "PORTMARK_SIGNING_ISSUER": self.HOST,
+            "PORTMARK_ALLOWED_AUDIENCES": self.HOST,
+        }
+        with patch.dict(os.environ, env, clear=True):
+            return make_host(host_id=self.HOST, trust_registry_path=str(path), store=store)
+
+    def test_boot_rejects_unusable_audit_key_revoked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "cannot sign audit heads .revoked"):
+                self._make_with_host_key_entry(directory, revoked=True)
+
+    def test_boot_rejects_unusable_audit_key_expired(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "cannot sign audit heads .expired"):
+                self._make_with_host_key_entry(directory, expires_at=1)
+
+    def test_boot_rejects_unusable_audit_key_not_yet_active(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "cannot sign audit heads .not-yet-active"):
+                self._make_with_host_key_entry(directory, not_before=9_999_999_999)
+
+    def test_boot_rejects_unusable_audit_key_wrong_usage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "cannot sign audit heads .usage"):
+                self._make_with_host_key_entry(directory, usages=["envelope"])
+
+    def test_boot_allows_audit_only_key_on_a_non_migrating_host(self):
+        # The boot check requires ONLY the 'audit' usage -- a host that never migrates must
+        # still start with an audit-scoped key (do not widen the requirement to 'migration').
+        with tempfile.TemporaryDirectory() as directory:
+            host = self._make_with_host_key_entry(directory, usages=["audit"])
+            self.assertIsNotNone(host)
+
+    def test_persist_fails_closed_on_unusable_key_at_signing_time(self):
+        # A host that booted with a usable key, whose key then becomes unusable while the
+        # process runs (no on-disk file change), must FAIL CLOSED on the next audit-head
+        # signing rather than write evidence that is invalid from birth.
+        from dataclasses import replace
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trust.json"
+            agent = EnvelopeSigner.generate("agent-key", "user:alice", (self.HOST,))
+            _write_registry(path, agent, audiences=(self.HOST,))
+            store = SQLiteRuntimeStore(str(Path(directory) / "store.sqlite"))
+            with patch.dict(os.environ, {}, clear=True):
+                host = make_host(host_id=self.HOST, trust_registry_path=str(path), store=store, allow_ephemeral_signing_key=True)
+
+            # First run succeeds with the (usable, overlay) host key.
+            self.assertEqual(host.run(_agent_envelope(agent, self.HOST)).status, "completed")
+
+            # The host's own key becomes revoked in-memory (models an expiry/revocation that
+            # took effect mid-process, which no digest check would notice).
+            overlay = host.signer.registry._overlay  # type: ignore[attr-defined]
+            key_id = host.signer.key_id
+            overlay._identities[key_id] = replace(overlay._identities[key_id], revoked=True)  # type: ignore[attr-defined]
+
+            second = _agent_envelope(agent, self.HOST)
+            with self.assertRaisesRegex(SecurityError, "no longer usable"):
+                host.run(second)
+            # Fail-closed left no completed audit chain for the refused task.
+            self.assertNotEqual(store.verify_audit_chain_status(second.state.task_id).status, "valid")
+
+    def test_audit_signing_reason_predicate_covers_every_reason(self):
+        signer = EnvelopeSigner.generate("k", self.HOST)
+        pub = signer.public_key_bytes()
+
+        def reg(**kw):
+            r = TrustRegistry()
+            r.add(TrustedIdentity(key_id="k", issuer=self.HOST, public_key=pub, allowed_audiences=("*",), **kw))
+            return r
+
+        self.assertIsNone(reg().audit_signing_reason("k", now=1000))
+        self.assertEqual(TrustRegistry().audit_signing_reason("k", now=1000), "untrusted")
+        self.assertEqual(reg(revoked=True).audit_signing_reason("k", now=1000), "revoked")
+        self.assertEqual(reg(not_before=5000).audit_signing_reason("k", now=1000), "not-yet-active")
+        self.assertEqual(reg(expires_at=500).audit_signing_reason("k", now=1000), "expired")
+        self.assertEqual(reg(usages=("envelope",)).audit_signing_reason("k", now=1000), "usage")
+
+
+class KeygenForceMergeTests(unittest.TestCase):
+    def _keygen(self, args: list[str]) -> None:
+        with patch.object(sys, "argv", ["portmark", "keygen", *args]):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                try:
+                    cli_main()
+                except SystemExit:
+                    pass
+
+    def test_force_merge_adds_rotation_entry_without_clobbering(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trust.json"
+            self._keygen(["--key-id", "key-a", "--issuer", "user:a", "--out-registry", str(path)])
+            first = json.loads(path.read_text())
+            self.assertEqual([i["key_id"] for i in first["identities"]], ["key-a"])
+
+            self._keygen(["--key-id", "key-b", "--issuer", "user:a", "--out-registry", str(path), "--force"])
+            merged = json.loads(path.read_text())
+            self.assertEqual(sorted(i["key_id"] for i in merged["identities"]), ["key-a", "key-b"])
+
+    def test_force_merge_rejects_duplicate_key_id_with_different_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trust.json"
+            self._keygen(["--key-id", "dup", "--issuer", "user:a", "--out-registry", str(path)])
+            with patch.object(sys, "argv", ["portmark", "keygen", "--key-id", "dup", "--issuer", "user:a", "--out-registry", str(path), "--force"]):
+                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        cli_main()
+
+    def test_force_merge_preserves_restrictive_permissions(self):
+        if os.name != "posix":
+            self.skipTest("POSIX file modes only")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trust.json"
+            self._keygen(["--key-id", "key-a", "--issuer", "user:a", "--out-registry", str(path)])
+            os.chmod(path, 0o600)
+            self._keygen(["--key-id", "key-b", "--issuer", "user:a", "--out-registry", str(path), "--force"])
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    @unittest.skipUnless(_has_registry_lock(), "no file-lock primitive available")
+    def test_keygen_force_concurrent_merges_keep_every_key(self):
+        # Auditor finding #4: two racing --force merges must not lose an entry. Each writer
+        # takes the sidecar lock (a fresh fd per acquisition -> the OS lock serializes even
+        # across threads: fcntl.flock on POSIX, msvcrt.locking on Windows -- both conflict
+        # across distinct handles to the same file within one process), so
+        # read->validate->merge->replace is atomic and every rotation survives.
+        import argparse
+        import threading
+
+        from portmark.cli import _write_out_registry
+        from portmark.security import generate_signing_material
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "trust.json")
+            seed = generate_signing_material("seed", "user:seed", ("*",))["trust_registry"]
+            _write_out_registry(argparse.ArgumentParser(), path, seed, merge=False)
+
+            count = 12
+            barrier = threading.Barrier(count)
+            errors: list[BaseException] = []
+
+            def worker(i: int) -> None:
+                try:
+                    material = generate_signing_material(f"key-{i}", f"user:{i}", ("*",))["trust_registry"]
+                    barrier.wait(timeout=10)  # maximize contention
+                    _write_out_registry(argparse.ArgumentParser(), path, material, merge=True)
+                except BaseException as exc:  # noqa: BLE001 -- surface any worker failure
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(count)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            self.assertEqual(errors, [])
+            ids = {entry["key_id"] for entry in json.loads(Path(path).read_text())["identities"]}
+            self.assertIn("seed", ids)
+            for i in range(count):
+                self.assertIn(f"key-{i}", ids)
+
+    def test_keygen_force_validates_existing_registry_before_merge(self):
+        # A pre-existing registry that is itself invalid (duplicate key id) must be rejected
+        # before merge, not silently collapsed. keygen --force exits without clobbering.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trust.json"
+            pub = _b64url_encode(EnvelopeSigner.generate().public_key_bytes())
+            corrupt = {
+                "identities": [
+                    {"key_id": "dup", "issuer": "user:a", "public_key_b64": pub, "allowed_audiences": ["*"]},
+                    {"key_id": "dup", "issuer": "user:b", "public_key_b64": pub, "allowed_audiences": ["*"]},
+                ]
+            }
+            path.write_text(json.dumps(corrupt), encoding="utf-8")
+            self._keygen(["--key-id", "new", "--issuer", "user:new", "--out-registry", str(path), "--force"])
+            # Rejected before writing: the new key never landed and the file is untouched.
+            after = json.loads(path.read_text())
+            self.assertEqual(after, corrupt)
+
+
+class MigrationUsageTests(unittest.TestCase):
+    HOST = "host:mig"
+
+    def _registry(self, signer: EnvelopeSigner, usages: tuple[str, ...]) -> TrustRegistry:
+        registry = TrustRegistry()
+        registry.add(TrustedIdentity(key_id=signer.key_id, issuer=self.HOST, public_key=signer.public_key_bytes(), allowed_audiences=("*",), usages=usages))
+        return registry
+
+    def test_migration_usage_required_for_migration_handoff_verification(self):
+        from portmark.security import audit_head_payload
+
+        signer = EnvelopeSigner.generate("k", self.HOST)
+        payload = audit_head_payload("t", self.HOST, "hash", 3)
+        sig = signer.sign_audit_head("t", self.HOST, "hash", 3)
+
+        # A key permitted only for "audit" (not "migration") is rejected when the required
+        # usage is "migration" (the migration-handoff verification path).
+        audit_only = self._registry(signer, ("audit",))
+        with self.assertRaisesRegex(SecurityError, "migration"):
+            audit_only.verify_audit_head("k", payload, sig, required_usage="migration")
+        # ... but still accepted on the ordinary audit path.
+        audit_only.verify_audit_head("k", payload, sig)  # required_usage defaults to "audit"
+
+    def test_migration_usage_permitted_key_verifies(self):
+        signer = EnvelopeSigner.generate("k", self.HOST)
+        from portmark.security import audit_head_payload
+
+        payload = audit_head_payload("t", self.HOST, "hash", 3)
+        sig = signer.sign_audit_head("t", self.HOST, "hash", 3)
+        self._registry(signer, ("envelope", "migration")).verify_audit_head("k", payload, sig, required_usage="migration")
 
 
 if __name__ == "__main__":

@@ -38,15 +38,18 @@ class EnvelopeSigningIdentity(EnvelopeVerifier, Protocol):
     def seal(self, envelope: AgentEnvelope) -> AgentEnvelope:
         ...
 
-    def sign_audit_head(self, task_id: str, host_id: str, head_hash: str, sequence: int) -> str:
+    def sign_audit_head(self, task_id: str, host_id: str, head_hash: str, sequence: int, signed_at: int | None = None) -> str:
         ...
 
-    def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str) -> None:
+    def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None, required_usage: str = "audit") -> None:
         ...
 
 
 class AuditHeadVerifier(Protocol):
-    def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str) -> None:
+    def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None, required_usage: str = "audit") -> None:
+        ...
+
+    def evaluate_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None) -> "AuditHeadEvaluation":
         ...
 
 
@@ -70,6 +73,52 @@ def audit_head_payload(task_id: str, host_id: str, head_hash: str, sequence: int
         "head_hash": head_hash,
         "sequence": sequence,
     }
+
+
+def audit_head_payload_v2(task_id: str, host_id: str, head_hash: str, sequence: int, signed_at: int) -> dict[str, Any]:
+    # v2 adds a signed `signed_at` so verification can be evaluated against the key's
+    # validity AT SIGNING TIME (finding #3, Option B), instead of the current wall clock.
+    return {
+        "type": "portmark.audit-head.v2",
+        "task_id": task_id,
+        "host_id": host_id,
+        "head_hash": head_hash,
+        "sequence": sequence,
+        "signed_at": signed_at,
+    }
+
+
+def _audit_head_payload_for(task_id: str, host_id: str, head_hash: str, sequence: int, signed_at: int | None) -> dict[str, Any]:
+    # signed_at None -> v1 (legacy / backward compatible); otherwise v2.
+    if signed_at is None:
+        return audit_head_payload(task_id, host_id, head_hash, sequence)
+    return audit_head_payload_v2(task_id, host_id, head_hash, sequence, signed_at)
+
+
+@dataclass(frozen=True)
+class AuditHeadEvaluation:
+    """Historical verification of a STORED audit head (finding #3, Option B).
+
+    Distinct from `verify_audit_head`, which answers "may this key be accepted right now"
+    for admission. `evaluate_audit_head` answers "was this head validly signed, judged at
+    signing time" -- so a key that legitimately expired or was rotated after signing still
+    yields a valid head, while a compromised key is distinguished by revocation effective time.
+
+    `ok` is the coarse accept/reject; `head_status` is the precise outcome for reporting;
+    `detail` is a human-readable message.
+    """
+
+    ok: bool
+    head_status: str
+    detail: str
+
+
+# Clock-skew allowance for a v2 audit head's attested `signed_at` (finding #3). A signed_at
+# more than this many seconds ahead of the verifier's clock is rejected as `signed-in-future`:
+# a signer cannot honestly attest a time it has not reached, and an unbounded future timestamp
+# would otherwise be reported as ordinary valid evidence. This is a local sanity bound, not a
+# proof of existence-before-T -- that needs the external transparency-log witness (deferred).
+AUDIT_HEAD_CLOCK_SKEW_SECONDS = 300
 
 
 def canonical_json(value: Any) -> bytes:
@@ -133,6 +182,11 @@ class TrustedIdentity:
     # means unrestricted (backward compatible with registries written before usages
     # existed). A key valid for one purpose cannot be used for another it does not list.
     usages: tuple[str, ...] = ()
+    # Effective time of revocation (finding #3, Option B). When set with revoked=True, an
+    # audit head signed strictly BEFORE this time is "cryptographically valid, key later
+    # revoked"; a head signed at/after it is "signed after revocation" (a forgery signal).
+    # revoked=True with revoked_at=None means revoked for all time (no pre-revocation trust).
+    revoked_at: int | None = None
 
 
 def _identity_permits(identity: TrustedIdentity, usage: str) -> bool:
@@ -191,6 +245,25 @@ class TrustRegistry:
         current_time = int(time.time()) if now is None else now
         return _identity_unusable_reason(identity, current_time) is None
 
+    def audit_signing_reason(self, key_id: str, now: int | None = None) -> str | None:
+        """Why the key MAY NOT sign audit heads right now, or None if it may (finding #2).
+
+        A host must not sign new audit evidence with a key that is untrusted, not yet
+        active, expired, revoked, or not authorized for the `audit` purpose -- such heads
+        are invalid from birth. This is the enforcement boundary make_host checks at boot
+        and host._persist rechecks before every signing, so it fails closed rather than
+        relying on readiness (which only reports)."""
+        identity = self._identities.get(key_id)
+        if identity is None:
+            return "untrusted"
+        current_time = int(time.time()) if now is None else now
+        reason = _identity_unusable_reason(identity, current_time)
+        if reason is not None:
+            return reason
+        if not _identity_permits(identity, "audit"):
+            return "usage"
+        return None
+
     def add(self, identity: TrustedIdentity) -> None:
         if identity.key_id in self._identities:
             raise ValueError(f"duplicate signing key id {identity.key_id!r}")
@@ -204,7 +277,10 @@ class TrustRegistry:
     def identity(self, key_id: str) -> TrustedIdentity | None:
         return self._identities.get(key_id)
 
-    def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None) -> None:
+    def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None, required_usage: str = "audit") -> None:
+        # required_usage lets the migration-handoff path require the "migration" purpose
+        # (finding #5 / #2) rather than plain "audit", so an operator can issue keys scoped
+        # to audit-only or migration-only. Default "audit" keeps the ordinary path unchanged.
         identity = self._identities.get(key_id)
         if identity is None:
             raise SecurityError("audit head signing key is not trusted")
@@ -216,8 +292,8 @@ class TrustRegistry:
             raise SecurityError("audit head signing key is not active yet")
         if reason == "expired":
             raise SecurityError("audit head signing key has expired")
-        if not _identity_permits(identity, "audit"):
-            raise SecurityError("audit head signing key lacks the required 'audit' usage")
+        if not _identity_permits(identity, required_usage):
+            raise SecurityError(f"audit head signing key lacks the required '{required_usage}' usage")
         if payload.get("host_id") != identity.issuer:
             raise SecurityError("audit head signer identity does not match host")
         try:
@@ -227,6 +303,64 @@ class TrustRegistry:
             )
         except (InvalidSignature, ValueError) as error:
             raise SecurityError("audit head signature is invalid") from error
+
+    def evaluate_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None) -> AuditHeadEvaluation:
+        # Historical verification (finding #3, Option B). Authenticity first, then validity
+        # judged AT SIGNING TIME for v2 heads (signed_at in the payload); v1 heads fall under
+        # a documented legacy policy. Returns a rich status instead of raising, so the audit
+        # report can distinguish valid / valid-but-expired / valid-but-later-revoked /
+        # signed-after-revocation rather than collapsing them to "invalid".
+        current_time = int(time.time()) if now is None else now
+        identity = self._identities.get(key_id)
+        if identity is None:
+            return AuditHeadEvaluation(False, "untrusted", "audit head signing key is not trusted")
+        if not _identity_permits(identity, "audit"):
+            return AuditHeadEvaluation(False, "usage-violation", "audit head signing key lacks the required 'audit' usage")
+        if payload.get("host_id") != identity.issuer:
+            return AuditHeadEvaluation(False, "host-mismatch", "audit head signer identity does not match host")
+        try:
+            Ed25519PublicKey.from_public_bytes(identity.public_key).verify(_b64url_decode(signature), canonical_json(payload))
+        except (InvalidSignature, ValueError):
+            return AuditHeadEvaluation(False, "signature-invalid", "audit head signature is invalid")
+        # Signature is authentic. Judge validity.
+        signed_at = payload.get("signed_at") if payload.get("type") == "portmark.audit-head.v2" else None
+        if signed_at is None:
+            # v1 legacy policy: no attested signing time, so benign expiry/activation are NOT
+            # applied retroactively. Only revocation blocks -- a compromised key's v1 heads
+            # cannot be proven pre-compromise without a signed_at.
+            if identity.revoked:
+                return AuditHeadEvaluation(False, "revoked-key-legacy-v1", "v1 audit head signed by a now-revoked key; pre-revocation signing cannot be established without a signed_at")
+            return AuditHeadEvaluation(True, "valid-legacy-v1", "v1 audit head cryptographically valid (legacy: signing time not attested)")
+        if not isinstance(signed_at, int) or isinstance(signed_at, bool):
+            return AuditHeadEvaluation(False, "signature-invalid", "audit head signed_at is malformed")
+        if signed_at < 0:
+            return AuditHeadEvaluation(False, "signature-invalid", "audit head signed_at is malformed (negative)")
+        # A signer cannot honestly attest a signing time it has not reached. Reject a
+        # future-dated signed_at beyond a small clock-skew allowance (finding #3) -- without
+        # this, signed_at=9999999999 was reported as ordinary `valid` evidence. This is a
+        # sanity bound only; proof that a head existed no later than time T needs the
+        # external transparency-log witness (deferred), not the signer's own timestamp.
+        if signed_at > current_time + AUDIT_HEAD_CLOCK_SKEW_SECONDS:
+            return AuditHeadEvaluation(False, "signed-in-future", "audit head signed_at is in the future beyond the allowed clock skew")
+        # Validity is judged AT SIGNING TIME, in strict lifecycle order. Activation and
+        # expiry-at-signing decide whether the key was valid WHEN it signed; only if it
+        # was do we report a later revocation/expiry. Expiry-at-signing must precede the
+        # revocation branch (finding #1): otherwise a head signed after the key expired
+        # (already invalid) was upgraded to accepted `valid-key-revoked` by a later
+        # revocation.
+        if signed_at < identity.not_before:
+            return AuditHeadEvaluation(False, "signed-before-activation", "audit head signed before the key's activation time")
+        if identity.expires_at is not None and identity.expires_at <= signed_at:
+            return AuditHeadEvaluation(False, "signed-after-expiry", "audit head signed after the signing key expired")
+        # Signed while the key was valid. Report the most serious later lifecycle fact,
+        # with revocation taking precedence over a since-expiry.
+        if identity.revoked:
+            if identity.revoked_at is not None and signed_at < identity.revoked_at:
+                return AuditHeadEvaluation(True, "valid-key-revoked", f"audit head cryptographically valid; signing key was later revoked (effective {identity.revoked_at})")
+            return AuditHeadEvaluation(False, "signed-after-revocation", "audit head signed at/after the signing key's revocation (or the key is revoked with no effective time)")
+        if identity.expires_at is not None and identity.expires_at <= current_time:
+            return AuditHeadEvaluation(True, "valid-key-expired", "audit head cryptographically valid; signing key has since expired")
+        return AuditHeadEvaluation(True, "valid", "audit head verified")
 
     def require_identity(self, envelope: AgentEnvelope, now: int | None = None) -> TrustedIdentity:
         if not envelope.signature_key_id:
@@ -271,6 +405,7 @@ def _parse_trust_registry(value: Any) -> TrustRegistry:
                 expires_at=None if item.get("expires_at") is None else _strict_int(item["expires_at"], "trust registry expires_at"),
                 revoked=_strict_bool(item.get("revoked", False), "trust registry revoked"),
                 usages=_usages_tuple(item.get("usages", ())),
+                revoked_at=None if item.get("revoked_at") is None else _strict_int(item["revoked_at"], "trust registry revoked_at"),
             )
         )
     return registry
@@ -381,18 +516,30 @@ class TrustSource:
             return self._overlay.is_usable(key_id, now)
         return registry.is_usable(key_id, now)
 
+    def audit_signing_reason(self, key_id: str, now: int | None = None) -> str | None:
+        registry = self._verified_file()
+        if self._overlay.has_key(key_id):
+            return self._overlay.audit_signing_reason(key_id, now)
+        return registry.audit_signing_reason(key_id, now)
+
     def require_identity(self, envelope: AgentEnvelope, now: int | None = None) -> TrustedIdentity:
         registry = self._verified_file()
         if envelope.signature_key_id and self._overlay.has_key(envelope.signature_key_id):
             return self._overlay.require_identity(envelope, now)
         return registry.require_identity(envelope, now)
 
-    def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None) -> None:
+    def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None, required_usage: str = "audit") -> None:
         registry = self._verified_file()
         if self._overlay.has_key(key_id):
-            self._overlay.verify_audit_head(key_id, payload, signature, now)
+            self._overlay.verify_audit_head(key_id, payload, signature, now, required_usage=required_usage)
         else:
-            registry.verify_audit_head(key_id, payload, signature, now)
+            registry.verify_audit_head(key_id, payload, signature, now, required_usage=required_usage)
+
+    def evaluate_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None) -> AuditHeadEvaluation:
+        registry = self._verified_file()
+        if self._overlay.has_key(key_id):
+            return self._overlay.evaluate_audit_head(key_id, payload, signature, now)
+        return registry.evaluate_audit_head(key_id, payload, signature, now)
 
 
 def _issuer_matches(signing_issuer: str, permit_issuer: str) -> bool:
@@ -824,13 +971,16 @@ class EnvelopeSigner:
     def public_key_bytes(self) -> bytes:
         return self._private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
 
-    def sign_audit_head(self, task_id: str, host_id: str, head_hash: str, sequence: int) -> str:
+    def sign_audit_head(self, task_id: str, host_id: str, head_hash: str, sequence: int, signed_at: int | None = None) -> str:
         if host_id != self.issuer:
             raise SecurityError("audit head host does not match signing identity")
-        return _b64url_encode(self._private_key.sign(canonical_json(audit_head_payload(task_id, host_id, head_hash, sequence))))
+        return _b64url_encode(self._private_key.sign(canonical_json(_audit_head_payload_for(task_id, host_id, head_hash, sequence, signed_at))))
 
-    def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str) -> None:
-        self.registry.verify_audit_head(key_id, payload, signature)
+    def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None, required_usage: str = "audit") -> None:
+        self.registry.verify_audit_head(key_id, payload, signature, now, required_usage=required_usage)
+
+    def evaluate_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None) -> AuditHeadEvaluation:
+        return self.registry.evaluate_audit_head(key_id, payload, signature, now)
 
 
 class HmacEnvelopeSigner:
@@ -861,15 +1011,28 @@ class HmacEnvelopeSigner:
         if not hmac.compare_digest(expected, envelope.signature):
             raise SecurityError("agent envelope signature is invalid")
 
-    def sign_audit_head(self, task_id: str, host_id: str, head_hash: str, sequence: int) -> str:
-        return hmac.new(self._key, canonical_json(audit_head_payload(task_id, host_id, head_hash, sequence)), hashlib.sha256).hexdigest()
+    def sign_audit_head(self, task_id: str, host_id: str, head_hash: str, sequence: int, signed_at: int | None = None) -> str:
+        return hmac.new(self._key, canonical_json(_audit_head_payload_for(task_id, host_id, head_hash, sequence, signed_at)), hashlib.sha256).hexdigest()
 
-    def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str) -> None:
+    def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None, required_usage: str = "audit") -> None:
+        # Legacy HMAC has no per-key usages or lifecycle; now/required_usage are accepted for interface parity.
         if key_id != self.key_id:
             raise SecurityError("audit head signing key is not trusted")
         expected = hmac.new(self._key, canonical_json(payload), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(expected, signature):
             raise SecurityError("audit head signature is invalid")
+
+    def evaluate_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None) -> AuditHeadEvaluation:
+        # Legacy HMAC has no trust registry, revocation, or key lifecycle -- authenticity is
+        # all it can attest. Distinguish only signature validity; a valid v1 head is legacy.
+        if key_id != self.key_id:
+            return AuditHeadEvaluation(False, "untrusted", "audit head signing key is not trusted")
+        expected = hmac.new(self._key, canonical_json(payload), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, signature):
+            return AuditHeadEvaluation(False, "signature-invalid", "audit head signature is invalid")
+        if payload.get("type") == "portmark.audit-head.v2":
+            return AuditHeadEvaluation(True, "valid", "audit head verified (legacy HMAC)")
+        return AuditHeadEvaluation(True, "valid-legacy-v1", "v1 audit head verified (legacy HMAC)")
 
 
 RESERVED_CONSTRAINT_KEYS = frozenset({"arguments", "required", "additional_arguments"})

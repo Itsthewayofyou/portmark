@@ -6,7 +6,53 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
-### Section 3 — Signing and key lifecycle
+### Section 3 (part 2) — historical audit validity + key-purpose completion
+
+- **Audit heads are signed as `portmark.audit-head.v2` with an attested `signed_at`, and verified
+  at signing time (finding #3, Option B).** Ordinary key rotation/expiry no longer retroactively
+  invalidates a head that was validly signed; the trust registry retains rotated/expired keys (with
+  their validity intervals) as the key archive. A nullable `signed_at` column was added to
+  `audit_heads` (SQLite schema v6, Postgres v4; old stores migrate).
+- **Four-way verification status.** `verify-audit` now reports a precise `head_status` alongside the
+  coarse status: `valid` / `valid-key-expired` / `valid-key-revoked` (cryptographically valid, key
+  later revoked — reported prominently) / `signed-after-revocation`, plus `valid-legacy-v1` and the
+  rejection reasons. `TrustedIdentity` gained `revoked_at` (revocation effective time) to distinguish
+  pre- from post-revocation heads.
+- **v1 legacy policy (documented).** A v1 head verifies as `valid-legacy-v1` when the key is not
+  revoked; a v1 head from a now-revoked key is rejected, since pre-compromise cannot be established
+  without a signing time. `signed_at` is signer-set and cannot alone prove pre-compromise — an
+  external witness is required for that (deferred, below).
+- **Migration purpose is now enforced (finding #2/#5).** `verify_audit_head` takes a `required_usage`;
+  the migration-handoff verification requires the `migration` usage, so a key scoped to audit-only
+  cannot mint migration handoffs. (Supersedes the part-1 "migration not enforced" note.)
+- **`keygen --force` merges instead of clobbering (finding #14).** It now merge-adds a rotation entry
+  into an existing trust registry, writes atomically (temp + fsync + `os.replace`), and preserves the
+  file's permissions; a duplicate key id with a different public key is rejected.
+
+Hardening from the PR review round on the above:
+
+- **Signing-time validity is now judged in strict order (High).** `evaluate_audit_head` checks
+  at/after-expiry *before* the revocation branch, so a head signed after its key expired stays
+  `signed-after-expiry` and a later revocation can no longer upgrade it into accepted
+  `valid-key-revoked` evidence.
+- **Future-dated `signed_at` is rejected (`signed-in-future`).** A `signed_at` beyond a 300s clock-skew
+  allowance (`AUDIT_HEAD_CLOCK_SKEW_SECONDS`), or a negative one, is no longer reported as `valid`.
+- **Host audit-signing key enforced at boot and at every signing (High).** `make_host` fails closed at
+  startup unless the host's own key is trusted, active, unexpired, unrevoked, and `audit`-authorized in
+  the registry it verifies against; the same check re-runs before each audit head is signed, so a key
+  that becomes unusable mid-process fails the run closed instead of writing invalid evidence. Enforcement
+  no longer depends on readiness.
+- **`keygen --force` rotation is concurrency-safe on POSIX and Windows.** read → validate → merge →
+  replace runs under a sidecar lock (`<file>.lock`) — `fcntl` on POSIX, `msvcrt.locking` on Windows,
+  both OS-released on process death — so racing rotations cannot lose a key; the whole existing registry
+  is validated before merge (duplicate ids rejected, not collapsed) and the parent directory is fsynced
+  after the rename.
+
+Still deferred (a further follow-up, needs its own auditor review): the **registry rollback floor**
+(#13 — a durable minimum-accepted registry version) and the **transparency-log anchor** (external
+witness for compromise-sensitive "signed before time T" proof).
+
+### Section 3 (part 1) — signing & key lifecycle
 
 - **A durable store now refuses to start on an ephemeral signing key (finding #1, release blocker).**
   When no operator key was configured, the host generated a fresh Ed25519 key on every start but
@@ -39,8 +85,8 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   the `audit` purpose in audit-head verification, so an envelope-only key cannot sign an audit head.
   Empty/absent `usages` = unrestricted (backward compatible), and the host's own self-registered key
   is unrestricted, so existing registries and the default host still allow one key to span purposes.
-  **Not yet enforced:** the `migration` purpose (a migration-proposing envelope is still verified only
-  as `envelope`), and separate host audit/migration signing keys — these are deferred with #3-B.
+  (At part-1 time the `migration` purpose was not yet enforced; **Section 3 part 2 above now enforces
+  it** and adds the historical-audit model.)
 - **Stricter Base64URL and trust-registry parsing (findings #6, #15).** Signature and public-key
   decoding is now strict canonical Base64URL — non-alphabet characters, added padding, and
   non-canonical trailing bits are rejected at every decoder site, including the
@@ -48,10 +94,10 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   must be real integers (a boolean is rejected, not coerced) and `revoked` a real boolean; a
   duplicate key id in a `TrustRegistry` is rejected rather than silently collapsed.
 
-Deferred within Section 3 (tracked for a follow-up, needs its own auditor review): historical
-audit-head validity under Option B (`audit-head.v2` with a signed `signed_at`, verify-at-signing-time,
-a public-key archive with validity intervals, and a four-way verification status), the
-transparency-log anchor, the registry rollback floor, and the atomic `keygen --force` rotation merge.
+(Deferred at part-1 time and now delivered in **Section 3 part 2** above: Option B historical
+audit-head validity, `audit-head.v2` + verify-at-signing-time, the key archive, the four-way status,
+migration-purpose enforcement, and the atomic `keygen --force` merge. Still deferred: the registry
+rollback floor and the transparency-log anchor.)
 
 ### Section 2 — A2A network boundary
 
