@@ -3180,6 +3180,61 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(second.status, "completed")
         self.assertEqual(second.result["resumed_on"], destination.host_id)
 
+    def test_migration_provenance_cannot_be_spliced_between_trusted_hosts(self):
+        # Section 4 finding #1 (High): the destination verified the anchor signature and its
+        # "migration" usage, but never bound the anchor host to the permit issuer. A permit
+        # delegated + sealed by host:a could therefore carry an audit anchor validly signed by
+        # an unrelated but individually-trusted host:c, and the destination would accept it and
+        # record host:c as the lineage -- a provenance splice. This uses TWO trusted,
+        # migration-capable keys (not a bad signature): the anchor sig is genuinely valid.
+        source_signer = EnvelopeSigner.generate("splice-source", "host:a", ("host:a", "host:destination"))
+        destination_signer = trust_signer(
+            EnvelopeSigner.generate("splice-dest", "host:destination", ("host:destination",)),
+            source_signer,
+        )
+        # host:c: independently trusted at the destination, migration-capable (default unrestricted
+        # usages), but NOT the permit issuer.
+        other_signer = EnvelopeSigner.generate("splice-other", "host:c", ("host:c", "host:destination"))
+        trust_signer(destination_signer, other_signer)
+
+        source = make_host(host_id="host:a", signer=source_signer)
+        destination = make_host(host_id="host:destination", signer=destination_signer)
+        source.policy.migration = MigrationPolicy(allowed=True, destinations=(destination.host_id,))
+        provider = MigrateThenCompleteProvider(destination.host_id)
+        source.providers["migrator"] = provider
+        destination.providers["migrator"] = provider
+
+        envelope = make_demo_envelope(source, "splice", "migrator")
+        object.__setattr__(envelope.permit, "delegation_allowed", True)
+        source.signer.seal(envelope)
+        first = source.run(envelope)
+
+        # A legit migration envelope binds all three identities together.
+        migrated = envelope_from_dict(first.migration_envelope)
+        self.assertEqual(migrated.permit.issuer, "host:a")
+        self.assertEqual(migrated.previous_audit_host_id, "host:a")
+
+        # Splice: swap the anchor for one validly signed by host:c over a self-consistent payload
+        # (host_id=host:c), leaving the permit (issuer host:a) intact, then re-seal with the real
+        # permit holder (host:a) so the envelope signature stays valid.
+        forged_hash, forged_seq = "c0ffee-head", 5
+        spliced = envelope_from_dict(first.migration_envelope)
+        spliced.previous_audit_host_id = "host:c"
+        spliced.previous_audit_hash = forged_hash
+        spliced.previous_audit_sequence = forged_seq
+        spliced.previous_audit_signature_key_id = other_signer.key_id
+        spliced.previous_audit_signature = other_signer.sign_audit_head(spliced.state.task_id, "host:c", forged_hash, forged_seq)
+        source.signer.seal(spliced)
+
+        fresh_destination = make_host(host_id="host:destination", signer=destination_signer)
+        fresh_destination.providers["migrator"] = provider
+        with self.assertRaisesRegex(SecurityError, "audit host does not match permit issuer"):
+            fresh_destination.run(spliced)
+        # The finding is about false lineage being RECORDED. Prove the rejection is fail-closed:
+        # no checkpoint and no audit chain were persisted for the spliced task at the destination.
+        self.assertIsNone(fresh_destination.store.load_checkpoint(spliced.state.task_id))
+        self.assertIsNone(fresh_destination.store.audit_head(spliced.state.task_id))
+
     def test_attested_migration_requires_destination_evidence_and_resumes(self):
         authority = AttestationAuthority.generate()
         policy = AttestationPolicy(
