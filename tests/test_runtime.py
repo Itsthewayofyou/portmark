@@ -53,7 +53,7 @@ from portmark.security import (
     generate_signing_material,
     load_trust_registry,
 )
-from portmark.storage import SQLITE_BUSY_TIMEOUT_MS, SQLITE_SCHEMA_VERSION, InMemoryRuntimeStore, PostgresRuntimeStore, SQLiteRuntimeStore
+from portmark.storage import POSTGRES_SCHEMA_VERSION, SQLITE_BUSY_TIMEOUT_MS, SQLITE_SCHEMA_VERSION, InMemoryRuntimeStore, PostgresRuntimeStore, SQLiteRuntimeStore
 from portmark.cli import main as cli_main
 from portmark.tools import ToolRegistry, _CAN_KILL_PROCESS_GROUP, _can_hard_kill_process_tree
 from examples.tools import http_fetch
@@ -2505,7 +2505,7 @@ class RuntimeTests(unittest.TestCase):
                 connection.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(schema)))
                 version = connection.execute("SELECT version FROM portmark_schema WHERE singleton = TRUE").fetchone()[0]
                 regclass = connection.execute("SELECT to_regclass(%s)", (schema + ".migration_outbox",)).fetchone()[0]
-            self.assertEqual(version, 3)
+            self.assertEqual(version, POSTGRES_SCHEMA_VERSION)  # brought fully current, not just to v3
             self.assertIsNotNone(regclass)
         finally:
             self._drop_postgres_schema(dsn, schema)
@@ -2920,7 +2920,7 @@ class RuntimeTests(unittest.TestCase):
                     cli_main()
             self.assertEqual(
                 json.loads(output.getvalue()),
-                {"task_id": result.task_id, "status": "valid", "reason": "audit chain and signed head verified"},
+                {"task_id": result.task_id, "status": "valid", "head_status": "valid", "reason": "audit head verified"},
             )
 
             output = io.StringIO()
@@ -2931,7 +2931,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, 2)
             self.assertEqual(
                 json.loads(output.getvalue()),
-                {"task_id": result.task_id, "status": "unverifiable", "reason": "trust registry is not configured"},
+                {"task_id": result.task_id, "status": "unverifiable", "head_status": "unverifiable", "reason": "trust registry is not configured"},
             )
 
             with self._raw_sqlite(path) as connection:
@@ -2944,7 +2944,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, 1)
             self.assertEqual(
                 json.loads(output.getvalue()),
-                {"task_id": result.task_id, "status": "invalid", "reason": "stored audit head does not match audit events"},
+                {"task_id": result.task_id, "status": "invalid", "head_status": "", "reason": "stored audit head does not match audit events"},
             )
 
             output = io.StringIO()
@@ -2955,7 +2955,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, 1)
             self.assertEqual(
                 json.loads(output.getvalue()),
-                {"task_id": "missing-task", "status": "invalid", "reason": "audit chain is missing"},
+                {"task_id": "missing-task", "status": "invalid", "head_status": "", "reason": "audit chain is missing"},
             )
 
     def test_host_security_guards_are_directly_reachable(self):

@@ -623,11 +623,19 @@ class AgentHost:
         with self.store.transaction() as transaction:
             if consume_nonce is not None:
                 transaction.consume_nonce(consume_nonce, envelope.permit.subject, envelope.permit.audience, state.task_id)
+            # Finding #3 (Option B): sign audit heads as v2 with an attested signed_at so
+            # verification can be judged at signing time. One timestamp per persist; returned
+            # alongside (key_id, signature) so the store persists it for later verification.
+            head_signed_at = int(time.time())
             transaction.append_audit_events(
                 state.task_id,
                 self.host_id,
                 audit.events[persisted_events:],
-                lambda head_hash, sequence: (self.signer.key_id, self.signer.sign_audit_head(state.task_id, self.host_id, head_hash, sequence)),
+                lambda head_hash, sequence: (
+                    self.signer.key_id,
+                    self.signer.sign_audit_head(state.task_id, self.host_id, head_hash, sequence, signed_at=head_signed_at),
+                    head_signed_at,
+                ),
             )
             new_generation = transaction.save_checkpoint(state.task_id, state, state.checkpoint_generation, closed)
             # Section 1, finding #2: a migration's sealed destination envelope is

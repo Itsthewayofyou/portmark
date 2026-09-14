@@ -481,5 +481,177 @@ class FollowupAuditTests(unittest.TestCase):
             self.assertIsNotNone(host)
 
 
+# ---------------------------------------------------------------------------
+# Part 2 / Phase A — audit-head.v2 + signed_at.
+# ---------------------------------------------------------------------------
+class AuditHeadV2PayloadTests(unittest.TestCase):
+    def test_audit_head_v2_payload_shape(self):
+        from portmark.security import audit_head_payload, audit_head_payload_v2
+
+        v1 = audit_head_payload("t", "host:x", "hash", 0)
+        self.assertEqual(v1["type"], "portmark.audit-head.v1")
+        self.assertNotIn("signed_at", v1)
+
+        v2 = audit_head_payload_v2("t", "host:x", "hash", 0, 12345)
+        self.assertEqual(v2["type"], "portmark.audit-head.v2")
+        self.assertEqual(v2["signed_at"], 12345)
+        self.assertEqual(v2["head_hash"], "hash")
+
+    def test_audit_head_v2_sign_emits_v2_when_signed_at_given(self):
+        from portmark.security import audit_head_payload, audit_head_payload_v2
+
+        signer = EnvelopeSigner.generate("k", "host:x")
+        sig2 = signer.sign_audit_head("t", "host:x", "hash", 0, signed_at=999)
+        # verifies against the v2 payload, not the v1 payload
+        signer.registry.verify_audit_head("k", audit_head_payload_v2("t", "host:x", "hash", 0, 999), sig2)
+        with self.assertRaises(SecurityError):
+            signer.registry.verify_audit_head("k", audit_head_payload("t", "host:x", "hash", 0), sig2)
+
+    def test_audit_head_v2_sign_without_signed_at_is_v1(self):
+        from portmark.security import audit_head_payload
+
+        signer = EnvelopeSigner.generate("k", "host:x")
+        sig1 = signer.sign_audit_head("t", "host:x", "hash", 0)
+        signer.registry.verify_audit_head("k", audit_head_payload("t", "host:x", "hash", 0), sig1)  # v1 unchanged
+
+
+class SignedAtMigrationTests(unittest.TestCase):
+    def test_signed_at_migration_adds_column_and_bumps_version(self):
+        import sqlite3
+
+        from portmark.storage import SQLITE_SCHEMA_VERSION, SQLiteRuntimeStore
+
+        self.assertGreaterEqual(SQLITE_SCHEMA_VERSION, 6)
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "store.sqlite")
+            store = SQLiteRuntimeStore(path)
+            store.check_ready()  # exact-version readiness still passes at the new version
+            connection = sqlite3.connect(path)
+            try:
+                cols = [row[1] for row in connection.execute("PRAGMA table_info(audit_heads)")]
+            finally:
+                connection.close()
+            self.assertIn("signed_at", cols)
+
+    def test_signed_at_migration_upgrades_an_existing_v5_store(self):
+        import sqlite3
+
+        from portmark.storage import SQLITE_SCHEMA_VERSION, SQLiteRuntimeStore
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "store.sqlite")
+            SQLiteRuntimeStore(path)  # build current schema
+            # Simulate an OLD (pre-signed_at) store: drop the column and roll user_version back.
+            connection = sqlite3.connect(path)
+            try:
+                connection.execute("ALTER TABLE audit_heads DROP COLUMN signed_at")
+                connection.execute("PRAGMA user_version = 5")
+                connection.commit()
+            finally:
+                connection.close()
+            # Reopening runs the v6 migration rather than failing readiness.
+            store = SQLiteRuntimeStore(path)
+            store.check_ready()
+            connection = sqlite3.connect(path)
+            try:
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+                cols = [row[1] for row in connection.execute("PRAGMA table_info(audit_heads)")]
+            finally:
+                connection.close()
+            self.assertEqual(version, SQLITE_SCHEMA_VERSION)
+            self.assertIn("signed_at", cols)
+
+
+class EvaluateAuditHeadTests(unittest.TestCase):
+    HOST = "host:eval"
+
+    def _v2(self, signer: EnvelopeSigner, signed_at: int, seq: int = 0):
+        from portmark.security import audit_head_payload_v2
+
+        sig = signer.sign_audit_head("t", self.HOST, "hash", seq, signed_at=signed_at)
+        return audit_head_payload_v2("t", self.HOST, "hash", seq, signed_at), sig
+
+    def _registry(self, signer: EnvelopeSigner, **identity_kwargs) -> TrustRegistry:
+        registry = TrustRegistry()
+        registry.add(
+            TrustedIdentity(key_id=signer.key_id, issuer=self.HOST, public_key=signer.public_key_bytes(), allowed_audiences=("*",), **identity_kwargs)
+        )
+        return registry
+
+    # PA3 -----------------------------------------------------------------
+    def test_verify_at_signing_time_expired_key_still_verifies_old_head(self):
+        signer = EnvelopeSigner.generate("k", self.HOST)
+        payload, sig = self._v2(signer, signed_at=1000)
+        registry = self._registry(signer, expires_at=1500)  # expired long after signing
+        evaluation = registry.evaluate_audit_head("k", payload, sig, now=5000)
+        self.assertTrue(evaluation.ok)
+        self.assertEqual(evaluation.head_status, "valid-key-expired")
+
+    def test_verify_at_signing_time_currently_valid_key_is_plain_valid(self):
+        signer = EnvelopeSigner.generate("k", self.HOST)
+        payload, sig = self._v2(signer, signed_at=1000)
+        registry = self._registry(signer)  # no expiry/revocation
+        evaluation = registry.evaluate_audit_head("k", payload, sig, now=5000)
+        self.assertTrue(evaluation.ok)
+        self.assertEqual(evaluation.head_status, "valid")
+
+    # PA4 -----------------------------------------------------------------
+    def test_four_way_status_outcomes_are_distinct(self):
+        signer = EnvelopeSigner.generate("k", self.HOST)
+        payload, sig = self._v2(signer, signed_at=1000)
+
+        # 1. signature invalid
+        bad = self._registry(signer)
+        ev = bad.evaluate_audit_head("k", payload, sig[:-2] + ("AA" if not sig.endswith("AA") else "BB"), now=5000)
+        self.assertFalse(ev.ok)
+        self.assertEqual(ev.head_status, "signature-invalid")
+
+        # 2. valid, key later expired
+        ev = self._registry(signer, expires_at=1500).evaluate_audit_head("k", payload, sig, now=5000)
+        self.assertEqual((ev.ok, ev.head_status), (True, "valid-key-expired"))
+
+        # 3. valid, key later revoked (revoked AFTER signing)
+        ev = self._registry(signer, revoked=True, revoked_at=1500).evaluate_audit_head("k", payload, sig, now=5000)
+        self.assertEqual((ev.ok, ev.head_status), (True, "valid-key-revoked"))
+
+        # 4. signed after revocation
+        ev = self._registry(signer, revoked=True, revoked_at=500).evaluate_audit_head("k", payload, sig, now=5000)
+        self.assertEqual((ev.ok, ev.head_status), (False, "signed-after-revocation"))
+
+    # PA5 -----------------------------------------------------------------
+    def test_v1_legacy_policy_valid_and_revoked_suspect(self):
+        from portmark.security import audit_head_payload
+
+        signer = EnvelopeSigner.generate("k", self.HOST)
+        v1_sig = signer.sign_audit_head("t", self.HOST, "hash", 0)  # v1, no signed_at
+        v1_payload = audit_head_payload("t", self.HOST, "hash", 0)
+
+        ev = self._registry(signer).evaluate_audit_head("k", v1_payload, v1_sig, now=5000)
+        self.assertEqual((ev.ok, ev.head_status), (True, "valid-legacy-v1"))
+
+        # v1 head + now-revoked key: cannot establish pre-compromise without a signing time.
+        ev = self._registry(signer, revoked=True).evaluate_audit_head("k", v1_payload, v1_sig, now=5000)
+        self.assertEqual((ev.ok, ev.head_status), (False, "revoked-key-legacy-v1"))
+
+        # v1 head + expired key: benign expiry is NOT applied retroactively.
+        ev = self._registry(signer, expires_at=1).evaluate_audit_head("k", v1_payload, v1_sig, now=5000)
+        self.assertTrue(ev.ok)
+
+    # PA6 -----------------------------------------------------------------
+    def test_revocation_effective_time_distinguishes_before_and_after(self):
+        signer = EnvelopeSigner.generate("k", self.HOST)
+        payload, sig = self._v2(signer, signed_at=1000)
+
+        before = self._registry(signer, revoked=True, revoked_at=2000).evaluate_audit_head("k", payload, sig, now=5000)
+        self.assertEqual((before.ok, before.head_status), (True, "valid-key-revoked"))
+
+        after = self._registry(signer, revoked=True, revoked_at=1000).evaluate_audit_head("k", payload, sig, now=5000)
+        self.assertEqual((after.ok, after.head_status), (False, "signed-after-revocation"))
+
+        # revoked with NO effective time => no pre-revocation trust
+        no_time = self._registry(signer, revoked=True).evaluate_audit_head("k", payload, sig, now=5000)
+        self.assertEqual((no_time.ok, no_time.head_status), (False, "signed-after-revocation"))
+
+
 if __name__ == "__main__":
     unittest.main()
