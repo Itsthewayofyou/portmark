@@ -149,3 +149,6 @@ class RunResult:
     checkpoint: Json
     audit: tuple[Json, ...]
     migration_envelope: Json | None = None
+    # Section 4 #2: on the DESTINATION side, the signed receipt this run issued for an
+    # admitted migration (None otherwise). The source verifies it to settle delivery.
+    migration_receipt: Json | None = None

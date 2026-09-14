@@ -559,25 +559,32 @@ class SignedAtMigrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = str(Path(directory) / "store.sqlite")
             SQLiteRuntimeStore(path)  # build current schema
-            # Simulate an OLD (pre-signed_at) store: drop the column and roll user_version back.
+            # Simulate a genuine OLD v5 store: undo everything v6 (signed_at) and v7 (receipt
+            # storage) added, then roll user_version back to 5.
             connection = sqlite3.connect(path)
             try:
                 connection.execute("ALTER TABLE audit_heads DROP COLUMN signed_at")
+                connection.execute("ALTER TABLE migration_outbox DROP COLUMN receipt_json")
+                connection.execute("DROP TABLE migration_receipts")
                 connection.execute("PRAGMA user_version = 5")
                 connection.commit()
             finally:
                 connection.close()
-            # Reopening runs the v6 migration rather than failing readiness.
+            # Reopening runs the v6 + v7 migrations rather than failing readiness.
             store = SQLiteRuntimeStore(path)
             store.check_ready()
             connection = sqlite3.connect(path)
             try:
                 version = connection.execute("PRAGMA user_version").fetchone()[0]
-                cols = [row[1] for row in connection.execute("PRAGMA table_info(audit_heads)")]
+                audit_cols = [row[1] for row in connection.execute("PRAGMA table_info(audit_heads)")]
+                outbox_cols = [row[1] for row in connection.execute("PRAGMA table_info(migration_outbox)")]
+                tables = [row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")]
             finally:
                 connection.close()
             self.assertEqual(version, SQLITE_SCHEMA_VERSION)
-            self.assertIn("signed_at", cols)
+            self.assertIn("signed_at", audit_cols)
+            self.assertIn("receipt_json", outbox_cols)
+            self.assertIn("migration_receipts", tables)
 
 
 class EvaluateAuditHeadTests(unittest.TestCase):
