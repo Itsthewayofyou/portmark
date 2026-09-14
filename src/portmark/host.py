@@ -582,6 +582,9 @@ class AgentHost:
             or envelope.previous_audit_sequence <= 0
         ):
             raise SecurityError("previous audit head signature is missing")
+        # A migration handoff is a distinct purpose from ordinary audit-head signing
+        # (finding #5/#2): require the source key to carry the "migration" usage, so an
+        # operator can scope a key to audit-only and it cannot mint migration handoffs.
         self.signer.verify_audit_head(
             envelope.previous_audit_signature_key_id,
             audit_head_payload(
@@ -591,6 +594,7 @@ class AgentHost:
                 envelope.previous_audit_sequence,
             ),
             envelope.previous_audit_signature,
+            required_usage="migration",
         )
 
     def _persist(

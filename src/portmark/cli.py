@@ -6,7 +6,9 @@ import os
 import secrets
 import shlex
 import sys
+import tempfile
 from dataclasses import asdict
+from pathlib import Path
 
 from .a2a import A2AAuthConfig, serve
 from .config import RuntimeConfig
@@ -23,6 +25,57 @@ def _reject_control_characters(parser: argparse.ArgumentParser, name: str, value
         parser.error(f"{name} must not contain control characters or newlines")
 
 
+def _atomic_write_json(path: str, obj: dict) -> None:
+    # Atomic replace so a crash mid-write never leaves a half-written trust registry
+    # (finding #14). Preserve the existing file's permissions when replacing it.
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    try:
+        mode: int | None = os.stat(path).st_mode & 0o777
+    except OSError:
+        mode = None
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".trust-registry-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(obj, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if mode is not None:
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _write_out_registry(parser: argparse.ArgumentParser, path: str, new_registry: dict, merge: bool) -> None:
+    # With --force on an existing registry, MERGE the new identity in as a rotation entry
+    # rather than clobbering the file (finding #14): losing the other trusted keys on a
+    # rotation is a silent trust-downgrade. A duplicate key id carrying a different public
+    # key is a conflict, not a merge.
+    registry = new_registry
+    if merge:
+        try:
+            existing = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            parser.error(f"could not read existing trust registry {path}: {exc}")
+        if not isinstance(existing, dict) or not isinstance(existing.get("identities"), list):
+            parser.error(f"existing trust registry {path} is malformed; refusing to merge")
+        by_id = {entry.get("key_id"): entry for entry in existing["identities"] if isinstance(entry, dict)}
+        merged = list(existing["identities"])
+        for entry in new_registry.get("identities", []):
+            prior = by_id.get(entry["key_id"])
+            if prior is not None:
+                if prior.get("public_key_b64") != entry.get("public_key_b64"):
+                    parser.error(f"trust registry already has key id {entry['key_id']!r} with a different public key")
+                continue  # identical entry already present -> no-op
+            merged.append(entry)
+        registry = {**existing, "identities": merged}
+    _atomic_write_json(path, registry)
+
+
 def _run_keygen(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     from .security import generate_signing_material
 
@@ -32,8 +85,7 @@ def _run_keygen(parser: argparse.ArgumentParser, args: argparse.Namespace) -> No
         parser.error(f"{args.out_registry} already exists; pass --force to overwrite this trust registry")
     material = generate_signing_material(args.key_id, args.issuer, tuple(args.audience or ("*",)))
     if args.out_registry:
-        with open(args.out_registry, "w", encoding="utf-8") as handle:
-            json.dump(material["trust_registry"], handle, indent=2)
+        _write_out_registry(parser, args.out_registry, material["trust_registry"], merge=os.path.exists(args.out_registry))
         print(f"wrote trust registry to {args.out_registry}", file=sys.stderr)
     if args.format == "env":
         # shlex.quote every value so an operator-chosen key id / issuer cannot inject

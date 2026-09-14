@@ -653,5 +653,77 @@ class EvaluateAuditHeadTests(unittest.TestCase):
         self.assertEqual((no_time.ok, no_time.head_status), (False, "signed-after-revocation"))
 
 
+class KeygenForceMergeTests(unittest.TestCase):
+    def _keygen(self, args: list[str]) -> None:
+        with patch.object(sys, "argv", ["portmark", "keygen", *args]):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                try:
+                    cli_main()
+                except SystemExit:
+                    pass
+
+    def test_force_merge_adds_rotation_entry_without_clobbering(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trust.json"
+            self._keygen(["--key-id", "key-a", "--issuer", "user:a", "--out-registry", str(path)])
+            first = json.loads(path.read_text())
+            self.assertEqual([i["key_id"] for i in first["identities"]], ["key-a"])
+
+            self._keygen(["--key-id", "key-b", "--issuer", "user:a", "--out-registry", str(path), "--force"])
+            merged = json.loads(path.read_text())
+            self.assertEqual(sorted(i["key_id"] for i in merged["identities"]), ["key-a", "key-b"])
+
+    def test_force_merge_rejects_duplicate_key_id_with_different_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trust.json"
+            self._keygen(["--key-id", "dup", "--issuer", "user:a", "--out-registry", str(path)])
+            with patch.object(sys, "argv", ["portmark", "keygen", "--key-id", "dup", "--issuer", "user:a", "--out-registry", str(path), "--force"]):
+                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        cli_main()
+
+    def test_force_merge_preserves_restrictive_permissions(self):
+        if os.name != "posix":
+            self.skipTest("POSIX file modes only")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trust.json"
+            self._keygen(["--key-id", "key-a", "--issuer", "user:a", "--out-registry", str(path)])
+            os.chmod(path, 0o600)
+            self._keygen(["--key-id", "key-b", "--issuer", "user:a", "--out-registry", str(path), "--force"])
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+
+class MigrationUsageTests(unittest.TestCase):
+    HOST = "host:mig"
+
+    def _registry(self, signer: EnvelopeSigner, usages: tuple[str, ...]) -> TrustRegistry:
+        registry = TrustRegistry()
+        registry.add(TrustedIdentity(key_id=signer.key_id, issuer=self.HOST, public_key=signer.public_key_bytes(), allowed_audiences=("*",), usages=usages))
+        return registry
+
+    def test_migration_usage_required_for_migration_handoff_verification(self):
+        from portmark.security import audit_head_payload
+
+        signer = EnvelopeSigner.generate("k", self.HOST)
+        payload = audit_head_payload("t", self.HOST, "hash", 3)
+        sig = signer.sign_audit_head("t", self.HOST, "hash", 3)
+
+        # A key permitted only for "audit" (not "migration") is rejected when the required
+        # usage is "migration" (the migration-handoff verification path).
+        audit_only = self._registry(signer, ("audit",))
+        with self.assertRaisesRegex(SecurityError, "migration"):
+            audit_only.verify_audit_head("k", payload, sig, required_usage="migration")
+        # ... but still accepted on the ordinary audit path.
+        audit_only.verify_audit_head("k", payload, sig)  # required_usage defaults to "audit"
+
+    def test_migration_usage_permitted_key_verifies(self):
+        signer = EnvelopeSigner.generate("k", self.HOST)
+        from portmark.security import audit_head_payload
+
+        payload = audit_head_payload("t", self.HOST, "hash", 3)
+        sig = signer.sign_audit_head("t", self.HOST, "hash", 3)
+        self._registry(signer, ("envelope", "migration")).verify_audit_head("k", payload, sig, required_usage="migration")
+
+
 if __name__ == "__main__":
     unittest.main()
