@@ -42,10 +42,11 @@ Hardening from the PR review round on the above:
   the registry it verifies against; the same check re-runs before each audit head is signed, so a key
   that becomes unusable mid-process fails the run closed instead of writing invalid evidence. Enforcement
   no longer depends on readiness.
-- **`keygen --force` rotation is concurrency-safe.** read → validate → merge → replace runs under a
-  sidecar lock (`<file>.lock`, POSIX `fcntl`) so racing rotations cannot lose a key; the whole existing
-  registry is validated before merge (duplicate ids rejected, not collapsed) and the parent directory is
-  fsynced after the rename.
+- **`keygen --force` rotation is concurrency-safe on POSIX and Windows.** read → validate → merge →
+  replace runs under a sidecar lock (`<file>.lock`) — `fcntl` on POSIX, `msvcrt.locking` on Windows,
+  both OS-released on process death — so racing rotations cannot lose a key; the whole existing registry
+  is validated before merge (duplicate ids rejected, not collapsed) and the parent directory is fsynced
+  after the rename.
 
 Still deferred (a further follow-up, needs its own auditor review): the **registry rollback floor**
 (#13 — a durable minimum-accepted registry version) and the **transparency-log anchor** (external
