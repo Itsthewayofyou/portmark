@@ -41,12 +41,12 @@ class EnvelopeSigningIdentity(EnvelopeVerifier, Protocol):
     def sign_audit_head(self, task_id: str, host_id: str, head_hash: str, sequence: int, signed_at: int | None = None) -> str:
         ...
 
-    def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str) -> None:
+    def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None, required_usage: str = "audit") -> None:
         ...
 
 
 class AuditHeadVerifier(Protocol):
-    def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str) -> None:
+    def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None, required_usage: str = "audit") -> None:
         ...
 
     def evaluate_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None) -> "AuditHeadEvaluation":
@@ -250,7 +250,10 @@ class TrustRegistry:
     def identity(self, key_id: str) -> TrustedIdentity | None:
         return self._identities.get(key_id)
 
-    def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None) -> None:
+    def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None, required_usage: str = "audit") -> None:
+        # required_usage lets the migration-handoff path require the "migration" purpose
+        # (finding #5 / #2) rather than plain "audit", so an operator can issue keys scoped
+        # to audit-only or migration-only. Default "audit" keeps the ordinary path unchanged.
         identity = self._identities.get(key_id)
         if identity is None:
             raise SecurityError("audit head signing key is not trusted")
@@ -262,8 +265,8 @@ class TrustRegistry:
             raise SecurityError("audit head signing key is not active yet")
         if reason == "expired":
             raise SecurityError("audit head signing key has expired")
-        if not _identity_permits(identity, "audit"):
-            raise SecurityError("audit head signing key lacks the required 'audit' usage")
+        if not _identity_permits(identity, required_usage):
+            raise SecurityError(f"audit head signing key lacks the required '{required_usage}' usage")
         if payload.get("host_id") != identity.issuer:
             raise SecurityError("audit head signer identity does not match host")
         try:
@@ -475,12 +478,12 @@ class TrustSource:
             return self._overlay.require_identity(envelope, now)
         return registry.require_identity(envelope, now)
 
-    def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None) -> None:
+    def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None, required_usage: str = "audit") -> None:
         registry = self._verified_file()
         if self._overlay.has_key(key_id):
-            self._overlay.verify_audit_head(key_id, payload, signature, now)
+            self._overlay.verify_audit_head(key_id, payload, signature, now, required_usage=required_usage)
         else:
-            registry.verify_audit_head(key_id, payload, signature, now)
+            registry.verify_audit_head(key_id, payload, signature, now, required_usage=required_usage)
 
     def evaluate_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None) -> AuditHeadEvaluation:
         registry = self._verified_file()
@@ -923,8 +926,8 @@ class EnvelopeSigner:
             raise SecurityError("audit head host does not match signing identity")
         return _b64url_encode(self._private_key.sign(canonical_json(_audit_head_payload_for(task_id, host_id, head_hash, sequence, signed_at))))
 
-    def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str) -> None:
-        self.registry.verify_audit_head(key_id, payload, signature)
+    def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None, required_usage: str = "audit") -> None:
+        self.registry.verify_audit_head(key_id, payload, signature, now, required_usage=required_usage)
 
     def evaluate_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None) -> AuditHeadEvaluation:
         return self.registry.evaluate_audit_head(key_id, payload, signature, now)
@@ -961,7 +964,8 @@ class HmacEnvelopeSigner:
     def sign_audit_head(self, task_id: str, host_id: str, head_hash: str, sequence: int, signed_at: int | None = None) -> str:
         return hmac.new(self._key, canonical_json(_audit_head_payload_for(task_id, host_id, head_hash, sequence, signed_at)), hashlib.sha256).hexdigest()
 
-    def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str) -> None:
+    def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None, required_usage: str = "audit") -> None:
+        # Legacy HMAC has no per-key usages or lifecycle; now/required_usage are accepted for interface parity.
         if key_id != self.key_id:
             raise SecurityError("audit head signing key is not trusted")
         expected = hmac.new(self._key, canonical_json(payload), hashlib.sha256).hexdigest()
