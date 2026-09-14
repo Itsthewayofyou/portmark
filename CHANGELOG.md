@@ -6,6 +6,23 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Section 4 (part 1) — migration provenance binding
+
+- **Migration provenance can no longer be spliced between trusted hosts (finding #1, High).** When a
+  destination accepts a migrated task onto a fresh local chain, it verifies the previous-audit-head
+  anchor's signature and its `migration` usage — but it now also requires
+  `previous_audit_host_id == permit.issuer`. Combined with the existing binding of the anchor key's
+  `identity.issuer` to `previous_audit_host_id`, the recorded lineage is tied to the issuer that
+  actually delegated the migration: `previous_audit_host_id == permit.issuer == identity.issuer`.
+  Without this, an anchor validly signed by a *different* individually-trusted, migration-capable host
+  could be attached to another host's permit and recorded as false lineage.
+- Note: the legacy `HmacEnvelopeSigner` verifies neither `host_id` nor `usages`, so on that
+  demo/non-production path the new `permit.issuer` equality is the only provenance binding.
+- Still open in Section 4 (future PRs): signed idempotent destination receipts + delivery
+  reconciliation (#2, High), outbox claim/lease (#3), expiry/dead-letter recovery (#4), attestation
+  freshness (#5), migration-payload confidentiality boundary (#6), task-id namespacing (#7), and
+  outbox conflict auditing (#8).
+
 ### Section 3 (part 2) — historical audit validity + key-purpose completion
 
 - **Audit heads are signed as `portmark.audit-head.v2` with an attested `signed_at`, and verified

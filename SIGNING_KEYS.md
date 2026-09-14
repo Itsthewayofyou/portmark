@@ -29,6 +29,16 @@ The host verifier uses a `TrustRegistry` containing `TrustedIdentity` records:
   key scoped to audit-only cannot mint migration handoffs). Absent/empty means unrestricted
   (backward compatible), and the host's own self-registered key is unrestricted. A migration key
   therefore needs both `envelope` (to seal the migrated envelope) and `migration` (for the handoff).
+
+  **Migration provenance binding.** A `migration` usage on the anchor key is necessary but not
+  sufficient: when a destination records the migrated task's prior-chain anchor, it also requires the
+  anchor's host to be the permit issuer — `previous_audit_host_id == permit.issuer`. Together with the
+  anchor key's `identity.issuer == previous_audit_host_id` (enforced by audit-head verification), the
+  lineage is bound to the host that actually delegated the migration
+  (`previous_audit_host_id == permit.issuer == identity.issuer`). This stops a valid anchor signed by a
+  *different* trusted, migration-capable host from being spliced onto another host's permit. Caveat: the
+  legacy `HmacEnvelopeSigner` checks neither host nor usage, so on that demo/non-production path the
+  `permit.issuer` equality is the sole provenance binding.
 - `revoked_at` (optional): the effective epoch time of a revocation (see historical verification
   below). With `revoked=true` and `revoked_at` set, a head signed strictly before that time is
   "valid, key later revoked"; a head at/after it is "signed after revocation".
