@@ -40,6 +40,24 @@ from portmark.storage import InMemoryRuntimeStore, SQLiteRuntimeStore
 _HAS_POSIX_SH = os.path.exists("/bin/sh") and not os.environ.get("PORTMARK_TEST_NO_POSIX_SH")
 
 
+def _has_registry_lock() -> bool:
+    # The cross-process registry lock uses fcntl on POSIX and msvcrt on Windows; the
+    # concurrency test is meaningful wherever EITHER primitive exists (verified on real
+    # Windows Python: msvcrt.locking serializes 12+ concurrent threads, keeping every key,
+    # where the unlocked path drops ~11/12 and raises WinError 5 on the racing os.replace).
+    try:
+        import fcntl  # noqa: F401
+
+        return True
+    except ImportError:
+        try:
+            import msvcrt  # noqa: F401
+
+            return True
+        except ImportError:
+            return False
+
+
 def _write_registry(path: Path, signer: EnvelopeSigner, audiences=("*",), revoked: bool = False) -> None:
     entry = {
         "key_id": signer.key_id,
@@ -874,11 +892,13 @@ class KeygenForceMergeTests(unittest.TestCase):
             self._keygen(["--key-id", "key-b", "--issuer", "user:a", "--out-registry", str(path), "--force"])
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
-    @unittest.skipUnless(_HAS_POSIX_SH, "cross-process registry lock is POSIX-only (fcntl)")
+    @unittest.skipUnless(_has_registry_lock(), "no file-lock primitive available")
     def test_keygen_force_concurrent_merges_keep_every_key(self):
         # Auditor finding #4: two racing --force merges must not lose an entry. Each writer
-        # takes the sidecar lock (a fresh fd per acquisition -> flock serializes even across
-        # threads), so read->validate->merge->replace is atomic and every rotation survives.
+        # takes the sidecar lock (a fresh fd per acquisition -> the OS lock serializes even
+        # across threads: fcntl.flock on POSIX, msvcrt.locking on Windows -- both conflict
+        # across distinct handles to the same file within one process), so
+        # read->validate->merge->replace is atomic and every rotation survives.
         import argparse
         import threading
 
