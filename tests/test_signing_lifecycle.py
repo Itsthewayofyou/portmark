@@ -618,6 +618,15 @@ class EvaluateAuditHeadTests(unittest.TestCase):
         ev = self._registry(signer, revoked=True, revoked_at=500).evaluate_audit_head("k", payload, sig, now=5000)
         self.assertEqual((ev.ok, ev.head_status), (False, "signed-after-revocation"))
 
+    def test_four_way_status_revocation_takes_precedence_over_expiry(self):
+        # A v2 head signed while valid, on a key that is now BOTH expired and later-revoked:
+        # revocation is the more serious fact and wins the reported status.
+        signer = EnvelopeSigner.generate("k", self.HOST)
+        payload, sig = self._v2(signer, signed_at=1000)
+        registry = self._registry(signer, expires_at=1500, revoked=True, revoked_at=2000)
+        evaluation = registry.evaluate_audit_head("k", payload, sig, now=5000)
+        self.assertEqual((evaluation.ok, evaluation.head_status), (True, "valid-key-revoked"))
+
     # PA5 -----------------------------------------------------------------
     def test_v1_legacy_policy_valid_and_revoked_suspect(self):
         from portmark.security import audit_head_payload
