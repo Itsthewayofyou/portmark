@@ -29,6 +29,24 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   into an existing trust registry, writes atomically (temp + fsync + `os.replace`), and preserves the
   file's permissions; a duplicate key id with a different public key is rejected.
 
+Hardening from the PR review round on the above:
+
+- **Signing-time validity is now judged in strict order (High).** `evaluate_audit_head` checks
+  at/after-expiry *before* the revocation branch, so a head signed after its key expired stays
+  `signed-after-expiry` and a later revocation can no longer upgrade it into accepted
+  `valid-key-revoked` evidence.
+- **Future-dated `signed_at` is rejected (`signed-in-future`).** A `signed_at` beyond a 300s clock-skew
+  allowance (`AUDIT_HEAD_CLOCK_SKEW_SECONDS`), or a negative one, is no longer reported as `valid`.
+- **Host audit-signing key enforced at boot and at every signing (High).** `make_host` fails closed at
+  startup unless the host's own key is trusted, active, unexpired, unrevoked, and `audit`-authorized in
+  the registry it verifies against; the same check re-runs before each audit head is signed, so a key
+  that becomes unusable mid-process fails the run closed instead of writing invalid evidence. Enforcement
+  no longer depends on readiness.
+- **`keygen --force` rotation is concurrency-safe.** read → validate → merge → replace runs under a
+  sidecar lock (`<file>.lock`, POSIX `fcntl`) so racing rotations cannot lose a key; the whole existing
+  registry is validated before merge (duplicate ids rejected, not collapsed) and the parent directory is
+  fsynced after the rename.
+
 Still deferred (a further follow-up, needs its own auditor review): the **registry rollback floor**
 (#13 — a durable minimum-accepted registry version) and the **transparency-log anchor** (external
 witness for compromise-sensitive "signed before time T" proof).

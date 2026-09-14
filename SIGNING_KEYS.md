@@ -95,6 +95,25 @@ Production deployments should load private keys from a secret manager, workload 
 5. Set `expires_at` on the old key to prevent new long-lived trust.
 6. Remove or revoke the old key after the maximum envelope lifetime has passed.
 
+`portmark keygen --force --out-registry <file>` merges a new rotation entry into an existing
+registry rather than clobbering it, and the merge is **concurrency-safe**: it serializes
+read → validate → merge → replace under a sidecar lock (`<file>.lock`) so two simultaneous
+rotations cannot lose each other's key, validates the whole existing registry before merging
+(a duplicate id already in the file is rejected, not silently collapsed), and fsyncs the parent
+directory so the rename survives a crash. The cross-process lock uses `fcntl` and is POSIX-only;
+on other platforms the write stays crash-atomic but concurrent merges are not serialized.
+
+## Host Audit-Signing Key Must Be Usable At Boot
+
+A host signs every audit head with its own key. `make_host` **fails closed at startup** unless that
+key is, in the registry the host verifies audit heads against, currently trusted, active
+(`not_before` reached), unexpired, unrevoked, and authorized for the `audit` usage. Readiness only
+*reports* a bad key; startup enforcement is what stops a host from admitting a direct request and
+returning results whose audit head is invalid from birth. The same check re-runs before every audit
+head is signed, so a key that expires mid-process fails the run closed (the checkpoint stays
+resumable) rather than writing unverifiable evidence. Legacy HMAC signing has no key lifecycle and is
+exempt.
+
 ## Revoke A Key
 
 1. Mark the `TrustedIdentity` as `revoked=True` in every verifier registry.
@@ -138,7 +157,18 @@ plus a precise `head_status`:
   was **later revoked** — reported prominently, not silently accepted.
 - `signed-after-revocation` — signed at/after `revoked_at`, or the key is revoked with no effective
   time — rejected.
+- `signed-after-expiry` — signed at/after `expires_at`; the key was already invalid when it signed —
+  rejected. (A revocation recorded *later* never upgrades such a head back to accepted.)
+- `signed-in-future` — `signed_at` is more than `AUDIT_HEAD_CLOCK_SKEW_SECONDS` (300s) ahead of the
+  verifier's clock — rejected. A signer cannot honestly attest a time it has not reached; this is a
+  local sanity bound, not proof of existence-before-T (that needs the external witness below).
 - `signature-invalid` / `untrusted` / `usage-violation` / `host-mismatch` — rejected.
+
+Validity at signing time is judged in a strict order so a later lifecycle event cannot rehabilitate a
+head that was invalid when signed: **malformed/future → before activation → at/after expiry → revocation
+timing → since-expiry reporting.** Expiry-at-signing is decided *before* revocation, so a head signed
+after the key expired stays `signed-after-expiry` even if the key is revoked afterwards; among heads
+that *were* validly signed, a later revocation is reported ahead of a later expiry.
 
 **Legacy v1 policy.** A `portmark.audit-head.v1` head has no attested signing time. It verifies
 cryptographically as `valid-legacy-v1` when the key is not revoked; benign expiry/activation are NOT

@@ -7,6 +7,7 @@ import secrets
 import shlex
 import sys
 import tempfile
+from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
 
@@ -48,21 +49,75 @@ def _atomic_write_json(path: str, obj: dict) -> None:
         except OSError:
             pass
         raise
+    # Durability: fsync the parent directory so the rename itself survives a crash, not
+    # just the file contents (finding #4). Not all platforms permit opening a directory
+    # for fsync (Windows); best-effort there.
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
+
+
+@contextmanager
+def _registry_write_lock(path: str):
+    """Serialize read -> validate -> merge -> replace across concurrent writers (finding #4).
+
+    Locks a SIDE-CAR file (`<path>.lock`) that is never renamed. Locking `path` itself is
+    defeated by the atomic `os.replace`: it swaps the inode, so a second writer locks the
+    NEW inode and proceeds concurrently, silently discarding the first writer's rotation
+    entry. POSIX uses fcntl.flock; on platforms without it (Windows) the lock is a
+    documented no-op -- the write stays crash-atomic, only cross-process merge races are
+    not serialized there.
+    """
+    lock_path = path + ".lock"
+    directory = os.path.dirname(os.path.abspath(lock_path)) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            import fcntl
+        except ImportError:
+            fcntl = None  # type: ignore[assignment]  # non-POSIX: documented no-op
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
 
 
 def _write_out_registry(parser: argparse.ArgumentParser, path: str, new_registry: dict, merge: bool) -> None:
+    with _registry_write_lock(path):
+        _write_out_registry_locked(parser, path, new_registry, merge)
+
+
+def _write_out_registry_locked(parser: argparse.ArgumentParser, path: str, new_registry: dict, merge: bool) -> None:
     # With --force on an existing registry, MERGE the new identity in as a rotation entry
     # rather than clobbering the file (finding #14): losing the other trusted keys on a
     # rotation is a silent trust-downgrade. A duplicate key id carrying a different public
     # key is a conflict, not a merge.
+    # Re-check existence INSIDE the lock: two racers that both saw the file absent before
+    # locking must not both create-and-clobber. If it exists now, merge regardless of the
+    # caller's pre-lock guess (finding #4).
     registry = new_registry
-    if merge:
+    if merge or os.path.exists(path):
         try:
             existing = json.loads(Path(path).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             parser.error(f"could not read existing trust registry {path}: {exc}")
-        if not isinstance(existing, dict) or not isinstance(existing.get("identities"), list):
-            parser.error(f"existing trust registry {path} is malformed; refusing to merge")
+        # Validate the WHOLE existing registry before merging (finding #4): the loose dict
+        # build below would silently collapse duplicate ids already in the file and accept
+        # malformed entries. _parse_trust_registry enforces strict types, 32-byte keys, and
+        # duplicate-id rejection -- fail closed rather than propagate a corrupt registry.
+        from .security import _parse_trust_registry
+
+        try:
+            _parse_trust_registry(existing)
+        except ValueError as exc:
+            parser.error(f"existing trust registry {path} is invalid; refusing to merge: {exc}")
         by_id = {entry.get("key_id"): entry for entry in existing["identities"] if isinstance(entry, dict)}
         merged = list(existing["identities"])
         for entry in new_registry.get("identities", []):
