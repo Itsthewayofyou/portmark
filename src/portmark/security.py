@@ -113,6 +113,14 @@ class AuditHeadEvaluation:
     detail: str
 
 
+# Clock-skew allowance for a v2 audit head's attested `signed_at` (finding #3). A signed_at
+# more than this many seconds ahead of the verifier's clock is rejected as `signed-in-future`:
+# a signer cannot honestly attest a time it has not reached, and an unbounded future timestamp
+# would otherwise be reported as ordinary valid evidence. This is a local sanity bound, not a
+# proof of existence-before-T -- that needs the external transparency-log witness (deferred).
+AUDIT_HEAD_CLOCK_SKEW_SECONDS = 300
+
+
 def canonical_json(value: Any) -> bytes:
     # allow_nan=False: NaN/Infinity are not valid JSON and, if emitted, would not
     # round-trip through a strict parser or survive re-canonicalization -- breaking
@@ -237,6 +245,25 @@ class TrustRegistry:
         current_time = int(time.time()) if now is None else now
         return _identity_unusable_reason(identity, current_time) is None
 
+    def audit_signing_reason(self, key_id: str, now: int | None = None) -> str | None:
+        """Why the key MAY NOT sign audit heads right now, or None if it may (finding #2).
+
+        A host must not sign new audit evidence with a key that is untrusted, not yet
+        active, expired, revoked, or not authorized for the `audit` purpose -- such heads
+        are invalid from birth. This is the enforcement boundary make_host checks at boot
+        and host._persist rechecks before every signing, so it fails closed rather than
+        relying on readiness (which only reports)."""
+        identity = self._identities.get(key_id)
+        if identity is None:
+            return "untrusted"
+        current_time = int(time.time()) if now is None else now
+        reason = _identity_unusable_reason(identity, current_time)
+        if reason is not None:
+            return reason
+        if not _identity_permits(identity, "audit"):
+            return "usage"
+        return None
+
     def add(self, identity: TrustedIdentity) -> None:
         if identity.key_id in self._identities:
             raise ValueError(f"duplicate signing key id {identity.key_id!r}")
@@ -306,14 +333,31 @@ class TrustRegistry:
             return AuditHeadEvaluation(True, "valid-legacy-v1", "v1 audit head cryptographically valid (legacy: signing time not attested)")
         if not isinstance(signed_at, int) or isinstance(signed_at, bool):
             return AuditHeadEvaluation(False, "signature-invalid", "audit head signed_at is malformed")
-        if identity.not_before and signed_at < identity.not_before:
+        if signed_at < 0:
+            return AuditHeadEvaluation(False, "signature-invalid", "audit head signed_at is malformed (negative)")
+        # A signer cannot honestly attest a signing time it has not reached. Reject a
+        # future-dated signed_at beyond a small clock-skew allowance (finding #3) -- without
+        # this, signed_at=9999999999 was reported as ordinary `valid` evidence. This is a
+        # sanity bound only; proof that a head existed no later than time T needs the
+        # external transparency-log witness (deferred), not the signer's own timestamp.
+        if signed_at > current_time + AUDIT_HEAD_CLOCK_SKEW_SECONDS:
+            return AuditHeadEvaluation(False, "signed-in-future", "audit head signed_at is in the future beyond the allowed clock skew")
+        # Validity is judged AT SIGNING TIME, in strict lifecycle order. Activation and
+        # expiry-at-signing decide whether the key was valid WHEN it signed; only if it
+        # was do we report a later revocation/expiry. Expiry-at-signing must precede the
+        # revocation branch (finding #1): otherwise a head signed after the key expired
+        # (already invalid) was upgraded to accepted `valid-key-revoked` by a later
+        # revocation.
+        if signed_at < identity.not_before:
             return AuditHeadEvaluation(False, "signed-before-activation", "audit head signed before the key's activation time")
+        if identity.expires_at is not None and identity.expires_at <= signed_at:
+            return AuditHeadEvaluation(False, "signed-after-expiry", "audit head signed after the signing key expired")
+        # Signed while the key was valid. Report the most serious later lifecycle fact,
+        # with revocation taking precedence over a since-expiry.
         if identity.revoked:
             if identity.revoked_at is not None and signed_at < identity.revoked_at:
                 return AuditHeadEvaluation(True, "valid-key-revoked", f"audit head cryptographically valid; signing key was later revoked (effective {identity.revoked_at})")
             return AuditHeadEvaluation(False, "signed-after-revocation", "audit head signed at/after the signing key's revocation (or the key is revoked with no effective time)")
-        if identity.expires_at is not None and identity.expires_at <= signed_at:
-            return AuditHeadEvaluation(False, "signed-after-expiry", "audit head signed after the signing key expired")
         if identity.expires_at is not None and identity.expires_at <= current_time:
             return AuditHeadEvaluation(True, "valid-key-expired", "audit head cryptographically valid; signing key has since expired")
         return AuditHeadEvaluation(True, "valid", "audit head verified")
@@ -471,6 +515,12 @@ class TrustSource:
         if self._overlay.has_key(key_id):
             return self._overlay.is_usable(key_id, now)
         return registry.is_usable(key_id, now)
+
+    def audit_signing_reason(self, key_id: str, now: int | None = None) -> str | None:
+        registry = self._verified_file()
+        if self._overlay.has_key(key_id):
+            return self._overlay.audit_signing_reason(key_id, now)
+        return registry.audit_signing_reason(key_id, now)
 
     def require_identity(self, envelope: AgentEnvelope, now: int | None = None) -> TrustedIdentity:
         registry = self._verified_file()

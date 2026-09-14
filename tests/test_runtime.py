@@ -496,6 +496,10 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(SecurityError, "not trusted"):
             host.run(unknown)
 
+        # A host whose OWN audit-signing key is expired or revoked must not even START:
+        # make_host now fails closed at boot (finding #2) rather than admitting work whose
+        # audit head would be invalid from birth. This is strictly stronger than the former
+        # request-time rejection -- the key never gets a chance to sign.
         now = int(time.time())
         expired_registry = TrustRegistry((
             TrustedIdentity("expired-key", "host:local-demo", signer.public_key_bytes(), ("host:local-demo",), expires_at=now - 1),
@@ -503,10 +507,8 @@ class RuntimeTests(unittest.TestCase):
         expired_signer = EnvelopeSigner.from_private_key_bytes(
             "expired-key", "host:local-demo", signer.private_key_bytes(), ("host:local-demo",), expired_registry
         )
-        expired_host = make_host(signer=expired_signer)
-        expired = make_demo_envelope(expired_host, "expired key")
-        with self.assertRaisesRegex(SecurityError, "expired"):
-            expired_host.run(expired)
+        with self.assertRaisesRegex(ValueError, "cannot sign audit heads .expired"):
+            make_host(signer=expired_signer)
 
         revoked_registry = TrustRegistry((
             TrustedIdentity("revoked-key", "host:local-demo", signer.public_key_bytes(), ("host:local-demo",), revoked=True),
@@ -514,10 +516,8 @@ class RuntimeTests(unittest.TestCase):
         revoked_signer = EnvelopeSigner.from_private_key_bytes(
             "revoked-key", "host:local-demo", signer.private_key_bytes(), ("host:local-demo",), revoked_registry
         )
-        revoked_host = make_host(signer=revoked_signer)
-        revoked = make_demo_envelope(revoked_host, "revoked key")
-        with self.assertRaisesRegex(SecurityError, "revoked"):
-            revoked_host.run(revoked)
+        with self.assertRaisesRegex(ValueError, "cannot sign audit heads .revoked"):
+            make_host(signer=revoked_signer)
 
     def test_attested_execution_accepts_approved_measurement(self):
         authority = AttestationAuthority.generate()

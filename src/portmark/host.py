@@ -631,6 +631,22 @@ class AgentHost:
             # verification can be judged at signing time. One timestamp per persist; returned
             # alongside (key_id, signature) so the store persists it for later verification.
             head_signed_at = int(time.time())
+            # Finding #2 (runtime enforcement): fail closed if the audit-signing key stopped
+            # being usable while the process ran (e.g. it expired past its expires_at, which
+            # no on-disk file change would catch). We are about to sign a new audit head; if
+            # the key can no longer sign one we refuse rather than write evidence that is
+            # invalid from birth. Raising inside the transaction rolls back the nonce, the
+            # audit append, and the checkpoint together -- a closing _persist that trips this
+            # leaves the task in its prior (resumable) state, to be completed after a restart
+            # with a usable key. Legacy HMAC has no key lifecycle and exposes no registry.
+            audit_trust = getattr(self.signer, "registry", None)
+            if audit_trust is not None and hasattr(audit_trust, "audit_signing_reason"):
+                signing_reason = audit_trust.audit_signing_reason(self.signer.key_id, now=head_signed_at)
+                if signing_reason is not None:
+                    raise SecurityError(
+                        f"audit-signing key {self.signer.key_id!r} is no longer usable ({signing_reason}); "
+                        "refusing to sign a new audit head"
+                    )
             transaction.append_audit_events(
                 state.task_id,
                 self.host_id,
