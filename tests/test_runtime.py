@@ -2362,10 +2362,12 @@ class RuntimeTests(unittest.TestCase):
                     # into lists, so compare the canonical encodings, not the raw dict.
                     self.assertEqual(row["sealed_envelope_json"], canonical_json(result.migration_envelope).decode("utf-8"))
 
-                    # Delivery API: attempts increment; delivery clears it from pending.
+                    # Delivery API: attempts increment; settlement (with a verified receipt,
+                    # section 4 #2) clears it from pending and records the receipt on the row.
                     store.record_migration_attempt(result.task_id)
                     self.assertEqual(store.list_pending_migrations()[0]["attempt_count"], 1)
-                    store.mark_migration_delivered(result.task_id)
+                    receipt_json = json.dumps({"type": "portmark.migration-receipt.v1", "task_id": result.task_id})
+                    store.mark_migration_delivered(result.task_id, receipt_json)
                     self.assertEqual(store.list_pending_migrations(), [])
 
     def test_completed_run_writes_no_outbox_row(self):
@@ -3234,6 +3236,309 @@ class RuntimeTests(unittest.TestCase):
         # no checkpoint and no audit chain were persisted for the spliced task at the destination.
         self.assertIsNone(fresh_destination.store.load_checkpoint(spliced.state.task_id))
         self.assertIsNone(fresh_destination.store.audit_head(spliced.state.task_id))
+
+    def test_migration_envelope_digest_roundtrip_is_stable(self):
+        # Section 4 finding #2: a migration receipt binds to the sealed envelope by digest.
+        # The source digests its stored outbox JSON; the destination digests asdict() of the
+        # envelope it reconstructed from the wire. Those MUST match, or a receipt can never
+        # settle the delivery it belongs to. Pin the round-trip before anything depends on it.
+        from portmark.security import migration_envelope_digest
+
+        source_signer = EnvelopeSigner.generate("dg-source", "host:a", ("host:a", "host:destination"))
+        destination_signer = trust_signer(
+            EnvelopeSigner.generate("dg-dest", "host:destination", ("host:destination",)),
+            source_signer,
+        )
+        source = make_host(host_id="host:a", signer=source_signer)
+        destination = make_host(host_id="host:destination", signer=destination_signer)
+        source.policy.migration = MigrationPolicy(allowed=True, destinations=(destination.host_id,))
+        provider = MigrateThenCompleteProvider(destination.host_id)
+        source.providers["migrator"] = provider
+        envelope = make_demo_envelope(source, "digest", "migrator")
+        object.__setattr__(envelope.permit, "delegation_allowed", True)
+        source.signer.seal(envelope)
+        first = source.run(envelope)
+
+        sealed = first.migration_envelope  # source form: asdict(migrated)
+        wire = canonical_json(sealed).decode("utf-8")  # what the source enqueues / ships
+        reconstructed = asdict(envelope_from_dict(json.loads(wire)))  # destination's dict
+
+        self.assertEqual(migration_envelope_digest(sealed), migration_envelope_digest(reconstructed))
+        self.assertEqual(migration_envelope_digest(json.loads(wire)), migration_envelope_digest(reconstructed))
+
+    def test_migration_receipt_sign_verify(self):
+        from portmark.security import migration_receipt_payload
+
+        dest = EnvelopeSigner.generate("rcpt-dest", "host:destination", ("host:destination",))
+        source = EnvelopeSigner.generate("rcpt-source", "host:a", ("host:a",))
+        trust_signer(source, dest)  # the source trusts the destination's receipt key (unrestricted usage)
+
+        payload = migration_receipt_payload(
+            task_id="t1", source_host_id="host:a", destination_host_id="host:destination",
+            permit_nonce="n1", envelope_digest="deadbeef",
+            destination_checkpoint_generation=0, destination_audit_head="head1", accepted_at=1000,
+        )
+        receipt = dest.sign_migration_receipt(payload)
+        source.verify_migration_receipt(receipt)  # valid: trusted key, receipt usage, issuer==destination
+
+        tampered = {**receipt, "destination_checkpoint_generation": 99}
+        with self.assertRaisesRegex(SecurityError, "signature is invalid"):
+            source.verify_migration_receipt(tampered)
+
+        # a key lacking the 'receipt' usage is rejected
+        limited = EnvelopeSigner.generate("rcpt-limited", "host:destination", ("host:destination",))
+        source.registry.add(TrustedIdentity(limited.key_id, "host:destination", limited.public_key_bytes(), ("*",), usages=("audit",)))
+        with self.assertRaisesRegex(SecurityError, "lacks the required 'receipt' usage"):
+            source.verify_migration_receipt(limited.sign_migration_receipt(payload))
+
+        # a signer whose issuer != destination_host_id cannot mint the receipt at all
+        wrong = EnvelopeSigner.generate("rcpt-wrong", "host:c", ("host:c",))
+        with self.assertRaisesRegex(SecurityError, "destination does not match signing identity"):
+            wrong.sign_migration_receipt(payload)
+
+    def _migration_pair(self, directory):
+        # A source + destination that trust each other BOTH ways: the destination trusts the
+        # source's migration key (anchor), and the source trusts the destination's receipt key.
+        source_signer = EnvelopeSigner.generate("mr-source", "host:source", ("host:source", "host:destination"))
+        destination_signer = trust_signer(
+            EnvelopeSigner.generate("mr-dest", "host:destination", ("host:destination",)),
+            source_signer,
+        )
+        trust_signer(source_signer, destination_signer)  # source trusts the destination's receipt key
+        source_store = SQLiteRuntimeStore(Path(directory) / "source.sqlite")
+        destination_store = SQLiteRuntimeStore(Path(directory) / "dest.sqlite")
+        source = make_host(host_id="host:source", signer=source_signer, store=source_store, allow_ephemeral_signing_key=True)
+        destination = make_host(host_id="host:destination", signer=destination_signer, store=destination_store, allow_ephemeral_signing_key=True)
+        source.policy.migration = MigrationPolicy(allowed=True, destinations=("host:destination",))
+        provider = MigrateThenCompleteProvider("host:destination")
+        source.providers["migrator"] = provider
+        destination.providers["migrator"] = provider
+        envelope = make_demo_envelope(source, "receipt", "migrator")
+        object.__setattr__(envelope.permit, "delegation_allowed", True)
+        source.signer.seal(envelope)
+        return source, destination, destination_signer, envelope
+
+    def test_migration_receipt_issued_on_admission(self):
+        from portmark.security import migration_envelope_digest
+
+        with tempfile.TemporaryDirectory() as directory:
+            source, destination, _, envelope = self._migration_pair(directory)
+            first = source.run(envelope)
+            self.assertIsNone(first.migration_receipt)  # the source issues none
+
+            migrated = envelope_from_dict(first.migration_envelope)
+            second = destination.run(migrated)
+            self.assertEqual(second.status, "completed")
+            receipt = second.migration_receipt
+            self.assertIsNotNone(receipt)
+            self.assertEqual(receipt["type"], "portmark.migration-receipt.v1")
+            self.assertEqual(receipt["task_id"], migrated.state.task_id)
+            self.assertEqual(receipt["source_host_id"], "host:source")
+            self.assertEqual(receipt["destination_host_id"], "host:destination")
+            self.assertEqual(receipt["permit_nonce"], migrated.permit.nonce)
+            self.assertEqual(receipt["envelope_digest"], migration_envelope_digest(first.migration_envelope))
+            # The receipt was written in the admission transaction: it is durably stored.
+            self.assertEqual(destination.store.get_migration_receipt(migrated.state.task_id), receipt)
+
+    def test_migration_settlement_verifies_before_marking_delivered(self):
+        from portmark.security import migration_receipt_payload
+
+        with tempfile.TemporaryDirectory() as directory:
+            source, destination, destination_signer, envelope = self._migration_pair(directory)
+            first = source.run(envelope)
+            migrated = envelope_from_dict(first.migration_envelope)
+            receipt = destination.run(migrated).migration_receipt
+            task_id = migrated.state.task_id
+            self.assertEqual(len(source.store.list_pending_migrations()), 1)
+
+            # tampered receipt (bad signature) -> rejected, row stays pending
+            with self.assertRaisesRegex(SecurityError, "signature is invalid"):
+                source.settle_migration(task_id, {**receipt, "destination_audit_head": "forged"})
+            self.assertEqual(len(source.store.list_pending_migrations()), 1)
+
+            # validly-signed receipt whose bindings don't match this row -> rejected, still pending
+            mismatched = destination_signer.sign_migration_receipt(migration_receipt_payload(
+                task_id=task_id, source_host_id="host:source", destination_host_id="host:destination",
+                permit_nonce=migrated.permit.nonce, envelope_digest="wrong-digest",
+                destination_checkpoint_generation=1, destination_audit_head="h", accepted_at=1,
+            ))
+            with self.assertRaisesRegex(SecurityError, "does not match the outbox row"):
+                source.settle_migration(task_id, mismatched)
+            self.assertEqual(len(source.store.list_pending_migrations()), 1)
+
+            # the genuine receipt settles the row
+            source.settle_migration(task_id, receipt)
+            self.assertEqual(source.store.list_pending_migrations(), [])
+
+    def test_migration_settlement_names_missing_destination_trust(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, destination, _, envelope = self._migration_pair(directory)
+            first = source.run(envelope)
+            migrated = envelope_from_dict(first.migration_envelope)
+            receipt = destination.run(migrated).migration_receipt
+            # A source that does NOT trust the destination's receipt key cannot settle.
+            untrusting_signer = EnvelopeSigner.generate("mr-source", "host:source", ("host:source", "host:destination"))
+            untrusting = make_host(host_id="host:source", signer=untrusting_signer, store=source.store, allow_ephemeral_signing_key=True)
+            with self.assertRaisesRegex(SecurityError, "signing key is not trusted"):
+                untrusting.settle_migration(migrated.state.task_id, receipt)
+
+    def test_migration_duplicate_delivery_returns_receipt(self):
+        # Auditor scenario: a lost ack triggers a re-delivery of the SAME envelope. Pre-fix this
+        # raised "envelope audit head does not match stored audit head" (an undifferentiated replay
+        # error) and the source could not settle. Now the destination returns the SAME receipt
+        # without re-executing, so delivery can settle.
+        with tempfile.TemporaryDirectory() as directory:
+            source, destination, _, envelope = self._migration_pair(directory)
+            sealed = source.run(envelope).migration_envelope
+
+            first_receipt = destination.run(envelope_from_dict(sealed)).migration_receipt
+            self.assertIsNotNone(first_receipt)
+
+            # re-deliver the identical envelope: SAME receipt, no replay error
+            again = destination.run(envelope_from_dict(sealed))
+            self.assertEqual(again.migration_receipt, first_receipt)
+
+            # a DIFFERENT envelope squatting the same task id (re-sealed with a new nonce) is rejected
+            squatter = envelope_from_dict(sealed)
+            object.__setattr__(squatter.permit, "nonce", "squatting-nonce")
+            source.signer.seal(squatter)
+            with self.assertRaisesRegex(SecurityError, "different envelope"):
+                destination.run(squatter)
+
+    def test_migration_lost_ack_settles_instead_of_staying_pending(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, destination, _, envelope = self._migration_pair(directory)
+            sealed = source.run(envelope).migration_envelope
+            task_id = envelope_from_dict(sealed).state.task_id
+            self.assertEqual(len(source.store.list_pending_migrations()), 1)  # pending before delivery
+
+            destination.run(envelope_from_dict(sealed))  # destination admits; imagine the ACK is now lost
+            self.assertEqual(len(source.store.list_pending_migrations()), 1)  # still pending (no ack)
+
+            # dispatcher retries the exact envelope; the destination returns the same receipt
+            receipt = destination.run(envelope_from_dict(sealed)).migration_receipt
+            source.settle_migration(task_id, receipt)
+            self.assertEqual(source.store.list_pending_migrations(), [])  # settled, not stuck forever
+
+    def test_migration_receipt_rejects_unsigned_fields(self):
+        # Auditor follow-up (Medium): the signature covers only the body fields, so an unsigned extra
+        # field must NOT ride inside a verified receipt (it would be persisted as if signed). Pre-fix
+        # the auditor reproduced UNSIGNED_EXTRA_SETTLED=True with a `completion_status` field.
+        from portmark.security import migration_receipt_payload
+
+        dest = EnvelopeSigner.generate("uf-dest", "host:destination", ("host:destination",))
+        source = EnvelopeSigner.generate("uf-source", "host:a", ("host:a",))
+        trust_signer(source, dest)
+        payload = migration_receipt_payload(
+            task_id="t", source_host_id="host:a", destination_host_id="host:destination",
+            permit_nonce="n", envelope_digest="d", destination_checkpoint_generation=1,
+            destination_audit_head="h", accepted_at=1,
+        )
+        receipt = dest.sign_migration_receipt(payload)
+        source.verify_migration_receipt(receipt)  # baseline: exact field set verifies
+
+        with self.assertRaisesRegex(SecurityError, "unexpected fields"):  # extra scalar, signature unchanged
+            source.verify_migration_receipt({**receipt, "completion_status": "completed"})
+        with self.assertRaisesRegex(SecurityError, "unexpected fields"):  # extra nested object
+            source.verify_migration_receipt({**receipt, "extra": {"nested": True}})
+
+        # HMAC path enforces the same exact-shape rule
+        hm = HmacEnvelopeSigner(b"k" * 32, "hmac-receipt-key")
+        h_receipt = hm.sign_migration_receipt(payload)
+        hm.verify_migration_receipt(h_receipt)
+        with self.assertRaisesRegex(SecurityError, "unexpected fields"):
+            hm.verify_migration_receipt({**h_receipt, "completion_status": "completed"})
+
+        # End-to-end: settle refuses an extra-field receipt and the row stays pending.
+        with tempfile.TemporaryDirectory() as directory:
+            src_host, dst_host, _, envelope = self._migration_pair(directory)
+            migrated = envelope_from_dict(src_host.run(envelope).migration_envelope)
+            good = dst_host.run(migrated).migration_receipt
+            with self.assertRaisesRegex(SecurityError, "unexpected fields"):
+                src_host.settle_migration(migrated.state.task_id, {**good, "completion_status": "completed"})
+            self.assertEqual(len(src_host.store.list_pending_migrations()), 1)  # still pending
+            src_host.settle_migration(migrated.state.task_id, good)  # genuine receipt settles
+            self.assertEqual(src_host.store.list_pending_migrations(), [])
+
+    def test_migration_receipt_verify_rejection_branches(self):
+        # Exercise every rejection path in receipt verification (Ed25519 + HMAC).
+        from portmark.security import migration_receipt_payload
+
+        dest = EnvelopeSigner.generate("br-dest", "host:destination", ("host:destination",))
+        pub = dest.public_key_bytes()
+        payload = migration_receipt_payload(
+            task_id="t", source_host_id="host:a", destination_host_id="host:destination",
+            permit_nonce="n", envelope_digest="d", destination_checkpoint_generation=1,
+            destination_audit_head="h", accepted_at=1000,
+        )
+        receipt = dest.sign_migration_receipt(payload)
+
+        def reg(**kw):
+            registry = TrustRegistry()
+            registry.add(TrustedIdentity("br-dest", "host:destination", pub, ("*",), **kw))
+            return registry
+
+        # sign rejects a malformed payload (missing field / unknown type)
+        with self.assertRaisesRegex(SecurityError, "missing a required field"):
+            dest.sign_migration_receipt({k: v for k, v in payload.items() if k != "accepted_at"})
+        with self.assertRaisesRegex(SecurityError, "unknown type"):
+            dest.sign_migration_receipt({**payload, "type": "nope"})
+
+        # verify: right key set but wrong type value -> unknown type; empty signature -> missing
+        with self.assertRaisesRegex(SecurityError, "unknown type"):
+            reg().verify_migration_receipt({**receipt, "type": "nope"})
+        with self.assertRaisesRegex(SecurityError, "signature is missing"):
+            reg().verify_migration_receipt({**receipt, "signature": ""})
+        # untrusted / revoked / not-yet-active / expired / wrong-usage / host-mismatch / bad-sig
+        with self.assertRaisesRegex(SecurityError, "not trusted"):
+            TrustRegistry().verify_migration_receipt(receipt)
+        with self.assertRaisesRegex(SecurityError, "has been revoked"):
+            reg(revoked=True).verify_migration_receipt(receipt, now=1000)
+        with self.assertRaisesRegex(SecurityError, "not active yet"):
+            reg(not_before=5000).verify_migration_receipt(receipt, now=1000)
+        with self.assertRaisesRegex(SecurityError, "has expired"):
+            reg(expires_at=500).verify_migration_receipt(receipt, now=1000)
+        with self.assertRaisesRegex(SecurityError, "'receipt' usage"):
+            reg(usages=("audit",)).verify_migration_receipt(receipt, now=1000)
+        elsewhere = TrustRegistry()
+        elsewhere.add(TrustedIdentity("br-dest", "host:elsewhere", pub, ("*",)))
+        with self.assertRaisesRegex(SecurityError, "does not match the destination host"):
+            elsewhere.verify_migration_receipt(receipt, now=1000)
+        flipped = receipt["signature"][:-2] + ("AA" if not receipt["signature"].endswith("AA") else "BB")
+        with self.assertRaisesRegex(SecurityError, "signature is invalid"):
+            reg().verify_migration_receipt({**receipt, "signature": flipped}, now=1000)
+
+        # HMAC path: baseline verifies; wrong key and bad signature rejected
+        hm = HmacEnvelopeSigner(b"k" * 32, "hk")
+        h_receipt = hm.sign_migration_receipt(payload)
+        hm.verify_migration_receipt(h_receipt)
+        with self.assertRaisesRegex(SecurityError, "not trusted"):
+            HmacEnvelopeSigner(b"k" * 32, "other").verify_migration_receipt(h_receipt)
+        with self.assertRaisesRegex(SecurityError, "signature is invalid"):
+            hm.verify_migration_receipt({**h_receipt, "signature": "00"})
+
+    def test_migration_receipt_write_failure_rolls_back_admission(self):
+        # Atomicity: the receipt is written inside the destination's admission transaction, so if the
+        # receipt insert fails the WHOLE admission rolls back -- no checkpoint, no consumed nonce, no
+        # audit head, no partial receipt.
+        import portmark.storage as storage_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            source, destination, _, envelope = self._migration_pair(directory)
+            migrated = envelope_from_dict(source.run(envelope).migration_envelope)
+            task_id = migrated.state.task_id
+
+            def boom(self, task_id, receipt_json):  # noqa: ARG001
+                raise RuntimeError("simulated receipt write failure")
+
+            with patch.object(storage_module._SQLiteTransaction, "store_migration_receipt", boom):
+                with self.assertRaises(RuntimeError):
+                    destination.run(migrated)
+
+            self.assertIsNone(destination.store.load_checkpoint(task_id))
+            self.assertIsNone(destination.store.audit_head(task_id))
+            self.assertFalse(destination.store.consumed_nonce_exists(migrated.permit.nonce))
+            self.assertIsNone(destination.store.get_migration_receipt(task_id))
 
     def test_attested_migration_requires_destination_evidence_and_resumes(self):
         authority = AttestationAuthority.generate()

@@ -16,8 +16,8 @@ from .models import AgentState
 from .security import AUDIT_HASH_VERSION, AuditHeadVerifier, SecurityError, _audit_head_payload_for, audit_event_record, canonical_json
 
 
-SQLITE_SCHEMA_VERSION = 6
-POSTGRES_SCHEMA_VERSION = 4
+SQLITE_SCHEMA_VERSION = 7
+POSTGRES_SCHEMA_VERSION = 5
 
 
 def _advisory_lock_key(name: str) -> int:
@@ -87,6 +87,16 @@ class RuntimeTransaction(Protocol):
         """
         ...
 
+    def store_migration_receipt(self, task_id: str, receipt_json: str) -> None:
+        """Persist the destination's signed migration receipt (section 4 #2).
+
+        Called INSIDE the destination's admission transaction, so a crash cannot leave a
+        task admitted without a receipt to prove it. Idempotent per task_id: the first
+        receipt stored wins, so a duplicate delivery returns the same proof rather than a
+        new one.
+        """
+        ...
+
 
 class RuntimeStore(Protocol):
     # Whether checkpoints/audit heads survive a process restart. A durable store must
@@ -118,14 +128,31 @@ class RuntimeStore(Protocol):
         Portmark stores the sealed envelope durably but does NOT run a dispatcher:
         production delivery requires the embedder to run one that enumerates these
         rows, ships the sealed envelope to the destination, calls
-        `record_migration_attempt` on each try, and `mark_migration_delivered` on
-        acknowledgement. Without a dispatcher a migration stays pending and is never
-        delivered. Duplicate delivery is safe -- the destination's nonce/CAS
-        enforcement rejects a replay.
+        `record_migration_attempt` on each try, and settles delivery ONLY on a
+        verified destination receipt (section 4 #2): the destination returns a signed
+        receipt, the source verifies it against the destination's trusted key, then
+        calls `mark_migration_delivered(task_id, receipt_json)`. Without a dispatcher a
+        migration stays pending and is never delivered. Duplicate delivery is safe --
+        the destination returns the SAME receipt rather than re-executing.
         """
         ...
 
-    def mark_migration_delivered(self, task_id: str) -> None:
+    def get_migration_receipt(self, task_id: str) -> dict[str, Any] | None:
+        """The destination-issued receipt for an admitted migration, or None (section 4 #2).
+
+        Read on the DESTINATION side so a duplicate delivery of an already-admitted
+        migration returns the same receipt instead of a replay error.
+        """
+        ...
+
+    def mark_migration_delivered(self, task_id: str, receipt_json: str) -> None:
+        """Settle a source outbox row against a verified destination receipt (section 4 #2).
+
+        `receipt_json` is the receipt the source has ALREADY verified (signature + all
+        bindings) before calling this; the store persists it on the row and flips the
+        row to delivered. Passing an unverified receipt defeats the settlement, so the
+        verification belongs at the host layer (`AgentHost.settle_migration`), not here.
+        """
         ...
 
     def record_migration_attempt(self, task_id: str) -> None:
@@ -151,6 +178,7 @@ class InMemoryRuntimeStore:
         self._audit_events: dict[str, list[dict[str, Any]]] = {}
         self._audit_heads: dict[str, dict[str, Any]] = {}
         self._outbox: dict[str, dict[str, Any]] = {}
+        self._migration_receipts: dict[str, str] = {}
         self._audit_head_verifier: AuditHeadVerifier | None = None
 
     def set_audit_head_verifier(self, verifier: AuditHeadVerifier) -> None:
@@ -165,11 +193,17 @@ class InMemoryRuntimeStore:
         rows.sort(key=lambda row: (row["created_at"], row["task_id"]))
         return rows
 
-    def mark_migration_delivered(self, task_id: str) -> None:
+    def get_migration_receipt(self, task_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            stored = self._migration_receipts.get(task_id)
+        return None if stored is None else json.loads(stored)
+
+    def mark_migration_delivered(self, task_id: str, receipt_json: str) -> None:
         with self._lock:
             row = self._outbox.get(task_id)
             if row is not None:
                 row["status"] = "delivered"
+                row["receipt_json"] = receipt_json
 
     def record_migration_attempt(self, task_id: str) -> None:
         with self._lock:
@@ -225,7 +259,7 @@ class InMemoryRuntimeStore:
 class _InMemoryTransaction:
     def __init__(self, store: InMemoryRuntimeStore) -> None:
         self._store = store
-        self._snapshots: tuple[dict[str, Any], dict[str, Any], dict[str, list[dict[str, Any]]], dict[str, dict[str, Any]], dict[str, dict[str, Any]]] | None = None
+        self._snapshots: tuple[dict[str, Any], dict[str, Any], dict[str, list[dict[str, Any]]], dict[str, dict[str, Any]], dict[str, dict[str, Any]], dict[str, str]] | None = None
 
     def __enter__(self) -> "_InMemoryTransaction":
         self._store._lock.acquire()
@@ -235,6 +269,9 @@ class _InMemoryTransaction:
             json.loads(json.dumps(self._store._audit_events)),
             json.loads(json.dumps(self._store._audit_heads)),
             json.loads(json.dumps(self._store._outbox)),
+            # Shallow copy is sufficient here (unlike the deep-copied dicts above): the values are
+            # immutable JSON strings, never mutated in place -- store_migration_receipt only inserts.
+            dict(self._store._migration_receipts),
         )
         return self
 
@@ -246,6 +283,7 @@ class _InMemoryTransaction:
                 self._store._audit_events,
                 self._store._audit_heads,
                 self._store._outbox,
+                self._store._migration_receipts,
             ) = self._snapshots
         self._store._lock.release()
 
@@ -316,6 +354,11 @@ class _InMemoryTransaction:
             "created_at": int(time.time()),
         }
 
+    def store_migration_receipt(self, task_id: str, receipt_json: str) -> None:
+        # Keep-first: the first receipt issued for an admitted migration wins, so a
+        # duplicate delivery returns the same proof.
+        self._store._migration_receipts.setdefault(task_id, receipt_json)
+
 
 class SQLiteRuntimeStore:
     is_durable = True
@@ -370,6 +413,7 @@ class SQLiteRuntimeStore:
             3: self._migrate_to_v4,
             4: self._migrate_to_v5,
             5: self._migrate_to_v6,
+            6: self._migrate_to_v7,
         }
         migration = migrations.get(version)
         if migration is None:
@@ -493,6 +537,23 @@ class SQLiteRuntimeStore:
             """
         )
 
+    def _migrate_to_v7(self, connection: sqlite3.Connection) -> None:
+        # Section 4 #2: signed destination receipts for migration delivery settlement.
+        # migration_receipts holds the receipt this host ISSUED as a destination (so a
+        # duplicate delivery returns the same one); migration_outbox.receipt_json holds the
+        # receipt this host RECEIVED as a source and verified before settling the row.
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS migration_receipts (
+                task_id TEXT PRIMARY KEY,
+                receipt_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            ALTER TABLE migration_outbox ADD COLUMN receipt_json TEXT;
+            PRAGMA user_version = 7;
+            """
+        )
+
     def transaction(self) -> AbstractContextManager[RuntimeTransaction]:
         return _SQLiteTransaction(self)
 
@@ -504,9 +565,19 @@ class SQLiteRuntimeStore:
             ).fetchall()
             return [dict(row) for row in rows]
 
-    def mark_migration_delivered(self, task_id: str) -> None:
+    def get_migration_receipt(self, task_id: str) -> dict[str, Any] | None:
         with self._connection() as connection:
-            connection.execute("UPDATE migration_outbox SET status = 'delivered' WHERE task_id = ?", (task_id,))
+            row = connection.execute(
+                "SELECT receipt_json FROM migration_receipts WHERE task_id = ?", (task_id,)
+            ).fetchone()
+        return None if row is None else json.loads(row["receipt_json"])
+
+    def mark_migration_delivered(self, task_id: str, receipt_json: str) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE migration_outbox SET status = 'delivered', receipt_json = ? WHERE task_id = ?",
+                (receipt_json, task_id),
+            )
 
     def record_migration_attempt(self, task_id: str) -> None:
         with self._connection() as connection:
@@ -746,6 +817,21 @@ class PostgresRuntimeStore:
             )
             """
         )
+        # Section 4 #2, schema v5: signed destination receipts for delivery settlement.
+        # migration_receipts holds receipts this host ISSUED as a destination (keep-first, so a
+        # duplicate delivery returns the same one); migration_outbox.receipt_json holds the
+        # receipt this host RECEIVED as a source and verified before settling the row. ADD COLUMN
+        # IF NOT EXISTS upgrades a v4 store idempotently.
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS migration_receipts (
+                task_id TEXT PRIMARY KEY,
+                receipt_json TEXT NOT NULL,
+                created_at BIGINT NOT NULL
+            )
+            """
+        )
+        connection.execute("ALTER TABLE migration_outbox ADD COLUMN IF NOT EXISTS receipt_json TEXT")
         connection.execute(
             """
             INSERT INTO portmark_schema (singleton, version)
@@ -766,9 +852,19 @@ class PostgresRuntimeStore:
             ).fetchall()
             return [dict(row) for row in rows]
 
-    def mark_migration_delivered(self, task_id: str) -> None:
+    def get_migration_receipt(self, task_id: str) -> dict[str, Any] | None:
         with self._connect() as connection:
-            connection.execute("UPDATE migration_outbox SET status = 'delivered' WHERE task_id = %s", (task_id,))
+            row = connection.execute(
+                "SELECT receipt_json FROM migration_receipts WHERE task_id = %s", (task_id,)
+            ).fetchone()
+        return None if row is None else json.loads(row["receipt_json"])
+
+    def mark_migration_delivered(self, task_id: str, receipt_json: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE migration_outbox SET status = 'delivered', receipt_json = %s WHERE task_id = %s",
+                (receipt_json, task_id),
+            )
 
     def record_migration_attempt(self, task_id: str) -> None:
         with self._connect() as connection:
@@ -1002,6 +1098,19 @@ class _PostgresTransaction:
             (task_id, destination, sealed_envelope_json, int(time.time())),
         )
 
+    def store_migration_receipt(self, task_id: str, receipt_json: str) -> None:
+        if self._connection is None:
+            raise RuntimeError("Postgres transaction was not opened")
+        # Keep-first: a duplicate delivery returns the same receipt (section 4 #2).
+        self._connection.execute(
+            """
+            INSERT INTO migration_receipts (task_id, receipt_json, created_at)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (task_id) DO NOTHING
+            """,
+            (task_id, receipt_json, int(time.time())),
+        )
+
     @staticmethod
     def _checkpoint_json(state: AgentState, generation: int) -> str:
         blob = asdict(state)
@@ -1162,6 +1271,19 @@ class _SQLiteTransaction:
             ON CONFLICT(task_id) DO NOTHING
             """,
             (task_id, destination, sealed_envelope_json, int(time.time())),
+        )
+
+    def store_migration_receipt(self, task_id: str, receipt_json: str) -> None:
+        if self._connection is None:
+            raise RuntimeError("SQLite transaction was not opened")
+        # Keep-first: a duplicate delivery returns the same receipt (section 4 #2).
+        self._connection.execute(
+            """
+            INSERT INTO migration_receipts (task_id, receipt_json, created_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(task_id) DO NOTHING
+            """,
+            (task_id, receipt_json, int(time.time())),
         )
 
     @staticmethod

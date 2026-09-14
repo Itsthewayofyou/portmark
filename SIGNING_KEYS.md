@@ -39,6 +39,23 @@ The host verifier uses a `TrustRegistry` containing `TrustedIdentity` records:
   *different* trusted, migration-capable host from being spliced onto another host's permit. Caveat: the
   legacy `HmacEnvelopeSigner` checks neither host nor usage, so on that demo/non-production path the
   `permit.issuer` equality is the sole provenance binding.
+
+  **Migration delivery receipts (`receipt` usage).** When a destination admits a migrated task it
+  issues a `portmark.migration-receipt.v1` signed with its key, in the SAME transaction that commits
+  the admission checkpoint. The receipt binds the task id, source and destination hosts, the delegated
+  permit nonce, the sealed-envelope digest, and the destination's committed generation + audit head. The
+  source settles the outbox row ONLY after verifying that receipt (`AgentHost.settle_migration`), so
+  "delivered" means "provably committed at the destination" and a lost acknowledgement no longer strands
+  a migrated task as pending forever (a duplicate delivery returns the SAME receipt instead of a replay
+  error). Verifying a receipt requires the `receipt` usage. **Deployment prerequisite:** the SOURCE must
+  trust the DESTINATION's key (its public key in the source registry, with `receipt` or unrestricted
+  usage) — the mirror of the destination trusting the source's `migration` key. A source that lacks the
+  destination's key cannot settle and its rows stay pending with a clear "signing key is not trusted"
+  error. The receipt's `accepted_at` is destination-set and therefore not independently verifiable (same
+  class as an audit head's `signed_at`): it is recorded, never gated on. Because the signature covers only
+  the receipt body, verification rejects a receipt carrying **any** field outside the signed body plus the
+  signature envelope — so an unsigned field cannot ride inside a verified receipt and be persisted as if
+  it were destination-signed.
 - `revoked_at` (optional): the effective epoch time of a revocation (see historical verification
   below). With `revoked=true` and `revoked_at` set, a head signed strictly before that time is
   "valid, key later revoked"; a head at/after it is "signed after revocation".

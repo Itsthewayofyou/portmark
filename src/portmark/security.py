@@ -44,6 +44,12 @@ class EnvelopeSigningIdentity(EnvelopeVerifier, Protocol):
     def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None, required_usage: str = "audit") -> None:
         ...
 
+    def sign_migration_receipt(self, payload: dict[str, Any]) -> dict[str, Any]:
+        ...
+
+    def verify_migration_receipt(self, receipt: dict[str, Any], now: int | None = None) -> None:
+        ...
+
 
 class AuditHeadVerifier(Protocol):
     def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None, required_usage: str = "audit") -> None:
@@ -93,6 +99,88 @@ def _audit_head_payload_for(task_id: str, host_id: str, head_hash: str, sequence
     if signed_at is None:
         return audit_head_payload(task_id, host_id, head_hash, sequence)
     return audit_head_payload_v2(task_id, host_id, head_hash, sequence, signed_at)
+
+
+def migration_envelope_digest(sealed_envelope: dict[str, Any]) -> str:
+    """blake2b-256 hex over the canonical form of a sealed migrated envelope dict (S4 #2).
+
+    Both sides call this on the SEALED envelope dict -- the source from its stored outbox JSON,
+    the destination from `asdict()` of the envelope it received -- so a serialize -> deserialize
+    round-trip yields the same digest. It binds a migration receipt to the exact envelope that
+    was delivered, so a receipt for one envelope cannot settle a different one.
+    """
+    return hashlib.blake2b(canonical_json(sealed_envelope), digest_size=32).hexdigest()
+
+
+def migration_receipt_payload(
+    task_id: str,
+    source_host_id: str,
+    destination_host_id: str,
+    permit_nonce: str,
+    envelope_digest: str,
+    destination_checkpoint_generation: int,
+    destination_audit_head: str,
+    accepted_at: int,
+) -> dict[str, Any]:
+    """The signed body of a `portmark.migration-receipt.v1` (finding #2).
+
+    A durable, destination-signed proof that a migrated task was ADMITTED at the destination and its
+    admission checkpoint committed (bound to that generation + audit head), so the source can settle
+    delivery (distinguish admitted / rejected / never-arrived) instead of leaving the outbox row
+    pending forever. It attests ADMISSION, not completion: the run may still fail after admission, so
+    settlement means "the destination took ownership", not "the task finished". `accepted_at` is
+    destination-set and therefore not independently verifiable (same class as an audit head's
+    signed_at) -- it is recorded, never gated on.
+    """
+    return {
+        "type": "portmark.migration-receipt.v1",
+        "task_id": task_id,
+        "source_host_id": source_host_id,
+        "destination_host_id": destination_host_id,
+        "permit_nonce": permit_nonce,
+        "envelope_digest": envelope_digest,
+        "destination_checkpoint_generation": destination_checkpoint_generation,
+        "destination_audit_head": destination_audit_head,
+        "accepted_at": accepted_at,
+    }
+
+
+# The signed body of a receipt is every field EXCEPT the signature envelope. verify recomputes
+# the payload from these keys so a tampered/extra field cannot ride along unsigned.
+_MIGRATION_RECEIPT_FIELDS = (
+    "type",
+    "task_id",
+    "source_host_id",
+    "destination_host_id",
+    "permit_nonce",
+    "envelope_digest",
+    "destination_checkpoint_generation",
+    "destination_audit_head",
+    "accepted_at",
+)
+
+
+def _migration_receipt_body(receipt: dict[str, Any]) -> dict[str, Any]:
+    if receipt.get("type") != "portmark.migration-receipt.v1":
+        raise SecurityError("migration receipt has an unknown type")
+    try:
+        return {field: receipt[field] for field in _MIGRATION_RECEIPT_FIELDS}
+    except KeyError as error:
+        raise SecurityError("migration receipt is missing a required field") from error
+
+
+def _verified_migration_receipt_shape(receipt: dict[str, Any]) -> dict[str, Any]:
+    """Validate a full receipt's SHAPE before signature checks (finding S4-#2 follow-up).
+
+    The signature covers only the body fields, so an unknown key can ride inside an otherwise-valid
+    receipt and, if persisted, be mistaken later for destination-signed evidence. Reject any receipt
+    whose keys are not EXACTLY the signed body plus the signature envelope. Returns the body so the
+    caller verifies over it.
+    """
+    allowed = set(_MIGRATION_RECEIPT_FIELDS) | {"signature", "signature_key_id"}
+    if set(receipt) != allowed:
+        raise SecurityError("migration receipt has unexpected fields")
+    return _migration_receipt_body(receipt)
 
 
 @dataclass(frozen=True)
@@ -362,6 +450,38 @@ class TrustRegistry:
             return AuditHeadEvaluation(True, "valid-key-expired", "audit head cryptographically valid; signing key has since expired")
         return AuditHeadEvaluation(True, "valid", "audit head verified")
 
+    def verify_migration_receipt(self, receipt: dict[str, Any], now: int | None = None) -> None:
+        # Finding S4-#2: a migration receipt is a destination-signed proof of admission. The
+        # source verifies it before settling delivery. Mirrors verify_audit_head: the key must be
+        # trusted + currently usable, carry the `receipt` usage, and its issuer must equal the
+        # receipt's destination_host_id -- so a receipt signed by some other trusted host cannot
+        # be presented as this destination's proof. The exact-shape check rejects any unsigned
+        # field riding inside the receipt (it would otherwise be persisted as if signed).
+        body = _verified_migration_receipt_shape(receipt)
+        key_id = receipt.get("signature_key_id")
+        signature = receipt.get("signature")
+        if not isinstance(key_id, str) or not key_id or not isinstance(signature, str) or not signature:
+            raise SecurityError("migration receipt signature is missing")
+        identity = self._identities.get(key_id)
+        if identity is None:
+            raise SecurityError("migration receipt signing key is not trusted")
+        current_time = int(time.time()) if now is None else now
+        reason = _identity_unusable_reason(identity, current_time)
+        if reason == "revoked":
+            raise SecurityError("migration receipt signing key has been revoked")
+        if reason == "not-yet-active":
+            raise SecurityError("migration receipt signing key is not active yet")
+        if reason == "expired":
+            raise SecurityError("migration receipt signing key has expired")
+        if not _identity_permits(identity, "receipt"):
+            raise SecurityError("migration receipt signing key lacks the required 'receipt' usage")
+        if body["destination_host_id"] != identity.issuer:
+            raise SecurityError("migration receipt signer does not match the destination host")
+        try:
+            Ed25519PublicKey.from_public_bytes(identity.public_key).verify(_b64url_decode(signature), canonical_json(body))
+        except (InvalidSignature, ValueError) as error:
+            raise SecurityError("migration receipt signature is invalid") from error
+
     def require_identity(self, envelope: AgentEnvelope, now: int | None = None) -> TrustedIdentity:
         if not envelope.signature_key_id:
             raise SecurityError("agent envelope signature key id is missing")
@@ -540,6 +660,14 @@ class TrustSource:
         if self._overlay.has_key(key_id):
             return self._overlay.evaluate_audit_head(key_id, payload, signature, now)
         return registry.evaluate_audit_head(key_id, payload, signature, now)
+
+    def verify_migration_receipt(self, receipt: dict[str, Any], now: int | None = None) -> None:
+        registry = self._verified_file()
+        key_id = receipt.get("signature_key_id")
+        if isinstance(key_id, str) and self._overlay.has_key(key_id):
+            self._overlay.verify_migration_receipt(receipt, now)
+        else:
+            registry.verify_migration_receipt(receipt, now)
 
 
 def _issuer_matches(signing_issuer: str, permit_issuer: str) -> bool:
@@ -959,6 +1087,19 @@ class EnvelopeSigner:
         except (InvalidSignature, ValueError) as error:
             raise SecurityError("agent envelope signature is invalid") from error
 
+    def sign_migration_receipt(self, payload: dict[str, Any]) -> dict[str, Any]:
+        # The destination signs a receipt for a migration it admitted. Bind the signer to the
+        # claimed destination (destination_host_id == issuer) so a receipt can't claim to be from
+        # a host this key does not speak for. Returns the full receipt (body + signature envelope).
+        body = _migration_receipt_body(payload)
+        if body["destination_host_id"] != self.issuer:
+            raise SecurityError("migration receipt destination does not match signing identity")
+        signature = _b64url_encode(self._private_key.sign(canonical_json(body)))
+        return {**body, "signature": signature, "signature_key_id": self.key_id}
+
+    def verify_migration_receipt(self, receipt: dict[str, Any], now: int | None = None) -> None:
+        self.registry.verify_migration_receipt(receipt, now)
+
     def private_key_pem(self) -> bytes:
         return self._private_key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
 
@@ -1033,6 +1174,22 @@ class HmacEnvelopeSigner:
         if payload.get("type") == "portmark.audit-head.v2":
             return AuditHeadEvaluation(True, "valid", "audit head verified (legacy HMAC)")
         return AuditHeadEvaluation(True, "valid-legacy-v1", "v1 audit head verified (legacy HMAC)")
+
+    def sign_migration_receipt(self, payload: dict[str, Any]) -> dict[str, Any]:
+        body = _migration_receipt_body(payload)
+        signature = hmac.new(self._key, canonical_json(body), hashlib.sha256).hexdigest()
+        return {**body, "signature": signature, "signature_key_id": self.key_id}
+
+    def verify_migration_receipt(self, receipt: dict[str, Any], now: int | None = None) -> None:
+        # Legacy HMAC has no per-key issuer/usage; it only attests MAC authenticity. Reject unsigned
+        # extra fields the same way the Ed25519 path does (finding S4-#2 follow-up).
+        body = _verified_migration_receipt_shape(receipt)
+        if receipt.get("signature_key_id") != self.key_id:
+            raise SecurityError("migration receipt signing key is not trusted")
+        signature = receipt.get("signature")
+        expected = hmac.new(self._key, canonical_json(body), hashlib.sha256).hexdigest()
+        if not isinstance(signature, str) or not hmac.compare_digest(expected, signature):
+            raise SecurityError("migration receipt signature is invalid")
 
 
 RESERVED_CONSTRAINT_KEYS = frozenset({"arguments", "required", "additional_arguments"})

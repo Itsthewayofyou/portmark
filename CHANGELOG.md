@@ -6,6 +6,35 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Section 4 (part 2) — signed migration delivery receipts + reconciliation
+
+- **Migration delivery can now be settled, not just attempted (finding #2, High).** A destination that
+  admits a migrated task issues a signed `portmark.migration-receipt.v1` in the SAME transaction that
+  commits the admission checkpoint, bound to the task id, source/destination hosts, the delegated permit
+  nonce, the sealed-envelope digest (stable across the a2a round-trip), and the destination's committed
+  generation + audit head. `RunResult.migration_receipt` and the a2a artifact carry it back to the source.
+- **The source settles only against a verified receipt.** `AgentHost.settle_migration(task_id, receipt)`
+  verifies the receipt's signature (against the destination's trusted key, `receipt` usage) and every
+  binding against the outbox row, then `mark_migration_delivered(task_id, receipt_json)` records it and
+  flips the row to delivered. An unverifiable or mismatched receipt raises and the row stays pending, so a
+  bad receipt can never settle a migration. The store's `mark_migration_delivered` now REQUIRES the
+  receipt (its old task-id-only form is gone).
+- **Lost acknowledgements reconcile safely.** A duplicate delivery of the same envelope returns the SAME
+  receipt (no re-execution) instead of the old undifferentiated replay error, so a source whose ack was
+  lost can still settle; a different envelope squatting the same task id is rejected.
+- **Deployment prerequisite (documented):** the source must trust the destination's receipt key, or its
+  rows stay pending with a clear "signing key is not trusted" error. `accepted_at` is destination-set and
+  recorded, never gated on.
+- **Receipt verification rejects unsigned fields.** The signature covers only the body, so verification
+  now requires the receipt's keys to be EXACTLY the signed body plus `signature`/`signature_key_id` — an
+  unknown field (e.g. an unsigned `completion_status`) is rejected rather than verified and then persisted
+  as if signed. Enforced on both the Ed25519 and legacy-HMAC paths. Atomic receipt issuance has a
+  fault-injection regression test (a failed receipt insert rolls back the whole admission).
+- Schema: SQLite v7 / Postgres v5 add a `migration_receipts` table and a nullable
+  `migration_outbox.receipt_json`; old stores migrate. Still open in Section 4: #3 outbox claim/lease,
+  #4 expiry/dead-letter, #5 attestation freshness, #6 payload confidentiality, #7 task-id namespacing,
+  #8 outbox conflict auditing.
+
 ### Section 4 (part 1) — migration provenance binding
 
 - **Migration provenance can no longer be spliced between trusted hosts (finding #1, High).** When a

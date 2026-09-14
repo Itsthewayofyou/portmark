@@ -209,6 +209,11 @@ def task_from_run_result(result: Any) -> dict[str, Any]:
     migration = getattr(result, "migration_envelope", None)
     if migration is not None:
         artifact["migration_envelope"] = migration
+    # Section 4 #2: carry the destination's signed migration receipt back to the source so its
+    # dispatcher can settle delivery (source verifies it, then mark_migration_delivered).
+    receipt = getattr(result, "migration_receipt", None)
+    if receipt is not None:
+        artifact["migration_receipt"] = receipt
     return Task(
         id=result.task_id,
         status=TaskStatus(_task_state(result.status)),

@@ -322,10 +322,16 @@ closes the source checkpoint, so it survives a crash after the source closes.
 Portmark provides the outbox and its state API (`list_pending_migrations`,
 `record_migration_attempt`, `mark_migration_delivered`) but **does not run a
 delivery dispatcher**: production delivery requires the embedder to run one that
-enumerates pending rows, retries delivery, records attempts, and marks
-acknowledgement. Without a dispatcher a migration stays durably pending and is never
-delivered. Duplicate delivery is safe — the destination's nonce/CAS enforcement
-rejects a replay.
+enumerates pending rows, retries delivery, and settles each row against a signed
+destination receipt. On admission the destination issues a `portmark.migration-receipt.v1`
+(returned in `RunResult.migration_receipt` / the a2a artifact) bound to the task, the
+hosts, the permit nonce, and the sealed-envelope digest; the source verifies it via
+`AgentHost.settle_migration(task_id, receipt)` before `mark_migration_delivered`, so
+"delivered" means "provably admitted at the destination". Duplicate delivery is safe —
+the destination returns the SAME receipt instead of re-executing. The receipt attests
+**admission** (the migrated task was admitted and its admission checkpoint committed),
+not completion; a source must trust the destination's receipt key or its rows stay
+pending. Without a dispatcher a migration stays durably pending and is never delivered.
 
 ## Production status
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import secrets
 import time
 from dataclasses import asdict, replace
@@ -10,7 +11,7 @@ from .metrics import RuntimeMetrics
 from .models import AgentEnvelope, ApprovalToken, AttestationEvidence, ProviderDecision, RunResult
 from .projection import project_state_for_provider
 from .providers import ModelProvider
-from .security import AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, SecurityError, arguments_hash, audit_head_payload, canonical_json
+from .security import _MIGRATION_RECEIPT_FIELDS, AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, SecurityError, arguments_hash, audit_head_payload, canonical_json, migration_envelope_digest, migration_receipt_payload
 from .storage import InMemoryRuntimeStore, RuntimeStore
 from .tools import ToolExecutionError, ToolKilledError, ToolRegistry
 
@@ -69,9 +70,63 @@ class AgentHost:
         finally:
             self.metrics.observe_duration("run_duration_seconds", time.monotonic() - started)
 
+    def settle_migration(self, task_id: str, receipt: dict[str, Any]) -> None:
+        """Source-side delivery settlement against a verified destination receipt (section 4 #2).
+
+        A source marks a migration delivered ONLY on a receipt it has verified here: the receipt's
+        signature against this source's trust (the destination's key must be trusted, with the
+        `receipt` usage) AND every binding matching the outbox row (task id, this source, the row's
+        destination, the delegated permit nonce, the sealed-envelope digest). A receipt that fails
+        any check raises and the row stays pending -- an unverifiable receipt can never settle a
+        migration. A source that does not trust the destination's key gets a clear
+        "signing key is not trusted" error, which is the deployment prerequisite for settlement.
+        """
+        row = next((r for r in self.store.list_pending_migrations() if r["task_id"] == task_id), None)
+        if row is None:
+            raise SecurityError(f"no pending migration for task {task_id!r} to settle")
+        self.signer.verify_migration_receipt(receipt)
+        sealed = json.loads(row["sealed_envelope_json"])
+        expected = {
+            "task_id": task_id,
+            "source_host_id": self.host_id,
+            "destination_host_id": row["destination"],
+            "permit_nonce": sealed["permit"]["nonce"],
+            "envelope_digest": migration_envelope_digest(sealed),
+        }
+        mismatches = [field for field, value in expected.items() if receipt.get(field) != value]
+        if mismatches:
+            raise SecurityError(f"migration receipt does not match the outbox row: {', '.join(mismatches)}")
+        # Persist the canonical body + signature envelope by CONSTRUCTION (not the caller's dict), so a
+        # stored receipt only ever holds destination-signed fields even if the verify-side shape check is
+        # ever weakened -- every persisted field is one the signature covered.
+        canonical = {field: receipt[field] for field in _MIGRATION_RECEIPT_FIELDS}
+        canonical["signature_key_id"] = receipt["signature_key_id"]
+        canonical["signature"] = receipt["signature"]
+        self.store.mark_migration_delivered(task_id, canonical_json(canonical).decode("utf-8"))
+
     def _run(self, envelope: AgentEnvelope) -> RunResult:
         active_policy = self._active_policy()
         self.signer.verify(envelope)
+        # Section 4 #2: digest the sealed migration envelope NOW, while it is pristine -- admission
+        # mutates envelope.state (status, counters), and the source's stored copy is pre-mutation,
+        # so a later digest would not match. None for non-migration envelopes.
+        incoming_migration_digest = migration_envelope_digest(asdict(envelope)) if envelope.previous_audit_hash else None
+        # A re-delivery of an already-admitted migration returns the SAME receipt (no re-execution)
+        # instead of a replay error, so a source whose acknowledgement was lost can still settle
+        # delivery. The lookup happens before any nonce is touched. A stored receipt whose bindings
+        # differ means a DIFFERENT envelope is squatting this task id -- reject it.
+        if envelope.previous_audit_hash:
+            existing_receipt = self.store.get_migration_receipt(envelope.state.task_id)
+            if existing_receipt is not None:
+                if (
+                    existing_receipt.get("permit_nonce") != envelope.permit.nonce
+                    or existing_receipt.get("envelope_digest") != incoming_migration_digest
+                ):
+                    raise SecurityError("a migration receipt already exists for this task under a different envelope")
+                stored_checkpoint = self.store.load_checkpoint(envelope.state.task_id)
+                status = stored_checkpoint["status"] if stored_checkpoint else envelope.state.status
+                result = stored_checkpoint.get("result") if stored_checkpoint else None
+                return RunResult(status, envelope.state.task_id, result, stored_checkpoint or {}, (), migration_receipt=existing_receipt)
         effective = active_policy.effective_permit(envelope.manifest, envelope.permit)
         self.attestation_policy.verify_execution(effective, self.host_id)
         provider = self.providers.get(envelope.manifest.provider)
@@ -135,10 +190,19 @@ class AgentHost:
             "policy_version": active_policy.policy_version,
             "policy_hash": active_policy.policy_hash,
         }
+        receipt_binding: dict[str, Any] | None = None
         if migration_anchor is not None:
             accepted_details["migration"] = migration_anchor
+            # This is a migration admission: bind a destination receipt to the source
+            # (previous_audit_host_id == permit.issuer, per finding #1), the delegated permit
+            # nonce, and the exact sealed envelope, so the source can settle delivery.
+            receipt_binding = {
+                "source_host_id": envelope.previous_audit_host_id,
+                "permit_nonce": envelope.permit.nonce,
+                "envelope_digest": incoming_migration_digest,
+            }
         audit.append("agent.accepted", accepted_details)
-        persisted_events = self._persist(envelope, effective, state, audit, 0, consume_nonce=consume_nonce)
+        persisted_events = self._persist(envelope, effective, state, audit, 0, consume_nonce=consume_nonce, receipt_binding=receipt_binding)
         tool_names = tuple(grant.name for grant in effective.grants)
 
         while state.step < effective.budget.max_steps:
@@ -446,7 +510,10 @@ class AgentHost:
         # of run() (the very uncaught-raise EV-010 removed). Persist is the one place
         # the checkpoint ceiling is enforced.
         checkpoint = asdict(envelope.state)
-        return RunResult(envelope.state.status, envelope.state.task_id, envelope.state.result, checkpoint, audit.events, migration)
+        # Section 4 #2: surface the receipt this run issued as a migration destination (None for
+        # ordinary runs and on the source side), read from the store so it reflects what committed.
+        receipt = self.store.get_migration_receipt(envelope.state.task_id)
+        return RunResult(envelope.state.status, envelope.state.task_id, envelope.state.result, checkpoint, audit.events, migration, migration_receipt=receipt)
 
     def _checkpoint_fits(self, effective, state) -> bool:
         # Mirrors the ceiling _persist enforces (effective.budget = min(permit, host)),
@@ -617,6 +684,7 @@ class AgentHost:
         consume_nonce: str | None = None,
         closed: bool = False,
         migration: dict[str, Any] | None = None,
+        receipt_binding: dict[str, Any] | None = None,
     ) -> int:
         checkpoint = asdict(state)
         encoded_size = len(canonical_json(checkpoint))
@@ -668,6 +736,25 @@ class AgentHost:
                 ),
             )
             new_generation = transaction.save_checkpoint(state.task_id, state, state.checkpoint_generation, closed)
+            # Section 4 #2: the destination issues a signed migration receipt in the SAME
+            # transaction that commits the admission checkpoint, so a crash can never leave a
+            # task admitted without a receipt to prove it. Bound to the just-committed
+            # generation and audit head; keep-first, so a duplicate delivery returns this same
+            # receipt instead of re-executing. accepted_at is destination-set (recorded, not gated).
+            if receipt_binding is not None:
+                receipt = self.signer.sign_migration_receipt(
+                    migration_receipt_payload(
+                        task_id=state.task_id,
+                        source_host_id=receipt_binding["source_host_id"],
+                        destination_host_id=self.host_id,
+                        permit_nonce=receipt_binding["permit_nonce"],
+                        envelope_digest=receipt_binding["envelope_digest"],
+                        destination_checkpoint_generation=new_generation,
+                        destination_audit_head=audit.head,
+                        accepted_at=head_signed_at,
+                    )
+                )
+                transaction.store_migration_receipt(state.task_id, canonical_json(receipt).decode("utf-8"))
             # Section 1, finding #2: a migration's sealed destination envelope is
             # written to the outbox in the SAME transaction that closes the source
             # checkpoint. Either both commit or both roll back, so the source can
