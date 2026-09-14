@@ -559,18 +559,21 @@ class SignedAtMigrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = str(Path(directory) / "store.sqlite")
             SQLiteRuntimeStore(path)  # build current schema
-            # Simulate a genuine OLD v5 store: undo everything v6 (signed_at) and v7 (receipt
-            # storage) added, then roll user_version back to 5.
+            # Simulate a genuine OLD v5 store: undo everything v6 (signed_at), v7 (receipt storage)
+            # and v8 (claim/lease + dead-letter) added, then roll user_version back to 5.
             connection = sqlite3.connect(path)
             try:
                 connection.execute("ALTER TABLE audit_heads DROP COLUMN signed_at")
                 connection.execute("ALTER TABLE migration_outbox DROP COLUMN receipt_json")
+                connection.execute("ALTER TABLE migration_outbox DROP COLUMN claimed_by")
+                connection.execute("ALTER TABLE migration_outbox DROP COLUMN lease_expires_at")
+                connection.execute("ALTER TABLE migration_outbox DROP COLUMN dead_reason")
                 connection.execute("DROP TABLE migration_receipts")
                 connection.execute("PRAGMA user_version = 5")
                 connection.commit()
             finally:
                 connection.close()
-            # Reopening runs the v6 + v7 migrations rather than failing readiness.
+            # Reopening runs the v6 + v7 + v8 migrations rather than failing readiness.
             store = SQLiteRuntimeStore(path)
             store.check_ready()
             connection = sqlite3.connect(path)
@@ -585,6 +588,10 @@ class SignedAtMigrationTests(unittest.TestCase):
             self.assertIn("signed_at", audit_cols)
             self.assertIn("receipt_json", outbox_cols)
             self.assertIn("migration_receipts", tables)
+            # v8 additions present after the upgrade.
+            self.assertIn("claimed_by", outbox_cols)
+            self.assertIn("lease_expires_at", outbox_cols)
+            self.assertIn("dead_reason", outbox_cols)
 
 
 class EvaluateAuditHeadTests(unittest.TestCase):

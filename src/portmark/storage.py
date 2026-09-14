@@ -16,8 +16,8 @@ from .models import AgentState
 from .security import AUDIT_HASH_VERSION, AuditHeadVerifier, SecurityError, _audit_head_payload_for, audit_event_record, canonical_json
 
 
-SQLITE_SCHEMA_VERSION = 7
-POSTGRES_SCHEMA_VERSION = 5
+SQLITE_SCHEMA_VERSION = 8
+POSTGRES_SCHEMA_VERSION = 6
 
 
 def _advisory_lock_key(name: str) -> int:
@@ -123,17 +123,18 @@ class RuntimeStore(Protocol):
         ...
 
     def list_pending_migrations(self) -> list[dict[str, Any]]:
-        """Migration-outbox rows still awaiting delivery, oldest first (section 1 #2).
+        """All OUTSTANDING outbox rows (status='pending'), oldest first, INCLUDING rows another
+        worker currently holds under a lease. This is a VISIBILITY query, NOT a delivery queue.
 
-        Portmark stores the sealed envelope durably but does NOT run a dispatcher:
-        production delivery requires the embedder to run one that enumerates these
-        rows, ships the sealed envelope to the destination, calls
-        `record_migration_attempt` on each try, and settles delivery ONLY on a
-        verified destination receipt (section 4 #2): the destination returns a signed
-        receipt, the source verifies it against the destination's trusted key, then
-        calls `mark_migration_delivered(task_id, receipt_json)`. Without a dispatcher a
-        migration stays pending and is never delivered. Duplicate delivery is safe --
-        the destination returns the SAME receipt rather than re-executing.
+        Do NOT enumerate this list and ship its rows -- that is exactly the double-dispatch bug
+        section 4 #3 exists to prevent, because two dispatchers would each see and ship the same
+        row. A delivery dispatcher must instead `claim_migrations(worker_id, lease_seconds, limit)`,
+        which hands each row to at most one worker under a lease; ship the claimed rows, call
+        `record_migration_attempt(task_id, worker_id)` per try, `dead_letter_migration` the ones it
+        gives up on, and settle delivery ONLY on a verified destination receipt (section 4 #2) via
+        the source's `AgentHost.settle_migration` -> `mark_migration_delivered`. Each returned row
+        carries `claimed_by`/`lease_expires_at` so a caller can see the claim state. Portmark ships
+        the outbox mechanism, not a dispatcher: without one a migration stays durably pending.
         """
         ...
 
@@ -155,7 +156,49 @@ class RuntimeStore(Protocol):
         """
         ...
 
-    def record_migration_attempt(self, task_id: str) -> None:
+    def record_migration_attempt(self, task_id: str, worker_id: str | None = None) -> None:
+        """Count a delivery attempt. If `worker_id` is given, only the current lease holder counts
+        (a stale worker can't inflate the count toward dead-letter); without it the count is
+        unscoped (legacy callers). Section 4 part 3a."""
+        ...
+
+    def claim_migrations(
+        self, worker_id: str, lease_seconds: int, limit: int = 1, now: int | None = None
+    ) -> list[dict[str, Any]]:
+        """Atomically claim up to `limit` deliverable rows under a `lease_seconds` lease and return
+        them (section 4 #3). A row is claimable if pending AND (unclaimed OR its lease has expired),
+        so a worker that dies mid-delivery has its rows reclaimed once the lease lapses. Claiming is
+        race-safe: two concurrent dispatchers never receive the same row."""
+        ...
+
+    def release_migration(self, task_id: str, worker_id: str) -> bool:
+        """Release a claim so another worker can take the row. Holder-scoped: returns False if this
+        worker no longer holds the lease, so a stale worker can't clear a live claim. Section 4 #3."""
+        ...
+
+    def dead_letter_migration(self, task_id: str, worker_id: str, reason: str) -> bool:
+        """Terminalize a pending row the current holder gave up on into a 'dead' state with a reason
+        (section 4 #4). Holder-scoped like release. Returns False if not held or not pending (the
+        two are not distinguished -- a caller that lost its lease and one whose row was already
+        settled both see False). A verified receipt can still settle a dead row (see
+        `find_migration_for_settlement`)."""
+        ...
+
+    def list_dead_migrations(self) -> list[dict[str, Any]]:
+        """Dead-lettered rows for operator inspection, oldest first (section 4 #4)."""
+        ...
+
+    def requeue_migration(self, task_id: str) -> bool:
+        """Operator recovery: return a dead-lettered row to the pending queue, clearing its
+        dead_reason and any claim (section 4 #4). NOT lease-scoped -- the operator decides. Returns
+        False if the row is not dead."""
+        ...
+
+    def find_migration_for_settlement(self, task_id: str) -> dict[str, Any] | None:
+        """The outbox row for `task_id` if it is still settleable -- pending OR dead, never
+        delivered (section 4 #4). Used by the source's `settle_migration` so a verified destination
+        receipt settles a row even after the dispatcher dead-lettered it, keeping #4 from regressing
+        the section 4 #2 lost-ack fix."""
         ...
 
     def check_ready(self) -> None:
@@ -205,11 +248,89 @@ class InMemoryRuntimeStore:
                 row["status"] = "delivered"
                 row["receipt_json"] = receipt_json
 
-    def record_migration_attempt(self, task_id: str) -> None:
+    def record_migration_attempt(self, task_id: str, worker_id: str | None = None) -> None:
         with self._lock:
             row = self._outbox.get(task_id)
-            if row is not None:
-                row["attempt_count"] = int(row["attempt_count"]) + 1
+            if row is None:
+                return
+            # When a worker id is given, only the current lease holder may count an attempt, so a
+            # stale (expired-lease) worker can't inflate the count and push a row toward dead-letter.
+            if worker_id is not None and row.get("claimed_by") != worker_id:
+                return
+            row["attempt_count"] = int(row["attempt_count"]) + 1
+
+    def claim_migrations(
+        self, worker_id: str, lease_seconds: int, limit: int = 1, now: int | None = None
+    ) -> list[dict[str, Any]]:
+        moment = int(time.time()) if now is None else int(now)
+        with self._lock:
+            candidates = [
+                row
+                for row in self._outbox.values()
+                if row["status"] == "pending"
+                and (row.get("claimed_by") is None or int(row.get("lease_expires_at") or 0) <= moment)
+            ]
+            candidates.sort(key=lambda row: (row["created_at"], row["task_id"]))
+            claimed = []
+            for row in candidates[: max(0, limit)]:
+                row["claimed_by"] = worker_id
+                row["lease_expires_at"] = moment + int(lease_seconds)
+                claimed.append(dict(row))
+        return claimed
+
+    def release_migration(self, task_id: str, worker_id: str) -> bool:
+        # Holder-scoped: returns False if this worker no longer holds the lease, so a stale worker
+        # learns it lost the row instead of clearing another worker's active claim.
+        with self._lock:
+            row = self._outbox.get(task_id)
+            if row is None or row.get("claimed_by") != worker_id:
+                return False
+            row["claimed_by"] = None
+            row["lease_expires_at"] = None
+            return True
+
+    def dead_letter_migration(self, task_id: str, worker_id: str, reason: str) -> bool:
+        # Holder-scoped like release: only the lease holder may terminalize a row it gave up on.
+        with self._lock:
+            row = self._outbox.get(task_id)
+            if row is None or row.get("claimed_by") != worker_id:
+                return False
+            if row["status"] != "pending":
+                return False
+            row["status"] = "dead"
+            row["dead_reason"] = reason
+            row["claimed_by"] = None
+            row["lease_expires_at"] = None
+            return True
+
+    def list_dead_migrations(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = [dict(row) for row in self._outbox.values() if row["status"] == "dead"]
+        rows.sort(key=lambda row: (row["created_at"], row["task_id"]))
+        return rows
+
+    def requeue_migration(self, task_id: str) -> bool:
+        # Operator recovery of a dead-lettered row (NOT lease-scoped -- the operator, not a worker,
+        # decides to retry). dead_reason is cleared; the row returns to the pending queue.
+        with self._lock:
+            row = self._outbox.get(task_id)
+            if row is None or row["status"] != "dead":
+                return False
+            row["status"] = "pending"
+            row["dead_reason"] = None
+            row["claimed_by"] = None
+            row["lease_expires_at"] = None
+            return True
+
+    def find_migration_for_settlement(self, task_id: str) -> dict[str, Any] | None:
+        # A verified destination receipt settles a row even after the dispatcher gave up on it, so
+        # settlement looks up pending OR dead rows (not delivered -- re-settling a delivered row is
+        # Part 2b). This keeps #4 from regressing the section 4 #2 lost-ack fix.
+        with self._lock:
+            row = self._outbox.get(task_id)
+            if row is None or row["status"] not in ("pending", "dead"):
+                return None
+            return dict(row)
 
     def check_ready(self) -> None:
         # In-memory: no external dependency to probe, always ready.
@@ -343,8 +464,16 @@ class _InMemoryTransaction:
         return new_generation
 
     def enqueue_migration(self, task_id: str, destination: str, sealed_envelope_json: str) -> None:
-        if task_id in self._store._outbox:
-            return
+        # Section 4 #8: keep-first is only safe when the collision is an exact re-enqueue of the
+        # SAME sealed envelope (an idempotent retry). A same-task-id enqueue with a DIFFERENT
+        # envelope is a real collision -- silently dropping it (the old ON CONFLICT DO NOTHING)
+        # hides the anomaly, so raise and let the atomic source close roll back. Cross-source-host
+        # task-id collisions stay possible until #7 namespaces the key; this only makes them loud.
+        existing = self._store._outbox.get(task_id)
+        if existing is not None:
+            if existing["sealed_envelope_json"] == sealed_envelope_json and existing["destination"] == destination:
+                return
+            raise SecurityError(f"migration outbox already holds a different envelope for task {task_id!r}")
         self._store._outbox[task_id] = {
             "task_id": task_id,
             "destination": destination,
@@ -352,6 +481,9 @@ class _InMemoryTransaction:
             "status": "pending",
             "attempt_count": 0,
             "created_at": int(time.time()),
+            "claimed_by": None,
+            "lease_expires_at": None,
+            "dead_reason": None,
         }
 
     def store_migration_receipt(self, task_id: str, receipt_json: str) -> None:
@@ -414,6 +546,7 @@ class SQLiteRuntimeStore:
             4: self._migrate_to_v5,
             5: self._migrate_to_v6,
             6: self._migrate_to_v7,
+            7: self._migrate_to_v8,
         }
         migration = migrations.get(version)
         if migration is None:
@@ -554,13 +687,28 @@ class SQLiteRuntimeStore:
             """
         )
 
+    def _migrate_to_v8(self, connection: sqlite3.Connection) -> None:
+        # Section 4 part 3a: outbox reliability. A dispatcher CLAIMS a row under a time-bounded
+        # lease (claimed_by + lease_expires_at) so two dispatchers can't ship the same migration
+        # (#3); a row it gives up on moves to a terminal 'dead' state with a dead_reason instead
+        # of sitting pending forever (#4). All three columns are nullable -- an unclaimed, live,
+        # non-dead row has them NULL, so existing pending rows upgrade untouched.
+        connection.executescript(
+            """
+            ALTER TABLE migration_outbox ADD COLUMN claimed_by TEXT;
+            ALTER TABLE migration_outbox ADD COLUMN lease_expires_at INTEGER;
+            ALTER TABLE migration_outbox ADD COLUMN dead_reason TEXT;
+            PRAGMA user_version = 8;
+            """
+        )
+
     def transaction(self) -> AbstractContextManager[RuntimeTransaction]:
         return _SQLiteTransaction(self)
 
     def list_pending_migrations(self) -> list[dict[str, Any]]:
         with self._connection() as connection:
             rows = connection.execute(
-                "SELECT task_id, destination, sealed_envelope_json, status, attempt_count, created_at "
+                "SELECT task_id, destination, sealed_envelope_json, status, attempt_count, created_at, claimed_by, lease_expires_at "
                 "FROM migration_outbox WHERE status = 'pending' ORDER BY created_at, task_id"
             ).fetchall()
             return [dict(row) for row in rows]
@@ -579,9 +727,101 @@ class SQLiteRuntimeStore:
                 (receipt_json, task_id),
             )
 
-    def record_migration_attempt(self, task_id: str) -> None:
+    def record_migration_attempt(self, task_id: str, worker_id: str | None = None) -> None:
         with self._connection() as connection:
-            connection.execute("UPDATE migration_outbox SET attempt_count = attempt_count + 1 WHERE task_id = ?", (task_id,))
+            if worker_id is None:
+                connection.execute("UPDATE migration_outbox SET attempt_count = attempt_count + 1 WHERE task_id = ?", (task_id,))
+            else:
+                # Only the current lease holder may count an attempt (see the in-memory note).
+                connection.execute(
+                    "UPDATE migration_outbox SET attempt_count = attempt_count + 1 WHERE task_id = ? AND claimed_by = ?",
+                    (task_id, worker_id),
+                )
+
+    def claim_migrations(
+        self, worker_id: str, lease_seconds: int, limit: int = 1, now: int | None = None
+    ) -> list[dict[str, Any]]:
+        # Section 4 #3. Race-safety comes from BEGIN IMMEDIATE, which takes SQLite's single write
+        # lock up front, so two concurrent claimers serialize (the second blocks until the first
+        # commits) rather than both selecting and one silently losing its UPDATE. `_connect` opens
+        # in autocommit (isolation_level=None), so the transaction is managed explicitly here.
+        moment = int(time.time()) if now is None else int(now)
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                rows = connection.execute(
+                    "SELECT task_id, destination, sealed_envelope_json, status, attempt_count, created_at, "
+                    "claimed_by, lease_expires_at, dead_reason "
+                    "FROM migration_outbox "
+                    "WHERE status = 'pending' AND (claimed_by IS NULL OR lease_expires_at <= ?) "
+                    "ORDER BY created_at, task_id LIMIT ?",
+                    (moment, max(0, limit)),
+                ).fetchall()
+                expiry = moment + int(lease_seconds)
+                claimed = []
+                for row in rows:
+                    connection.execute(
+                        "UPDATE migration_outbox SET claimed_by = ?, lease_expires_at = ? WHERE task_id = ?",
+                        (worker_id, expiry, row["task_id"]),
+                    )
+                    record = dict(row)
+                    record["claimed_by"] = worker_id
+                    record["lease_expires_at"] = expiry
+                    claimed.append(record)
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        return claimed
+
+    def release_migration(self, task_id: str, worker_id: str) -> bool:
+        # Holder-scoped: a stale worker whose lease expired can't clear the row a new worker holds.
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE migration_outbox SET claimed_by = NULL, lease_expires_at = NULL "
+                "WHERE task_id = ? AND claimed_by = ?",
+                (task_id, worker_id),
+            )
+            return cursor.rowcount > 0
+
+    def dead_letter_migration(self, task_id: str, worker_id: str, reason: str) -> bool:
+        # Holder-scoped terminalization of a pending row the worker gave up on (#4).
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE migration_outbox SET status = 'dead', dead_reason = ?, claimed_by = NULL, "
+                "lease_expires_at = NULL WHERE task_id = ? AND claimed_by = ? AND status = 'pending'",
+                (reason, task_id, worker_id),
+            )
+            return cursor.rowcount > 0
+
+    def list_dead_migrations(self) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT task_id, destination, sealed_envelope_json, status, attempt_count, created_at, dead_reason "
+                "FROM migration_outbox WHERE status = 'dead' ORDER BY created_at, task_id"
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def requeue_migration(self, task_id: str) -> bool:
+        # Operator recovery of a dead row (NOT lease-scoped) -- clears dead_reason, returns to queue.
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE migration_outbox SET status = 'pending', dead_reason = NULL, claimed_by = NULL, "
+                "lease_expires_at = NULL WHERE task_id = ? AND status = 'dead'",
+                (task_id,),
+            )
+            return cursor.rowcount > 0
+
+    def find_migration_for_settlement(self, task_id: str) -> dict[str, Any] | None:
+        # Pending OR dead (not delivered): a verified receipt settles a row even after the
+        # dispatcher dead-lettered it, so #4 does not regress the section 4 #2 lost-ack fix.
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT task_id, destination, sealed_envelope_json, status, attempt_count, created_at, dead_reason "
+                "FROM migration_outbox WHERE task_id = ? AND status IN ('pending', 'dead')",
+                (task_id,),
+            ).fetchone()
+        return None if row is None else dict(row)
 
     def check_ready(self) -> None:
         # Bounded liveness only (section 2, findings #4 + follow-ups). Two hardenings
@@ -832,6 +1072,11 @@ class PostgresRuntimeStore:
             """
         )
         connection.execute("ALTER TABLE migration_outbox ADD COLUMN IF NOT EXISTS receipt_json TEXT")
+        # Section 4 part 3a (schema v6): claim/lease (#3) + dead-letter (#4). All nullable, so a v5
+        # store upgrades idempotently and existing pending rows are unclaimed/live/non-dead.
+        connection.execute("ALTER TABLE migration_outbox ADD COLUMN IF NOT EXISTS claimed_by TEXT")
+        connection.execute("ALTER TABLE migration_outbox ADD COLUMN IF NOT EXISTS lease_expires_at BIGINT")
+        connection.execute("ALTER TABLE migration_outbox ADD COLUMN IF NOT EXISTS dead_reason TEXT")
         connection.execute(
             """
             INSERT INTO portmark_schema (singleton, version)
@@ -847,7 +1092,7 @@ class PostgresRuntimeStore:
     def list_pending_migrations(self) -> list[dict[str, Any]]:
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT task_id, destination, sealed_envelope_json, status, attempt_count, created_at "
+                "SELECT task_id, destination, sealed_envelope_json, status, attempt_count, created_at, claimed_by, lease_expires_at "
                 "FROM migration_outbox WHERE status = 'pending' ORDER BY created_at, task_id"
             ).fetchall()
             return [dict(row) for row in rows]
@@ -866,9 +1111,85 @@ class PostgresRuntimeStore:
                 (receipt_json, task_id),
             )
 
-    def record_migration_attempt(self, task_id: str) -> None:
+    def record_migration_attempt(self, task_id: str, worker_id: str | None = None) -> None:
         with self._connect() as connection:
-            connection.execute("UPDATE migration_outbox SET attempt_count = attempt_count + 1 WHERE task_id = %s", (task_id,))
+            if worker_id is None:
+                connection.execute("UPDATE migration_outbox SET attempt_count = attempt_count + 1 WHERE task_id = %s", (task_id,))
+            else:
+                connection.execute(
+                    "UPDATE migration_outbox SET attempt_count = attempt_count + 1 WHERE task_id = %s AND claimed_by = %s",
+                    (task_id, worker_id),
+                )
+
+    def claim_migrations(
+        self, worker_id: str, lease_seconds: int, limit: int = 1, now: int | None = None
+    ) -> list[dict[str, Any]]:
+        # Section 4 #3. FOR UPDATE SKIP LOCKED is the standard Postgres queue claim: concurrent
+        # claimers lock disjoint rows and skip each other's, so no row is handed to two workers and
+        # claimers don't block. One statement claims and returns the rows atomically.
+        moment = int(time.time()) if now is None else int(now)
+        expiry = moment + int(lease_seconds)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                UPDATE migration_outbox SET claimed_by = %s, lease_expires_at = %s
+                WHERE task_id IN (
+                    SELECT task_id FROM migration_outbox
+                    WHERE status = 'pending' AND (claimed_by IS NULL OR lease_expires_at <= %s)
+                    ORDER BY created_at, task_id
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT %s
+                )
+                RETURNING task_id, destination, sealed_envelope_json, status, attempt_count,
+                          created_at, claimed_by, lease_expires_at, dead_reason
+                """,
+                (worker_id, expiry, moment, max(0, limit)),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def release_migration(self, task_id: str, worker_id: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE migration_outbox SET claimed_by = NULL, lease_expires_at = NULL "
+                "WHERE task_id = %s AND claimed_by = %s",
+                (task_id, worker_id),
+            )
+            return cursor.rowcount > 0
+
+    def dead_letter_migration(self, task_id: str, worker_id: str, reason: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE migration_outbox SET status = 'dead', dead_reason = %s, claimed_by = NULL, "
+                "lease_expires_at = NULL WHERE task_id = %s AND claimed_by = %s AND status = 'pending'",
+                (reason, task_id, worker_id),
+            )
+            return cursor.rowcount > 0
+
+    def list_dead_migrations(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT task_id, destination, sealed_envelope_json, status, attempt_count, created_at, dead_reason "
+                "FROM migration_outbox WHERE status = 'dead' ORDER BY created_at, task_id"
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def requeue_migration(self, task_id: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE migration_outbox SET status = 'pending', dead_reason = NULL, claimed_by = NULL, "
+                "lease_expires_at = NULL WHERE task_id = %s AND status = 'dead'",
+                (task_id,),
+            )
+            return cursor.rowcount > 0
+
+    def find_migration_for_settlement(self, task_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT task_id, destination, sealed_envelope_json, status, attempt_count, created_at, dead_reason "
+                "FROM migration_outbox WHERE task_id = %s AND status IN ('pending', 'dead')",
+                (task_id,),
+            ).fetchone()
+        return None if row is None else dict(row)
 
     def check_ready(self) -> None:
         # Bounded liveness only (section 2, finding #4 + #1 follow-up). Two separate
@@ -1089,6 +1410,18 @@ class _PostgresTransaction:
     def enqueue_migration(self, task_id: str, destination: str, sealed_envelope_json: str) -> None:
         if self._connection is None:
             raise RuntimeError("Postgres transaction was not opened")
+        # Section 4 #8: keep-first only for an exact re-enqueue of the SAME envelope (idempotent
+        # retry); a same-task-id enqueue with a DIFFERENT envelope raises so the atomic source
+        # close rolls back, instead of the old ON CONFLICT DO NOTHING silently dropping it. This
+        # runs inside the closing transaction, so the SELECT sees this txn's own uncommitted rows.
+        existing = self._connection.execute(
+            "SELECT destination, sealed_envelope_json FROM migration_outbox WHERE task_id = %s",
+            (task_id,),
+        ).fetchone()
+        if existing is not None:
+            if existing["sealed_envelope_json"] == sealed_envelope_json and existing["destination"] == destination:
+                return
+            raise SecurityError(f"migration outbox already holds a different envelope for task {task_id!r}")
         self._connection.execute(
             """
             INSERT INTO migration_outbox (task_id, destination, sealed_envelope_json, status, attempt_count, created_at)
@@ -1264,6 +1597,17 @@ class _SQLiteTransaction:
     def enqueue_migration(self, task_id: str, destination: str, sealed_envelope_json: str) -> None:
         if self._connection is None:
             raise RuntimeError("SQLite transaction was not opened")
+        # Section 4 #8: keep-first only for an exact re-enqueue of the SAME envelope; a different
+        # envelope under the same task id raises so the atomic source close rolls back rather than
+        # silently dropping it. Runs inside the closing transaction (sees its own uncommitted rows).
+        existing = self._connection.execute(
+            "SELECT destination, sealed_envelope_json FROM migration_outbox WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if existing is not None:
+            if existing["sealed_envelope_json"] == sealed_envelope_json and existing["destination"] == destination:
+                return
+            raise SecurityError(f"migration outbox already holds a different envelope for task {task_id!r}")
         self._connection.execute(
             """
             INSERT INTO migration_outbox (task_id, destination, sealed_envelope_json, status, attempt_count, created_at)

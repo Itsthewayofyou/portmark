@@ -6,6 +6,34 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Section 4 (part 3a) — migration outbox reliability
+
+- **Concurrent dispatchers can no longer double-ship a migration (finding #3).** A dispatcher now
+  CLAIMS outbox rows under a time-bounded lease via `store.claim_migrations(worker_id, lease_seconds,
+  limit)`; a row is claimable only if pending AND (unclaimed OR its lease expired), so two dispatchers
+  never receive the same row and a worker that dies mid-delivery has its rows reclaimed once the lease
+  lapses. Claiming is race-safe — `FOR UPDATE SKIP LOCKED` on Postgres, `BEGIN IMMEDIATE` on SQLite.
+  `release_migration(task_id, worker_id)` frees a claim; both it and dead-lettering are HOLDER-SCOPED,
+  so a stale (expired-lease) worker cannot disturb the row a new worker now owns.
+- **A stranded migration now has a terminal state and a recovery path (finding #4).** A dispatcher that
+  gives up on a row (permit expired, destination gone, attempts exhausted) calls
+  `dead_letter_migration(task_id, worker_id, reason)` to move it to a terminal `dead` state with a
+  reason, out of the pending queue and visible via `list_dead_migrations()`; `requeue_migration(task_id)`
+  returns it to the queue for a retry. Crucially, a later VERIFIED destination receipt still settles a
+  dead-lettered row — a verified receipt beats the local give-up — so this does not regress the section 4
+  #2 lost-ack fix (`settle_migration` now looks up pending-or-dead rows).
+- **A conflicting outbox enqueue is now loud instead of silent (finding #8).** `enqueue_migration`
+  keeps-first only for an exact re-enqueue of the SAME sealed envelope (an idempotent retry); a
+  same-task-id enqueue with a DIFFERENT envelope raises `SecurityError` and rolls back the atomic source
+  close, instead of the old `ON CONFLICT DO NOTHING` silently dropping it. NOTE: a same-task-id collision
+  ACROSS source hosts stays possible until #7 namespaces the key by `(source_host_id, task_id)`; #8 only
+  makes a collision loud rather than silent.
+- Schema: SQLite v8 / Postgres v6 add nullable `migration_outbox.claimed_by`, `lease_expires_at`,
+  `dead_reason`; old stores migrate. Portmark still ships the outbox mechanism, not a dispatcher — the
+  embedder owns delivery policy (max attempts, when to dead-letter). Still open in Section 4: #5
+  attestation freshness, #6 payload confidentiality (decided: per-destination projection), #7 task-id
+  namespacing.
+
 ### Section 4 (part 2) — signed migration delivery receipts + reconciliation
 
 - **Migration delivery can now be settled, not just attempted (finding #2, High).** A destination that

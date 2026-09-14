@@ -3540,6 +3540,175 @@ class RuntimeTests(unittest.TestCase):
             self.assertFalse(destination.store.consumed_nonce_exists(migrated.permit.nonce))
             self.assertIsNone(destination.store.get_migration_receipt(task_id))
 
+    # ---- Section 4 part 3a: outbox reliability (#3 claim/lease, #4 dead-letter, #8 conflict) ----
+
+    @contextmanager
+    def _memory_outbox_case(self):
+        yield "memory", InMemoryRuntimeStore()
+
+    def _outbox_store_contexts(self):
+        # All three store implementations of the outbox reliability API. Postgres is included in CI
+        # (PORTMARK_TEST_POSTGRES_DSN) and exercises FOR UPDATE SKIP LOCKED / RETURNING.
+        return [self._memory_outbox_case(), *self._store_case_contexts()]
+
+    def _seed_outbox(self, store, task_id, sealed="{}", destination="host:destination"):
+        with store.transaction() as txn:
+            txn.enqueue_migration(task_id, destination, sealed)
+
+    def test_migration_claim_is_exclusive(self):
+        # #3: a claimed row is never handed to a second worker. With two pending rows and limit=1,
+        # two workers get DISJOINT rows; a third claim finds nothing left.
+        # CALIBRATE: pre-fix there was no claim -- list_pending_migrations() handed the SAME rows to
+        # every dispatcher, so both would ship t1 (double-dispatch). Asserted below via disjointness.
+        for context in self._outbox_store_contexts():
+            with context as (backend, store):
+                with self.subTest(backend=backend):
+                    self._seed_outbox(store, "t1", sealed='{"n":1}')
+                    self._seed_outbox(store, "t2", sealed='{"n":2}')
+                    a = store.claim_migrations("worker-a", lease_seconds=60, limit=1)
+                    b = store.claim_migrations("worker-b", lease_seconds=60, limit=1)
+                    c = store.claim_migrations("worker-c", lease_seconds=60, limit=1)
+                    a_ids = {row["task_id"] for row in a}
+                    b_ids = {row["task_id"] for row in b}
+                    self.assertEqual(len(a), 1)
+                    self.assertEqual(len(b), 1)
+                    self.assertEqual(a_ids & b_ids, set())  # disjoint: no row claimed twice
+                    self.assertEqual(a_ids | b_ids, {"t1", "t2"})  # both rows claimed exactly once
+                    self.assertEqual(c, [])  # nothing left to claim
+                    self.assertEqual(a[0]["claimed_by"], "worker-a")
+
+    def test_migration_claim_is_race_safe_under_threads(self):
+        # #3 on SQLite specifically: BEGIN IMMEDIATE must serialize concurrent claimers so no row is
+        # claimed twice even under real thread contention (not just sequential calls).
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "race.sqlite")
+            for i in range(20):
+                self._seed_outbox(store, f"t{i:02d}", sealed=f'{{"n":{i}}}')
+            claimed_by_worker = {}
+            barrier = threading.Barrier(4)
+
+            def worker(name):
+                barrier.wait()
+                got = []
+                while True:
+                    rows = store.claim_migrations(name, lease_seconds=60, limit=1)
+                    if not rows:
+                        break
+                    got.append(rows[0]["task_id"])
+                claimed_by_worker[name] = got
+
+            threads = [threading.Thread(target=worker, args=(f"w{n}",)) for n in range(4)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            all_claimed = [tid for got in claimed_by_worker.values() for tid in got]
+            self.assertEqual(len(all_claimed), 20)  # every row claimed
+            self.assertEqual(len(set(all_claimed)), 20)  # each row claimed by exactly one worker
+
+    def test_migration_lease_expiry_and_release(self):
+        # #3: a claimed row is not re-claimable until its lease expires; after expiry it is; the
+        # holder can release it early; a NON-holder can neither release nor re-claim a live lease.
+        for context in self._outbox_store_contexts():
+            with context as (backend, store):
+                with self.subTest(backend=backend):
+                    self._seed_outbox(store, "t1", sealed='{"n":1}')
+                    claimed = store.claim_migrations("worker-a", lease_seconds=100, limit=1, now=1000)
+                    self.assertEqual(len(claimed), 1)
+                    # list_pending is a visibility query, not a queue: it still shows the claimed row,
+                    # and exposes who holds it so a caller can't mistake it for unclaimed work.
+                    visible = store.list_pending_migrations()
+                    self.assertEqual([row["task_id"] for row in visible], ["t1"])
+                    self.assertEqual(visible[0]["claimed_by"], "worker-a")
+                    # Before expiry, another worker gets nothing.
+                    self.assertEqual(store.claim_migrations("worker-b", lease_seconds=100, limit=1, now=1050), [])
+                    # A non-holder cannot release the row.
+                    self.assertFalse(store.release_migration("t1", "worker-b"))
+                    self.assertEqual(store.claim_migrations("worker-b", lease_seconds=100, limit=1, now=1050), [])
+                    # After the lease expires, it is re-claimable by another worker.
+                    later = store.claim_migrations("worker-b", lease_seconds=100, limit=1, now=1101)
+                    self.assertEqual([row["task_id"] for row in later], ["t1"])
+                    self.assertEqual(later[0]["claimed_by"], "worker-b")
+                    # The holder can release early, making it immediately re-claimable.
+                    self.assertTrue(store.release_migration("t1", "worker-b"))
+                    reclaim = store.claim_migrations("worker-c", lease_seconds=100, limit=1, now=1150)
+                    self.assertEqual([row["task_id"] for row in reclaim], ["t1"])
+
+    def test_migration_dead_letter_and_requeue(self):
+        # #4: a row the dispatcher gives up on gets a terminal 'dead' state (leaves the pending
+        # queue, appears in list_dead_migrations) and is recoverable via requeue. A non-holder
+        # cannot dead-letter. CALIBRATE: pre-fix there was NO terminal state -- a row whose attempts
+        # were exhausted stayed pending forever (asserted below before the fix's dead-letter runs).
+        for context in self._outbox_store_contexts():
+            with context as (backend, store):
+                with self.subTest(backend=backend):
+                    self._seed_outbox(store, "t1", sealed='{"n":1}')
+                    claimed = store.claim_migrations("worker-a", lease_seconds=60, limit=1)
+                    self.assertEqual(len(claimed), 1)
+                    # Stranding the fix cures: attempts exhaust but the row is still just pending.
+                    for _ in range(5):
+                        store.record_migration_attempt("t1", "worker-a")
+                    self.assertEqual([row["task_id"] for row in store.list_pending_migrations()], ["t1"])
+                    self.assertEqual(store.list_dead_migrations(), [])
+                    # A non-holder cannot dead-letter the row.
+                    self.assertFalse(store.dead_letter_migration("t1", "worker-x", "not yours"))
+                    # The holder dead-letters it: it leaves pending and gains a terminal state.
+                    self.assertTrue(store.dead_letter_migration("t1", "worker-a", "permit expired"))
+                    self.assertEqual(store.list_pending_migrations(), [])
+                    dead = store.list_dead_migrations()
+                    self.assertEqual([row["task_id"] for row in dead], ["t1"])
+                    self.assertEqual(dead[0]["dead_reason"], "permit expired")
+                    # Operator recovery returns it to the queue, clearing the dead reason.
+                    self.assertTrue(store.requeue_migration("t1"))
+                    self.assertEqual([row["task_id"] for row in store.list_pending_migrations()], ["t1"])
+                    self.assertEqual(store.list_dead_migrations(), [])
+                    self.assertFalse(store.requeue_migration("t1"))  # no longer dead
+
+    def test_migration_outbox_conflict_is_loud(self):
+        # #8: same task_id + identical envelope = idempotent no-op (keep-first); a DIFFERENT envelope
+        # under the same task_id raises instead of the old ON CONFLICT DO NOTHING silent drop.
+        # CALIBRATE: pre-fix the different-envelope enqueue silently succeeded and the FIRST envelope
+        # stayed (the new one lost) with no error; post-fix it raises (asserted here).
+        for context in self._outbox_store_contexts():
+            with context as (backend, store):
+                with self.subTest(backend=backend):
+                    self._seed_outbox(store, "t1", sealed='{"payload":"A"}')
+                    # Identical re-enqueue is an idempotent no-op.
+                    self._seed_outbox(store, "t1", sealed='{"payload":"A"}')
+                    self.assertEqual(len(store.list_pending_migrations()), 1)
+                    # A different envelope under the same task id is a real collision -> raise.
+                    with self.assertRaises(SecurityError):
+                        self._seed_outbox(store, "t1", sealed='{"payload":"B"}')
+                    # The original row is untouched (the conflicting write did not overwrite it).
+                    rows = store.list_pending_migrations()
+                    self.assertEqual(len(rows), 1)
+                    self.assertEqual(rows[0]["sealed_envelope_json"], '{"payload":"A"}')
+
+    def test_migration_dead_row_still_settles(self):
+        # B1 regression guard: dead-lettering a row (#4) must NOT strand a valid late receipt. A
+        # dispatcher gives up and dead-letters, then a genuine verified receipt arrives -- it settles
+        # the dead row (a verified receipt beats the local give-up). Protects the section 4 #2 fix.
+        with tempfile.TemporaryDirectory() as directory:
+            source, destination, _, envelope = self._migration_pair(directory)
+            sealed = source.run(envelope).migration_envelope
+            task_id = envelope_from_dict(sealed).state.task_id
+            receipt = destination.run(envelope_from_dict(sealed)).migration_receipt
+
+            # The source dispatcher claims the row and gives up on it (dead-letter).
+            claimed = source.store.claim_migrations("dispatcher", lease_seconds=60, limit=1)
+            self.assertEqual([row["task_id"] for row in claimed], [task_id])
+            self.assertTrue(source.store.dead_letter_migration(task_id, "dispatcher", "gave up"))
+            self.assertEqual([row["task_id"] for row in source.store.list_dead_migrations()], [task_id])
+
+            # A genuine receipt still settles the dead row.
+            source.settle_migration(task_id, receipt)
+            self.assertEqual(source.store.list_pending_migrations(), [])  # settled
+            self.assertEqual(source.store.list_dead_migrations(), [])  # no longer dead -> delivered
+            # And re-settlement of a delivered row is out of scope (Part 2b): the row is no longer
+            # findable for settlement, so a second settle raises rather than double-processing.
+            with self.assertRaises(SecurityError):
+                source.settle_migration(task_id, receipt)
+
     def test_attested_migration_requires_destination_evidence_and_resumes(self):
         authority = AttestationAuthority.generate()
         policy = AttestationPolicy(

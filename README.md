@@ -319,11 +319,14 @@ installed. Strong migration is implemented as checkpoint-and-resume: native stac
 sockets, and file descriptors never cross hosts. A migration's sealed destination
 envelope is written to a durable `migration_outbox` in the same transaction that
 closes the source checkpoint, so it survives a crash after the source closes.
-Portmark provides the outbox and its state API (`list_pending_migrations`,
-`record_migration_attempt`, `mark_migration_delivered`) but **does not run a
+Portmark provides the outbox and its state API (`claim_migrations`,
+`record_migration_attempt`, `mark_migration_delivered`, `dead_letter_migration`,
+`requeue_migration`, `list_pending_migrations`, `list_dead_migrations`) but **does not run a
 delivery dispatcher**: production delivery requires the embedder to run one that
-enumerates pending rows, retries delivery, and settles each row against a signed
-destination receipt. On admission the destination issues a `portmark.migration-receipt.v1`
+CLAIMS rows under a lease (so two dispatchers never ship the same migration), retries delivery,
+dead-letters rows it gives up on, and settles each row against a signed destination receipt.
+The runtime owns the outbox MECHANISM (claim/lease, dead-letter, conflict detection); the
+embedder owns delivery POLICY (max attempts, when to dead-letter). On admission the destination issues a `portmark.migration-receipt.v1`
 (returned in `RunResult.migration_receipt` / the a2a artifact) bound to the task, the
 hosts, the permit nonce, and the sealed-envelope digest; the source verifies it via
 `AgentHost.settle_migration(task_id, receipt)` before `mark_migration_delivered`, so
