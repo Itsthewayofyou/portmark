@@ -179,6 +179,22 @@ def make_host(
             "refused because such a key can change across restarts and orphan previously-signed "
             "audit heads; pass allow_ephemeral_signing_key=True for ephemeral demo/test use."
         )
+    # Finding #2: the host must not START with an audit-signing key it could not itself
+    # accept. Readiness reports such a key but does not block work -- a direct client would
+    # still submit a request and get back results whose audit head is invalid from birth
+    # (signed-after-revocation / expired). Enforce fail-closed at boot against the very
+    # trust the signer verifies audit heads with. Legacy HMAC has no key lifecycle or
+    # usages, exposes no registry, and is skipped (documented in SIGNING_KEYS.md).
+    audit_trust = getattr(host_signer, "registry", None)
+    audit_key_id = getattr(host_signer, "key_id", None)
+    if audit_trust is not None and audit_key_id is not None and hasattr(audit_trust, "audit_signing_reason"):
+        reason = audit_trust.audit_signing_reason(audit_key_id)
+        if reason is not None:
+            raise ValueError(
+                f"host audit-signing key {audit_key_id!r} cannot sign audit heads ({reason}): it must be "
+                "currently trusted, active, unexpired, unrevoked, and authorized for the 'audit' usage in "
+                "the trust registry that verifies audit heads. Rotate to a usable key before starting the host."
+            )
     return AgentHost(
         host_id,
         host_signer,

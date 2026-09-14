@@ -6,7 +6,11 @@ import os
 import secrets
 import shlex
 import sys
+import tempfile
+import time
+from contextlib import contextmanager
 from dataclasses import asdict
+from pathlib import Path
 
 from .a2a import A2AAuthConfig, serve
 from .config import RuntimeConfig
@@ -23,6 +27,157 @@ def _reject_control_characters(parser: argparse.ArgumentParser, name: str, value
         parser.error(f"{name} must not contain control characters or newlines")
 
 
+def _atomic_write_json(path: str, obj: dict) -> None:
+    # Atomic replace so a crash mid-write never leaves a half-written trust registry
+    # (finding #14). Preserve the existing file's permissions when replacing it.
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    try:
+        mode: int | None = os.stat(path).st_mode & 0o777
+    except OSError:
+        mode = None
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".trust-registry-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(obj, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if mode is not None:
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    # Durability: fsync the parent directory so the rename itself survives a crash, not
+    # just the file contents (finding #4). Not all platforms permit opening a directory
+    # for fsync (Windows); best-effort there.
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
+
+
+def _acquire_exclusive_lock(fd: int, timeout: float = 30.0) -> None:
+    """Take an exclusive, OS-released lock on `fd` (finding #4).
+
+    fcntl (POSIX) and msvcrt (Windows) locks are both released by the kernel when the
+    holding process dies, so neither can leave a stale lock the way an O_EXCL lock FILE
+    would. POSIX flock blocks; msvcrt has no blocking whole-file primitive, so we spin on
+    the non-blocking variant until we win or the timeout elapses (then surface the error).
+    On a platform offering neither primitive the lock is a documented no-op.
+    """
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None  # type: ignore[assignment]
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return
+    try:
+        import msvcrt
+    except ImportError:
+        return  # neither fcntl nor msvcrt: documented no-op (write stays crash-atomic)
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]  # Windows-only; stubs absent on POSIX
+            return
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
+
+
+def _release_exclusive_lock(fd: int) -> None:
+    # Closing the fd releases either lock, but release explicitly and match the msvcrt
+    # locked range (offset 0, 1 byte) so the unlock is well-formed.
+    try:
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return
+    except ImportError:
+        pass
+    try:
+        import msvcrt
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]  # Windows-only; stubs absent on POSIX
+    except (ImportError, OSError):
+        pass
+
+
+@contextmanager
+def _registry_write_lock(path: str):
+    """Serialize read -> validate -> merge -> replace across concurrent writers (finding #4).
+
+    Locks a SIDE-CAR file (`<path>.lock`) that is never renamed. Locking `path` itself is
+    defeated by the atomic `os.replace`: it swaps the inode, so a second writer locks the
+    NEW inode and proceeds concurrently, silently discarding the first writer's rotation
+    entry. POSIX uses fcntl.flock, Windows uses msvcrt.locking; on a platform offering
+    neither, the write stays crash-atomic but concurrent merges are not serialized.
+    """
+    lock_path = path + ".lock"
+    directory = os.path.dirname(os.path.abspath(lock_path)) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        _acquire_exclusive_lock(fd)
+        yield
+    finally:
+        try:
+            _release_exclusive_lock(fd)
+        finally:
+            os.close(fd)
+
+
+def _write_out_registry(parser: argparse.ArgumentParser, path: str, new_registry: dict, merge: bool) -> None:
+    with _registry_write_lock(path):
+        _write_out_registry_locked(parser, path, new_registry, merge)
+
+
+def _write_out_registry_locked(parser: argparse.ArgumentParser, path: str, new_registry: dict, merge: bool) -> None:
+    # With --force on an existing registry, MERGE the new identity in as a rotation entry
+    # rather than clobbering the file (finding #14): losing the other trusted keys on a
+    # rotation is a silent trust-downgrade. A duplicate key id carrying a different public
+    # key is a conflict, not a merge.
+    # Re-check existence INSIDE the lock: two racers that both saw the file absent before
+    # locking must not both create-and-clobber. If it exists now, merge regardless of the
+    # caller's pre-lock guess (finding #4).
+    registry = new_registry
+    if merge or os.path.exists(path):
+        try:
+            existing = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            parser.error(f"could not read existing trust registry {path}: {exc}")
+        # Validate the WHOLE existing registry before merging (finding #4): the loose dict
+        # build below would silently collapse duplicate ids already in the file and accept
+        # malformed entries. _parse_trust_registry enforces strict types, 32-byte keys, and
+        # duplicate-id rejection -- fail closed rather than propagate a corrupt registry.
+        from .security import _parse_trust_registry
+
+        try:
+            _parse_trust_registry(existing)
+        except ValueError as exc:
+            parser.error(f"existing trust registry {path} is invalid; refusing to merge: {exc}")
+        by_id = {entry.get("key_id"): entry for entry in existing["identities"] if isinstance(entry, dict)}
+        merged = list(existing["identities"])
+        for entry in new_registry.get("identities", []):
+            prior = by_id.get(entry["key_id"])
+            if prior is not None:
+                if prior.get("public_key_b64") != entry.get("public_key_b64"):
+                    parser.error(f"trust registry already has key id {entry['key_id']!r} with a different public key")
+                continue  # identical entry already present -> no-op
+            merged.append(entry)
+        registry = {**existing, "identities": merged}
+    _atomic_write_json(path, registry)
+
+
 def _run_keygen(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     from .security import generate_signing_material
 
@@ -32,8 +187,7 @@ def _run_keygen(parser: argparse.ArgumentParser, args: argparse.Namespace) -> No
         parser.error(f"{args.out_registry} already exists; pass --force to overwrite this trust registry")
     material = generate_signing_material(args.key_id, args.issuer, tuple(args.audience or ("*",)))
     if args.out_registry:
-        with open(args.out_registry, "w", encoding="utf-8") as handle:
-            json.dump(material["trust_registry"], handle, indent=2)
+        _write_out_registry(parser, args.out_registry, material["trust_registry"], merge=os.path.exists(args.out_registry))
         print(f"wrote trust registry to {args.out_registry}", file=sys.stderr)
     if args.format == "env":
         # shlex.quote every value so an operator-chosen key id / issuer cannot inject
@@ -170,7 +324,7 @@ def main() -> None:
         if store is None:
             parser.error("verify-audit requires --store-path or PORTMARK_STORE_PATH")
         verification = store.verify_audit_chain_status(args.task_id)
-        print(json.dumps({"task_id": args.task_id, "status": verification.status, "reason": verification.reason}, indent=2))
+        print(json.dumps({"task_id": args.task_id, "status": verification.status, "head_status": verification.head_status, "reason": verification.reason}, indent=2))
         if verification.status == "invalid":
             raise SystemExit(1)
         if verification.status == "unverifiable":

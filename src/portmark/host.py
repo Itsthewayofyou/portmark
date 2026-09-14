@@ -582,6 +582,9 @@ class AgentHost:
             or envelope.previous_audit_sequence <= 0
         ):
             raise SecurityError("previous audit head signature is missing")
+        # A migration handoff is a distinct purpose from ordinary audit-head signing
+        # (finding #5/#2): require the source key to carry the "migration" usage, so an
+        # operator can scope a key to audit-only and it cannot mint migration handoffs.
         self.signer.verify_audit_head(
             envelope.previous_audit_signature_key_id,
             audit_head_payload(
@@ -591,6 +594,7 @@ class AgentHost:
                 envelope.previous_audit_sequence,
             ),
             envelope.previous_audit_signature,
+            required_usage="migration",
         )
 
     def _persist(
@@ -623,11 +627,35 @@ class AgentHost:
         with self.store.transaction() as transaction:
             if consume_nonce is not None:
                 transaction.consume_nonce(consume_nonce, envelope.permit.subject, envelope.permit.audience, state.task_id)
+            # Finding #3 (Option B): sign audit heads as v2 with an attested signed_at so
+            # verification can be judged at signing time. One timestamp per persist; returned
+            # alongside (key_id, signature) so the store persists it for later verification.
+            head_signed_at = int(time.time())
+            # Finding #2 (runtime enforcement): fail closed if the audit-signing key stopped
+            # being usable while the process ran (e.g. it expired past its expires_at, which
+            # no on-disk file change would catch). We are about to sign a new audit head; if
+            # the key can no longer sign one we refuse rather than write evidence that is
+            # invalid from birth. Raising inside the transaction rolls back the nonce, the
+            # audit append, and the checkpoint together -- a closing _persist that trips this
+            # leaves the task in its prior (resumable) state, to be completed after a restart
+            # with a usable key. Legacy HMAC has no key lifecycle and exposes no registry.
+            audit_trust = getattr(self.signer, "registry", None)
+            if audit_trust is not None and hasattr(audit_trust, "audit_signing_reason"):
+                signing_reason = audit_trust.audit_signing_reason(self.signer.key_id, now=head_signed_at)
+                if signing_reason is not None:
+                    raise SecurityError(
+                        f"audit-signing key {self.signer.key_id!r} is no longer usable ({signing_reason}); "
+                        "refusing to sign a new audit head"
+                    )
             transaction.append_audit_events(
                 state.task_id,
                 self.host_id,
                 audit.events[persisted_events:],
-                lambda head_hash, sequence: (self.signer.key_id, self.signer.sign_audit_head(state.task_id, self.host_id, head_hash, sequence)),
+                lambda head_hash, sequence: (
+                    self.signer.key_id,
+                    self.signer.sign_audit_head(state.task_id, self.host_id, head_hash, sequence, signed_at=head_signed_at),
+                    head_signed_at,
+                ),
             )
             new_generation = transaction.save_checkpoint(state.task_id, state, state.checkpoint_generation, closed)
             # Section 1, finding #2: a migration's sealed destination envelope is
