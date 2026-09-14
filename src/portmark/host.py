@@ -11,7 +11,7 @@ from .metrics import RuntimeMetrics
 from .models import AgentEnvelope, ApprovalToken, AttestationEvidence, ProviderDecision, RunResult
 from .projection import project_state_for_provider
 from .providers import ModelProvider
-from .security import AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, SecurityError, arguments_hash, audit_head_payload, canonical_json, migration_envelope_digest, migration_receipt_payload
+from .security import _MIGRATION_RECEIPT_FIELDS, AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, SecurityError, arguments_hash, audit_head_payload, canonical_json, migration_envelope_digest, migration_receipt_payload
 from .storage import InMemoryRuntimeStore, RuntimeStore
 from .tools import ToolExecutionError, ToolKilledError, ToolRegistry
 
@@ -96,7 +96,13 @@ class AgentHost:
         mismatches = [field for field, value in expected.items() if receipt.get(field) != value]
         if mismatches:
             raise SecurityError(f"migration receipt does not match the outbox row: {', '.join(mismatches)}")
-        self.store.mark_migration_delivered(task_id, canonical_json(receipt).decode("utf-8"))
+        # Persist the canonical body + signature envelope by CONSTRUCTION (not the caller's dict), so a
+        # stored receipt only ever holds destination-signed fields even if the verify-side shape check is
+        # ever weakened -- every persisted field is one the signature covered.
+        canonical = {field: receipt[field] for field in _MIGRATION_RECEIPT_FIELDS}
+        canonical["signature_key_id"] = receipt["signature_key_id"]
+        canonical["signature"] = receipt["signature"]
+        self.store.mark_migration_delivered(task_id, canonical_json(canonical).decode("utf-8"))
 
     def _run(self, envelope: AgentEnvelope) -> RunResult:
         active_policy = self._active_policy()

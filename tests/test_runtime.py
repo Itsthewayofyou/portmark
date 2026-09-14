@@ -3420,6 +3420,126 @@ class RuntimeTests(unittest.TestCase):
             source.settle_migration(task_id, receipt)
             self.assertEqual(source.store.list_pending_migrations(), [])  # settled, not stuck forever
 
+    def test_migration_receipt_rejects_unsigned_fields(self):
+        # Auditor follow-up (Medium): the signature covers only the body fields, so an unsigned extra
+        # field must NOT ride inside a verified receipt (it would be persisted as if signed). Pre-fix
+        # the auditor reproduced UNSIGNED_EXTRA_SETTLED=True with a `completion_status` field.
+        from portmark.security import migration_receipt_payload
+
+        dest = EnvelopeSigner.generate("uf-dest", "host:destination", ("host:destination",))
+        source = EnvelopeSigner.generate("uf-source", "host:a", ("host:a",))
+        trust_signer(source, dest)
+        payload = migration_receipt_payload(
+            task_id="t", source_host_id="host:a", destination_host_id="host:destination",
+            permit_nonce="n", envelope_digest="d", destination_checkpoint_generation=1,
+            destination_audit_head="h", accepted_at=1,
+        )
+        receipt = dest.sign_migration_receipt(payload)
+        source.verify_migration_receipt(receipt)  # baseline: exact field set verifies
+
+        with self.assertRaisesRegex(SecurityError, "unexpected fields"):  # extra scalar, signature unchanged
+            source.verify_migration_receipt({**receipt, "completion_status": "completed"})
+        with self.assertRaisesRegex(SecurityError, "unexpected fields"):  # extra nested object
+            source.verify_migration_receipt({**receipt, "extra": {"nested": True}})
+
+        # HMAC path enforces the same exact-shape rule
+        hm = HmacEnvelopeSigner(b"k" * 32, "hmac-receipt-key")
+        h_receipt = hm.sign_migration_receipt(payload)
+        hm.verify_migration_receipt(h_receipt)
+        with self.assertRaisesRegex(SecurityError, "unexpected fields"):
+            hm.verify_migration_receipt({**h_receipt, "completion_status": "completed"})
+
+        # End-to-end: settle refuses an extra-field receipt and the row stays pending.
+        with tempfile.TemporaryDirectory() as directory:
+            src_host, dst_host, _, envelope = self._migration_pair(directory)
+            migrated = envelope_from_dict(src_host.run(envelope).migration_envelope)
+            good = dst_host.run(migrated).migration_receipt
+            with self.assertRaisesRegex(SecurityError, "unexpected fields"):
+                src_host.settle_migration(migrated.state.task_id, {**good, "completion_status": "completed"})
+            self.assertEqual(len(src_host.store.list_pending_migrations()), 1)  # still pending
+            src_host.settle_migration(migrated.state.task_id, good)  # genuine receipt settles
+            self.assertEqual(src_host.store.list_pending_migrations(), [])
+
+    def test_migration_receipt_verify_rejection_branches(self):
+        # Exercise every rejection path in receipt verification (Ed25519 + HMAC).
+        from portmark.security import migration_receipt_payload
+
+        dest = EnvelopeSigner.generate("br-dest", "host:destination", ("host:destination",))
+        pub = dest.public_key_bytes()
+        payload = migration_receipt_payload(
+            task_id="t", source_host_id="host:a", destination_host_id="host:destination",
+            permit_nonce="n", envelope_digest="d", destination_checkpoint_generation=1,
+            destination_audit_head="h", accepted_at=1000,
+        )
+        receipt = dest.sign_migration_receipt(payload)
+
+        def reg(**kw):
+            registry = TrustRegistry()
+            registry.add(TrustedIdentity("br-dest", "host:destination", pub, ("*",), **kw))
+            return registry
+
+        # sign rejects a malformed payload (missing field / unknown type)
+        with self.assertRaisesRegex(SecurityError, "missing a required field"):
+            dest.sign_migration_receipt({k: v for k, v in payload.items() if k != "accepted_at"})
+        with self.assertRaisesRegex(SecurityError, "unknown type"):
+            dest.sign_migration_receipt({**payload, "type": "nope"})
+
+        # verify: right key set but wrong type value -> unknown type; empty signature -> missing
+        with self.assertRaisesRegex(SecurityError, "unknown type"):
+            reg().verify_migration_receipt({**receipt, "type": "nope"})
+        with self.assertRaisesRegex(SecurityError, "signature is missing"):
+            reg().verify_migration_receipt({**receipt, "signature": ""})
+        # untrusted / revoked / not-yet-active / expired / wrong-usage / host-mismatch / bad-sig
+        with self.assertRaisesRegex(SecurityError, "not trusted"):
+            TrustRegistry().verify_migration_receipt(receipt)
+        with self.assertRaisesRegex(SecurityError, "has been revoked"):
+            reg(revoked=True).verify_migration_receipt(receipt, now=1000)
+        with self.assertRaisesRegex(SecurityError, "not active yet"):
+            reg(not_before=5000).verify_migration_receipt(receipt, now=1000)
+        with self.assertRaisesRegex(SecurityError, "has expired"):
+            reg(expires_at=500).verify_migration_receipt(receipt, now=1000)
+        with self.assertRaisesRegex(SecurityError, "'receipt' usage"):
+            reg(usages=("audit",)).verify_migration_receipt(receipt, now=1000)
+        elsewhere = TrustRegistry()
+        elsewhere.add(TrustedIdentity("br-dest", "host:elsewhere", pub, ("*",)))
+        with self.assertRaisesRegex(SecurityError, "does not match the destination host"):
+            elsewhere.verify_migration_receipt(receipt, now=1000)
+        flipped = receipt["signature"][:-2] + ("AA" if not receipt["signature"].endswith("AA") else "BB")
+        with self.assertRaisesRegex(SecurityError, "signature is invalid"):
+            reg().verify_migration_receipt({**receipt, "signature": flipped}, now=1000)
+
+        # HMAC path: baseline verifies; wrong key and bad signature rejected
+        hm = HmacEnvelopeSigner(b"k" * 32, "hk")
+        h_receipt = hm.sign_migration_receipt(payload)
+        hm.verify_migration_receipt(h_receipt)
+        with self.assertRaisesRegex(SecurityError, "not trusted"):
+            HmacEnvelopeSigner(b"k" * 32, "other").verify_migration_receipt(h_receipt)
+        with self.assertRaisesRegex(SecurityError, "signature is invalid"):
+            hm.verify_migration_receipt({**h_receipt, "signature": "00"})
+
+    def test_migration_receipt_write_failure_rolls_back_admission(self):
+        # Atomicity: the receipt is written inside the destination's admission transaction, so if the
+        # receipt insert fails the WHOLE admission rolls back -- no checkpoint, no consumed nonce, no
+        # audit head, no partial receipt.
+        import portmark.storage as storage_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            source, destination, _, envelope = self._migration_pair(directory)
+            migrated = envelope_from_dict(source.run(envelope).migration_envelope)
+            task_id = migrated.state.task_id
+
+            def boom(self, task_id, receipt_json):  # noqa: ARG001
+                raise RuntimeError("simulated receipt write failure")
+
+            with patch.object(storage_module._SQLiteTransaction, "store_migration_receipt", boom):
+                with self.assertRaises(RuntimeError):
+                    destination.run(migrated)
+
+            self.assertIsNone(destination.store.load_checkpoint(task_id))
+            self.assertIsNone(destination.store.audit_head(task_id))
+            self.assertFalse(destination.store.consumed_nonce_exists(migrated.permit.nonce))
+            self.assertIsNone(destination.store.get_migration_receipt(task_id))
+
     def test_attested_migration_requires_destination_evidence_and_resumes(self):
         authority = AttestationAuthority.generate()
         policy = AttestationPolicy(

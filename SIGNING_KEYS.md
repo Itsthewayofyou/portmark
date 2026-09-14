@@ -52,7 +52,10 @@ The host verifier uses a `TrustRegistry` containing `TrustedIdentity` records:
   usage) — the mirror of the destination trusting the source's `migration` key. A source that lacks the
   destination's key cannot settle and its rows stay pending with a clear "signing key is not trusted"
   error. The receipt's `accepted_at` is destination-set and therefore not independently verifiable (same
-  class as an audit head's `signed_at`): it is recorded, never gated on.
+  class as an audit head's `signed_at`): it is recorded, never gated on. Because the signature covers only
+  the receipt body, verification rejects a receipt carrying **any** field outside the signed body plus the
+  signature envelope — so an unsigned field cannot ride inside a verified receipt and be persisted as if
+  it were destination-signed.
 - `revoked_at` (optional): the effective epoch time of a revocation (see historical verification
   below). With `revoked=true` and `revoked_at` set, a head signed strictly before that time is
   "valid, key later revoked"; a head at/after it is "signed after revocation".

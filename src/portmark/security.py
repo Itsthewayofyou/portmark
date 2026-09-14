@@ -169,6 +169,20 @@ def _migration_receipt_body(receipt: dict[str, Any]) -> dict[str, Any]:
         raise SecurityError("migration receipt is missing a required field") from error
 
 
+def _verified_migration_receipt_shape(receipt: dict[str, Any]) -> dict[str, Any]:
+    """Validate a full receipt's SHAPE before signature checks (finding S4-#2 follow-up).
+
+    The signature covers only the body fields, so an unknown key can ride inside an otherwise-valid
+    receipt and, if persisted, be mistaken later for destination-signed evidence. Reject any receipt
+    whose keys are not EXACTLY the signed body plus the signature envelope. Returns the body so the
+    caller verifies over it.
+    """
+    allowed = set(_MIGRATION_RECEIPT_FIELDS) | {"signature", "signature_key_id"}
+    if set(receipt) != allowed:
+        raise SecurityError("migration receipt has unexpected fields")
+    return _migration_receipt_body(receipt)
+
+
 @dataclass(frozen=True)
 class AuditHeadEvaluation:
     """Historical verification of a STORED audit head (finding #3, Option B).
@@ -441,8 +455,9 @@ class TrustRegistry:
         # source verifies it before settling delivery. Mirrors verify_audit_head: the key must be
         # trusted + currently usable, carry the `receipt` usage, and its issuer must equal the
         # receipt's destination_host_id -- so a receipt signed by some other trusted host cannot
-        # be presented as this destination's proof.
-        body = _migration_receipt_body(receipt)
+        # be presented as this destination's proof. The exact-shape check rejects any unsigned
+        # field riding inside the receipt (it would otherwise be persisted as if signed).
+        body = _verified_migration_receipt_shape(receipt)
         key_id = receipt.get("signature_key_id")
         signature = receipt.get("signature")
         if not isinstance(key_id, str) or not key_id or not isinstance(signature, str) or not signature:
@@ -1166,8 +1181,9 @@ class HmacEnvelopeSigner:
         return {**body, "signature": signature, "signature_key_id": self.key_id}
 
     def verify_migration_receipt(self, receipt: dict[str, Any], now: int | None = None) -> None:
-        # Legacy HMAC has no per-key issuer/usage; it only attests MAC authenticity.
-        body = _migration_receipt_body(receipt)
+        # Legacy HMAC has no per-key issuer/usage; it only attests MAC authenticity. Reject unsigned
+        # extra fields the same way the Ed25519 path does (finding S4-#2 follow-up).
+        body = _verified_migration_receipt_shape(receipt)
         if receipt.get("signature_key_id") != self.key_id:
             raise SecurityError("migration receipt signing key is not trusted")
         signature = receipt.get("signature")

@@ -25,6 +25,11 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
 - **Deployment prerequisite (documented):** the source must trust the destination's receipt key, or its
   rows stay pending with a clear "signing key is not trusted" error. `accepted_at` is destination-set and
   recorded, never gated on.
+- **Receipt verification rejects unsigned fields.** The signature covers only the body, so verification
+  now requires the receipt's keys to be EXACTLY the signed body plus `signature`/`signature_key_id` — an
+  unknown field (e.g. an unsigned `completion_status`) is rejected rather than verified and then persisted
+  as if signed. Enforced on both the Ed25519 and legacy-HMAC paths. Atomic receipt issuance has a
+  fault-injection regression test (a failed receipt insert rolls back the whole admission).
 - Schema: SQLite v7 / Postgres v5 add a `migration_receipts` table and a nullable
   `migration_outbox.receipt_json`; old stores migrate. Still open in Section 4: #3 outbox claim/lease,
   #4 expiry/dead-letter, #5 attestation freshness, #6 payload confidentiality, #7 task-id namespacing,
