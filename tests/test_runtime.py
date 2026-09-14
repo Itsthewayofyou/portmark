@@ -3613,7 +3613,7 @@ class RuntimeTests(unittest.TestCase):
             with context as (backend, store):
                 with self.subTest(backend=backend):
                     self._seed_outbox(store, "t1", sealed='{"n":1}')
-                    claimed = store.claim_migrations("worker-a", lease_seconds=100, limit=1, now=1000)
+                    claimed = store.claim_migrations("worker-a", lease_seconds=100, limit=1, _now=1000)
                     self.assertEqual(len(claimed), 1)
                     # list_pending is a visibility query, not a queue: it still shows the claimed row,
                     # and exposes who holds it so a caller can't mistake it for unclaimed work.
@@ -3621,17 +3621,17 @@ class RuntimeTests(unittest.TestCase):
                     self.assertEqual([row["task_id"] for row in visible], ["t1"])
                     self.assertEqual(visible[0]["claimed_by"], "worker-a")
                     # Before expiry, another worker gets nothing.
-                    self.assertEqual(store.claim_migrations("worker-b", lease_seconds=100, limit=1, now=1050), [])
-                    # A non-holder cannot release the row.
-                    self.assertFalse(store.release_migration("t1", "worker-b"))
-                    self.assertEqual(store.claim_migrations("worker-b", lease_seconds=100, limit=1, now=1050), [])
+                    self.assertEqual(store.claim_migrations("worker-b", lease_seconds=100, limit=1, _now=1050), [])
+                    # A non-holder cannot release the row (while worker-a's lease is still live).
+                    self.assertFalse(store.release_migration("t1", "worker-b", _now=1050))
+                    self.assertEqual(store.claim_migrations("worker-b", lease_seconds=100, limit=1, _now=1050), [])
                     # After the lease expires, it is re-claimable by another worker.
-                    later = store.claim_migrations("worker-b", lease_seconds=100, limit=1, now=1101)
+                    later = store.claim_migrations("worker-b", lease_seconds=100, limit=1, _now=1101)
                     self.assertEqual([row["task_id"] for row in later], ["t1"])
                     self.assertEqual(later[0]["claimed_by"], "worker-b")
-                    # The holder can release early, making it immediately re-claimable.
-                    self.assertTrue(store.release_migration("t1", "worker-b"))
-                    reclaim = store.claim_migrations("worker-c", lease_seconds=100, limit=1, now=1150)
+                    # The holder can release early (within its lease), making it immediately re-claimable.
+                    self.assertTrue(store.release_migration("t1", "worker-b", _now=1150))
+                    reclaim = store.claim_migrations("worker-c", lease_seconds=100, limit=1, _now=1160)
                     self.assertEqual([row["task_id"] for row in reclaim], ["t1"])
 
     def test_migration_dead_letter_and_requeue(self):
@@ -3708,6 +3708,103 @@ class RuntimeTests(unittest.TestCase):
             # findable for settlement, so a second settle raises rather than double-processing.
             with self.assertRaises(SecurityError):
                 source.settle_migration(task_id, receipt)
+
+    def test_migration_claim_rejects_bad_input(self):
+        # #3 fix round: exclusivity holds only for well-formed leases, so bad inputs are rejected up
+        # front rather than silently defeating it (a zero/negative lease let two workers claim the
+        # same row). bool is an int subclass and must be rejected too.
+        for context in self._outbox_store_contexts():
+            with context as (backend, store):
+                with self.subTest(backend=backend):
+                    self._seed_outbox(store, "t1", sealed='{"n":1}')
+                    for bad in ("", "   "):
+                        with self.assertRaises(SecurityError):
+                            store.claim_migrations(bad, lease_seconds=60, limit=1)
+                    for bad in (0, -5, True, 1.5, "60"):
+                        with self.assertRaises(SecurityError):
+                            store.claim_migrations("worker", lease_seconds=bad, limit=1)
+                    from portmark.storage import MAX_MIGRATION_LEASE_SECONDS
+                    with self.assertRaises(SecurityError):
+                        store.claim_migrations("worker", lease_seconds=MAX_MIGRATION_LEASE_SECONDS + 1, limit=1)
+                    # The ceiling itself is a LEGAL lease (fencepost: MAX accepted, MAX+1 rejected).
+                    at_ceiling = store.claim_migrations("worker", lease_seconds=MAX_MIGRATION_LEASE_SECONDS, limit=1, _now=1000)
+                    self.assertEqual([row["task_id"] for row in at_ceiling], ["t1"])
+                    store.release_migration("t1", "worker", _now=1000)  # unclaim for the assertion below
+                    for bad in (0, -1, True, 2.0):
+                        with self.assertRaises(SecurityError):
+                            store.claim_migrations("worker", lease_seconds=60, limit=bad)
+                    # The row was never claimed by any rejected call.
+                    self.assertIsNone(store.list_pending_migrations()[0].get("claimed_by"))
+
+    def test_migration_expired_holder_loses_authority(self):
+        # #3 fix round: an EXPIRED holder is no longer the logical owner even though its name is still
+        # in claimed_by. It must not be able to release, dead-letter, or count an attempt -- both
+        # before another worker reclaims AND after. A LIVE holder still can.
+        for context in self._outbox_store_contexts():
+            with context as (backend, store):
+                with self.subTest(backend=backend):
+                    self._seed_outbox(store, "t1", sealed='{"n":1}')
+                    store.claim_migrations("w1", lease_seconds=100, limit=1, _now=1000)  # lease -> 1100
+                    # BEFORE reclaim: w1's lease has expired (now=1200 > 1100) -> no authority.
+                    self.assertFalse(store.release_migration("t1", "w1", _now=1200))
+                    self.assertFalse(store.dead_letter_migration("t1", "w1", "too late", _now=1200))
+                    store.record_migration_attempt("t1", "w1", _now=1200)
+                    self.assertEqual(store.list_pending_migrations()[0]["attempt_count"], 0)  # not counted
+                    self.assertEqual(store.list_dead_migrations(), [])  # still pending, not dead
+                    # A LIVE holder (within lease) CAN count an attempt...
+                    store.record_migration_attempt("t1", "w1", _now=1050)
+                    self.assertEqual(store.list_pending_migrations()[0]["attempt_count"], 1)
+                    # AFTER another worker reclaims the expired row, w1 has no authority either.
+                    reclaimed = store.claim_migrations("w2", lease_seconds=100, limit=1, _now=1200)
+                    self.assertEqual([row["task_id"] for row in reclaimed], ["t1"])
+                    self.assertFalse(store.release_migration("t1", "w1", _now=1250))
+                    self.assertFalse(store.dead_letter_migration("t1", "w1", "not mine", _now=1250))
+                    # The live new holder can dead-letter it.
+                    self.assertTrue(store.dead_letter_migration("t1", "w2", "w2 gives up", _now=1250))
+                    self.assertEqual([row["task_id"] for row in store.list_dead_migrations()], ["t1"])
+
+    @unittest.skipUnless(
+        os.environ.get("PORTMARK_TEST_POSTGRES_DSN") and PostgresRuntimeStore.available(),
+        "needs a live Postgres (PORTMARK_TEST_POSTGRES_DSN)",
+    )
+    def test_migration_outbox_conflict_is_atomic_under_concurrency(self):
+        # #8 fix round: the pre-fix SELECT-then-INSERT-DO-NOTHING let two concurrent FIRST enqueues
+        # both see no row; one inserted, the other DO-NOTHINGed and silently dropped its different
+        # envelope. Two real connections, same task_id + DIFFERENT envelopes, barrier-synchronized:
+        # exactly one commits, the other raises (its source-close rolls back), stored == winner.
+        dsn = os.environ["PORTMARK_TEST_POSTGRES_DSN"]
+        schema = "portmark_conflict_" + secrets.token_hex(8)
+        store_a = PostgresRuntimeStore(dsn, schema=schema)
+        store_b = PostgresRuntimeStore(dsn, schema=schema)  # same schema -> same outbox, 2 connections
+        try:
+            barrier = threading.Barrier(2)
+            results: dict[str, str] = {}
+
+            def attempt(name, store, sealed):
+                barrier.wait()
+                try:
+                    with store.transaction() as txn:
+                        txn.enqueue_migration("shared-task", "host:dest", sealed)
+                    results[name] = "committed:" + sealed
+                except SecurityError:
+                    results[name] = "rejected"
+
+            ta = threading.Thread(target=attempt, args=("a", store_a, '{"payload":"A"}'))
+            tb = threading.Thread(target=attempt, args=("b", store_b, '{"payload":"B"}'))
+            ta.start(); tb.start(); ta.join(); tb.join()
+
+            outcomes = sorted(results.values())
+            # exactly one committed, exactly one rejected -- never two silent successes.
+            self.assertEqual(len(outcomes), 2, results)
+            self.assertEqual(sum(1 for o in outcomes if o.startswith("committed:")), 1, results)
+            self.assertEqual(sum(1 for o in outcomes if o == "rejected"), 1, results)
+            # The stored envelope is exactly the winner's; the loser's write rolled back.
+            winner_sealed = next(o.split("committed:", 1)[1] for o in outcomes if o.startswith("committed:"))
+            pending = store_a.list_pending_migrations()
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending[0]["sealed_envelope_json"], winner_sealed)
+        finally:
+            self._drop_postgres_schema(dsn, schema)
 
     def test_attested_migration_requires_destination_evidence_and_resumes(self):
         authority = AttestationAuthority.generate()

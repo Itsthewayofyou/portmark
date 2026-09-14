@@ -33,6 +33,23 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   embedder owns delivery policy (max attempts, when to dead-letter). Still open in Section 4: #5
   attestation freshness, #6 payload confidentiality (decided: per-destination projection), #7 task-id
   namespacing.
+- **Fix round (concurrency hardening):**
+  - **#8 is now atomic under concurrency.** The conflict check was a SELECT followed by a separate
+    `INSERT ... ON CONFLICT DO NOTHING`, so two concurrent FIRST enqueues could both see no row and the
+    loser silently dropped its different envelope. Replaced with ONE conflict-validating upsert
+    (`ON CONFLICT DO UPDATE ... WHERE existing envelope = incoming`, `RETURNING`/rowcount): a fresh or
+    identical enqueue keeps-first, a different envelope raises. Proven with a two-connection,
+    barrier-synchronized Postgres test (calibrated: the old code produced two silent commits).
+  - **Lease inputs are validated.** `claim_migrations` rejects an empty worker id, a non-int/bool or
+    non-positive `lease_seconds`, a lease past a 7-day ceiling, and a non-positive limit — a zero or
+    negative lease would otherwise let two workers hold the same row.
+  - **An expired holder loses authority.** `release_migration`, `dead_letter_migration`, and scoped
+    `record_migration_attempt` now require `lease_expires_at > now`, so a worker whose lease lapsed
+    can no longer dead-letter or inflate the attempt count on a row it no longer owns. (An expired
+    holder's *release* is a harmless no-op — the lapsed lease already made the row reclaimable.)
+  - The time source for these operations is a private, test-only keyword (`_now`); production always
+    uses the wall clock, so a caller cannot pass a `now` that bypasses a live lease. `record_migration_attempt`
+    with no worker id still counts unscoped (back-compat for a single-dispatcher embedder).
 
 ### Section 4 (part 2) — signed migration delivery receipts + reconciliation
 
