@@ -100,8 +100,10 @@ registry rather than clobbering it, and the merge is **concurrency-safe**: it se
 read → validate → merge → replace under a sidecar lock (`<file>.lock`) so two simultaneous
 rotations cannot lose each other's key, validates the whole existing registry before merging
 (a duplicate id already in the file is rejected, not silently collapsed), and fsyncs the parent
-directory so the rename survives a crash. The cross-process lock uses `fcntl` and is POSIX-only;
-on other platforms the write stays crash-atomic but concurrent merges are not serialized.
+directory so the rename survives a crash. The cross-process lock uses `fcntl` on POSIX and
+`msvcrt.locking` on Windows — both are released by the OS if the holding process dies, so neither
+can leave a stale lock the way an `O_EXCL` lock *file* would. On a platform that offers neither
+primitive the write stays crash-atomic but concurrent merges are not serialized.
 
 ## Host Audit-Signing Key Must Be Usable At Boot
 
