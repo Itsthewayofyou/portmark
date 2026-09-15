@@ -81,7 +81,11 @@ class AgentHost:
         migration. A source that does not trust the destination's key gets a clear
         "signing key is not trusted" error, which is the deployment prerequisite for settlement.
         """
-        row = next((r for r in self.store.list_pending_migrations() if r["task_id"] == task_id), None)
+        # Pending OR dead-lettered (section 4 #4): a verified receipt beats the dispatcher's local
+        # give-up, so a late-but-valid receipt still settles a row the dispatcher dead-lettered --
+        # this is what keeps #4 from regressing the section 4 #2 lost-ack fix. A row already
+        # delivered returns None here (re-settlement is out of scope, Part 2b).
+        row = self.store.find_migration_for_settlement(task_id)
         if row is None:
             raise SecurityError(f"no pending migration for task {task_id!r} to settle")
         self.signer.verify_migration_receipt(receipt)

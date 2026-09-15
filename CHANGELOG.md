@@ -6,6 +6,64 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Section 4 (part 3a) — migration outbox reliability
+
+- **Concurrent dispatchers can no longer double-ship a migration (finding #3).** A dispatcher now
+  CLAIMS outbox rows under a time-bounded lease via `store.claim_migrations(worker_id, lease_seconds,
+  limit)`; a row is claimable only if pending AND (unclaimed OR its lease expired), so two dispatchers
+  never receive the same row and a worker that dies mid-delivery has its rows reclaimed once the lease
+  lapses. Claiming is race-safe — `FOR UPDATE SKIP LOCKED` on Postgres, `BEGIN IMMEDIATE` on SQLite.
+  `release_migration(task_id, worker_id)` frees a claim; both it and dead-lettering are HOLDER-SCOPED,
+  so a stale (expired-lease) worker cannot disturb the row a new worker now owns.
+- **A stranded migration now has a terminal state and a recovery path (finding #4).** A dispatcher that
+  gives up on a row (permit expired, destination gone, attempts exhausted) calls
+  `dead_letter_migration(task_id, worker_id, reason)` to move it to a terminal `dead` state with a
+  reason, out of the pending queue and visible via `list_dead_migrations()`; `requeue_migration(task_id)`
+  returns it to the queue for a retry. Crucially, a later VERIFIED destination receipt still settles a
+  dead-lettered row — a verified receipt beats the local give-up — so this does not regress the section 4
+  #2 lost-ack fix (`settle_migration` now looks up pending-or-dead rows).
+- **A conflicting outbox enqueue is now loud instead of silent (finding #8).** `enqueue_migration`
+  keeps-first only for an exact re-enqueue of the SAME sealed envelope (an idempotent retry); a
+  same-task-id enqueue with a DIFFERENT envelope raises `SecurityError` and rolls back the atomic source
+  close, instead of the old `ON CONFLICT DO NOTHING` silently dropping it. NOTE: a same-task-id collision
+  ACROSS source hosts stays possible until #7 namespaces the key by `(source_host_id, task_id)`; #8 only
+  makes a collision loud rather than silent.
+- Schema: SQLite v8 / Postgres v6 add nullable `migration_outbox.claimed_by`, `lease_expires_at`,
+  `dead_reason`; old stores migrate. Portmark still ships the outbox mechanism, not a dispatcher — the
+  embedder owns delivery policy (max attempts, when to dead-letter). Still open in Section 4: #5
+  attestation freshness, #6 payload confidentiality (decided: per-destination projection), #7 task-id
+  namespacing.
+- **Fix round (concurrency hardening):**
+  - **#8 is now atomic under concurrency.** The conflict check was a SELECT followed by a separate
+    `INSERT ... ON CONFLICT DO NOTHING`, so two concurrent FIRST enqueues could both see no row and the
+    loser silently dropped its different envelope. Replaced with ONE conflict-validating upsert
+    (`ON CONFLICT DO UPDATE ... WHERE existing envelope = incoming`, `RETURNING`/rowcount): a fresh or
+    identical enqueue keeps-first, a different envelope raises. Proven with a two-connection,
+    barrier-synchronized Postgres test (calibrated: the old code produced two silent commits).
+  - **Lease inputs are validated.** `claim_migrations` rejects an empty worker id, a non-int/bool or
+    non-positive `lease_seconds`, a lease past a 7-day ceiling, and a non-positive limit — a zero or
+    negative lease would otherwise let two workers hold the same row.
+  - **An expired holder loses authority.** `release_migration`, `dead_letter_migration`, and scoped
+    `record_migration_attempt` now require `lease_expires_at > now`, so a worker whose lease lapsed
+    can no longer dead-letter or inflate the attempt count on a row it no longer owns. (An expired
+    holder's *release* is a harmless no-op — the lapsed lease already made the row reclaimable.)
+  - The lease clock is injected at store CONSTRUCTION (default: the wall clock), never a per-call
+    parameter — so a caller of claim/release/dead-letter/attempt cannot supply a forged `now` to
+    steal or bypass another worker's live lease. (An earlier iteration exposed a keyword-only `_now`;
+    that was NOT private — a caller could pass it — and has been removed from the public API. Tests
+    control time via a constructor-injected clock.) `record_migration_attempt` with no worker id still
+    counts unscoped (single-dispatcher back-compat).
+  - **Postgres leases use DATABASE time, closing a cross-host exclusivity break.** Judging a committed
+    lease against each dispatcher's own host clock is not safe: a host whose clock runs ahead classifies
+    a still-live lease as expired and reclaims a row another worker holds — `FOR UPDATE SKIP LOCKED`
+    serializes the two claim statements but not the clock each reads, so two workers could deliver the
+    same migration. All five Postgres lease operations (claim eligibility, new-lease expiry, release,
+    dead-letter, scoped attempt) now compute time from `EXTRACT(EPOCH FROM clock_timestamp())::bigint`,
+    so every dispatcher shares the one database clock and host skew cannot break exclusivity. The
+    embedded stores (SQLite/InMemory) are single-process, so their construction-injected clock is the
+    only clock and needs no change. (This supersedes an earlier note that mischaracterised the skew as
+    a mere liveness window.)
+
 ### Section 4 (part 2) — signed migration delivery receipts + reconciliation
 
 - **Migration delivery can now be settled, not just attempted (finding #2, High).** A destination that
