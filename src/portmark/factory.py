@@ -11,7 +11,7 @@ from .metrics import RuntimeMetrics
 from .models import AgentEnvelope, AgentManifest, AgentState, Permit, ResourceBudget, ToolGrant
 from .policy import load_host_policy
 from .providers import DeterministicProvider, GenericHttpProvider, ModelProvider, NativeWasmtimeComponentProvider, WasmDecisionProvider
-from .security import AttestationPolicy, EnvelopeSigner, EnvelopeSigningIdentity, ExternalAttestationVerifier, HmacEnvelopeSigner, HostPolicy, TrustRegistry, TrustSource, _b64url_decode, validate_constraints
+from .security import AttestationPolicy, EnvelopeSigner, EnvelopeSigningIdentity, ExternalAttestationVerifier, HmacEnvelopeSigner, HostPolicy, MigrationAttesterProtocol, TrustRegistry, TrustSource, _b64url_decode, validate_constraints
 from .storage import RuntimeStore, create_runtime_store
 from .tools import ToolRegistry, demo_registry
 
@@ -71,6 +71,7 @@ def make_host(
     attestation_policy: AttestationPolicy | None = None,
     attestation_verifier_command: tuple[str, ...] | str | None = None,
     require_attestation: bool | None = None,
+    migration_attester: MigrationAttesterProtocol | None = None,
     metrics: RuntimeMetrics | None = None,
     policy_path: str | None = None,
     trust_registry_path: str | None = None,
@@ -201,11 +202,12 @@ def make_host(
         policy,
         tools if tools is not None else demo_registry(),
         configured_providers,
-        configured_store,
-        configured_attestation_policy,
-        policy_loader,
-        reload_policy,
-        metrics,
+        store=configured_store,
+        attestation_policy=configured_attestation_policy,
+        migration_attester=migration_attester,
+        policy_loader=policy_loader,
+        reload_policy=reload_policy,
+        metrics=metrics,
     )
 
 

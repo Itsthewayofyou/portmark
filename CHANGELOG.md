@@ -6,6 +6,33 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Section 4 — migration challenge-passing protocol (finding #5 follow-up)
+
+- **Migration attestation freshness can now be closed with a source-verified challenge (finding #5,
+  opt-in).** #5's first step bound migration attestation to the migration's permit nonce, but that nonce
+  is the source's *incoming* (upstream-chosen) nonce and the source's provider produced the "destination
+  attestation" — so a source could present pre-collected evidence. With the new opt-in, the source mints
+  a **fresh challenge** at migrate time (carried as the delegated permit nonce), the destination attests
+  to **its own** identity over that challenge with an injected `migration_attester`, and the evidence
+  rides back in the signed delivery receipt where the **source verifies it** before marking the migration
+  delivered. Because the source chose the challenge, pre-collected or stale evidence cannot satisfy it.
+  Enable it with `AttestationPolicy(require_migration_challenge=True)` on the source and a
+  `migration_attester` on the destination; both default off, so existing migrations are unchanged.
+- **A challenge-required migration fails admission closed when the destination cannot attest.** The
+  source's demand rides inside the sealed envelope, and a destination with no (or a failing) attester
+  refuses admission **before persisting anything** — so no evidence-less receipt is ever stored (receipts
+  are idempotent, so a stored one would strand the outbox row forever). A failing attester surfaces as a
+  `SecurityError`, not an uncaught error out of `run()`. The source can re-deliver once the attester
+  recovers.
+- **Supersedes #64's reuse only when enabled.** In challenge mode the delegated permit carries a fresh
+  challenge nonce and **no** source-provided attestation (a source attestation bound to the incoming
+  nonce would make the destination's `verify_execution` reject the fresh challenge); freshness moves from
+  the source-side `verify_migration` check to the receipt-verify step at settlement. With challenge mode
+  off, #64's incoming-nonce reuse is byte-identical. The evidence is an **optional** signed receipt field,
+  so pre-#5 receipts and both directions of mixed-version delivery still validate. No schema change.
+  Documented bound: a destination that also sets `required_for_execution=True` refuses challenge
+  migrations (the two attestation mechanisms are mutually exclusive per destination).
+
 ### Section 4 — migration task-id namespacing (finding #7)
 
 - **A destination no longer lets one source squat another source's task id (finding #7).** Checkpoints,

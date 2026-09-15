@@ -116,6 +116,32 @@ Dockerfile. Common configuration:
 Do not bake tokens, private keys, policy files containing local secrets, or
 runtime stores into the container image.
 
+## Migration Attestation Freshness (optional)
+
+Migration attestation freshness is **opt-in** and off by default. To require that a destination proves
+itself with fresh, non-replayable evidence before a source considers a migration delivered, enable the
+**challenge-passing protocol**:
+
+- On the **source** host: `AttestationPolicy(require_migration_challenge=True)`, and the source must
+  trust the destination's attestation authority (add it to the policy's `authorities`). The source mints
+  a fresh challenge per migration and verifies the destination's evidence in the delivery receipt before
+  settling.
+- On the **destination** host: pass a `migration_attester` (implements `MigrationAttesterProtocol`) that
+  produces the destination's own attestation over the challenge. The attester runs inside the admission
+  path, so its implementation **must be bounded** (timeout + response cap, like
+  `ExternalAttestationVerifier`); an attester that blocks holds admission open.
+
+Operational notes:
+
+- A destination that receives a challenge-required migration but has **no** working attester refuses
+  admission (fail-closed) and persists nothing, so the source can re-deliver once the attester recovers.
+- Challenge mode is **mutually exclusive** with `required_for_execution=True` on the same destination:
+  in challenge mode the migrated permit carries no execution attestation (the proof travels in the
+  receipt), so a destination that also requires an execution attestation will refuse challenge
+  migrations. Pick one mechanism per destination.
+- A migrated task's challenge nonce is consumed at the destination on first admission, so a task
+  migrates to a given destination once (identical re-delivery remains idempotent).
+
 ## Upgrading
 
 ### Reserved migration task-id namespace (`mig::`)
