@@ -24,17 +24,24 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   and strand the admitted task in a non-terminal state. The token is now validated against an exact
   schema with type checks, and any malformation becomes a bounded `approval.denied` with a fixed reason
   code (no attacker-chosen key names or exception text in the audit).
-- **A task can now be durably cancelled, and cancellation is enforced at the approval gate (finding
-  #3, Medium).** `AgentHost.cancel_task(task_id)` records a durable cancellation (new
-  `task_cancellations` table; SQLite schema v9, Postgres schema v7). An approval that has not yet been
-  redeemed is refused **inside the same transaction that consumes the approval nonce**, so a cancel
-  that wins the race atomically rolls the redemption back (nothing burned), and a cancel that lands
-  after the redemption is caught by a **pre-launch re-check** just before the tool runs. This narrows —
-  does not close — the window: a crash, or a cancel arriving between the re-check and the tool launch,
-  still burns the approval (the operator re-approves), and cancellation can never retract a tool effect
-  that has already committed. The supported entry point is the host method; a network-triggered cancel
-  endpoint (with its own auth) and idempotency keys for external effects are future work (the latter is
-  Section 7, tool boundary).
+- **A task can now be durably cancelled, with best-effort-before-launch enforcement (finding #3,
+  Medium).** `AgentHost.cancel_task(task_id)` records a durable cancellation (new `task_cancellations`
+  table; SQLite schema v9, Postgres schema v7). Cancellation is enforced in **three tiers**:
+  1. **Before an approval is redeemed** — refused **inside the same transaction that consumes the
+     approval nonce**, so nothing is burned (fully enforced).
+  2. **Racing the redemption transaction** — serialized (SQLite `BEGIN IMMEDIATE`; Postgres per-task
+     advisory lock); if the cancel wins, the redemption rolls back (fully enforced).
+  3. **After redemption** — a **best-effort** pre-launch re-check catches a cancel that has *already
+     committed* before the check. A cancel that commits **after** that read — in the read→launch
+     window, or once the tool is running — does **not** prevent the side effect: **the tool runs and
+     its effect happens even though the task is now cancelled.** This is deliberately not atomic with
+     the effect.
+
+  So cancellation of an already-redeemed approval is **best-effort before launch, not a guarantee that
+  the effect is prevented.** Guaranteeing "no effect after cancel" requires per-tool idempotency keys
+  and a reconciliation pass, which is **Section 7 (tool boundary)** — not provided here. The supported
+  entry point is the host method; a network-triggered cancel endpoint (with its own auth) is future
+  work.
 - **Approval expiry is a redemption deadline.** Expiry is checked when the approval is redeemed at the
   gate; the tool then runs. Portmark does not cap the tool's execution to the remaining approval
   lifetime — even doing so could not roll back an external effect already committed after expiry. Keep

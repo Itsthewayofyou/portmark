@@ -116,13 +116,16 @@ class AgentHost:
             self.metrics.observe_duration("run_duration_seconds", time.monotonic() - started)
 
     def cancel_task(self, task_id: str) -> None:
-        """Durably cancel an admitted task (section 5 #3).
+        """Durably cancel an admitted task (section 5 #3). Idempotent.
 
-        An approval that has not yet been redeemed will be refused at the gate (checked inside
-        the same transaction that consumes the approval nonce), and an approval consumed but not
-        yet launched is caught by the pre-launch re-check. Idempotent. This is the supported
-        operator entry point; a network-triggered cancel endpoint (with its own auth) is future
-        work. Cancellation cannot retract a tool effect that has already committed.
+        Cancellation is enforced in three tiers: (1) before an approval is redeemed -> refused at
+        the gate, nothing burned; (2) racing the redemption transaction -> serialized, rolled back
+        if the cancel wins; (3) after redemption -> BEST-EFFORT, caught only if the cancel commits
+        before the pre-launch re-check. A cancel that commits after that read does NOT prevent the
+        tool effect -- the tool runs and its effect happens even though the task is now cancelled.
+        Guaranteeing "no effect after cancel" requires per-tool idempotency keys + a reconciliation
+        pass (Section 7); it is not provided here. This is the supported operator entry point; a
+        network-triggered cancel endpoint (with its own auth) is future work.
         """
         self.store.cancel_task(task_id)
 
@@ -451,12 +454,18 @@ class AgentHost:
             approval_result = self._approval_gate(active_policy, effective, state, decision, audit, admission_generation)
             if approval_result is not None:
                 return approval_result
-            # Section 5 #3: pre-launch cancellation re-check. The approval was consumed atomically
-            # with a first cancellation check (inside _approval_gate); re-read just before the tool
-            # actually launches so a cancel that landed AFTER the redeem still stops the side effect.
-            # This narrows -- does not close -- the window: a crash or a cancel arriving between this
-            # check and tools.invoke still burns the approval (operator re-approves). Only fires for
-            # approval-gated tools; the approval is already consumed, so a stopped launch is terminal.
+            # Section 5 #3: BEST-EFFORT pre-launch cancellation re-check. Cancellation enforcement
+            # has three tiers, and this is the boundary of the last one:
+            #   (1) a cancel committed before redemption -> refused at the gate, nothing burned;
+            #   (2) a cancel racing the redemption transaction -> serialized, rolled back if it wins;
+            #   (3) a cancel committed after redemption -> caught ONLY if it lands before this read.
+            # A cancel that commits AFTER this read (in the read->tools.invoke window, or once the tool
+            # is running) does NOT prevent the side effect: the tool runs and its effect happens, even
+            # though the task is now cancelled. This check and tools.invoke are deliberately not atomic
+            # with the effect -- closing that fully requires the tool to carry an idempotency key and a
+            # reconciliation pass (Section 7, tool boundary), not available here. So cancellation of an
+            # already-redeemed approval is best-effort-before-launch, not a guarantee that the effect is
+            # prevented. Fires only for approval-gated tools; the approval is already consumed.
             if active_policy.requires_approval(decision.tool) and self.store.is_task_cancelled(state.task_id):
                 return self._approval_failure(state, audit, "approval.denied", "cancelled")
             try:

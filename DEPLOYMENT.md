@@ -180,6 +180,13 @@ and the change is additive. As with any schema bump, upgrade the code before poi
 do not run an older Portmark against a store a newer one has already upgraded (the store refuses a schema
 version newer than it supports).
 
+**Cancellation is best-effort before launch, not a kill switch.** A cancel is fully enforced before an
+approval is redeemed and while racing the redemption; after redemption it is caught only if it commits
+before the pre-launch re-check. A cancel that lands later — in the check→launch window or once the tool
+is already running — does **not** stop the effect: the tool runs and its effect happens even though the
+task is now cancelled. Do not rely on `cancel_task` to prevent an in-flight external side effect;
+guaranteeing that requires per-tool idempotency keys and reconciliation (a later tool-boundary change).
+
 ### Reserved migration task-id namespace (`mig::`)
 
 A destination namespaces a **migrated** task's stored identity by the source host it

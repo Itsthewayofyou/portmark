@@ -2128,9 +2128,9 @@ class RuntimeTests(unittest.TestCase):
 
     # ---- Section 5 (Approvals) helpers + tests ----
 
-    def _approval_gated_host(self, store=None):
+    def _approval_gated_host(self, store=None, tools=None):
         authority = ApprovalAuthority.generate()
-        host = make_host(store=store, attestation_policy=None, allow_ephemeral_signing_key=True)
+        host = make_host(store=store, tools=tools, attestation_policy=None, allow_ephemeral_signing_key=True)
         host.policy = HostPolicy(
             "host:local-demo",
             (ToolGrant("payments.reserve", {"max_amount": 100, "currency": "USD"}, ("reserved",)),),
@@ -2247,50 +2247,87 @@ class RuntimeTests(unittest.TestCase):
         self.assertNotIn("approval.approved", [event["event"] for event in result.audit])
 
     def test_cancel_and_redeem_are_atomic_under_concurrency(self):
-        # Section 5 #3 CONCURRENT (SQLite, two real connections synchronized). Redeem (consume_nonce +
-        # the in-transaction cancel check) and cancel racing can never both win: the tool-authorizing
-        # nonce is consumed IFF the redeem committed as not-cancelled; otherwise the whole transaction
-        # rolls back. No half state.
+        # Section 5 #3 CONCURRENT, on SQLite AND Postgres (two real connections synchronized on a
+        # barrier). Redeem (consume_nonce + the in-transaction cancel check) and cancel racing can
+        # never both win: the tool-authorizing nonce is consumed IFF the redeem committed as
+        # not-cancelled; otherwise the whole transaction rolls back. No half state. Postgres serializes
+        # on the per-task advisory xact lock, SQLite on BEGIN IMMEDIATE.
         class _Rollback(Exception):
             pass
 
-        for trial in range(25):
-            with tempfile.TemporaryDirectory() as directory:
-                store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
-                task_id = f"task-{trial}"
-                nonce = f"approval:{task_id}:a"
-                barrier = threading.Barrier(2)
-                outcome = {}
+        for context in self._store_case_contexts():
+            with context as (backend, store):
+                with self.subTest(backend=backend):
+                    trials = 8 if backend == "postgres" else 25
+                    for trial in range(trials):
+                        task_id = f"task-{backend}-{trial}"
+                        nonce = f"approval:{task_id}:a"
+                        barrier = threading.Barrier(2)
+                        outcome = {}
 
-                def redeem():
-                    barrier.wait()
-                    try:
-                        with store.transaction() as txn:
-                            txn.consume_nonce(nonce, "s", "a", task_id)
-                            if txn.is_task_cancelled(task_id):
-                                raise _Rollback
-                        outcome["redeemed"] = True
-                    except (_Rollback, SecurityError):
-                        outcome["redeemed"] = False
+                        def redeem():
+                            barrier.wait()
+                            try:
+                                with store.transaction() as txn:
+                                    txn.consume_nonce(nonce, "s", "a", task_id)
+                                    if txn.is_task_cancelled(task_id):
+                                        raise _Rollback
+                                outcome["redeemed"] = True
+                            except (_Rollback, SecurityError):
+                                outcome["redeemed"] = False
 
-                def cancel():
-                    barrier.wait()
-                    store.cancel_task(task_id)
+                        def cancel():
+                            barrier.wait()
+                            store.cancel_task(task_id)
 
-                tr = threading.Thread(target=redeem)
-                tc = threading.Thread(target=cancel)
-                tr.start()
-                tc.start()
-                tr.join()
-                tc.join()
-                self.assertTrue(store.is_task_cancelled(task_id))
-                self.assertEqual(store.consumed_nonce_exists(nonce), outcome["redeemed"])
+                        tr = threading.Thread(target=redeem)
+                        tc = threading.Thread(target=cancel)
+                        tr.start()
+                        tc.start()
+                        tr.join(timeout=30)
+                        tc.join(timeout=30)
+                        self.assertTrue(store.is_task_cancelled(task_id))
+                        self.assertEqual(store.consumed_nonce_exists(nonce), outcome["redeemed"])
+
+    def test_cancel_during_tool_launch_does_not_prevent_effect_best_effort_limit(self):
+        # Section 5 #3 — the documented BEST-EFFORT boundary, asserted (not just documented). Tier 3:
+        # a cancel that commits AFTER the pre-launch re-check does not prevent the tool effect. This
+        # reproduces exactly the auditor's observed sequence (cancel committed, effect produced): the
+        # tool cancels its own task mid-execution (a cancel landing past the pre-launch read), yet the
+        # run completes and the effect happens. Closing this fully needs per-tool idempotency keys +
+        # reconciliation (Section 7); here it is the intended, known limit.
+        store = InMemoryRuntimeStore()
+        ctx: dict[str, str] = {}
+        effects: list[str] = []
+        registry = ToolRegistry()
+
+        def reserve(arguments):
+            store.cancel_task(ctx["task_id"])  # a cancel commits after the pre-launch check, during launch
+            effects.append("effect")
+            return {"reserved": True}
+
+        # In-process tool so it can observe the store; side_effecting is orthogonal to the timing
+        # boundary this asserts (the tool runs past the pre-launch cancellation read either way).
+        registry.register("payments.reserve", reserve)
+        host, authority = self._approval_gated_host(store=store, tools=registry)
+        envelope, first = self._suspend_payment_envelope(host, "cancel during launch")
+        ctx["task_id"] = envelope.state.task_id
+        token = self._mint_payment_approval(authority, envelope, first.checkpoint["checkpoint_generation"])
+        envelope.state.memory["approvals"] = {"payments.reserve": asdict(token)}
+        host.signer.seal(envelope)
+        result = host.run(envelope)
+
+        # Best-effort limit: the effect happened despite the task now being cancelled.
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(effects, ["effect"])
+        self.assertTrue(store.is_task_cancelled(envelope.state.task_id))
 
     def test_cancel_after_consume_is_caught_before_tool_launch(self):
-        # Section 5 #3. A cancel committed AFTER the approval is consumed but BEFORE the tool launches is
-        # caught by the pre-launch re-check; the tool never runs (approval burned, operator re-approves).
-        # Modeled by a store whose in-transaction check does not yet see the cancel while the store-level
-        # pre-launch read does.
+        # Section 5 #3, tier-3 ENFORCED sub-case. A cancel committed AFTER the approval is consumed but
+        # BEFORE the pre-launch re-check reads is caught; the tool never runs. (A cancel that commits
+        # AFTER the read is NOT caught -- that best-effort limit is asserted separately in
+        # test_cancel_during_tool_launch_does_not_prevent_effect_best_effort_limit.) Modeled by a store
+        # whose in-transaction check does not yet see the cancel while the store-level pre-launch read does.
         class _CancelBetween(InMemoryRuntimeStore):
             def transaction(self):
                 txn = super().transaction()
