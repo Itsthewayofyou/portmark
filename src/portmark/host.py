@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import secrets
 import time
 from dataclasses import asdict, replace
 from collections.abc import Callable
@@ -374,7 +373,12 @@ class AgentHost:
             # must also allow migration and allowlist this destination.
             active_policy.authorize_migration(envelope.permit, decision.destination)
             destination_attestation = self._migration_attestation(decision)
-            self.attestation_policy.verify_migration(destination_attestation, decision.destination, self.host_id)
+            # Section 4 #5: bind the destination attestation to this migration's permit nonce (the same
+            # nonce verify_execution binds to), so a valid attestation can't be replayed for another
+            # migration. Enforcement is gated by attestation_policy.require_migration_nonce.
+            self.attestation_policy.verify_migration(
+                destination_attestation, decision.destination, self.host_id, expected_nonce=effective.nonce
+            )
             state.status = "ready"
             state.memory["migration"] = {"from": self.host_id, "to": decision.destination}
             if destination_attestation is not None:
@@ -386,7 +390,16 @@ class AgentHost:
                 subject=effective.subject,
                 audience=decision.destination,
                 expires_at=effective.expires_at,
-                nonce=secrets.token_hex(16),
+                # Section 4 #5: the delegated permit reuses THIS migration's incoming nonce rather than
+                # a fresh one, so a single destination attestation binds to one nonce that BOTH the
+                # source (verify_migration) and the destination (verify_execution on the migrated
+                # permit) check against -- otherwise the strict require_migration_nonce path can pass
+                # at the source and never admit at the destination. The nonce is still unique per
+                # migration (so attestation replay across migrations is rejected) and the destination
+                # has never seen it, so first-admission is still nonce-guarded; the deliberate
+                # consequence is that a task migrates to a given destination once (its nonce is consumed
+                # there), not repeatedly.
+                nonce=effective.nonce,
                 grants=effective.grants,
                 budget=effective.budget,
                 delegation_allowed=False,
@@ -396,10 +409,11 @@ class AgentHost:
             # Finding EV-008: the destination host runs its own checkpoint lineage,
             # so the migrated envelope must start at generation 0 (a fresh task
             # there). Carrying the source generation would make the destination's
-            # fresh-task admission reject it. Safe because the delegated permit
-            # mints a fresh nonce, so the first admission at the destination is
-            # nonce-guarded and every later one is generation-guarded. The source
-            # task is closed by the final _persist of this run (closed=True).
+            # fresh-task admission reject it. Safe because the delegated permit's
+            # nonce (this migration's incoming nonce, see above) has never been seen
+            # at the destination, so the first admission there is nonce-guarded and
+            # every later one is generation-guarded. The source task is closed by the
+            # final _persist of this run (closed=True).
             migrated = AgentEnvelope(
                 envelope.manifest,
                 delegated,
