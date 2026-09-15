@@ -4102,30 +4102,35 @@ class RuntimeTests(unittest.TestCase):
         # is persisted; a corrected attester regenerates a good receipt on redelivery but the ack is LOST
         # (source still pending); the attester then goes DOWN; a further redelivery must still settle from
         # the durably-stored good receipt. CALIBRATED: without persisting the regenerated receipt the
-        # store keeps the bad one and the post-outage redelivery cannot settle.
+        # store keeps the bad one and the post-outage redelivery cannot settle. Runs on SQLite AND
+        # Postgres so the durable overwrite (replace_migration_receipt) is exercised on both backends.
         from portmark.host import _namespaced_migration_task_id
 
-        with tempfile.TemporaryDirectory() as directory:
-            rogue = AttestationAuthority.generate("dest-enclave-key", "verifier:enclave")
-            source, destination, _, authority, envelope = self._challenge_migration_pair(
-                directory, attester=_StubMigrationAttester(rogue))
-            sealed = source.run(envelope).migration_envelope
-            original_id = envelope_from_dict(sealed).state.task_id
-            namespaced_id = _namespaced_migration_task_id("host:source", original_id)
-            destination.run(envelope_from_dict(sealed))  # bad receipt persisted (dest cannot check the key)
-            # Corrected attester; redeliver -> regenerates + PERSISTS a good receipt, but the ack is lost.
-            destination.migration_attester = _StubMigrationAttester(authority)
-            good_receipt = destination.run(envelope_from_dict(sealed)).migration_receipt
-            self.assertEqual(len(source.store.list_pending_migrations()), 1)  # source never got the ack
-            self.assertEqual(
-                destination.store.get_migration_receipt(namespaced_id)["destination_attestation"],
-                good_receipt["destination_attestation"],
-            )  # the stored receipt is now the regenerated GOOD one
-            # The attester goes down; a later redelivery falls back to the durably-stored good receipt.
-            destination.migration_attester = None
-            recovered = destination.run(envelope_from_dict(sealed)).migration_receipt
-            source.settle_migration(original_id, recovered)
-            self.assertEqual(source.store.list_pending_migrations(), [])
+        for context in self._dual_store_case_contexts():
+            with context as (backend, source_store, destination_store):
+                with self.subTest(backend=backend):
+                    with tempfile.TemporaryDirectory() as directory:
+                        rogue = AttestationAuthority.generate("dest-enclave-key", "verifier:enclave")
+                        source, destination, _, authority, envelope = self._challenge_migration_pair(
+                            directory, attester=_StubMigrationAttester(rogue),
+                            source_store=source_store, destination_store=destination_store)
+                        sealed = source.run(envelope).migration_envelope
+                        original_id = envelope_from_dict(sealed).state.task_id
+                        namespaced_id = _namespaced_migration_task_id("host:source", original_id)
+                        destination.run(envelope_from_dict(sealed))  # bad receipt persisted (dest cannot check the key)
+                        # Corrected attester; redeliver -> regenerates + PERSISTS a good receipt, ack LOST.
+                        destination.migration_attester = _StubMigrationAttester(authority)
+                        good_receipt = destination.run(envelope_from_dict(sealed)).migration_receipt
+                        self.assertEqual(len(source.store.list_pending_migrations()), 1)  # source never got the ack
+                        self.assertEqual(
+                            destination.store.get_migration_receipt(namespaced_id)["destination_attestation"],
+                            good_receipt["destination_attestation"],
+                        )  # the stored receipt is now the regenerated GOOD one (durably overwritten)
+                        # Attester goes DOWN; a later redelivery falls back to the durably-stored good receipt.
+                        destination.migration_attester = None
+                        recovered = destination.run(envelope_from_dict(sealed)).migration_receipt
+                        source.settle_migration(original_id, recovered)
+                        self.assertEqual(source.store.list_pending_migrations(), [])
 
     def test_challenge_attester_calls_are_bounded_no_thread_explosion(self):
         # Finding 2b: repeated delivery against a hung attester must NOT spawn an unbounded number of
