@@ -22,14 +22,18 @@ def project_state_for_provider(state: AgentState, grants: tuple[ToolGrant, ...] 
     # is untouched: this is a copy, and the host keeps the full tool_results for its own
     # bookkeeping.
     projections = {grant.name: (grant.output_projection or ()) for grant in grants}
-    raw_results = state.memory.get("tool_results", {})
+    raw_results = state.memory.get("tool_results")
     projected_memory = dict(state.memory)
-    if isinstance(raw_results, dict):
+    # Fail closed, same as project_state_for_migration: tool_results is ALWAYS replaced
+    # when present, never passed through. A well-formed dict is projected per grant; any
+    # other shape (list/string/number/null -- e.g. a captured or crafted wire state) is
+    # dropped to {} rather than reaching the provider unprojected.
+    if "tool_results" in projected_memory:
         projected_memory["tool_results"] = {
             name: project_tool_output(result, projections[name])
             for name, result in raw_results.items()
             if name in projections
-        }
+        } if isinstance(raw_results, dict) else {}
     return replace(
         state,
         memory=projected_memory,

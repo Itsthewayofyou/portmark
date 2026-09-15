@@ -115,3 +115,34 @@ Dockerfile. Common configuration:
 
 Do not bake tokens, private keys, policy files containing local secrets, or
 runtime stores into the container image.
+
+## Upgrading
+
+### Reserved migration task-id namespace (`mig::`)
+
+A destination namespaces a **migrated** task's stored identity by the source host it
+authenticates at admission, so two source hosts can migrate a task with the same
+caller-chosen id to one destination without collision. The stored identity uses the
+reserved prefix `mig::`. From this release, a **fresh, non-migration** task whose
+`task_id` begins with `mig::` is refused at admission (this prevents a local caller
+from pre-occupying a migrated task's key).
+
+The guard applies to new admissions only; it cannot retroactively remove a collision
+that already exists in a store written by an earlier version. **Before upgrading, check
+every runtime store for a pre-existing task id that begins with `mig::`.** Such ids are
+not produced by normal use (the prefix is internal), so a match is unexpected and should
+be resolved before upgrading.
+
+```bash
+# SQLite
+sqlite3 /data/runtime.sqlite \
+  "SELECT task_id FROM checkpoints WHERE task_id LIKE 'mig::%';"
+
+# Postgres (per schema)
+psql "$PORTMARK_STORE_PATH" -c \
+  "SELECT task_id FROM checkpoints WHERE task_id LIKE 'mig::%';"
+```
+
+If either query returns rows, migrate or rename those tasks (they were created under a
+caller-chosen id that now collides with the reserved namespace) before rolling out the
+new version.

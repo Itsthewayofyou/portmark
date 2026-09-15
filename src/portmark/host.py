@@ -24,6 +24,27 @@ def _is_content_digest(digest: str) -> bool:
     return bool(rest) and algo in _CONTENT_DIGEST_ALGOS
 
 
+# Section 4 #7: task ids are caller-chosen and only unique within their originating host.
+# A destination that admits migrations from several sources would otherwise key
+# checkpoints/audit/receipts on a bare task id, so one source could squat another's id
+# (observed: the second migration is rejected as a receipt collision, a denial of the
+# peer's delivery). The destination namespaces a MIGRATED task's stored identity by the
+# source host it has cryptographically authenticated at admission
+# (previous_audit_host_id == permit.issuer == signing identity.issuer). The source is not
+# yet trusted to name another source's space, so the namespace comes from the verified
+# source, not the id the source chose.
+_MIGRATION_TASK_NAMESPACE = "mig::"
+
+
+def _namespaced_migration_task_id(source_host_id: str, task_id: str) -> str:
+    # Injective by the embedded length: given the result, the source is exactly the
+    # `len(source_host_id)` chars after the count, so two distinct (source, task_id) pairs
+    # can never collide even if either contains "::". We never parse this back -- the
+    # source settles delivery by the ORIGINAL task_id carried in the receipt payload, so a
+    # constructor is all that is needed (a parser would be a second place to get it wrong).
+    return f"{_MIGRATION_TASK_NAMESPACE}{len(source_host_id)}::{source_host_id}::{task_id}"
+
+
 class AgentHost:
     def __init__(
         self,
@@ -114,6 +135,18 @@ class AgentHost:
         # mutates envelope.state (status, counters), and the source's stored copy is pre-mutation,
         # so a later digest would not match. None for non-migration envelopes.
         incoming_migration_digest = migration_envelope_digest(asdict(envelope)) if envelope.previous_audit_hash else None
+        # Section 4 #7: namespace a migrated task's stored identity by the authenticated
+        # source. The digest above was taken on the pristine, source-sealed envelope (the
+        # source's outbox row carries the ORIGINAL id), so it is computed BEFORE this
+        # rewrite. previous_audit_host_id is only cryptographically verified later in
+        # _audit_start; using it here is safe because nothing is PERSISTED under the
+        # namespaced id until that verification has passed (a forged source aborts the run),
+        # and the lookups below only READ -- a forged namespace finds nothing or a row whose
+        # bindings will not match. The original id rides on in receipt_binding for the
+        # source-facing receipt; every downstream store key uses the namespaced id.
+        original_task_id = envelope.state.task_id
+        if envelope.previous_audit_hash:
+            envelope.state.task_id = _namespaced_migration_task_id(envelope.previous_audit_host_id, original_task_id)
         # A re-delivery of an already-admitted migration returns the SAME receipt (no re-execution)
         # instead of a replay error, so a source whose acknowledgement was lost can still settle
         # delivery. The lookup happens before any nonce is touched. A stored receipt whose bindings
@@ -159,6 +192,15 @@ class AgentHost:
         if stored is None:
             if state.checkpoint_generation != 0:
                 raise SecurityError("new task has invalid checkpoint generation")
+            # Section 4 #7: the migration namespace is reserved. A fresh, NON-migration
+            # admission (no previous_audit_hash) may not claim a reserved id -- otherwise a
+            # local caller could pre-occupy a migrated task's key and deny a remote peer's
+            # migration (the same squat, reached without any credential). A resume of a
+            # resident migrated task takes the `else` branch (stored is not None), so this
+            # never blocks a legitimate resume; a migration admission has previous_audit_hash
+            # set and its id was namespaced above, so it is exempt here.
+            if not envelope.previous_audit_hash and state.task_id.startswith(_MIGRATION_TASK_NAMESPACE):
+                raise SecurityError("task id uses the reserved migration namespace")
             # Finding #3: budget accounting (max_steps / max_tool_calls) trusts the
             # step/tool_calls counters on the incoming state. A fresh admission with
             # caller-supplied NEGATIVE (or bool/float) counters -- e.g. tool_calls=-3
@@ -185,7 +227,7 @@ class AgentHost:
             state.tool_calls = int(stored["tool_calls"])
             consume_nonce = None
         state.status = "running"
-        previous_hash, start_sequence, migration_anchor = self._audit_start(envelope)
+        previous_hash, start_sequence, migration_anchor = self._audit_start(envelope, original_task_id)
         audit = AuditLog(previous_hash, start_sequence, self.host_id)
         accepted_details: dict[str, Any] = {
             "agent": envelope.manifest.agent_id,
@@ -203,6 +245,11 @@ class AgentHost:
                 "source_host_id": envelope.previous_audit_host_id,
                 "permit_nonce": envelope.permit.nonce,
                 "envelope_digest": incoming_migration_digest,
+                # Section 4 #7: the receipt is source-facing -- the source settles by the
+                # ORIGINAL task id its outbox row is keyed on, so the receipt payload keeps
+                # the original id even though the destination stores everything under the
+                # source-namespaced id.
+                "original_task_id": original_task_id,
             }
         audit.append("agent.accepted", accepted_details)
         persisted_events = self._persist(envelope, effective, state, audit, 0, consume_nonce=consume_nonce, receipt_binding=receipt_binding)
@@ -540,6 +587,9 @@ class AgentHost:
         checkpoint = asdict(envelope.state)
         # Section 4 #2: surface the receipt this run issued as a migration destination (None for
         # ordinary runs and on the source side), read from the store so it reflects what committed.
+        # `envelope.state.task_id` here is the storage key: source-namespaced for a migration
+        # admission (rewritten above, section 4 #7), the unchanged original for a local run -- either
+        # way it matches the key store_migration_receipt used, so this lookup is always consistent.
         receipt = self.store.get_migration_receipt(envelope.state.task_id)
         return RunResult(envelope.state.status, envelope.state.task_id, envelope.state.result, checkpoint, audit.events, migration, migration_receipt=receipt)
 
@@ -646,7 +696,10 @@ class AgentHost:
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise SecurityError(f"migrated state has invalid {name} counter")
 
-    def _audit_start(self, envelope: AgentEnvelope) -> tuple[str, int, dict[str, Any] | None]:
+    def _audit_start(self, envelope: AgentEnvelope, original_task_id: str) -> tuple[str, int, dict[str, Any] | None]:
+        # `envelope.state.task_id` is the destination storage key (source-namespaced for a
+        # migration, section 4 #7), so store lookups use it; `original_task_id` is the
+        # source-signed id, used only to reconstruct the SOURCE's audit-head signature.
         stored = self.store.audit_head(envelope.state.task_id)
         if envelope.previous_audit_hash:
             if stored is not None and stored[0] != envelope.previous_audit_hash:
@@ -657,7 +710,7 @@ class AgentHost:
                 # record the verified anchor (prior head hash + sequence + host) in
                 # the first audit event. It lands inside the hashed event, making the
                 # migration point durable and tamper-evident. Finding #3.
-                self._verify_previous_audit_head(envelope)
+                self._verify_previous_audit_head(envelope, original_task_id)
                 anchor = {
                     "previous_audit_hash": envelope.previous_audit_hash,
                     "previous_audit_sequence": envelope.previous_audit_sequence,
@@ -669,7 +722,7 @@ class AgentHost:
             return stored[0], stored[1], None
         return "", 0, None
 
-    def _verify_previous_audit_head(self, envelope: AgentEnvelope) -> None:
+    def _verify_previous_audit_head(self, envelope: AgentEnvelope, original_task_id: str) -> None:
         if (
             not envelope.previous_audit_host_id
             or not envelope.previous_audit_signature_key_id
@@ -693,7 +746,9 @@ class AgentHost:
         self.signer.verify_audit_head(
             envelope.previous_audit_signature_key_id,
             audit_head_payload(
-                envelope.state.task_id,
+                # The source signed its audit head over the ORIGINAL task id; the
+                # destination reconstructs that exact payload here (section 4 #7).
+                original_task_id,
                 envelope.previous_audit_host_id,
                 envelope.previous_audit_hash,
                 envelope.previous_audit_sequence,
@@ -772,7 +827,10 @@ class AgentHost:
             if receipt_binding is not None:
                 receipt = self.signer.sign_migration_receipt(
                     migration_receipt_payload(
-                        task_id=state.task_id,
+                        # Section 4 #7: the receipt payload carries the ORIGINAL task id (the
+                        # source settles against its outbox row keyed on it); the receipt ROW
+                        # below is stored under the source-namespaced state.task_id.
+                        task_id=receipt_binding["original_task_id"],
                         source_host_id=receipt_binding["source_host_id"],
                         destination_host_id=self.host_id,
                         permit_nonce=receipt_binding["permit_nonce"],
