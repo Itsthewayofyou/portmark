@@ -51,11 +51,18 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
     parameter — so a caller of claim/release/dead-letter/attempt cannot supply a forged `now` to
     steal or bypass another worker's live lease. (An earlier iteration exposed a keyword-only `_now`;
     that was NOT private — a caller could pass it — and has been removed from the public API. Tests
-    control time via a constructor-injected clock.) NOTE: the clock is the dispatcher HOST's; across
-    multiple dispatcher hosts, clock skew can shift when an expired lease becomes reclaimable — a
-    liveness window, not a break of claim exclusivity (which rests on `FOR UPDATE SKIP LOCKED` /
-    `BEGIN IMMEDIATE`). A future hardening can use DB time (`clock_timestamp()`) to remove cross-host
-    skew. `record_migration_attempt` with no worker id still counts unscoped (single-dispatcher back-compat).
+    control time via a constructor-injected clock.) `record_migration_attempt` with no worker id still
+    counts unscoped (single-dispatcher back-compat).
+  - **Postgres leases use DATABASE time, closing a cross-host exclusivity break.** Judging a committed
+    lease against each dispatcher's own host clock is not safe: a host whose clock runs ahead classifies
+    a still-live lease as expired and reclaims a row another worker holds — `FOR UPDATE SKIP LOCKED`
+    serializes the two claim statements but not the clock each reads, so two workers could deliver the
+    same migration. All five Postgres lease operations (claim eligibility, new-lease expiry, release,
+    dead-letter, scoped attempt) now compute time from `EXTRACT(EPOCH FROM clock_timestamp())::bigint`,
+    so every dispatcher shares the one database clock and host skew cannot break exclusivity. The
+    embedded stores (SQLite/InMemory) are single-process, so their construction-injected clock is the
+    only clock and needs no change. (This supersedes an earlier note that mischaracterised the skew as
+    a mere liveness window.)
 
 ### Section 4 (part 2) — signed migration delivery receipts + reconciliation
 

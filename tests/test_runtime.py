@@ -3557,22 +3557,16 @@ class RuntimeTests(unittest.TestCase):
 
     @contextmanager
     def _clocked_outbox_stores(self, clock):
-        # All three stores built with an injected clock (a callable) so a test controls "now" WITHOUT
-        # any per-call time parameter -- time is a construction dependency, never caller-supplied.
+        # The EMBEDDED stores (memory + sqlite) built with an injected clock, so a test controls "now"
+        # WITHOUT any per-call time parameter -- time is a construction dependency, never caller-supplied.
+        # Postgres is intentionally excluded here: its lease operations use DATABASE time
+        # (clock_timestamp()), not the injected clock, precisely so skewed dispatcher hosts can't break
+        # exclusivity -- that behavior is covered by test_migration_lease_uses_db_time_not_host_clock.
         with tempfile.TemporaryDirectory() as directory:
-            stores = [
+            yield [
                 ("memory", InMemoryRuntimeStore(clock=clock)),
                 ("sqlite", SQLiteRuntimeStore(Path(directory) / "outbox.sqlite", clock=clock)),
             ]
-            schema = None
-            if os.environ.get("PORTMARK_TEST_POSTGRES_DSN") and PostgresRuntimeStore.available():
-                schema = "portmark_clock_" + secrets.token_hex(8)
-                stores.append(("postgres", PostgresRuntimeStore(os.environ["PORTMARK_TEST_POSTGRES_DSN"], schema=schema, clock=clock)))
-            try:
-                yield stores
-            finally:
-                if schema is not None:
-                    self._drop_postgres_schema(os.environ["PORTMARK_TEST_POSTGRES_DSN"], schema)
 
     def test_migration_claim_is_exclusive(self):
         # #3: a claimed row is never handed to a second worker. With two pending rows and limit=1,
@@ -3814,6 +3808,63 @@ class RuntimeTests(unittest.TestCase):
                         store.dead_letter_migration("t1", "w", "x", _now=1)
                     with self.assertRaises(TypeError):
                         store.record_migration_attempt("t1", "w", _now=1)
+
+    @unittest.skipUnless(
+        os.environ.get("PORTMARK_TEST_POSTGRES_DSN") and PostgresRuntimeStore.available(),
+        "needs a live Postgres (PORTMARK_TEST_POSTGRES_DSN)",
+    )
+    def test_migration_lease_uses_db_time_not_host_clock(self):
+        # #3 round 3 (auditor): two store instances against the SAME database with DISAGREEING host
+        # clocks. Worker B's host clock is far ahead. Under host-clock lease logic, B judged worker A's
+        # fresh 60s lease as already expired and reclaimed the row (both then deliver -> exclusivity
+        # break). With DB time (clock_timestamp()), eligibility is judged by the one DB clock, so B's
+        # ahead host clock is irrelevant and B gets nothing.
+        dsn = os.environ["PORTMARK_TEST_POSTGRES_DSN"]
+        schema = "portmark_dbtime_" + secrets.token_hex(8)
+        normal = PostgresRuntimeStore(dsn, schema=schema, clock=lambda: 1000)
+        ahead = PostgresRuntimeStore(dsn, schema=schema, clock=lambda: 1000 + 10_000)  # host clock far ahead
+        try:
+            with normal.transaction() as txn:
+                txn.enqueue_migration("t", "host:dest", '{"n":1}')
+            claimed = normal.claim_migrations("worker-a", lease_seconds=60, limit=1)
+            self.assertEqual([row["task_id"] for row in claimed], ["t"])
+            # CALIBRATE: under the round-2 host-clock code, `ahead` (clock +10000s) saw the 60s lease as
+            # expired and reclaimed -> stolen == ["t"]. With DB time the lease is still live.
+            stolen = ahead.claim_migrations("worker-b", lease_seconds=60, limit=1)
+            self.assertEqual(stolen, [])  # no cross-host takeover of a live lease
+            self.assertEqual(normal.list_pending_migrations()[0]["claimed_by"], "worker-a")
+        finally:
+            self._drop_postgres_schema(dsn, schema)
+
+    @unittest.skipUnless(
+        os.environ.get("PORTMARK_TEST_POSTGRES_DSN") and PostgresRuntimeStore.available(),
+        "needs a live Postgres (PORTMARK_TEST_POSTGRES_DSN)",
+    )
+    def test_migration_expired_holder_blocked_on_postgres_db_time(self):
+        # #3 round 3: the memory/sqlite expired-holder test uses an injected clock, but PG uses DB time
+        # (clock_timestamp()) and cannot freeze it -- so this proves the PG release/dead_letter/scoped-
+        # attempt `lease_expires_at > clock_timestamp()` clauses actually enforce expiry, using a real
+        # 1s lease + a short sleep. A typo in any of those three WHERE clauses would otherwise pass the
+        # whole suite silently. (Direction-safe: waiting longer only makes the lease more expired.)
+        dsn = os.environ["PORTMARK_TEST_POSTGRES_DSN"]
+        schema = "portmark_expiry_" + secrets.token_hex(8)
+        store = PostgresRuntimeStore(dsn, schema=schema)
+        try:
+            with store.transaction() as txn:
+                txn.enqueue_migration("t", "host:dest", '{"n":1}')
+            self.assertEqual([row["task_id"] for row in store.claim_migrations("w1", lease_seconds=1, limit=1)], ["t"])
+            # While the lease is live, the holder can count an attempt.
+            store.record_migration_attempt("t", "w1")
+            self.assertEqual(store.list_pending_migrations()[0]["attempt_count"], 1)
+            time.sleep(1.2)  # the 1s lease has now expired in DB time
+            self.assertFalse(store.release_migration("t", "w1"))
+            self.assertFalse(store.dead_letter_migration("t", "w1", "too late"))
+            store.record_migration_attempt("t", "w1")  # expired holder -> not counted
+            self.assertEqual(store.list_pending_migrations()[0]["attempt_count"], 1)  # unchanged
+            # A fresh worker can reclaim the now-expired row.
+            self.assertEqual([row["task_id"] for row in store.claim_migrations("w2", lease_seconds=60, limit=1)], ["t"])
+        finally:
+            self._drop_postgres_schema(dsn, schema)
 
     @unittest.skipUnless(
         os.environ.get("PORTMARK_TEST_POSTGRES_DSN") and PostgresRuntimeStore.available(),

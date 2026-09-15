@@ -970,11 +970,10 @@ class PostgresRuntimeStore:
         self.dsn = dsn
         self.schema = schema
         self._audit_head_verifier = audit_head_verifier
-        # Section 4 #3: lease clock is a construction dependency (see InMemoryRuntimeStore). NOTE: this
-        # is the dispatcher HOST's clock; across multiple dispatcher hosts, clock skew can shift when an
-        # expired lease becomes reclaimable (a liveness window, not a break of claim exclusivity, which
-        # rests on FOR UPDATE SKIP LOCKED). A future hardening can switch to DB time
-        # (EXTRACT(EPOCH FROM clock_timestamp())) inside the SQL to eliminate cross-host skew.
+        # Section 4 #3: the lease OPERATIONS on Postgres use DATABASE time (clock_timestamp(), see the
+        # lease-methods class note), NOT this clock -- so multiple dispatcher hosts with skewed clocks
+        # cannot break lease exclusivity. `clock` is accepted for constructor uniformity with the
+        # embedded stores and may be injected by a test, but it does NOT govern Postgres lease timing.
         self._clock: Callable[[], int] = clock or _wall_clock
         self._initialize_schema()
 
@@ -1171,34 +1170,46 @@ class PostgresRuntimeStore:
                 (receipt_json, task_id),
             )
 
+    # Section 4 #3 (round 3): every lease comparison and every new-lease expiry on Postgres is
+    # computed from DATABASE time -- EXTRACT(EPOCH FROM clock_timestamp())::bigint -- NOT the
+    # dispatcher host's clock (self._clock, which governs only the embedded SQLite/InMemory stores).
+    # With a shared central DB, judging a committed lease against a per-host clock lets a host whose
+    # clock runs ahead classify a still-live lease as expired and reclaim a row another worker holds
+    # (SKIP LOCKED serializes the statements but not the clock they read). Using the single DB clock
+    # for eligibility, expiry, and release/dead-letter/attempt authority closes that cross-host break.
+    # The SQL below is STATIC (no f-strings / formatting / user data) -- the DB-time expression is a
+    # literal, and every value is a bound %s parameter -- so there is no injection surface.
+
     def record_migration_attempt(self, task_id: str, worker_id: str | None = None) -> None:
-        moment = self._clock()
         with self._connect() as connection:
             if worker_id is None:
                 connection.execute("UPDATE migration_outbox SET attempt_count = attempt_count + 1 WHERE task_id = %s", (task_id,))
             else:
                 connection.execute(
                     "UPDATE migration_outbox SET attempt_count = attempt_count + 1 "
-                    "WHERE task_id = %s AND claimed_by = %s AND lease_expires_at > %s",
-                    (task_id, worker_id, moment),
+                    "WHERE task_id = %s AND claimed_by = %s "
+                    "AND lease_expires_at > EXTRACT(EPOCH FROM clock_timestamp())::bigint",
+                    (task_id, worker_id),
                 )
 
     def claim_migrations(
         self, worker_id: str, lease_seconds: int, limit: int = 1
     ) -> list[dict[str, Any]]:
-        # Section 4 #3. FOR UPDATE SKIP LOCKED is the standard Postgres queue claim: concurrent
-        # claimers lock disjoint rows and skip each other's, so no row is handed to two workers and
-        # claimers don't block. One statement claims and returns the rows atomically.
+        # FOR UPDATE SKIP LOCKED is the standard Postgres queue claim: concurrent claimers lock
+        # disjoint rows and skip each other's, so no row is handed to two workers and claimers don't
+        # block. Eligibility and the new lease expiry are both computed from DB time (see class note).
         _validate_claim_args(worker_id, lease_seconds, limit)
-        moment = self._clock()
-        expiry = moment + int(lease_seconds)
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                UPDATE migration_outbox SET claimed_by = %s, lease_expires_at = %s
+                UPDATE migration_outbox
+                SET claimed_by = %s,
+                    lease_expires_at = EXTRACT(EPOCH FROM clock_timestamp())::bigint + %s
                 WHERE task_id IN (
                     SELECT task_id FROM migration_outbox
-                    WHERE status = 'pending' AND (claimed_by IS NULL OR lease_expires_at <= %s)
+                    WHERE status = 'pending'
+                      AND (claimed_by IS NULL
+                           OR lease_expires_at <= EXTRACT(EPOCH FROM clock_timestamp())::bigint)
                     ORDER BY created_at, task_id
                     FOR UPDATE SKIP LOCKED
                     LIMIT %s
@@ -1206,28 +1217,27 @@ class PostgresRuntimeStore:
                 RETURNING task_id, destination, sealed_envelope_json, status, attempt_count,
                           created_at, claimed_by, lease_expires_at, dead_reason
                 """,
-                (worker_id, expiry, moment, limit),
+                (worker_id, lease_seconds, limit),
             ).fetchall()
             return [dict(row) for row in rows]
 
     def release_migration(self, task_id: str, worker_id: str) -> bool:
-        moment = self._clock()
         with self._connect() as connection:
             cursor = connection.execute(
                 "UPDATE migration_outbox SET claimed_by = NULL, lease_expires_at = NULL "
-                "WHERE task_id = %s AND claimed_by = %s AND lease_expires_at > %s",
-                (task_id, worker_id, moment),
+                "WHERE task_id = %s AND claimed_by = %s "
+                "AND lease_expires_at > EXTRACT(EPOCH FROM clock_timestamp())::bigint",
+                (task_id, worker_id),
             )
             return cursor.rowcount > 0
 
     def dead_letter_migration(self, task_id: str, worker_id: str, reason: str) -> bool:
-        moment = self._clock()
         with self._connect() as connection:
             cursor = connection.execute(
                 "UPDATE migration_outbox SET status = 'dead', dead_reason = %s, claimed_by = NULL, "
                 "lease_expires_at = NULL WHERE task_id = %s AND claimed_by = %s AND status = 'pending' "
-                "AND lease_expires_at > %s",
-                (reason, task_id, worker_id, moment),
+                "AND lease_expires_at > EXTRACT(EPOCH FROM clock_timestamp())::bigint",
+                (reason, task_id, worker_id),
             )
             return cursor.rowcount > 0
 
