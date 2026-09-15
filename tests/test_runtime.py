@@ -2510,6 +2510,158 @@ class RuntimeTests(unittest.TestCase):
                 self.assertEqual(projected.memory["tool_results"], {})
                 self.assertEqual(projected.memory["other"], "kept")
 
+    @contextmanager
+    def _three_store_context(self, backend):
+        # Three stores (2 sources + 1 destination) on one backend, for the section 4 #7
+        # cross-host collision tests. make_host sets each store's audit verifier to its
+        # host signer, so the stores are constructed without one here. SQLite always;
+        # Postgres when a DSN is configured.
+        if backend == "sqlite":
+            with tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                yield (SQLiteRuntimeStore(root / "a.sqlite"),
+                       SQLiteRuntimeStore(root / "b.sqlite"),
+                       SQLiteRuntimeStore(root / "dest.sqlite"))
+        else:
+            dsn = os.environ["PORTMARK_TEST_POSTGRES_DSN"]
+            schemas = ["portmark_c_" + secrets.token_hex(8) for _ in range(3)]
+            stores = [PostgresRuntimeStore(dsn, schema=s) for s in schemas]
+            try:
+                yield tuple(stores)
+            finally:
+                for s in schemas:
+                    self._drop_postgres_schema(dsn, s)
+
+    def _three_store_backends(self):
+        backends = ["sqlite"]
+        if os.environ.get("PORTMARK_TEST_POSTGRES_DSN") and PostgresRuntimeStore.available():
+            backends.append("postgres")
+        return backends
+
+    def _two_source_collision_fixture(self, storeA, storeB, dest_store):
+        # Two source hosts + one destination, all trusting each other, each able to migrate
+        # a task with the SAME caller-chosen task_id to the destination (section 4 #7).
+        signerA = EnvelopeSigner.generate("srcA-key", "host:sourceA", ("host:sourceA", "host:destination"))
+        signerB = EnvelopeSigner.generate("srcB-key", "host:sourceB", ("host:sourceB", "host:destination"))
+        dest_signer = EnvelopeSigner.generate("dest-key", "host:destination", ("host:destination",))
+        trust_signer(dest_signer, signerA)
+        trust_signer(dest_signer, signerB)
+        # Each source must trust the destination's receipt-signing key to settle delivery.
+        trust_signer(signerA, dest_signer)
+        trust_signer(signerB, dest_signer)
+        sourceA = make_host(host_id="host:sourceA", signer=signerA, store=storeA, allow_ephemeral_signing_key=True)
+        sourceB = make_host(host_id="host:sourceB", signer=signerB, store=storeB, allow_ephemeral_signing_key=True)
+        dest = make_host(host_id="host:destination", signer=dest_signer, store=dest_store, allow_ephemeral_signing_key=True)
+        for s in (sourceA, sourceB):
+            s.policy.migration = MigrationPolicy(allowed=True, destinations=("host:destination",))
+        return sourceA, signerA, storeA, sourceB, signerB, storeB, dest, dest_store
+
+    @staticmethod
+    def _migrate_same_task_id(source, signer, task_id, provider):
+        source.providers["migrator"] = provider
+        env = make_demo_envelope(source, "collide", "migrator")
+        env.state.task_id = task_id
+        object.__setattr__(env.permit, "delegation_allowed", True)
+        signer.seal(env)
+        first = source.run(env)
+        return envelope_from_dict(first.migration_envelope)
+
+    def test_migration_taskid_namespaced_by_source_two_hosts_coexist(self):
+        # Section 4 #7: two source hosts migrate the SAME caller-chosen task_id to one
+        # destination. Both must ADMIT and COEXIST as distinct tasks (namespaced by the
+        # authenticated source), each with its own verifying audit chain -- neither can
+        # squat the other's id. Then each source settles ITS OWN migration, and one
+        # source's receipt cannot settle the other's row.
+        for backend in self._three_store_backends():
+          with self.subTest(backend=backend), self._three_store_context(backend) as (sa, sb, ds):
+            sourceA, signerA, storeA, sourceB, signerB, storeB, dest, dest_store = self._two_source_collision_fixture(sa, sb, ds)
+            provider = MigrateThenCompleteProvider("host:destination")
+            dest.providers["migrator"] = provider
+
+            migratedA = self._migrate_same_task_id(sourceA, signerA, "shared-task-X", provider)
+            migratedB = self._migrate_same_task_id(sourceB, signerB, "shared-task-X", provider)
+
+            resA = dest.run(migratedA)
+            resB = dest.run(migratedB)  # pre-fix: raises "receipt already exists ... different envelope"
+            self.assertEqual(resA.status, "completed")
+            self.assertEqual(resB.status, "completed")
+            # Two distinct resident tasks, two verifying chains, distinct namespaced ids.
+            self.assertNotEqual(resA.task_id, resB.task_id)
+            self.assertTrue(dest_store.verify_audit_chain(resA.task_id))
+            self.assertTrue(dest_store.verify_audit_chain(resB.task_id))
+            self.assertEqual(dest_store.load_checkpoint(resA.task_id)["status"], "completed")
+            self.assertEqual(dest_store.load_checkpoint(resB.task_id)["status"], "completed")
+            # The original (source-chosen) id is NOT a stored key at the destination.
+            self.assertIsNone(dest_store.load_checkpoint("shared-task-X"))
+
+            # A's receipt must NOT settle B's row: the bindings (source/nonce/digest) differ.
+            with self.assertRaises(SecurityError):
+                sourceB.settle_migration("shared-task-X", resA.migration_receipt)
+            self.assertEqual(len(storeB.list_pending_migrations()), 1)
+
+            # Each source settles ITS OWN migration with the destination's receipt (the
+            # receipt payload keeps the ORIGINAL task_id so settle_migration matches the
+            # source outbox row keyed by that original id).
+            sourceA.settle_migration("shared-task-X", resA.migration_receipt)
+            sourceB.settle_migration("shared-task-X", resB.migration_receipt)
+            self.assertEqual(storeA.list_pending_migrations(), [])
+            self.assertEqual(storeB.list_pending_migrations(), [])
+
+    def test_fresh_task_cannot_claim_reserved_migration_namespace(self):
+        # Section 4 #7: a local, NON-migration task may not pre-occupy the reserved migration
+        # namespace -- otherwise a local caller could squat a migrated task's key and deny a
+        # remote peer's migration (the same squat, reached without any credential).
+        host = make_host(allow_ephemeral_signing_key=True)
+        env = make_demo_envelope(host, "squat")
+        env.state.task_id = "mig::squatter"
+        host.signer.seal(env)
+        with self.assertRaisesRegex(SecurityError, "reserved migration namespace"):
+            host.run(env)
+
+    def test_migration_redelivery_is_idempotent_per_source(self):
+        # Section 4 #7 + #2: a re-delivery of the SAME source's migrated envelope returns the
+        # SAME receipt (idempotent, no re-execution), while a DIFFERENT source's same
+        # original task_id is NOT mistaken for that duplicate -- it admits as a distinct task.
+        for backend in self._three_store_backends():
+          with self.subTest(backend=backend), self._three_store_context(backend) as (sa, sb, ds):
+            sourceA, signerA, storeA, sourceB, signerB, storeB, dest, dest_store = self._two_source_collision_fixture(sa, sb, ds)
+            provider = MigrateThenCompleteProvider("host:destination")
+            dest.providers["migrator"] = provider
+
+            migratedA = self._migrate_same_task_id(sourceA, signerA, "shared-task-X", provider)
+            replay = copy.deepcopy(migratedA)  # pristine copy: run() mutates the envelope in place
+            r1 = dest.run(migratedA)
+            r2 = dest.run(replay)  # re-delivery of A's SAME envelope
+            self.assertEqual(r1.migration_receipt, r2.migration_receipt)
+            self.assertEqual(r2.status, r1.status)
+
+            migratedB = self._migrate_same_task_id(sourceB, signerB, "shared-task-X", provider)
+            rB = dest.run(migratedB)  # same original id, different source -> NOT A's duplicate
+            self.assertNotEqual(rB.task_id, r1.task_id)
+            self.assertNotEqual(rB.migration_receipt, r1.migration_receipt)
+
+    def test_migrated_task_is_addressable_only_by_namespaced_id(self):
+        # Section 4 #7 resume-addressing: a resume looks the task up by task_id
+        # (load_checkpoint / audit_head). The resident migrated task must be keyed by the
+        # source-namespaced id, and the original (source-chosen) id must resolve to NOTHING
+        # -- so a resume addresses the right task and another source's same original id can
+        # never resolve to it. (A full run()-based resume of a migrated task is a separate,
+        # pre-existing concern: the delegated permit names the SOURCE as issuer, so the
+        # destination cannot re-sign a resume envelope -- unrelated to #7.)
+        for backend in self._three_store_backends():
+          with self.subTest(backend=backend), self._three_store_context(backend) as (sa, sb, ds):
+            sourceA, signerA, storeA, sourceB, signerB, storeB, dest, dest_store = self._two_source_collision_fixture(sa, sb, ds)
+            provider = MigrateThenCompleteProvider("host:destination")
+            dest.providers["migrator"] = provider
+            resA = dest.run(self._migrate_same_task_id(sourceA, signerA, "shared-task-X", provider))
+            namespaced = resA.task_id
+            self.assertTrue(namespaced.startswith("mig::"))
+            # The store resolves the resident task ONLY by the namespaced id.
+            self.assertIsNotNone(dest_store.load_checkpoint(namespaced))
+            self.assertIsNotNone(dest_store.audit_head(namespaced))
+            self.assertIsNone(dest_store.load_checkpoint("shared-task-X"))
+            self.assertIsNone(dest_store.audit_head("shared-task-X"))
+
     def test_migration_writes_sealed_envelope_to_outbox_atomically(self):
         # Section 1, finding #2: the sealed destination envelope is stored durably in
         # the source store's migration_outbox in the SAME commit that closes the source
@@ -3507,17 +3659,23 @@ class RuntimeTests(unittest.TestCase):
             self.assertIsNone(first.migration_receipt)  # the source issues none
 
             migrated = envelope_from_dict(first.migration_envelope)
+            original_id = migrated.state.task_id  # section 4 #7: admission namespaces the stored id
             second = destination.run(migrated)
             self.assertEqual(second.status, "completed")
             receipt = second.migration_receipt
             self.assertIsNotNone(receipt)
             self.assertEqual(receipt["type"], "portmark.migration-receipt.v1")
-            self.assertEqual(receipt["task_id"], migrated.state.task_id)
+            # The receipt payload keeps the ORIGINAL (source-chosen) task id so the source
+            # settles against its outbox row; the destination stores everything under the
+            # source-namespaced id (see below).
+            self.assertEqual(receipt["task_id"], original_id)
+            self.assertTrue(migrated.state.task_id.startswith("mig::"))
+            self.assertNotEqual(migrated.state.task_id, original_id)
             self.assertEqual(receipt["source_host_id"], "host:source")
             self.assertEqual(receipt["destination_host_id"], "host:destination")
             self.assertEqual(receipt["permit_nonce"], migrated.permit.nonce)
             self.assertEqual(receipt["envelope_digest"], migration_envelope_digest(first.migration_envelope))
-            # The receipt was written in the admission transaction: it is durably stored.
+            # The receipt row is stored under the destination's namespaced id.
             self.assertEqual(destination.store.get_migration_receipt(migrated.state.task_id), receipt)
 
     def test_migration_settlement_verifies_before_marking_delivered(self):
@@ -3527,8 +3685,8 @@ class RuntimeTests(unittest.TestCase):
             source, destination, destination_signer, envelope = self._migration_pair(directory)
             first = source.run(envelope)
             migrated = envelope_from_dict(first.migration_envelope)
+            task_id = migrated.state.task_id  # capture BEFORE run: admission namespaces the id (section 4 #7)
             receipt = destination.run(migrated).migration_receipt
-            task_id = migrated.state.task_id
             self.assertEqual(len(source.store.list_pending_migrations()), 1)
 
             # tampered receipt (bad signature) -> rejected, row stays pending
@@ -3555,12 +3713,13 @@ class RuntimeTests(unittest.TestCase):
             source, destination, _, envelope = self._migration_pair(directory)
             first = source.run(envelope)
             migrated = envelope_from_dict(first.migration_envelope)
+            original_id = migrated.state.task_id  # capture BEFORE run (section 4 #7 namespacing)
             receipt = destination.run(migrated).migration_receipt
             # A source that does NOT trust the destination's receipt key cannot settle.
             untrusting_signer = EnvelopeSigner.generate("mr-source", "host:source", ("host:source", "host:destination"))
             untrusting = make_host(host_id="host:source", signer=untrusting_signer, store=source.store, allow_ephemeral_signing_key=True)
             with self.assertRaisesRegex(SecurityError, "signing key is not trusted"):
-                untrusting.settle_migration(migrated.state.task_id, receipt)
+                untrusting.settle_migration(original_id, receipt)
 
     def test_migration_duplicate_delivery_returns_receipt(self):
         # Auditor scenario: a lost ack triggers a re-delivery of the SAME envelope. Pre-fix this
@@ -3633,11 +3792,12 @@ class RuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             src_host, dst_host, _, envelope = self._migration_pair(directory)
             migrated = envelope_from_dict(src_host.run(envelope).migration_envelope)
+            original_id = migrated.state.task_id  # capture BEFORE run (section 4 #7 namespacing)
             good = dst_host.run(migrated).migration_receipt
             with self.assertRaisesRegex(SecurityError, "unexpected fields"):
-                src_host.settle_migration(migrated.state.task_id, {**good, "completion_status": "completed"})
+                src_host.settle_migration(original_id, {**good, "completion_status": "completed"})
             self.assertEqual(len(src_host.store.list_pending_migrations()), 1)  # still pending
-            src_host.settle_migration(migrated.state.task_id, good)  # genuine receipt settles
+            src_host.settle_migration(original_id, good)  # genuine receipt settles
             self.assertEqual(src_host.store.list_pending_migrations(), [])
 
     def test_migration_receipt_verify_rejection_branches(self):
@@ -4074,7 +4234,10 @@ class RuntimeTests(unittest.TestCase):
 
             ta = threading.Thread(target=attempt, args=("a", store_a, '{"payload":"A"}'))
             tb = threading.Thread(target=attempt, args=("b", store_b, '{"payload":"B"}'))
-            ta.start(); tb.start(); ta.join(); tb.join()
+            ta.start()
+            tb.start()
+            ta.join()
+            tb.join()
 
             outcomes = sorted(results.values())
             # exactly one committed, exactly one rejected -- never two silent successes.
@@ -4922,8 +5085,6 @@ class RuntimeTests(unittest.TestCase):
     def test_sqlite_check_ready_rejects_missing_or_incomplete_schema(self):
         # Section 2 follow-up: readiness must fail closed on a missing or incomplete
         # store, never silently recreate an empty database and report it ready.
-        from portmark.storage import SQLITE_SCHEMA_VERSION
-
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runtime.sqlite"
             store = SQLiteRuntimeStore(path)

@@ -6,6 +6,23 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Section 4 — migration task-id namespacing (finding #7)
+
+- **A destination no longer lets one source squat another source's task id (finding #7).** Checkpoints,
+  audit heads and receipts keyed on a bare, caller-chosen `task_id`, which is only unique within its
+  originating host — so a trusted host that migrated a task with an id another source was already using
+  at the destination denied that peer's delivery (the second migration was rejected as a receipt
+  collision). The destination now namespaces a **migrated** task's stored identity by the source it has
+  cryptographically authenticated at admission (`previous_audit_host_id == permit.issuer == signing
+  identity.issuer`), so two sources' same-named tasks admit and coexist as distinct tasks. The namespace
+  comes from the verified source, not the id the source chose, so it holds against a deliberately
+  squatting trusted host. The source-facing receipt keeps the original task id (the source settles its
+  outbox row by it); only the destination's stored identity is namespaced. A fresh, non-migration task
+  may not claim the reserved migration namespace. No schema change; the store API is unchanged.
+  - Scope bound: this closes the squat at the migration-admission boundary, where it occurs. A full
+    resume of a migrated task that suspends is governed by the existing delegated-permit auth model
+    (the permit names the source as issuer) and is unaffected by this change.
+
 ### Section 4 (part 3b) — provider projection fail-closed parity
 
 - **The provider projection now fails closed on a malformed `tool_results`, matching the migration
