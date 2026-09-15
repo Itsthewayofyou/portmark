@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import secrets
+import threading
 import time
 from dataclasses import asdict, replace
 from collections.abc import Callable
@@ -10,7 +12,7 @@ from .metrics import RuntimeMetrics
 from .models import AgentEnvelope, ApprovalToken, AttestationEvidence, ProviderDecision, RunResult
 from .projection import project_state_for_migration, project_state_for_provider
 from .providers import ModelProvider
-from .security import _MIGRATION_RECEIPT_FIELDS, AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, SecurityError, arguments_hash, audit_head_payload, canonical_json, migration_envelope_digest, migration_receipt_payload
+from .security import _MIGRATION_RECEIPT_FIELDS, _OPTIONAL_MIGRATION_RECEIPT_FIELDS, AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, MigrationAttesterProtocol, SecurityError, arguments_hash, audit_head_payload, canonical_json, migration_envelope_digest, migration_receipt_payload
 from .storage import InMemoryRuntimeStore, RuntimeStore
 from .tools import ToolExecutionError, ToolKilledError, ToolRegistry
 
@@ -55,6 +57,9 @@ class AgentHost:
         providers: dict[str, ModelProvider],
         store: RuntimeStore | None = None,
         attestation_policy: AttestationPolicy | None = None,
+        migration_attester: MigrationAttesterProtocol | None = None,
+        migration_attester_timeout: float | None = 5.0,
+        migration_attester_max_inflight: int = 8,
         policy_loader: Callable[[], HostPolicy] | None = None,
         reload_policy: bool = False,
         metrics: RuntimeMetrics | None = None,
@@ -70,6 +75,21 @@ class AgentHost:
         if hasattr(self.store, "set_audit_head_verifier"):
             self.store.set_audit_head_verifier(self.signer)  # type: ignore[attr-defined]  # guarded by hasattr; not on the base RuntimeStore protocol
         self.attestation_policy = attestation_policy or AttestationPolicy()
+        # Section 4 #5: destination-side challenge attester. When a migrated envelope demands a challenge,
+        # the host uses this to attest to its own identity over the source's fresh challenge at admission.
+        # None (default) => the host cannot satisfy a challenge-required migration and fails it closed.
+        self.migration_attester = migration_attester
+        # Section 4 #5 (finding 2): the attester runs inside the admission path, so the host bounds it
+        # rather than trusting each implementation to self-bound. On timeout admission fails CLOSED
+        # (nothing persisted); the worker thread is a daemon so a hung attester leaks a thread but can
+        # never hold admission open. None disables the host bound (an explicit opt-out).
+        self.migration_attester_timeout = migration_attester_timeout
+        # Section 4 #5 (finding 2b): cap concurrent in-flight attester calls so a stream of deliveries
+        # against a slow/hung attester cannot spawn an unbounded number of worker threads. A timed-out
+        # call's worker holds its permit until it actually finishes (a truly-hung one holds it, so at
+        # most this many hang before further calls are refused fail-closed); a call that returns -- even
+        # after its timeout -- releases its permit, so transient slowness self-heals.
+        self._attester_slots = threading.BoundedSemaphore(max(1, migration_attester_max_inflight))
         self._policy_loader = policy_loader
         self._reload_policy = reload_policy
         self.metrics = metrics or RuntimeMetrics()
@@ -120,10 +140,28 @@ class AgentHost:
         mismatches = [field for field, value in expected.items() if receipt.get(field) != value]
         if mismatches:
             raise SecurityError(f"migration receipt does not match the outbox row: {', '.join(mismatches)}")
+        # Section 4 #5 (challenge-passing protocol): when this migration was sealed as challenge-required,
+        # the source demands the destination's fresh attestation over the challenge it minted (the sealed
+        # permit nonce) and verifies it here against the source's trusted attestation authorities. Because
+        # the source chose the challenge, pre-collected or stale destination evidence cannot satisfy it.
+        # Runs after the receipt's own signature/shape check, so a present attestation is already
+        # destination-signed. A challenge-required row whose receipt carries no attestation fails closed.
+        sealed_memory = sealed.get("state", {}).get("memory", {})
+        sealed_migration = sealed_memory.get("migration") if isinstance(sealed_memory, dict) else None
+        if isinstance(sealed_migration, dict) and sealed_migration.get("challenge_required"):
+            self.attestation_policy.verify_migration_challenge(
+                receipt.get("destination_attestation"),
+                challenge=sealed["permit"]["nonce"],
+                destination=row["destination"],
+                source_host_id=self.host_id,
+            )
         # Persist the canonical body + signature envelope by CONSTRUCTION (not the caller's dict), so a
         # stored receipt only ever holds destination-signed fields even if the verify-side shape check is
         # ever weakened -- every persisted field is one the signature covered.
         canonical = {field: receipt[field] for field in _MIGRATION_RECEIPT_FIELDS}
+        for field in _OPTIONAL_MIGRATION_RECEIPT_FIELDS:
+            if field in receipt:
+                canonical[field] = receipt[field]
         canonical["signature_key_id"] = receipt["signature_key_id"]
         canonical["signature"] = receipt["signature"]
         self.store.mark_migration_delivered(task_id, canonical_json(canonical).decode("utf-8"))
@@ -147,10 +185,10 @@ class AgentHost:
         original_task_id = envelope.state.task_id
         if envelope.previous_audit_hash:
             envelope.state.task_id = _namespaced_migration_task_id(envelope.previous_audit_host_id, original_task_id)
-        # A re-delivery of an already-admitted migration returns the SAME receipt (no re-execution)
-        # instead of a replay error, so a source whose acknowledgement was lost can still settle
-        # delivery. The lookup happens before any nonce is touched. A stored receipt whose bindings
-        # differ means a DIFFERENT envelope is squatting this task id -- reject it.
+        # A re-delivery of an already-admitted migration returns a receipt (no re-execution) instead of
+        # a replay error, so a source whose acknowledgement was lost can still settle delivery. The
+        # lookup happens before any nonce is touched. A stored receipt whose bindings differ means a
+        # DIFFERENT envelope is squatting this task id -- reject it.
         if envelope.previous_audit_hash:
             existing_receipt = self.store.get_migration_receipt(envelope.state.task_id)
             if existing_receipt is not None:
@@ -159,10 +197,51 @@ class AgentHost:
                     or existing_receipt.get("envelope_digest") != incoming_migration_digest
                 ):
                     raise SecurityError("a migration receipt already exists for this task under a different envelope")
+                delivered_receipt = existing_receipt
+                migration_memory = envelope.state.memory.get("migration") if isinstance(envelope.state.memory, dict) else None
+                if isinstance(migration_memory, dict) and migration_memory.get("challenge_required"):
+                    # Section 4 #5: REGENERATE the challenge attestation on redelivery, keeping the
+                    # admission's checkpoint/audit bindings (task id, generation, audit head, accepted_at)
+                    # unchanged. Keep-first storage would otherwise freeze the FIRST attester's evidence,
+                    # so a first evidence the destination could not locally reject (e.g. signed by a key
+                    # only the SOURCE knows it does not trust, or a source-only measurement policy) would
+                    # be returned forever and the source could never settle -- an unrecoverable wedge.
+                    try:
+                        fresh_evidence = self._produce_challenge_evidence(envelope)
+                    except SecurityError:
+                        # The attester is unavailable or still producing invalid evidence. Fall back to
+                        # the STORED receipt rather than raising, so a previously-regenerated VALID
+                        # receipt (persisted below) still settles a lost-ack redelivery even after the
+                        # attester goes down. A still-bad stored receipt just stays pending -- no worse
+                        # than before, and it recovers once the attester is back. First admission (no
+                        # existing receipt) still fails closed; only redelivery falls back.
+                        fresh_evidence = None
+                    if fresh_evidence is not None:
+                        delivered_receipt = self.signer.sign_migration_receipt(
+                            migration_receipt_payload(
+                                task_id=existing_receipt["task_id"],
+                                source_host_id=existing_receipt["source_host_id"],
+                                destination_host_id=self.host_id,
+                                permit_nonce=existing_receipt["permit_nonce"],
+                                envelope_digest=existing_receipt["envelope_digest"],
+                                destination_checkpoint_generation=existing_receipt["destination_checkpoint_generation"],
+                                destination_audit_head=existing_receipt["destination_audit_head"],
+                                accepted_at=existing_receipt["accepted_at"],
+                                destination_attestation=fresh_evidence,
+                            )
+                        )
+                        # Durability: persist the regenerated receipt (only the attestation + signature
+                        # change; every binding is carried over from the stored one), so recovery
+                        # survives a lost acknowledgement, a restart, or a later attester outage. Atomic
+                        # overwrite; concurrent regenerations are last-write-wins over equally-valid
+                        # receipts.
+                        self.store.replace_migration_receipt(
+                            envelope.state.task_id, canonical_json(delivered_receipt).decode("utf-8")
+                        )
                 stored_checkpoint = self.store.load_checkpoint(envelope.state.task_id)
                 status = stored_checkpoint["status"] if stored_checkpoint else envelope.state.status
                 result = stored_checkpoint.get("result") if stored_checkpoint else None
-                return RunResult(status, envelope.state.task_id, result, stored_checkpoint or {}, (), migration_receipt=existing_receipt)
+                return RunResult(status, envelope.state.task_id, result, stored_checkpoint or {}, (), migration_receipt=delivered_receipt)
         effective = active_policy.effective_permit(envelope.manifest, envelope.permit)
         self.attestation_policy.verify_execution(effective, self.host_id)
         provider = self.providers.get(envelope.manifest.provider)
@@ -251,6 +330,17 @@ class AgentHost:
                 # source-namespaced id.
                 "original_task_id": original_task_id,
             }
+            # Section 4 #5 (challenge-passing protocol): if the source sealed a `challenge_required`
+            # marker into this migration, the destination must attest to ITS OWN identity over the
+            # source's fresh challenge (the delegated permit nonce) and return that evidence in the
+            # receipt for the source to verify at settlement. This runs BEFORE the first _persist so a
+            # missing or failing attester fails admission CLOSED with nothing stored -- a stored
+            # evidence-less receipt would be handed back idempotently on every retry and strand the
+            # outbox row forever, so fail-open here is unrecoverable, not merely degraded. A recovered
+            # attester lets the source re-deliver the same envelope.
+            migration_memory = envelope.state.memory.get("migration") if isinstance(envelope.state.memory, dict) else None
+            if isinstance(migration_memory, dict) and migration_memory.get("challenge_required"):
+                receipt_binding["destination_attestation"] = self._produce_challenge_evidence(envelope)
         audit.append("agent.accepted", accepted_details)
         persisted_events = self._persist(envelope, effective, state, audit, 0, consume_nonce=consume_nonce, receipt_binding=receipt_binding)
         tool_names = tuple(grant.name for grant in effective.grants)
@@ -430,6 +520,24 @@ class AgentHost:
             state.memory["migration"] = {"from": self.host_id, "to": decision.destination}
             if destination_attestation is not None:
                 state.memory["migration"]["attested_measurement"] = destination_attestation.measurement
+            # Section 4 #5 (challenge-passing protocol): when the source requires a challenge, mint a
+            # FRESH, source-chosen challenge and carry it as the delegated permit nonce (so it inherits
+            # the sealed-envelope digest and the receipt permit_nonce binding for free). The destination
+            # attests to itself over this challenge at admission and returns that evidence in the
+            # receipt, which the source verifies at settlement -- pre-collected/stale evidence cannot
+            # satisfy a challenge the source just minted. A `challenge_required` marker rides in the
+            # sealed migration memory (set pre-seal, so it is digest-covered) so an honest destination
+            # with no attester fails admission closed before persisting anything. This supersedes #64's
+            # incoming-nonce reuse: in challenge mode the delegated permit carries NO source-provided
+            # attestation, because that attestation (bound to the incoming nonce) would make the
+            # destination's verify_execution raise against the fresh challenge nonce.
+            if self.attestation_policy.require_migration_challenge:
+                delegated_nonce = secrets.token_urlsafe(32)
+                delegated_attestation = None
+                state.memory["migration"]["challenge_required"] = True
+            else:
+                delegated_nonce = effective.nonce
+                delegated_attestation = destination_attestation
             state.result = {"destination": decision.destination}
             audit.append("agent.migrating", state.result)
             delegated = type(effective)(
@@ -437,20 +545,16 @@ class AgentHost:
                 subject=effective.subject,
                 audience=decision.destination,
                 expires_at=effective.expires_at,
-                # Section 4 #5: the delegated permit reuses THIS migration's incoming nonce rather than
-                # a fresh one, so a single destination attestation binds to one nonce that BOTH the
-                # source (verify_migration) and the destination (verify_execution on the migrated
-                # permit) check against -- otherwise the strict require_migration_nonce path can pass
-                # at the source and never admit at the destination. The nonce is still unique per
-                # migration (so attestation replay across migrations is rejected) and the destination
-                # has never seen it, so first-admission is still nonce-guarded; the deliberate
-                # consequence is that a task migrates to a given destination once (its nonce is consumed
-                # there), not repeatedly.
-                nonce=effective.nonce,
+                # Section 4 #5: the delegated permit nonce is either #64's reused incoming nonce (default)
+                # or, in challenge mode, a fresh source-minted challenge (see above). Either way it is
+                # unique per migration (so attestation replay across migrations is rejected) and unseen at
+                # the destination, so first-admission is still nonce-guarded; the deliberate consequence is
+                # that a task migrates to a given destination once (its nonce is consumed there).
+                nonce=delegated_nonce,
                 grants=effective.grants,
                 budget=effective.budget,
                 delegation_allowed=False,
-                attestation=destination_attestation,
+                attestation=delegated_attestation,
             )
             previous_sequence = audit.events[-1]["sequence"] + 1
             # Finding EV-008: the destination host runs its own checkpoint lineage,
@@ -577,6 +681,75 @@ class AgentHost:
         if not isinstance(value, dict):
             raise SecurityError("migration attestation has invalid shape")
         return AttestationEvidence(**value)
+
+    def _attest_migration_challenge(self, *, subject: str, audience: str, challenge: str) -> AttestationEvidence:
+        # Section 4 #5 (finding 2): run the injected attester with a host-enforced timeout so a hung
+        # attester cannot hold admission open. The worker is a daemon thread; on timeout admission fails
+        # closed (nothing persisted) while the thread is abandoned (it cannot be force-killed, but it
+        # never blocks admission and does not keep the process alive). `migration_attester_timeout=None`
+        # is an explicit opt-out that calls the attester synchronously.
+        attester = self.migration_attester
+        if attester is None:  # guarded by the caller; re-checked so this helper is safe in isolation
+            raise SecurityError("migration requires a challenge attestation but no attester is configured")
+        timeout = self.migration_attester_timeout
+        if timeout is None:
+            return attester.attest(subject=subject, audience=audience, challenge=challenge)
+        # Finding 2b: refuse (fail closed) rather than spawn a worker when the in-flight bound is
+        # already saturated by earlier hung calls, so a flood of deliveries cannot grow threads without
+        # limit. The permit is released by the worker itself (below), so a call that eventually returns
+        # -- even past its timeout -- frees its slot; only truly-hung calls hold slots indefinitely.
+        if not self._attester_slots.acquire(blocking=False):
+            raise SecurityError("migration challenge attester capacity is exhausted")
+        outcome: dict[str, Any] = {}
+
+        def _invoke() -> None:
+            try:
+                outcome["value"] = attester.attest(subject=subject, audience=audience, challenge=challenge)
+            except Exception as error:  # surfaced to the caller below (fail closed)
+                outcome["error"] = error
+            finally:
+                self._attester_slots.release()
+
+        worker = threading.Thread(target=_invoke, daemon=True)
+        worker.start()
+        worker.join(timeout)
+        if worker.is_alive():
+            raise SecurityError("migration challenge attestation timed out")
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["value"]
+
+    def _produce_challenge_evidence(self, envelope: AgentEnvelope) -> dict[str, Any]:
+        # Section 4 #5: obtain + locally validate the destination's challenge evidence, returning it as a
+        # dict for the receipt. Shared by first admission and by redelivery regeneration so a corrected
+        # attester recovers from a bad first evidence. Fails closed (nothing persisted) on a missing,
+        # failing, or locally-detectably-invalid attester output.
+        if self.migration_attester is None:
+            raise SecurityError("migration requires a challenge attestation but no attester is configured")
+        try:
+            evidence = self._attest_migration_challenge(
+                subject=self.host_id,
+                audience=envelope.previous_audit_host_id,
+                challenge=envelope.permit.nonce,
+            )
+        except SecurityError:
+            raise
+        except Exception as error:
+            # A flaky/erroring attester fails admission CLOSED (nothing persisted) as a SecurityError,
+            # not an uncaught error out of run() (the EV-010 defect class).
+            raise SecurityError("migration challenge attestation failed") from error
+        if not isinstance(evidence, AttestationEvidence):
+            raise SecurityError("migration attester returned invalid evidence")
+        # Validate the attester's OWN output before it can be persisted, so a defective attester's
+        # evidence is never frozen into the keep-first receipt store (which the source would reject
+        # forever). The source's verify_migration_challenge stays the trust authority at settlement.
+        self.attestation_policy.check_local_migration_evidence(
+            evidence,
+            subject=self.host_id,
+            audience=envelope.previous_audit_host_id,
+            challenge=envelope.permit.nonce,
+        )
+        return asdict(evidence)
 
     def _result(self, envelope, audit, migration=None):
         # No size guard here: _result runs only right after a _persist that already
@@ -838,6 +1011,9 @@ class AgentHost:
                         destination_checkpoint_generation=new_generation,
                         destination_audit_head=audit.head,
                         accepted_at=head_signed_at,
+                        # Section 4 #5: present only for a challenge-required migration; part of the
+                        # signed body, so the source can verify the destination's fresh evidence.
+                        destination_attestation=receipt_binding.get("destination_attestation"),
                     )
                 )
                 transaction.store_migration_receipt(state.task_id, canonical_json(receipt).decode("utf-8"))

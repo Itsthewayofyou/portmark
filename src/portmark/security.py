@@ -71,6 +71,23 @@ class ExternalAttestationVerifierProtocol(Protocol):
         ...
 
 
+class MigrationAttesterProtocol(Protocol):
+    """Section 4 #5: a DESTINATION-side attester that produces fresh evidence over a source challenge.
+
+    Injected on the destination `AgentHost`. When a migrated envelope demands a challenge, the host
+    calls `attest` at admission to obtain the destination's own attestation, bound to the challenge (the
+    delegated permit nonce the source freshly minted) and addressed to the source, which rides back in
+    the delivery receipt for the source to verify. Implementations MUST bound the call (timeout +
+    response cap, like `ExternalAttestationVerifier`) -- it runs inside the admission path -- and MUST
+    set `subject` to the given host identity and `audience` to the given source (the source enforces
+    both). A raised exception fails admission closed before anything is persisted, so the source can
+    re-deliver once the attester recovers.
+    """
+
+    def attest(self, *, subject: str, audience: str, challenge: str) -> AttestationEvidence:
+        ...
+
+
 def audit_head_payload(task_id: str, host_id: str, head_hash: str, sequence: int) -> dict[str, Any]:
     return {
         "type": "portmark.audit-head.v1",
@@ -121,6 +138,7 @@ def migration_receipt_payload(
     destination_checkpoint_generation: int,
     destination_audit_head: str,
     accepted_at: int,
+    destination_attestation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The signed body of a `portmark.migration-receipt.v1` (finding #2).
 
@@ -132,7 +150,7 @@ def migration_receipt_payload(
     destination-set and therefore not independently verifiable (same class as an audit head's
     signed_at) -- it is recorded, never gated on.
     """
-    return {
+    body: dict[str, Any] = {
         "type": "portmark.migration-receipt.v1",
         "task_id": task_id,
         "source_host_id": source_host_id,
@@ -143,6 +161,14 @@ def migration_receipt_payload(
         "destination_audit_head": destination_audit_head,
         "accepted_at": accepted_at,
     }
+    # Section 4 #5: the destination's fresh challenge attestation is an OPTIONAL, signed body field --
+    # present only when the source demanded a challenge. Kept optional (not added to the mandatory
+    # field tuple) so the #62 exact-match receipt shape check still accepts pre-#5 receipts and both
+    # directions of mixed-version delivery; when present it is part of the signed body (below), so the
+    # signature covers it and it cannot ride along unsigned.
+    if destination_attestation is not None:
+        body["destination_attestation"] = destination_attestation
+    return body
 
 
 # The signed body of a receipt is every field EXCEPT the signature envelope. verify recomputes
@@ -159,14 +185,23 @@ _MIGRATION_RECEIPT_FIELDS = (
     "accepted_at",
 )
 
+# Section 4 #5: signed body fields that may or may not be present. Each, when present, is added to the
+# reconstructed body so the signature covers it (a tampered/added/removed optional field fails the
+# signature check); when absent, the receipt is still a valid pre-#5-shaped receipt.
+_OPTIONAL_MIGRATION_RECEIPT_FIELDS = ("destination_attestation",)
+
 
 def _migration_receipt_body(receipt: dict[str, Any]) -> dict[str, Any]:
     if receipt.get("type") != "portmark.migration-receipt.v1":
         raise SecurityError("migration receipt has an unknown type")
     try:
-        return {field: receipt[field] for field in _MIGRATION_RECEIPT_FIELDS}
+        body = {field: receipt[field] for field in _MIGRATION_RECEIPT_FIELDS}
     except KeyError as error:
         raise SecurityError("migration receipt is missing a required field") from error
+    for field in _OPTIONAL_MIGRATION_RECEIPT_FIELDS:
+        if field in receipt:
+            body[field] = receipt[field]
+    return body
 
 
 def _verified_migration_receipt_shape(receipt: dict[str, Any]) -> dict[str, Any]:
@@ -178,6 +213,9 @@ def _verified_migration_receipt_shape(receipt: dict[str, Any]) -> dict[str, Any]
     caller verifies over it.
     """
     allowed = set(_MIGRATION_RECEIPT_FIELDS) | {"signature", "signature_key_id"}
+    # Section 4 #5: a present optional field is allowed; still EXACT-match otherwise, so any unknown key
+    # is rejected and a present optional field is forced into the signed body (verified below).
+    allowed |= {field for field in _OPTIONAL_MIGRATION_RECEIPT_FIELDS if field in receipt}
     if set(receipt) != allowed:
         raise SecurityError("migration receipt has unexpected fields")
     return _migration_receipt_body(receipt)
@@ -748,6 +786,7 @@ class AttestationPolicy:
         external_verifier: ExternalAttestationVerifierProtocol | None = None,
         require_execution_nonce: bool = False,
         require_migration_nonce: bool = False,
+        require_migration_challenge: bool = False,
     ) -> None:
         self._authorities = {authority.key_id: authority for authority in authorities}
         self.allowed_measurements = allowed_measurements
@@ -770,6 +809,89 @@ class AttestationPolicy:
         # rather than ignored. A migration that carries NO attestation is unaffected unless
         # required_for_migration is set.
         self.require_migration_nonce = require_migration_nonce
+        # Section 4 #5 (challenge-passing protocol): the SOURCE-side control. When set, a source mints a
+        # FRESH challenge at migrate time (the delegated permit nonce) and, at settlement, REQUIRES the
+        # destination's receipt to carry that destination's own attestation over the challenge (verified
+        # here via `verify_migration_challenge`). Because the source minted the challenge, pre-collected
+        # or stale destination evidence cannot satisfy it -- closing the replay gap #64 left open, where
+        # freshness was bound only to the source's INCOMING (upstream-chosen) nonce. Off by default; a
+        # migration with neither this nor a destination attester behaves exactly as before.
+        self.require_migration_challenge = require_migration_challenge
+
+    def verify_migration_challenge(
+        self,
+        evidence: dict[str, Any] | None,
+        challenge: str,
+        destination: str,
+        source_host_id: str,
+        now: int | None = None,
+    ) -> None:
+        """Source-side verification of a destination's fresh challenge attestation (section 4 #5).
+
+        The destination proves ITS OWN identity (subject) TO the source (audience) over a challenge the
+        source freshly minted (the delegated permit nonce). A matching non-empty nonce is mandatory here
+        -- the whole point is freshness -- so stale or pre-collected evidence, evidence for a different
+        destination, or evidence addressed to a different relying party is refused. The evidence is a
+        serialized `AttestationEvidence`; a missing or malformed one fails closed.
+        """
+        if evidence is None:
+            raise SecurityError("migration challenge attestation is required")
+        try:
+            reconstructed = AttestationEvidence(**evidence)
+        except TypeError as error:
+            raise SecurityError("migration challenge attestation has invalid shape") from error
+        self.verify(
+            reconstructed,
+            expected_subject=destination,
+            relying_party=source_host_id,
+            expected_nonce=challenge,
+            now=now,
+            require_nonce=True,
+        )
+
+    def check_local_migration_evidence(
+        self,
+        evidence: AttestationEvidence,
+        subject: str,
+        audience: str,
+        challenge: str,
+        now: int | None = None,
+    ) -> None:
+        """Destination-side pre-persist sanity check of its OWN attester's output (section 4 #5).
+
+        A destination validates the evidence its attester produced BEFORE persisting the receipt, so a
+        defective attester's output is never frozen into the keep-first receipt store. Without this a
+        semantically-invalid receipt (e.g. wrong nonce) is stored, returned idempotently on every
+        redelivery, and rejected by the source forever -- an unrecoverable wedge that even a corrected
+        attester cannot clear. This checks the per-admission dimensions the destination authoritatively
+        owns (subject == this host, audience == the source, nonce == the source's challenge, temporal
+        validity), and ADDITIONALLY measurement/signature when the destination's own policy is configured
+        to (a destination that mirrors the source's policy gets a complete pre-persist check). It is a
+        fail-closed availability guard, not the trust boundary -- the source's `verify_migration_challenge`
+        remains the authority and still runs at settlement.
+        """
+        current_time = int(time.time()) if now is None else now
+        if evidence.subject != subject:
+            raise SecurityError("migration challenge evidence subject does not match this host")
+        if evidence.audience not in {audience, "*"}:
+            raise SecurityError("migration challenge evidence audience does not match the source")
+        if not evidence.nonce or not hmac.compare_digest(evidence.nonce, challenge):
+            raise SecurityError("migration challenge evidence nonce does not match the challenge")
+        if evidence.issued_at > current_time:
+            raise SecurityError("migration challenge evidence is not active yet")
+        if evidence.expires_at <= current_time:
+            raise SecurityError("migration challenge evidence has expired")
+        if self.allowed_measurements and evidence.measurement not in self.allowed_measurements:
+            raise SecurityError("migration challenge evidence measurement is not approved")
+        authority = self._authorities.get(evidence.signature_key_id) if evidence.signature_key_id else None
+        if authority is not None:
+            try:
+                Ed25519PublicKey.from_public_bytes(authority.public_key).verify(
+                    _b64url_decode(evidence.signature),
+                    canonical_json(evidence.unsigned_dict()),
+                )
+            except (InvalidSignature, ValueError) as error:
+                raise SecurityError("migration challenge evidence signature is invalid") from error
 
     def verify_execution(self, permit: Permit, host_id: str, now: int | None = None) -> None:
         if not self.required_for_execution and permit.attestation is None:

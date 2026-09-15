@@ -116,6 +116,46 @@ Dockerfile. Common configuration:
 Do not bake tokens, private keys, policy files containing local secrets, or
 runtime stores into the container image.
 
+## Migration Attestation Freshness (optional)
+
+Migration attestation freshness is **opt-in** and off by default. To require that a destination proves
+itself with fresh, non-replayable evidence before a source considers a migration delivered, enable the
+**challenge-passing protocol**:
+
+- On the **source** host: `AttestationPolicy(require_migration_challenge=True)`, and the source must
+  trust the destination's attestation authority (add it to the policy's `authorities`). The source mints
+  a fresh challenge per migration and verifies the destination's evidence in the delivery receipt before
+  settling.
+- On the **destination** host: pass a `migration_attester` (implements `MigrationAttesterProtocol`) that
+  produces the destination's own attestation over the challenge. The host runs it on a daemon thread with
+  a timeout (`migration_attester_timeout`, default 5s) so a hung attester fails admission closed rather
+  than holding it open, and caps concurrent in-flight attester calls (`migration_attester_max_inflight`,
+  default 8) so a flood of deliveries cannot spawn unbounded threads; the attester should still bound its
+  own work (a leaked daemon thread from a truly-hung attester is not reclaimed and holds one of the
+  in-flight slots). Set the timeout to `None` to opt out of the host time bound.
+
+Operational notes:
+
+- A destination that receives a challenge-required migration but has **no** working attester — or whose
+  attester returns **semantically-invalid** evidence (wrong nonce/subject/audience/expiry) — refuses
+  admission (fail-closed) and persists nothing, so the source can re-deliver once the attester is fixed.
+  The destination validates its own attester's output before persisting so a defective attester cannot
+  freeze a bad receipt into the idempotent receipt store. A destination whose `attestation_policy` is
+  configured with the trusted authority and allowed measurements gets a complete pre-persist check.
+- Even for a bad first evidence the destination could **not** locally detect (signed by a key or bearing
+  a measurement only the source's policy rejects), redelivery of the identical envelope **regenerates**
+  the attestation, so once a correct attester is in place the next delivery settles. Recovery therefore
+  never requires deleting or editing stored state — just redelivering after fixing the attester.
+- The regenerated receipt is **persisted durably**, and a redelivery whose attester is unavailable falls
+  back to the stored receipt. So after a correct attester has produced one good receipt, settlement still
+  recovers across a lost acknowledgement, a destination restart, or a later attester outage.
+- Challenge mode is **mutually exclusive** with `required_for_execution=True` on the same destination:
+  in challenge mode the migrated permit carries no execution attestation (the proof travels in the
+  receipt), so a destination that also requires an execution attestation will refuse challenge
+  migrations. Pick one mechanism per destination.
+- A migrated task's challenge nonce is consumed at the destination on first admission, so a task
+  migrates to a given destination once (identical re-delivery remains idempotent).
+
 ## Upgrading
 
 ### Reserved migration task-id namespace (`mig::`)

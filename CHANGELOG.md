@@ -6,6 +6,57 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Section 4 — migration challenge-passing protocol (finding #5 follow-up)
+
+- **Migration attestation freshness can now be closed with a source-verified challenge (finding #5,
+  opt-in).** #5's first step bound migration attestation to the migration's permit nonce, but that nonce
+  is the source's *incoming* (upstream-chosen) nonce and the source's provider produced the "destination
+  attestation" — so a source could present pre-collected evidence. With the new opt-in, the source mints
+  a **fresh challenge** at migrate time (carried as the delegated permit nonce), the destination attests
+  to **its own** identity over that challenge with an injected `migration_attester`, and the evidence
+  rides back in the signed delivery receipt where the **source verifies it** before marking the migration
+  delivered. Because the source chose the challenge, pre-collected or stale evidence cannot satisfy it.
+  Enable it with `AttestationPolicy(require_migration_challenge=True)` on the source and a
+  `migration_attester` on the destination; both default off, so existing migrations are unchanged.
+- **A challenge-required migration fails admission closed when the destination cannot produce valid
+  evidence.** The source's demand rides inside the sealed envelope, and a destination with no attester, a
+  failing attester, or an attester that returns **semantically-invalid** evidence (wrong nonce, subject,
+  audience, or expiry) refuses admission **before persisting anything** — so no bad or evidence-less
+  receipt is ever stored. This matters because receipts are idempotent: a stored bad receipt would be
+  returned unchanged on every redelivery, stranding the outbox row forever even after a corrected
+  attester is installed. Because nothing is persisted, the source re-delivers and settles once a working
+  attester is in place. A failing attester surfaces as a `SecurityError`, not an uncaught error out of
+  `run()`. The source's settlement check remains the trust authority (a malicious destination that
+  persists bad evidence anyway is still rejected there).
+- **A corrected attester always recovers — the invalid-evidence wedge is fully closed.** The destination
+  can only locally check the dimensions it owns (nonce, subject, audience, expiry, and — when its own
+  policy is configured — measurement and signature); a first evidence wrong only in a dimension it cannot
+  evaluate (a signing key or measurement policy only the *source* trusts) would still pass the destination
+  and, under keep-first receipt storage, be frozen and rejected by the source forever. So on **redelivery**
+  of an identical envelope the destination **regenerates** the receipt attestation — re-running the
+  attester while keeping the admission's checkpoint / audit / generation bindings unchanged — so a
+  corrected attester's evidence replaces the bad one and the source settles. No re-execution of the task.
+- **Regeneration is durable.** The regenerated receipt is atomically **persisted** (overwriting the stored
+  one; only the attestation and signature change, every binding is carried over), and a redelivery whose
+  attester is unavailable **falls back** to the stored receipt instead of failing. So once a correct
+  attester has produced one good receipt, recovery survives a lost acknowledgement, a restart, or a later
+  attester outage — the durable lost-ack guarantee holds. First admission still fails closed (there is no
+  stored receipt to fall back to).
+- **The attester call is host-bounded and rate-bounded.** The destination runs the attester on a daemon
+  thread with a configurable timeout (`migration_attester_timeout`, default 5s); a hung attester fails
+  admission closed rather than holding it open. Concurrent in-flight attester calls are capped
+  (`migration_attester_max_inflight`, default 8) so a flood of deliveries against a slow or hung attester
+  cannot spawn unbounded threads — excess calls are refused fail-closed. Set the timeout to `None` to opt
+  out of the host time bound.
+- **Supersedes #64's reuse only when enabled.** In challenge mode the delegated permit carries a fresh
+  challenge nonce and **no** source-provided attestation (a source attestation bound to the incoming
+  nonce would make the destination's `verify_execution` reject the fresh challenge); freshness moves from
+  the source-side `verify_migration` check to the receipt-verify step at settlement. With challenge mode
+  off, #64's incoming-nonce reuse is byte-identical. The evidence is an **optional** signed receipt field,
+  so pre-#5 receipts and both directions of mixed-version delivery still validate. No schema change.
+  Documented bound: a destination that also sets `required_for_execution=True` refuses challenge
+  migrations (the two attestation mechanisms are mutually exclusive per destination).
+
 ### Section 4 — migration task-id namespacing (finding #7)
 
 - **A destination no longer lets one source squat another source's task id (finding #7).** Checkpoints,
