@@ -6,6 +6,31 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Section 4 (part 3b) — migration payload confidentiality
+
+- **A migration no longer ships the source's full raw state to the destination (finding #6).** A
+  tool's `output_projection` is the confidentiality ceiling on what that tool's output may reveal, and
+  the provider path already enforced it — but a migration sealed the complete unprojected state, so a
+  tool's withheld fields crossed the trust boundary to the destination host inside both
+  `memory["tool_results"]` and the tool messages. The source now projects the migrated payload to the
+  destination's entitlement (`project_state_for_migration`) **before sealing**: each granted tool's
+  output is reduced to its projection ceiling in both places, a tool the destination has no grant for is
+  dropped, and user/assistant messages cross in full so the task can still be resumed. Because the
+  delegated permit is minted with `audience == destination` and carries exactly these grants, projecting
+  to them is per-destination projection by construction. The source's own checkpoint keeps the full,
+  unprojected state. The projection **fails closed**: `tool_results` is always replaced when present, so
+  a non-dict value (a list/string/number/null from signed, imported, or legacy state) is dropped to `{}`
+  rather than crossing the boundary unprojected.
+  - **Bounds (unchanged behavior, stated):** the ceiling governs tool *output*; user/assistant message
+    content is out of its scope and crosses unchanged. A share-nothing grant (empty projection) reduces
+    a tool's output to a falsy-but-present `{}`, exactly as the provider path does today, so a
+    truthiness-based "already ran this tool?" provider check may re-propose that tool at the destination
+    — migration merely stops bypassing the ceiling; it adds no new leak or re-run semantics.
+    Non-`tool_results` memory keys (`migration`, `used_approval_ids`, `approvals`) cross verbatim by
+    design: they are source-side control data, not tool output, and dropping the approval bookkeeping
+    would weaken migration replay prevention. Projecting approval-token contents is a separate concern,
+    not part of #6.
+
 ### Section 4 (part 3b) — migration attestation freshness
 
 - **A migration attestation can no longer be replayed across migrations (finding #5).**

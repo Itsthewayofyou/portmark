@@ -33,6 +33,7 @@ from portmark.factory import build_envelope, make_demo_envelope, make_host, sign
 from portmark.metrics import RuntimeMetrics
 from portmark.logging_config import JsonLogFormatter
 from portmark.models import AgentState, AttestationEvidence, Permit, ProviderDecision, ResourceBudget, ToolGrant
+from portmark.projection import project_state_for_migration
 from portmark.providers import GenericHttpProvider, ModelProvider, NativeWasmtimeComponentProvider
 from portmark.policy import load_host_policy
 from portmark.security import (
@@ -102,6 +103,30 @@ class AttestedMigrateThenCompleteProvider(ModelProvider):
         if "migration" not in state.memory:
             return ProviderDecision("migrate", destination=self.destination, content={"attestation": asdict(self.attestation)})
         return ProviderDecision("complete", content={"resumed_on": self.destination})
+
+
+class SearchThenMigrateProvider(ModelProvider):
+    # Section 4 #6 fixture. Run catalog.search (its result carries a `score` field the
+    # grant's ("id", "title") output_projection deliberately WITHHOLDS), THEN migrate,
+    # then complete at the destination. Exercises payload confidentiality on migration:
+    # the withheld field must not cross to the destination inside the sealed envelope.
+    def __init__(self, destination):
+        self.destination = destination
+    def decide(self, state, available_tools, grants=()):
+        if "migration" in state.memory:
+            return ProviderDecision("complete", content={"resumed_on": self.destination})
+        if not state.memory.get("tool_results", {}).get("catalog.search"):
+            return ProviderDecision("tool", "catalog.search", {"query": "widgets", "limit": 2})
+        return ProviderDecision("migrate", destination=self.destination)
+
+
+def _json_contains_key(obj, key):
+    # True if `key` appears as a dict key anywhere in a JSON-shaped structure.
+    if isinstance(obj, dict):
+        return key in obj or any(_json_contains_key(value, key) for value in obj.values())
+    if isinstance(obj, list):
+        return any(_json_contains_key(item, key) for item in obj)
+    return False
 
 
 class ExplodingProvider(ModelProvider):
@@ -2329,6 +2354,144 @@ class RuntimeTests(unittest.TestCase):
                     self.assertEqual(anchor["previous_audit_host_id"], "host:source")
                     # The anchor ties this chain to the source's actual head hash.
                     self.assertEqual(anchor["previous_audit_hash"], first.audit[-1]["hash"])
+
+    def test_migration_payload_is_projected_to_destination_grants(self):
+        # Section 4 #6 (payload confidentiality). A tool result carries fields beyond
+        # the grant's output_projection ceiling. The provider path already enforces that
+        # ceiling, but a migration used to seal the FULL raw state, so the withheld
+        # fields crossed the trust boundary to the destination host inside both
+        # state.memory["tool_results"] and the tool messages. Per-destination projection:
+        # the source reduces the migrated payload to the destination's entitlement (the
+        # delegated permit's grants, minted with audience == destination) BEFORE sealing.
+        # Here catalog.search returns id/title/SCORE and the grant projects to id/title,
+        # so "score" must be absent everywhere in the sealed envelope AND the outbox row.
+        source_signer = EnvelopeSigner.generate("conf-source-key", "host:source", ("host:source", "host:destination"))
+        destination_signer = trust_signer(
+            EnvelopeSigner.generate("conf-destination-key", "host:destination", ("host:destination",)),
+            source_signer,
+        )
+        for context in self._dual_store_case_contexts(source_signer, destination_signer):
+            with context as (backend, source_store, destination_store):
+                with self.subTest(backend=backend):
+                    source = make_host(host_id="host:source", signer=source_signer, store=source_store, allow_ephemeral_signing_key=True)
+                    destination = make_host(host_id="host:destination", signer=destination_signer, store=destination_store, allow_ephemeral_signing_key=True)
+                    source.policy.migration = MigrationPolicy(allowed=True, destinations=(destination.host_id,))
+                    provider = SearchThenMigrateProvider(destination.host_id)
+                    source.providers["migrator"] = provider
+                    destination.providers["migrator"] = provider
+                    envelope = make_demo_envelope(source, f"{backend} confidentiality", "migrator")
+                    object.__setattr__(envelope.permit, "delegation_allowed", True)
+                    source_signer.seal(envelope)
+
+                    first = source.run(envelope)
+                    self.assertEqual(source_store.load_checkpoint(first.task_id)["status"], "ready")
+                    self.assertIsNotNone(first.migration_envelope)
+
+                    # The source ran the tool: its OWN durable checkpoint keeps the full,
+                    # unprojected result (projection reduces the migrated copy, not the
+                    # source's records).
+                    source_results = source_store.load_checkpoint(first.task_id)["memory"]["tool_results"]["catalog.search"]
+                    self.assertTrue(all("score" in item for item in source_results))
+
+                    # The withheld field must not cross to the destination anywhere in the
+                    # sealed envelope (memory["tool_results"] AND the tool messages), and the
+                    # granted fields must still be present so the destination can resume.
+                    sealed = first.migration_envelope
+                    self.assertFalse(_json_contains_key(sealed["state"], "score"))
+                    migrated_results = sealed["state"]["memory"]["tool_results"]["catalog.search"]
+                    self.assertTrue(all(set(item.keys()) == {"id", "title"} for item in migrated_results))
+                    tool_messages = [m for m in sealed["state"]["messages"] if m.get("role") == "tool"]
+                    self.assertTrue(tool_messages)
+                    self.assertFalse(any(_json_contains_key(m, "score") for m in tool_messages))
+
+                    # The durable outbox row is the same projected bytes (nothing leaks by
+                    # the delivery path either).
+                    row = source_store.list_pending_migrations()[0]
+                    self.assertNotIn("score", row["sealed_envelope_json"])
+                    self.assertEqual(row["sealed_envelope_json"], canonical_json(first.migration_envelope).decode("utf-8"))
+
+                    # End-to-end: the projected envelope still admits and completes at the
+                    # destination, and its audit chain verifies.
+                    migrated = envelope_from_dict(first.migration_envelope)
+                    second = destination.run(migrated)
+                    self.assertEqual(second.status, "completed")
+                    self.assertEqual(destination_store.load_checkpoint(second.task_id)["status"], "completed")
+                    self.assertTrue(destination_store.verify_audit_chain(second.task_id))
+
+    def test_project_state_for_migration_branches(self):
+        # Section 4 #6 unit pins for project_state_for_migration:
+        #  - a GRANTED tool's output is reduced to its projection in BOTH memory and the
+        #    tool message;
+        #  - a tool with NO destination grant is dropped from both;
+        #  - NON-tool (user/assistant) messages are kept in full (resumption continuity);
+        #  - a SHARE-NOTHING grant (empty projection) reduces the output to a falsy-but-
+        #    present {} rather than dropping the key -- the deliberate, documented
+        #    consequence, identical to the provider path.
+        state = AgentState(
+            task_id="t1",
+            goal="do the thing",
+            memory={
+                "tool_results": {
+                    "keep.tool": {"public": "shown", "withheld_field": "not-for-destination"},
+                    "drop.tool": {"anything": "ungranted"},
+                    "empty.tool": {"whatever": "held-back"},
+                },
+                "other": "kept-verbatim",
+            },
+            messages=[
+                {"role": "user", "content": "the original prompt"},
+                {"role": "assistant", "content": "thinking"},
+                {"role": "tool", "name": "keep.tool", "content": {"public": "shown", "withheld_field": "not-for-destination"}},
+                {"role": "tool", "name": "drop.tool", "content": {"anything": "ungranted"}},
+                {"role": "tool", "name": "empty.tool", "content": {"whatever": "held-back"}},
+            ],
+        )
+        grants = (
+            ToolGrant("keep.tool", output_projection=("public",)),
+            ToolGrant("empty.tool", output_projection=()),
+        )
+        projected = project_state_for_migration(state, grants)
+
+        # Granted tool reduced to its ceiling; withheld field gone; ungranted tool dropped.
+        self.assertEqual(projected.memory["tool_results"]["keep.tool"], {"public": "shown"})
+        self.assertNotIn("drop.tool", projected.memory["tool_results"])
+        # Share-nothing keeps the key with a falsy-but-present {} (documented consequence).
+        self.assertEqual(projected.memory["tool_results"]["empty.tool"], {})
+        # Non-tool_results memory is carried verbatim.
+        self.assertEqual(projected.memory["other"], "kept-verbatim")
+
+        # Non-tool messages kept verbatim; granted tool message reduced; ungranted dropped.
+        self.assertEqual(projected.messages[0], {"role": "user", "content": "the original prompt"})
+        self.assertEqual(projected.messages[1], {"role": "assistant", "content": "thinking"})
+        tool_messages = [m for m in projected.messages if m.get("role") == "tool"]
+        self.assertEqual({m["name"] for m in tool_messages}, {"keep.tool", "empty.tool"})
+        keep_msg = next(m for m in tool_messages if m["name"] == "keep.tool")
+        self.assertEqual(keep_msg["content"], {"public": "shown"})
+        empty_msg = next(m for m in tool_messages if m["name"] == "empty.tool")
+        self.assertEqual(empty_msg["content"], {})
+
+        # The source's own state is untouched (projection returns a copy).
+        self.assertIn("withheld_field", state.memory["tool_results"]["keep.tool"])
+        self.assertEqual(len(state.messages), 5)
+
+    def test_project_state_for_migration_fails_closed_on_malformed_tool_results(self):
+        # Section 4 #6 fail-closed: a confidentiality boundary must not pass unknown
+        # shapes through. tool_results is normally a dict, but a signed/imported or
+        # legacy state can carry any JSON value. A non-dict tool_results cannot be
+        # projected per-grant, so it must be DROPPED (replaced with {}), never crossed
+        # unchanged. The KEY presence is preserved (replaced, not deleted) so a resumer
+        # sees an empty-but-present results bag rather than a missing one.
+        for malformed in ([{"leaked": "not-for-destination"}], "opaque-blob", 42, None):
+            with self.subTest(shape=type(malformed).__name__):
+                state = AgentState(
+                    task_id="t2",
+                    goal="malformed",
+                    memory={"tool_results": malformed, "other": "kept"},
+                    messages=[],
+                )
+                projected = project_state_for_migration(state, (ToolGrant("any.tool", output_projection=("x",)),))
+                self.assertEqual(projected.memory["tool_results"], {})
+                self.assertEqual(projected.memory["other"], "kept")
 
     def test_migration_writes_sealed_envelope_to_outbox_atomically(self):
         # Section 1, finding #2: the sealed destination envelope is stored durably in

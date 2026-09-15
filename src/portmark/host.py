@@ -8,7 +8,7 @@ from typing import Any
 
 from .metrics import RuntimeMetrics
 from .models import AgentEnvelope, ApprovalToken, AttestationEvidence, ProviderDecision, RunResult
-from .projection import project_state_for_provider
+from .projection import project_state_for_migration, project_state_for_provider
 from .providers import ModelProvider
 from .security import _MIGRATION_RECEIPT_FIELDS, AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, SecurityError, arguments_hash, audit_head_payload, canonical_json, migration_envelope_digest, migration_receipt_payload
 from .storage import InMemoryRuntimeStore, RuntimeStore
@@ -414,10 +414,20 @@ class AgentHost:
             # at the destination, so the first admission there is nonce-guarded and
             # every later one is generation-guarded. The source task is closed by the
             # final _persist of this run (closed=True).
+            # Section 4 #6 (payload confidentiality): reduce the migrated payload to the
+            # destination's entitlement BEFORE sealing. `delegated.grants` == this
+            # migration's grants, and the delegated permit's audience IS the destination,
+            # so a tool's output_projection ceiling (already enforced on the provider
+            # path) is applied here to what crosses the trust boundary -- otherwise the
+            # source's full raw tool output would reach the destination host unprojected.
+            # The source's OWN checkpoint keeps the full state; only this sealed copy is
+            # projected. Order is project -> construct -> seal -> digest (the receipt
+            # digest, section 4 #2, is taken on the sealed projected bytes at both ends).
+            migrated_state = project_state_for_migration(replace(state, checkpoint_generation=0), delegated.grants)
             migrated = AgentEnvelope(
                 envelope.manifest,
                 delegated,
-                replace(state, checkpoint_generation=0),
+                migrated_state,
                 previous_audit_hash=audit.head,
                 previous_audit_sequence=previous_sequence,
                 previous_audit_host_id=self.host_id,
