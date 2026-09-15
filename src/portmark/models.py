@@ -69,6 +69,15 @@ class ApprovalToken:
     audience: str
     task_id: str
     permit_nonce: str
+    # Section 5 #1 (High): the approval is bound to the exact stored checkpoint
+    # generation it was issued for. Without this an approval minted for the task's
+    # suspended state at generation N is replayable after the task legitimately
+    # advances to a later generation M (same tool/args/permit-nonce/policy), letting
+    # a stale authorization take effect in a context it never approved. REQUIRED,
+    # never defaulted: an optional generation claim is no binding at all (an attacker
+    # simply omits it). Verified against the DURABLE store generation, not the
+    # caller-asserted envelope value.
+    checkpoint_generation: int
     arguments_hash: str
     policy_hash: str
     approved_by: str

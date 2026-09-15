@@ -76,11 +76,12 @@ class SecurityGuardTests(unittest.TestCase):
             arguments,
             "policy-hash",
             NOW + 60,
+            checkpoint_generation=3,
             issued_at=NOW - 1,
             approval_id="approval-1",
         )
         self._approval_policy(authority.trusted_approver()).verify_approval(
-            token, permit, "task-1", "payments.reserve", arguments, now=NOW
+            token, permit, "task-1", "payments.reserve", arguments, expected_generation=3, now=NOW
         )
 
         cases = [
@@ -94,6 +95,8 @@ class SecurityGuardTests(unittest.TestCase):
             ("approval audience does not match permit", replace(token, audience="host:other"), None, arguments, "payments.reserve", "task-1"),
             ("approval task does not match request", replace(token, task_id="task-2"), None, arguments, "payments.reserve", "task-1"),
             ("approval does not match permit nonce", replace(token, permit_nonce="other-nonce"), None, arguments, "payments.reserve", "task-1"),
+            # Section 5 #1: an approval bound to a different checkpoint generation is refused.
+            ("approval does not match checkpoint generation", replace(token, checkpoint_generation=99), None, arguments, "payments.reserve", "task-1"),
             ("approval policy hash does not match active policy", replace(token, policy_hash="old-policy"), None, arguments, "payments.reserve", "task-1"),
             ("approval arguments do not match request", token, None, {"amount": 26, "currency": "USD"}, "payments.reserve", "task-1"),
             ("approval is not active yet", replace(token, issued_at=NOW + 1), None, arguments, "payments.reserve", "task-1"),
@@ -105,7 +108,7 @@ class SecurityGuardTests(unittest.TestCase):
                 trusted = mutated_authority or authority.trusted_approver()
                 with self.assertRaisesRegex(SecurityError, message):
                     self._approval_policy(trusted).verify_approval(
-                        mutated_token, permit, task_id, tool, mutated_arguments, now=NOW
+                        mutated_token, permit, task_id, tool, mutated_arguments, expected_generation=3, now=NOW
                     )
 
     def test_trust_registry_identity_guards_are_table_driven(self):

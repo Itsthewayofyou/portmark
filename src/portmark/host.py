@@ -12,9 +12,14 @@ from .metrics import RuntimeMetrics
 from .models import AgentEnvelope, ApprovalToken, AttestationEvidence, ProviderDecision, RunResult
 from .projection import project_state_for_migration, project_state_for_provider
 from .providers import ModelProvider
-from .security import _MIGRATION_RECEIPT_FIELDS, _OPTIONAL_MIGRATION_RECEIPT_FIELDS, AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, MigrationAttesterProtocol, SecurityError, arguments_hash, audit_head_payload, canonical_json, migration_envelope_digest, migration_receipt_payload
+from .security import _MIGRATION_RECEIPT_FIELDS, _OPTIONAL_MIGRATION_RECEIPT_FIELDS, AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, MigrationAttesterProtocol, SecurityError, arguments_hash, audit_head_payload, canonical_json, migration_envelope_digest, migration_receipt_payload, verified_approval_token
 from .storage import InMemoryRuntimeStore, RuntimeStore
 from .tools import ToolExecutionError, ToolKilledError, ToolRegistry
+
+
+class _TaskCancelled(Exception):
+    """Internal: a durable cancellation was observed inside the approval transaction, so the
+    consume_nonce must roll back with it (section 5 #3). Never escapes _approval_gate."""
 
 # Prefixes that mark a manifest's component_digest as a content-addressed pin of
 # exact bytes, as opposed to the symbolic default (e.g. "python:reference-agent-v1").
@@ -109,6 +114,20 @@ class AgentHost:
             raise
         finally:
             self.metrics.observe_duration("run_duration_seconds", time.monotonic() - started)
+
+    def cancel_task(self, task_id: str) -> None:
+        """Durably cancel an admitted task (section 5 #3). Idempotent.
+
+        Cancellation is enforced in three tiers: (1) before an approval is redeemed -> refused at
+        the gate, nothing burned; (2) racing the redemption transaction -> serialized, rolled back
+        if the cancel wins; (3) after redemption -> BEST-EFFORT, caught only if the cancel commits
+        before the pre-launch re-check. A cancel that commits after that read does NOT prevent the
+        tool effect -- the tool runs and its effect happens even though the task is now cancelled.
+        Guaranteeing "no effect after cancel" requires per-tool idempotency keys + a reconciliation
+        pass (Section 7); it is not provided here. This is the supported operator entry point; a
+        network-triggered cancel endpoint (with its own auth) is future work.
+        """
+        self.store.cancel_task(task_id)
 
     def settle_migration(self, task_id: str, receipt: dict[str, Any]) -> None:
         """Source-side delivery settlement against a verified destination receipt (section 4 #2).
@@ -268,6 +287,14 @@ class AgentHost:
         # is the actual authorization, so a stale or replayed resume is rejected there,
         # before any provider decision, tool call, approval, or migration.
         stored = self.store.load_checkpoint(state.task_id)
+        # Section 5 #1 (High): the generation an approval must be bound to is the
+        # DURABLE store generation of the checkpoint being admitted -- never the
+        # caller-asserted state.checkpoint_generation, which the pre-loop _persist
+        # (below) advances before the approval gate runs and which is an unvalidated
+        # assertion at the gate. A fresh task (no stored checkpoint) is generation 0.
+        # This constant is captured once here and carried to _approval_gate; the live
+        # state.checkpoint_generation climbs with every persist and must not be used.
+        admission_generation = 0 if stored is None else int(stored["checkpoint_generation"])
         if stored is None:
             if state.checkpoint_generation != 0:
                 raise SecurityError("new task has invalid checkpoint generation")
@@ -360,7 +387,7 @@ class AgentHost:
             self.metrics.increment("provider.decisions")
             audit.append("provider.proposed", {"kind": decision.kind, "tool": decision.tool})
             tool_calls_before = state.tool_calls
-            finished, migration = self._apply_decision(decision, state, effective, audit, envelope, active_policy)
+            finished, migration = self._apply_decision(decision, state, effective, audit, envelope, active_policy, admission_generation)
             state.step += 1
             # Close the checkpoint's lineage at this host when the task terminates
             # (completed/failed) or migrates away, so it can never be resumed here
@@ -414,7 +441,7 @@ class AgentHost:
         self._record_run_status(result.status)
         return result
 
-    def _apply_decision(self, decision, state, effective, audit, envelope, active_policy):
+    def _apply_decision(self, decision, state, effective, audit, envelope, active_policy, admission_generation=0):
         if decision.kind == "tool":
             if state.tool_calls >= effective.budget.max_tool_calls:
                 raise SecurityError("tool-call budget exhausted")
@@ -424,9 +451,23 @@ class AgentHost:
                 raise SecurityError(
                     active_policy.explain_missing_grant(envelope.manifest, envelope.permit, decision.tool)
                 )
-            approval_result = self._approval_gate(active_policy, effective, state, decision, audit)
+            approval_result = self._approval_gate(active_policy, effective, state, decision, audit, admission_generation)
             if approval_result is not None:
                 return approval_result
+            # Section 5 #3: BEST-EFFORT pre-launch cancellation re-check. Cancellation enforcement
+            # has three tiers, and this is the boundary of the last one:
+            #   (1) a cancel committed before redemption -> refused at the gate, nothing burned;
+            #   (2) a cancel racing the redemption transaction -> serialized, rolled back if it wins;
+            #   (3) a cancel committed after redemption -> caught ONLY if it lands before this read.
+            # A cancel that commits AFTER this read (in the read->tools.invoke window, or once the tool
+            # is running) does NOT prevent the side effect: the tool runs and its effect happens, even
+            # though the task is now cancelled. This check and tools.invoke are deliberately not atomic
+            # with the effect -- closing that fully requires the tool to carry an idempotency key and a
+            # reconciliation pass (Section 7, tool boundary), not available here. So cancellation of an
+            # already-redeemed approval is best-effort-before-launch, not a guarantee that the effect is
+            # prevented. Fires only for approval-gated tools; the approval is already consumed.
+            if active_policy.requires_approval(decision.tool) and self.store.is_task_cancelled(state.task_id):
+                return self._approval_failure(state, audit, "approval.denied", "cancelled")
             try:
                 tool_started = time.monotonic()
                 try:
@@ -602,10 +643,16 @@ class AgentHost:
             self.policy = loaded
         return self.policy
 
-    def _approval_gate(self, policy: HostPolicy, permit, state, decision: ProviderDecision, audit: AuditLog) -> tuple[bool, None] | None:
+    def _approval_gate(self, policy: HostPolicy, permit, state, decision: ProviderDecision, audit: AuditLog, admission_generation: int) -> tuple[bool, None] | None:
         if decision.tool is None or not policy.requires_approval(decision.tool):
             return None
-        token = self._approval_token(state, decision.tool)
+        # Section 5 #4: the token is loaded from untrusted mutable memory. Any malformation
+        # (missing/extra keys, wrong types) is turned into a controlled approval.denied here,
+        # never an uncaught exception out of run() that strands the admitted task nonterminally.
+        try:
+            token = self._approval_token(state, decision.tool)
+        except SecurityError:
+            return self._approval_failure(state, audit, "approval.denied", "invalid")
         if token is None:
             state.status = "awaiting_input"
             state.result = {
@@ -618,11 +665,19 @@ class AgentHost:
             }
             audit.append("approval.requested", state.result)
             return True, None
-        used = set(state.memory.get("used_approval_ids", []))
-        if token.approval_id in used:
+        # Section 5 #4: used_approval_ids also comes from untrusted memory. A non-list (or a
+        # non-string element) would raise inside set()/membership; treat it as a denied approval
+        # rather than crash.
+        used_ids = state.memory.get("used_approval_ids", [])
+        if not isinstance(used_ids, list) or not all(isinstance(item, str) for item in used_ids):
+            return self._approval_failure(state, audit, "approval.denied", "invalid")
+        if token.approval_id in set(used_ids):
             return self._approval_failure(state, audit, "approval.denied", "replayed")
         try:
-            policy.verify_approval(token, permit, state.task_id, decision.tool, decision.arguments)
+            # Section 5 #1: expected_generation is the DURABLE store generation captured at
+            # admission, so an approval minted for the suspended state at generation N cannot be
+            # redeemed after the task advances to a later generation.
+            policy.verify_approval(token, permit, state.task_id, decision.tool, decision.arguments, expected_generation=admission_generation)
         except SecurityError as error:
             event = "approval.expired" if "expired" in str(error) else "approval.denied"
             return self._approval_failure(state, audit, event, "invalid")
@@ -631,6 +686,9 @@ class AgentHost:
         # ("awaiting_input") envelope could replay the same approval to re-run a
         # side-effecting tool. Consume a namespaced token in the runtime store —
         # atomic on every backend and independent of the replayable wire state.
+        # Section 5 #3: the cancellation check runs in the SAME transaction, AFTER the consume,
+        # so a cancel that wins the race rolls the consume back (nothing is burned) and one that
+        # loses is caught by the pre-launch re-check in _apply_decision.
         try:
             with self.store.transaction() as approval_transaction:
                 approval_transaction.consume_nonce(
@@ -639,10 +697,14 @@ class AgentHost:
                     permit.audience,
                     state.task_id,
                 )
+                if approval_transaction.is_task_cancelled(state.task_id):
+                    raise _TaskCancelled
+        except _TaskCancelled:
+            return self._approval_failure(state, audit, "approval.denied", "cancelled")
         except SecurityError:
             return self._approval_failure(state, audit, "approval.denied", "replayed")
         audit.append("approval.approved", {"approval_id": token.approval_id, "tool": decision.tool, "approved_by": token.approved_by})
-        used_values = list(state.memory.get("used_approval_ids", []))
+        used_values = list(used_ids)
         used_values.append(token.approval_id)
         state.memory["used_approval_ids"] = used_values
         audit.append("approval.used", {"approval_id": token.approval_id, "tool": decision.tool})
@@ -666,9 +728,9 @@ class AgentHost:
             return None
         if isinstance(value, ApprovalToken):
             return value
-        if not isinstance(value, dict):
-            raise SecurityError("approval token has invalid shape")
-        return ApprovalToken(**value)
+        # Section 5 #4: exact-schema + type validation (raises SecurityError on any malformation),
+        # so a hand-built dict from untrusted memory can never crash run() via ApprovalToken(**value).
+        return verified_approval_token(value)
 
     def _migration_attestation(self, decision: ProviderDecision) -> AttestationEvidence | None:
         if not isinstance(decision.content, dict):

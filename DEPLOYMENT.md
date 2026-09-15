@@ -158,6 +158,35 @@ Operational notes:
 
 ## Upgrading
 
+### Approvals now carry a required checkpoint generation (breaking approval format)
+
+From this release a signed `ApprovalToken` includes a required `checkpoint_generation` and the host
+verifies it (finding #1). Any approval **issued before the upgrade** — or issued by an approver that
+does not set the generation — is refused at the gate as malformed or generation-mismatched. This is
+fail-closed and intended: a held, not-yet-redeemed approval must be re-issued after the upgrade.
+
+The generation to bind is the suspended checkpoint's generation, which the host returns on the
+awaiting-input run (`RunResult.checkpoint["checkpoint_generation"]`). An approver reads that value from
+the suspended task and seals it into the approval. **Before upgrading, drain or plan to re-issue any
+approvals that are outstanding (issued but not yet redeemed).** They cannot be honored after the upgrade.
+
+### Task cancellation (new schema: SQLite v9, Postgres v7)
+
+This release adds durable task cancellation (`AgentHost.cancel_task`, finding #3), backed by a new
+`task_cancellations` table. The store schema version advances (SQLite 8 → 9, Postgres 6 → 7). Schema
+creation is automatic at startup: SQLite runs a forward-only migration, and Postgres creates the table
+idempotently (`CREATE TABLE IF NOT EXISTS`) and bumps its recorded version. No data migration is needed
+and the change is additive. As with any schema bump, upgrade the code before pointing it at a store, and
+do not run an older Portmark against a store a newer one has already upgraded (the store refuses a schema
+version newer than it supports).
+
+**Cancellation is best-effort before launch, not a kill switch.** A cancel is fully enforced before an
+approval is redeemed and while racing the redemption; after redemption it is caught only if it commits
+before the pre-launch re-check. A cancel that lands later — in the check→launch window or once the tool
+is already running — does **not** stop the effect: the tool runs and its effect happens even though the
+task is now cancelled. Do not rely on `cancel_task` to prevent an in-flight external side effect;
+guaranteeing that requires per-tool idempotency keys and reconciliation (a later tool-boundary change).
+
 ### Reserved migration task-id namespace (`mig::`)
 
 A destination namespaces a **migrated** task's stored identity by the source host it
