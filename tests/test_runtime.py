@@ -33,7 +33,7 @@ from portmark.factory import build_envelope, make_demo_envelope, make_host, sign
 from portmark.metrics import RuntimeMetrics
 from portmark.logging_config import JsonLogFormatter
 from portmark.models import AgentState, AttestationEvidence, Permit, ProviderDecision, ResourceBudget, ToolGrant
-from portmark.projection import project_state_for_migration
+from portmark.projection import project_state_for_migration, project_state_for_provider
 from portmark.providers import GenericHttpProvider, ModelProvider, NativeWasmtimeComponentProvider
 from portmark.policy import load_host_policy
 from portmark.security import (
@@ -2490,6 +2490,23 @@ class RuntimeTests(unittest.TestCase):
                     messages=[],
                 )
                 projected = project_state_for_migration(state, (ToolGrant("any.tool", output_projection=("x",)),))
+                self.assertEqual(projected.memory["tool_results"], {})
+                self.assertEqual(projected.memory["other"], "kept")
+
+    def test_project_state_for_provider_fails_closed_on_malformed_tool_results(self):
+        # Consistency parity with project_state_for_migration: the provider projection
+        # (finding #4 confidentiality ceiling) must also fail closed on a non-dict
+        # tool_results (a captured/crafted wire state), dropping it to {} rather than
+        # letting the raw value reach the provider unprojected.
+        for malformed in ([{"leaked": "not-for-provider"}], "opaque-blob", 42, None):
+            with self.subTest(shape=type(malformed).__name__):
+                state = AgentState(
+                    task_id="p1",
+                    goal="malformed",
+                    memory={"tool_results": malformed, "other": "kept"},
+                    messages=[],
+                )
+                projected = project_state_for_provider(state, (ToolGrant("any.tool", output_projection=("x",)),))
                 self.assertEqual(projected.memory["tool_results"], {})
                 self.assertEqual(projected.memory["other"], "kept")
 

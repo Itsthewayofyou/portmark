@@ -6,6 +6,15 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Section 4 (part 3b) — provider projection fail-closed parity
+
+- **The provider projection now fails closed on a malformed `tool_results`, matching the migration
+  path.** `project_state_for_provider` (the finding #4 confidentiality ceiling) previously passed a
+  non-dict `tool_results` (a list/string/number/null from a captured or crafted wire state) through
+  unprojected; it is now dropped to `{}`, the same fail-closed handling shipped for
+  `project_state_for_migration` in #6. Consistency hardening flagged by the #65 auditor review; no
+  behavior change for the normal dict shape.
+
 ### Section 4 (part 3b) — migration payload confidentiality
 
 - **A migration no longer ships the source's full raw state to the destination (finding #6).** A
