@@ -4068,6 +4068,57 @@ class RuntimeTests(unittest.TestCase):
             self.assertIsNone(destination.store.get_migration_receipt(namespaced_id))
             self.assertEqual(len(source.store.list_pending_migrations()), 1)
 
+    def test_challenge_wrong_key_evidence_recovers_via_regeneration(self):
+        # Auditor round 2 Medium (CALIBRATED). A first attester whose evidence is correct in every
+        # dimension the DESTINATION can locally check, but signed by a key the SOURCE does not trust
+        # (same key id, different keypair), passes the destination's pre-persist check (the destination
+        # is not configured with the authority, so it cannot evaluate the signature) and IS persisted.
+        # Keep-first storage would freeze it and the source could never settle. On redelivery the
+        # destination REGENERATES the attestation, so a corrected attester's evidence replaces the bad
+        # one and the source settles. CALIBRATED: with redelivery regeneration disabled, redelivery
+        # returns the frozen bad receipt and settlement still fails (the auditor's WRONG_KEY_PERSISTED
+        # wedge).
+        with tempfile.TemporaryDirectory() as directory:
+            rogue = AttestationAuthority.generate("dest-enclave-key", "verifier:enclave")  # source does NOT trust this keypair
+            source, destination, _, authority, envelope = self._challenge_migration_pair(
+                directory, attester=_StubMigrationAttester(rogue))
+            sealed = source.run(envelope).migration_envelope
+            original_id = envelope_from_dict(sealed).state.task_id
+            bad_receipt = destination.run(envelope_from_dict(sealed)).migration_receipt  # persisted (dest can't check the key)
+            self.assertIsNotNone(bad_receipt)
+            with self.assertRaisesRegex(SecurityError, "signature is invalid"):
+                source.settle_migration(original_id, bad_receipt)
+            self.assertEqual(len(source.store.list_pending_migrations()), 1)  # would be stuck forever pre-fix
+            # Install the correct attester (trusted keypair) and REDELIVER: regeneration produces valid evidence.
+            destination.migration_attester = _StubMigrationAttester(authority)
+            good_receipt = destination.run(envelope_from_dict(sealed)).migration_receipt
+            self.assertNotEqual(good_receipt["destination_attestation"], bad_receipt["destination_attestation"])
+            source.settle_migration(original_id, good_receipt)
+            self.assertEqual(source.store.list_pending_migrations(), [])
+
+    def test_challenge_attester_calls_are_bounded_no_thread_explosion(self):
+        # Finding 2b: repeated delivery against a hung attester must NOT spawn an unbounded number of
+        # worker threads. The host caps concurrent in-flight attester calls; excess calls are refused
+        # fail-closed rather than each spawning a thread (the auditor observed 13 threads from 12 calls).
+        with tempfile.TemporaryDirectory() as directory:
+            authority = AttestationAuthority.generate("dest-enclave-key", "verifier:enclave")
+            hung = _StubMigrationAttester(authority, sleep_seconds=3.0)
+            source, destination, _, _, envelope = self._challenge_migration_pair(directory, attester=hung)
+            destination.migration_attester_timeout = 0.1
+            destination._attester_slots = threading.BoundedSemaphore(2)  # tighten the bound for the test
+            sealed = source.run(envelope).migration_envelope
+            before = threading.active_count()
+            refusals = 0
+            for _ in range(12):
+                try:
+                    destination.run(envelope_from_dict(sealed))
+                except SecurityError as error:
+                    if "capacity" in str(error):
+                        refusals += 1
+            after = threading.active_count()
+            self.assertLessEqual(after - before, 2)  # bounded by the semaphore, not 12
+            self.assertGreater(refusals, 0)          # excess calls refused, not spawned
+
     def test_migration_receipt_rejects_unsigned_fields(self):
         # Auditor follow-up (Medium): the signature covers only the body fields, so an unsigned extra
         # field must NOT ride inside a verified receipt (it would be persisted as if signed). Pre-fix

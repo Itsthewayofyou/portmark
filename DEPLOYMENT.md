@@ -129,18 +129,23 @@ itself with fresh, non-replayable evidence before a source considers a migration
 - On the **destination** host: pass a `migration_attester` (implements `MigrationAttesterProtocol`) that
   produces the destination's own attestation over the challenge. The host runs it on a daemon thread with
   a timeout (`migration_attester_timeout`, default 5s) so a hung attester fails admission closed rather
-  than holding it open; the attester should still bound its own work (a leaked daemon thread from a hung
-  attester is not reclaimed). Set the timeout to `None` to opt out of the host bound.
+  than holding it open, and caps concurrent in-flight attester calls (`migration_attester_max_inflight`,
+  default 8) so a flood of deliveries cannot spawn unbounded threads; the attester should still bound its
+  own work (a leaked daemon thread from a truly-hung attester is not reclaimed and holds one of the
+  in-flight slots). Set the timeout to `None` to opt out of the host time bound.
 
 Operational notes:
 
 - A destination that receives a challenge-required migration but has **no** working attester — or whose
   attester returns **semantically-invalid** evidence (wrong nonce/subject/audience/expiry) — refuses
   admission (fail-closed) and persists nothing, so the source can re-deliver once the attester is fixed.
-  The destination validates its own attester's output before persisting precisely so a defective attester
-  cannot freeze a bad receipt into the idempotent receipt store (which would strand the migration
-  permanently). A destination whose `attestation_policy` is configured with the trusted authority and
-  allowed measurements gets a complete pre-persist check.
+  The destination validates its own attester's output before persisting so a defective attester cannot
+  freeze a bad receipt into the idempotent receipt store. A destination whose `attestation_policy` is
+  configured with the trusted authority and allowed measurements gets a complete pre-persist check.
+- Even for a bad first evidence the destination could **not** locally detect (signed by a key or bearing
+  a measurement only the source's policy rejects), redelivery of the identical envelope **regenerates**
+  the attestation, so once a correct attester is in place the next delivery settles. Recovery therefore
+  never requires deleting or editing stored state — just redelivering after fixing the attester.
 - Challenge mode is **mutually exclusive** with `required_for_execution=True` on the same destination:
   in challenge mode the migrated permit carries no execution attestation (the proof travels in the
   receipt), so a destination that also requires an execution attestation will refuse challenge

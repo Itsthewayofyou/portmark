@@ -28,9 +28,20 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   attester is in place. A failing attester surfaces as a `SecurityError`, not an uncaught error out of
   `run()`. The source's settlement check remains the trust authority (a malicious destination that
   persists bad evidence anyway is still rejected there).
-- **The attester call is host-bounded.** The destination runs the attester on a daemon thread with a
-  configurable timeout (`migration_attester_timeout`, default 5s); a hung attester fails admission closed
-  rather than holding it open. Set it to `None` to opt out of the host bound.
+- **A corrected attester always recovers — the invalid-evidence wedge is fully closed.** The destination
+  can only locally check the dimensions it owns (nonce, subject, audience, expiry, and — when its own
+  policy is configured — measurement and signature); a first evidence wrong only in a dimension it cannot
+  evaluate (a signing key or measurement policy only the *source* trusts) would still pass the destination
+  and, under keep-first receipt storage, be frozen and rejected by the source forever. So on **redelivery**
+  of an identical envelope the destination **regenerates** the receipt attestation — re-running the
+  attester while keeping the admission's checkpoint / audit / generation bindings unchanged — so a
+  corrected attester's evidence replaces the bad one and the source settles. No re-execution of the task.
+- **The attester call is host-bounded and rate-bounded.** The destination runs the attester on a daemon
+  thread with a configurable timeout (`migration_attester_timeout`, default 5s); a hung attester fails
+  admission closed rather than holding it open. Concurrent in-flight attester calls are capped
+  (`migration_attester_max_inflight`, default 8) so a flood of deliveries against a slow or hung attester
+  cannot spawn unbounded threads — excess calls are refused fail-closed. Set the timeout to `None` to opt
+  out of the host time bound.
 - **Supersedes #64's reuse only when enabled.** In challenge mode the delegated permit carries a fresh
   challenge nonce and **no** source-provided attestation (a source attestation bound to the incoming
   nonce would make the destination's `verify_execution` reject the fresh challenge); freshness moves from
