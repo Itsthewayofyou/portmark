@@ -221,6 +221,44 @@ def _verified_migration_receipt_shape(receipt: dict[str, Any]) -> dict[str, Any]
     return _migration_receipt_body(receipt)
 
 
+# Section 5 #4: an approval token loaded from untrusted mutable memory is built with
+# ApprovalToken(**value). A missing/extra key raises a raw TypeError and a wrong-typed field
+# (e.g. expires_at="soon") crashes later -- either way an uncaught exception out of run() strands
+# an admitted task nonterminally. Validate the EXACT schema and field types here, converting any
+# malformation into a SecurityError the approval gate turns into a controlled approval.denied.
+_APPROVAL_TOKEN_STR_FIELDS = (
+    "approval_id",
+    "tool",
+    "subject",
+    "audience",
+    "task_id",
+    "permit_nonce",
+    "arguments_hash",
+    "policy_hash",
+    "approved_by",
+    "signature_key_id",
+    "signature",
+)
+_APPROVAL_TOKEN_INT_FIELDS = ("checkpoint_generation", "issued_at", "expires_at")
+
+
+def verified_approval_token(value: dict[str, Any]) -> ApprovalToken:
+    """Build an ApprovalToken from untrusted mutable-memory input, failing closed on bad shape."""
+    if not isinstance(value, dict):
+        raise SecurityError("approval token has invalid shape")
+    expected = set(_APPROVAL_TOKEN_STR_FIELDS) | set(_APPROVAL_TOKEN_INT_FIELDS)
+    if set(value) != expected:
+        raise SecurityError("approval token has invalid shape")
+    for field in _APPROVAL_TOKEN_STR_FIELDS:
+        if not isinstance(value[field], str):
+            raise SecurityError("approval token has invalid shape")
+    for field in _APPROVAL_TOKEN_INT_FIELDS:
+        # bool is an int subclass; reject it so a True cannot pose as a generation/timestamp.
+        if not isinstance(value[field], int) or isinstance(value[field], bool):
+            raise SecurityError("approval token has invalid shape")
+    return ApprovalToken(**value)
+
+
 @dataclass(frozen=True)
 class AuditHeadEvaluation:
     """Historical verification of a STORED audit head (finding #3, Option B).
@@ -1068,6 +1106,7 @@ class ApprovalAuthority:
         arguments: dict[str, Any],
         policy_hash: str,
         expires_at: int,
+        checkpoint_generation: int,
         issued_at: int | None = None,
         approval_id: str | None = None,
     ) -> ApprovalToken:
@@ -1078,6 +1117,7 @@ class ApprovalAuthority:
             audience=audience,
             task_id=task_id,
             permit_nonce=permit_nonce,
+            checkpoint_generation=checkpoint_generation,
             arguments_hash=arguments_hash(arguments),
             policy_hash=policy_hash,
             approved_by=self.approver,
@@ -1857,6 +1897,7 @@ class HostPolicy:
         task_id: str,
         tool: str,
         arguments: dict[str, Any],
+        expected_generation: int,
         now: int | None = None,
     ) -> None:
         authority = self._approval_authorities.get(token.signature_key_id)
@@ -1881,6 +1922,13 @@ class HostPolicy:
             raise SecurityError("approval task does not match request")
         if token.permit_nonce != permit.nonce:
             raise SecurityError("approval does not match permit nonce")
+        # Section 5 #1 (High): the approval only authorizes the tool at the exact
+        # stored checkpoint generation it was issued for. `expected_generation` is
+        # the DURABLE store generation captured at admission (never the caller's
+        # asserted envelope value), so an approval minted for the suspended state at
+        # generation N cannot be replayed after the task advances to generation M.
+        if token.checkpoint_generation != expected_generation:
+            raise SecurityError("approval does not match checkpoint generation")
         if token.policy_hash != self.policy_hash:
             raise SecurityError("approval policy hash does not match active policy")
         if token.arguments_hash != arguments_hash(arguments):

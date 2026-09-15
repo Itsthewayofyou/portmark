@@ -16,8 +16,8 @@ from .models import AgentState
 from .security import AUDIT_HASH_VERSION, AuditHeadVerifier, SecurityError, _audit_head_payload_for, audit_event_record, canonical_json
 
 
-SQLITE_SCHEMA_VERSION = 8
-POSTGRES_SCHEMA_VERSION = 6
+SQLITE_SCHEMA_VERSION = 9
+POSTGRES_SCHEMA_VERSION = 7
 
 # Section 4 #3: a migration lease is bounded. Zero/negative would defeat exclusivity (two workers
 # could claim the same row at the same instant); an unbounded lease would let a dead worker hold a
@@ -80,6 +80,15 @@ class RuntimeTransaction(Protocol):
     def consume_nonce(self, nonce: str, subject: str, audience: str, task_id: str) -> None:
         ...
 
+    def is_task_cancelled(self, task_id: str) -> bool:
+        """Whether the task is durably cancelled, read inside this transaction (section 5 #3).
+
+        Called after `consume_nonce` in the approval gate so the redeem and the cancel check
+        commit or roll back together: a cancel that lands first is observed and rolls the redeem
+        back; one that lands after is caught by a later pre-launch re-check.
+        """
+        ...
+
     def append_audit_events(self, task_id: str, host_id: str, events: tuple[dict[str, Any], ...], sign_head: AuditHeadSigner | None = None) -> None:
         ...
 
@@ -130,6 +139,14 @@ class RuntimeStore(Protocol):
     is_durable: bool
 
     def transaction(self) -> AbstractContextManager[RuntimeTransaction]:
+        ...
+
+    def cancel_task(self, task_id: str) -> None:
+        """Durably record that a task is cancelled (section 5 #3). Idempotent."""
+        ...
+
+    def is_task_cancelled(self, task_id: str) -> bool:
+        """Whether a task is durably cancelled (non-transactional read for the pre-launch re-check)."""
         ...
 
     def consumed_nonce_exists(self, nonce: str) -> bool:
@@ -266,6 +283,10 @@ class InMemoryRuntimeStore:
         self._audit_heads: dict[str, dict[str, Any]] = {}
         self._outbox: dict[str, dict[str, Any]] = {}
         self._migration_receipts: dict[str, str] = {}
+        # Section 5 #3: durable task cancellation. Membership means cancelled. Read inside the
+        # approval transaction (which holds self._lock for its whole duration, so a concurrent
+        # cancel cannot interleave with a redeem) and again before the tool launches.
+        self._cancelled: set[str] = set()
         self._audit_head_verifier: AuditHeadVerifier | None = None
         # Section 4 #3: the lease clock is a CONSTRUCTION dependency, never a per-call parameter --
         # so a caller of claim/release/dead_letter cannot pass a forged "now" to steal a live lease.
@@ -292,6 +313,14 @@ class InMemoryRuntimeStore:
     def replace_migration_receipt(self, task_id: str, receipt_json: str) -> None:
         with self._lock:
             self._migration_receipts[task_id] = receipt_json
+
+    def cancel_task(self, task_id: str) -> None:
+        with self._lock:
+            self._cancelled.add(task_id)
+
+    def is_task_cancelled(self, task_id: str) -> bool:
+        with self._lock:
+            return task_id in self._cancelled
 
     def mark_migration_delivered(self, task_id: str, receipt_json: str) -> None:
         with self._lock:
@@ -478,6 +507,10 @@ class _InMemoryTransaction:
             "consumed_at": int(time.time()),
         }
 
+    def is_task_cancelled(self, task_id: str) -> bool:
+        # Read within the held transaction lock so the redeem-vs-cancel decision is atomic.
+        return task_id in self._store._cancelled
+
     def append_audit_events(self, task_id: str, host_id: str, events: tuple[dict[str, Any], ...], sign_head: AuditHeadSigner | None = None) -> None:
         current = self._store._audit_events.setdefault(task_id, [])
         hashes = {event["hash"] for event in current}
@@ -609,6 +642,7 @@ class SQLiteRuntimeStore:
             5: self._migrate_to_v6,
             6: self._migrate_to_v7,
             7: self._migrate_to_v8,
+            8: self._migrate_to_v9,
         }
         migration = migrations.get(version)
         if migration is None:
@@ -764,6 +798,22 @@ class SQLiteRuntimeStore:
             """
         )
 
+    def _migrate_to_v9(self, connection: sqlite3.Connection) -> None:
+        # Section 5 #3: durable cancellation. An operator can cancel an admitted task; the
+        # approval gate consults this table inside the SAME transaction that consumes the
+        # approval nonce, so a cancel that lands first atomically prevents redemption, and a
+        # cancel that lands after redemption is caught by the pre-launch re-check. One row per
+        # cancelled task; presence means cancelled (idempotent).
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS task_cancellations (
+                task_id TEXT PRIMARY KEY,
+                cancelled_at INTEGER NOT NULL
+            );
+            PRAGMA user_version = 9;
+            """
+        )
+
     def transaction(self) -> AbstractContextManager[RuntimeTransaction]:
         return _SQLiteTransaction(self)
 
@@ -798,6 +848,22 @@ class SQLiteRuntimeStore:
                 "UPDATE migration_outbox SET status = 'delivered', receipt_json = ? WHERE task_id = ?",
                 (receipt_json, task_id),
             )
+
+    def cancel_task(self, task_id: str) -> None:
+        # Idempotent: a repeat cancel keeps the first cancelled_at. Presence = cancelled.
+        with self._connection() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO task_cancellations (task_id, cancelled_at) VALUES (?, ?)",
+                (task_id, int(time.time())),
+            )
+
+    def is_task_cancelled(self, task_id: str) -> bool:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM task_cancellations WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        return row is not None
 
     def record_migration_attempt(self, task_id: str, worker_id: str | None = None) -> None:
         moment = self._clock()
@@ -1162,6 +1228,17 @@ class PostgresRuntimeStore:
         connection.execute("ALTER TABLE migration_outbox ADD COLUMN IF NOT EXISTS claimed_by TEXT")
         connection.execute("ALTER TABLE migration_outbox ADD COLUMN IF NOT EXISTS lease_expires_at BIGINT")
         connection.execute("ALTER TABLE migration_outbox ADD COLUMN IF NOT EXISTS dead_reason TEXT")
+        # Section 5 #3 (schema v7): durable task cancellation. Presence of a row means the
+        # task is cancelled; the approval gate reads it inside the nonce-consume transaction
+        # (FOR the atomic redeem-vs-cancel race) and again just before the tool launches.
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS task_cancellations (
+                task_id TEXT PRIMARY KEY,
+                cancelled_at BIGINT NOT NULL
+            )
+            """
+        )
         connection.execute(
             """
             INSERT INTO portmark_schema (singleton, version)
@@ -1205,6 +1282,30 @@ class PostgresRuntimeStore:
                 "UPDATE migration_outbox SET status = 'delivered', receipt_json = %s WHERE task_id = %s",
                 (receipt_json, task_id),
             )
+
+    def cancel_task(self, task_id: str) -> None:
+        # Idempotent: a repeat cancel keeps the first cancelled_at. Presence = cancelled. Takes the
+        # per-task advisory xact lock so a cancel racing an in-flight redemption serializes with the
+        # approval gate's own check (see _PostgresTransaction.is_task_cancelled) -- the two cannot
+        # both succeed.
+        with self._connect() as connection:
+            connection.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (task_id,))
+            connection.execute(
+                "INSERT INTO task_cancellations (task_id, cancelled_at) VALUES (%s, %s) "
+                "ON CONFLICT (task_id) DO NOTHING",
+                (task_id, int(time.time())),
+            )
+
+    def is_task_cancelled(self, task_id: str) -> bool:
+        # The pre-launch re-check reads under the same advisory lock, so a cancel committed by the
+        # time the tool is about to launch is always observed here.
+        with self._connect() as connection:
+            connection.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (task_id,))
+            row = connection.execute(
+                "SELECT 1 FROM task_cancellations WHERE task_id = %s",
+                (task_id,),
+            ).fetchone()
+        return row is not None
 
     # Section 4 #3 (round 3): every lease comparison and every new-lease expiry on Postgres is
     # computed from DATABASE time -- EXTRACT(EPOCH FROM clock_timestamp())::bigint -- NOT the
@@ -1427,6 +1528,22 @@ class _PostgresTransaction:
         except errors.UniqueViolation as error:
             raise SecurityError("permit nonce has already been consumed") from error
 
+    def is_task_cancelled(self, task_id: str) -> bool:
+        # Take the per-task advisory xact lock (same key cancel_task uses) so redeem and cancel
+        # serialize: whichever grabs the lock first wins, and the loser observes the winner. Held
+        # until this approval transaction commits or rolls back, so the check is atomic with the
+        # consume_nonce above -- a cancel that wins the lock makes this return True and rolls the
+        # redeem back; a redeem that wins commits first and the pre-launch re-check catches a later
+        # cancel.
+        if self._connection is None:
+            raise RuntimeError("Postgres transaction was not opened")
+        self._connection.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (task_id,))
+        row = self._connection.execute(
+            "SELECT 1 FROM task_cancellations WHERE task_id = %s",
+            (task_id,),
+        ).fetchone()
+        return row is not None
+
     def append_audit_events(self, task_id: str, host_id: str, events: tuple[dict[str, Any], ...], sign_head: AuditHeadSigner | None = None) -> None:
         if self._connection is None:
             raise RuntimeError("Postgres transaction was not opened")
@@ -1618,6 +1735,18 @@ class _SQLiteTransaction:
             )
         except sqlite3.IntegrityError as error:
             raise SecurityError("permit nonce has already been consumed") from error
+
+    def is_task_cancelled(self, task_id: str) -> bool:
+        # Read within the open BEGIN IMMEDIATE write transaction so the redeem (consume_nonce)
+        # and the cancel check commit or roll back together -- a cancel that lands first is seen
+        # here and rolls the redeem back; one that lands after is caught by the pre-launch re-check.
+        if self._connection is None:
+            raise RuntimeError("SQLite transaction was not opened")
+        row = self._connection.execute(
+            "SELECT 1 FROM task_cancellations WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        return row is not None
 
     def append_audit_events(self, task_id: str, host_id: str, events: tuple[dict[str, Any], ...], sign_head: AuditHeadSigner | None = None) -> None:
         if self._connection is None:

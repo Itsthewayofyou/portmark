@@ -1982,6 +1982,9 @@ class RuntimeTests(unittest.TestCase):
             {"amount": 50, "currency": "USD"},
             "policy-hash",
             int(time.time()) + 60,
+            # Section 5 #1: bind the suspended checkpoint's generation, which the operator
+            # reads back from the awaiting-input run's returned checkpoint.
+            checkpoint_generation=first.checkpoint["checkpoint_generation"],
         )
         envelope.state.memory["approvals"] = {"payments.reserve": asdict(token)}
         host.signer.seal(envelope)
@@ -2018,6 +2021,8 @@ class RuntimeTests(unittest.TestCase):
             {"amount": 50, "currency": "USD"},
             "policy-hash",
             int(time.time()) - 1,
+            # Fresh single-run admission with the approval pre-injected: generation 0.
+            checkpoint_generation=0,
         )
         expired.state.memory["approvals"] = {"payments.reserve": asdict(expired_token)}
         host.signer.seal(expired)
@@ -2036,6 +2041,7 @@ class RuntimeTests(unittest.TestCase):
             {"amount": 50, "currency": "USD"},
             "policy-hash",
             int(time.time()) + 60,
+            checkpoint_generation=0,
         )
         replayed.state.memory["approvals"] = {"payments.reserve": asdict(token)}
         replayed.state.memory["used_approval_ids"] = [token.approval_id]
@@ -2071,6 +2077,7 @@ class RuntimeTests(unittest.TestCase):
             {"amount": 50, "currency": "USD"},
             "policy-hash",
             int(time.time()) + 60,
+            checkpoint_generation=0,
         )
         env.state.memory["approvals"] = {"payments.reserve": asdict(token)}
         # A suspended (resumed) envelope: the permit nonce is NOT consumed on this
@@ -2110,6 +2117,7 @@ class RuntimeTests(unittest.TestCase):
                 {"amount": 50, "currency": "USD"},
                 first.result["policy_hash"],
                 int(time.time()) + 60,
+                checkpoint_generation=first.checkpoint["checkpoint_generation"],
             )
             self._write_policy(directory, authority, version="policy-v2")
             envelope.state.memory["approvals"] = {"payments.reserve": asdict(token)}
@@ -2117,6 +2125,285 @@ class RuntimeTests(unittest.TestCase):
             second = host.run(envelope)
             self.assertEqual(second.status, "failed")
             self.assertIn("approval.denied", [event["event"] for event in second.audit])
+
+    # ---- Section 5 (Approvals) helpers + tests ----
+
+    def _approval_gated_host(self, store=None):
+        authority = ApprovalAuthority.generate()
+        host = make_host(store=store, attestation_policy=None, allow_ephemeral_signing_key=True)
+        host.policy = HostPolicy(
+            "host:local-demo",
+            (ToolGrant("payments.reserve", {"max_amount": 100, "currency": "USD"}, ("reserved",)),),
+            ResourceBudget(),
+            "policy-v1",
+            "policy-hash",
+            {"payments.reserve": "external-payment"},
+            (authority.trusted_approver(),),
+        )
+        host.providers["payer"] = PaymentProvider()
+        return host, authority
+
+    def _suspend_payment_envelope(self, host, goal):
+        envelope = make_demo_envelope(host, goal, "payer")
+        object.__setattr__(envelope.permit, "grants", (ToolGrant("payments.reserve", {"max_amount": 100, "currency": "USD"}),))
+        host.signer.seal(envelope)
+        first = host.run(envelope)
+        return envelope, first
+
+    def _mint_payment_approval(self, authority, envelope, generation, expires_delta=60):
+        return authority.issue(
+            "payments.reserve",
+            envelope.permit.subject,
+            envelope.permit.audience,
+            envelope.state.task_id,
+            envelope.permit.nonce,
+            {"amount": 50, "currency": "USD"},
+            "policy-hash",
+            int(time.time()) + expires_delta,
+            checkpoint_generation=generation,
+        )
+
+    def test_approval_generation_binding_refuses_replay_at_later_generation(self):
+        # Section 5 #1 (High), CALIBRATED. An approval minted for the task's suspended checkpoint at
+        # generation N must not authorize the tool after the task advances to a later generation
+        # (the auditor's repro: issued at gen N, redeemed at gen M, tool executed).
+        host, authority = self._approval_gated_host()
+        envelope, first = self._suspend_payment_envelope(host, "pay once")
+        self.assertEqual(first.status, "awaiting_input")
+        bound_generation = first.checkpoint["checkpoint_generation"]
+
+        # Advance the suspended task WITHOUT redeeming: a resume with no approval re-suspends at a
+        # higher generation. The stale approval below is minted for the ORIGINAL generation.
+        host.signer.seal(envelope)
+        advanced = host.run(envelope)
+        self.assertEqual(advanced.status, "awaiting_input")
+        self.assertGreater(advanced.checkpoint["checkpoint_generation"], bound_generation)
+
+        stale_token = self._mint_payment_approval(authority, envelope, bound_generation)
+        envelope.state.memory["approvals"] = {"payments.reserve": asdict(stale_token)}
+        host.signer.seal(envelope)
+        result = host.run(envelope)
+
+        self.assertEqual(result.status, "failed")
+        events = [event["event"] for event in result.audit]
+        self.assertIn("approval.denied", events)
+        self.assertNotIn("approval.approved", events)
+        # CALIBRATION: comment out the `if token.checkpoint_generation != expected_generation` raise in
+        # security.verify_approval and this run COMPLETES -- the stale approval executes payments.reserve
+        # at the wrong generation (the auditor's replay). Verified by hand, then reverted.
+
+    def test_malformed_approval_memory_is_controlled_failure_not_crash(self):
+        # Section 5 #4 (class sweep), CALIBRATED. Every malformed approval shape from untrusted memory
+        # yields a controlled approval.denied + terminal fail, never an uncaught exception out of run()
+        # that strands the admitted task (the EV-010 nonterminal-strand class).
+        malformations = [
+            ("extra key", lambda tok: {**asdict(tok), "surprise": 1}),
+            ("wrong-typed field", lambda tok: {**asdict(tok), "expires_at": "soon"}),
+            ("bool generation", lambda tok: {**asdict(tok), "checkpoint_generation": True}),
+            ("missing key", lambda tok: {k: v for k, v in asdict(tok).items() if k != "signature"}),
+        ]
+        for label, mutate in malformations:
+            with self.subTest(label=label):
+                host, authority = self._approval_gated_host()
+                envelope, first = self._suspend_payment_envelope(host, f"malformed {label}")
+                token = self._mint_payment_approval(authority, envelope, first.checkpoint["checkpoint_generation"])
+                envelope.state.memory["approvals"] = {"payments.reserve": mutate(token)}
+                host.signer.seal(envelope)
+                result = host.run(envelope)
+                self.assertEqual(result.status, "failed")
+                self.assertIn("approval.denied", [event["event"] for event in result.audit])
+        # CALIBRATION: revert _approval_token to `ApprovalToken(**value)` and the "extra/missing key"
+        # cases raise TypeError out of run() (never returns), the wrong-typed cases crash later --
+        # reproducing the strand. Verified by hand, then reverted.
+
+    def test_malformed_used_approval_ids_is_controlled_failure(self):
+        # Section 5 #4: used_approval_ids is also untrusted memory. A non-list would raise inside
+        # set(); it must be a controlled denial instead of a crash.
+        host, authority = self._approval_gated_host()
+        envelope, first = self._suspend_payment_envelope(host, "bad used ids")
+        token = self._mint_payment_approval(authority, envelope, first.checkpoint["checkpoint_generation"])
+        envelope.state.memory["approvals"] = {"payments.reserve": asdict(token)}
+        envelope.state.memory["used_approval_ids"] = 5  # not a list -> set(5) would raise
+        host.signer.seal(envelope)
+        result = host.run(envelope)
+        self.assertEqual(result.status, "failed")
+        self.assertIn("approval.denied", [event["event"] for event in result.audit])
+
+    def test_cancelled_task_is_refused_at_approval_gate(self):
+        # Section 5 #3. A task cancelled before its approval is redeemed is refused at the gate (inside
+        # the same transaction that consumes the approval nonce); the tool never runs and, because the
+        # consume rolls back, no approval is burned.
+        host, authority = self._approval_gated_host()
+        envelope, first = self._suspend_payment_envelope(host, "cancel before redeem")
+        token = self._mint_payment_approval(authority, envelope, first.checkpoint["checkpoint_generation"])
+        envelope.state.memory["approvals"] = {"payments.reserve": asdict(token)}
+        host.signer.seal(envelope)
+        host.cancel_task(envelope.state.task_id)
+        result = host.run(envelope)
+        self.assertEqual(result.status, "failed")
+        denials = [event for event in result.audit if event["event"] == "approval.denied"]
+        self.assertTrue(denials)
+        self.assertEqual(denials[0]["details"]["reason"], "cancelled")
+        self.assertNotIn("approval.approved", [event["event"] for event in result.audit])
+
+    def test_cancel_and_redeem_are_atomic_under_concurrency(self):
+        # Section 5 #3 CONCURRENT (SQLite, two real connections synchronized). Redeem (consume_nonce +
+        # the in-transaction cancel check) and cancel racing can never both win: the tool-authorizing
+        # nonce is consumed IFF the redeem committed as not-cancelled; otherwise the whole transaction
+        # rolls back. No half state.
+        class _Rollback(Exception):
+            pass
+
+        for trial in range(25):
+            with tempfile.TemporaryDirectory() as directory:
+                store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+                task_id = f"task-{trial}"
+                nonce = f"approval:{task_id}:a"
+                barrier = threading.Barrier(2)
+                outcome = {}
+
+                def redeem():
+                    barrier.wait()
+                    try:
+                        with store.transaction() as txn:
+                            txn.consume_nonce(nonce, "s", "a", task_id)
+                            if txn.is_task_cancelled(task_id):
+                                raise _Rollback
+                        outcome["redeemed"] = True
+                    except (_Rollback, SecurityError):
+                        outcome["redeemed"] = False
+
+                def cancel():
+                    barrier.wait()
+                    store.cancel_task(task_id)
+
+                tr = threading.Thread(target=redeem)
+                tc = threading.Thread(target=cancel)
+                tr.start()
+                tc.start()
+                tr.join()
+                tc.join()
+                self.assertTrue(store.is_task_cancelled(task_id))
+                self.assertEqual(store.consumed_nonce_exists(nonce), outcome["redeemed"])
+
+    def test_cancel_after_consume_is_caught_before_tool_launch(self):
+        # Section 5 #3. A cancel committed AFTER the approval is consumed but BEFORE the tool launches is
+        # caught by the pre-launch re-check; the tool never runs (approval burned, operator re-approves).
+        # Modeled by a store whose in-transaction check does not yet see the cancel while the store-level
+        # pre-launch read does.
+        class _CancelBetween(InMemoryRuntimeStore):
+            def transaction(self):
+                txn = super().transaction()
+                txn.is_task_cancelled = lambda task_id: False  # cancel not yet committed at gate time
+                return txn
+
+        store = _CancelBetween()
+        host, authority = self._approval_gated_host(store=store)
+        envelope, first = self._suspend_payment_envelope(host, "cancel between")
+        token = self._mint_payment_approval(authority, envelope, first.checkpoint["checkpoint_generation"])
+        envelope.state.memory["approvals"] = {"payments.reserve": asdict(token)}
+        host.signer.seal(envelope)
+        store.cancel_task(envelope.state.task_id)  # committed; the pre-launch read will observe it
+        result = host.run(envelope)
+        self.assertEqual(result.status, "failed")
+        denials = [event for event in result.audit if event["event"] == "approval.denied"]
+        self.assertTrue(denials)
+        self.assertEqual(denials[0]["details"]["reason"], "cancelled")
+        self.assertNotIn("payment", str(result.result or ""))
+
+    def test_cancellation_end_to_end_on_both_backends(self):
+        # Section 5 #3 + schema v9/v7: cancel_task + is_task_cancelled + the gate refusal on BOTH durable
+        # backends, exercising the new task_cancellations table and (Postgres) the advisory-lock path.
+        for context in self._store_case_contexts():
+            with context as (backend, store):
+                with self.subTest(backend=backend):
+                    host, authority = self._approval_gated_host(store=store)
+                    envelope, first = self._suspend_payment_envelope(host, f"cancel {backend}")
+                    token = self._mint_payment_approval(authority, envelope, first.checkpoint["checkpoint_generation"])
+                    envelope.state.memory["approvals"] = {"payments.reserve": asdict(token)}
+                    host.signer.seal(envelope)
+                    host.cancel_task(envelope.state.task_id)
+                    self.assertTrue(store.is_task_cancelled(envelope.state.task_id))
+                    result = host.run(envelope)
+                    self.assertEqual(result.status, "failed")
+                    self.assertIn("approval.denied", [event["event"] for event in result.audit])
+
+    def test_stale_asserted_generation_cannot_satisfy_approval_gate(self):
+        # Section 5 #1 (G2). The expected generation is sourced from the DURABLE store, so an
+        # attacker cannot redeem a stale-generation approval by ASSERTING the stale generation on the
+        # resume envelope: the pre-loop admission CAS rejects the stale assertion before the approval
+        # gate is ever reached, and the tool never runs. This is what makes store-sourcing (not
+        # envelope-sourcing) the actual fix.
+        host, authority = self._approval_gated_host()
+        envelope, first = self._suspend_payment_envelope(host, "stale assertion")
+        stale_generation = first.checkpoint["checkpoint_generation"]
+        stale_token = self._mint_payment_approval(authority, envelope, stale_generation)
+
+        # Advance the store past the suspended generation.
+        host.signer.seal(envelope)
+        advanced = host.run(envelope)
+        self.assertGreater(advanced.checkpoint["checkpoint_generation"], stale_generation)
+
+        # Craft a resume that ASSERTS the stale generation (== the token's) while the store is ahead.
+        object.__setattr__(envelope.state, "checkpoint_generation", stale_generation)
+        envelope.state.memory["approvals"] = {"payments.reserve": asdict(stale_token)}
+        host.signer.seal(envelope)
+        # Rejected at admission (CAS) before the gate; the tool never runs.
+        with self.assertRaisesRegex(SecurityError, "stale checkpoint generation"):
+            host.run(envelope)
+
+    def test_sqlite_v8_to_v9_upgrade_adds_cancellations(self):
+        # Section 5 #3 (G8, upgrade path). An existing v8 SQLite store opened by v9 code migrates to
+        # v9 and gains the task_cancellations table -- the path real deployments take (fresh stores
+        # only exercise the 0->9 chain).
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime.sqlite"
+            SQLiteRuntimeStore(path)  # build a full v9 store, then roll it back to look like v8
+            with self._raw_sqlite(str(path)) as connection:
+                connection.execute("DROP TABLE task_cancellations")
+                connection.execute("PRAGMA user_version = 8")
+            with self._raw_sqlite(str(path)) as connection:
+                self.assertEqual(int(connection.execute("PRAGMA user_version").fetchone()[0]), 8)
+                self.assertIsNone(connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='task_cancellations'").fetchone())
+
+            store = SQLiteRuntimeStore(path)  # v9 code opens a v8 db -> migrates
+            with self._raw_sqlite(str(path)) as connection:
+                self.assertEqual(int(connection.execute("PRAGMA user_version").fetchone()[0]), SQLITE_SCHEMA_VERSION)
+                self.assertIsNotNone(connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='task_cancellations'").fetchone())
+            store.cancel_task("t1")
+            self.assertTrue(store.is_task_cancelled("t1"))
+
+    @unittest.skipUnless(
+        os.environ.get("PORTMARK_TEST_POSTGRES_DSN") and PostgresRuntimeStore.available(),
+        "needs a live Postgres (PORTMARK_TEST_POSTGRES_DSN)",
+    )
+    def test_postgres_v6_to_v7_upgrade_adds_cancellations(self):
+        # Section 5 #3 (G8, upgrade path, Postgres). A v6 schema re-initialized by v7 code creates
+        # task_cancellations idempotently and bumps the recorded version to 7.
+        import psycopg
+        dsn = os.environ["PORTMARK_TEST_POSTGRES_DSN"]
+        schema = "portmark_upgrade_" + secrets.token_hex(8)
+        try:
+            PostgresRuntimeStore(dsn, schema=schema)  # full v7 schema
+            with psycopg.connect(dsn) as connection:
+                connection.execute(f'SET search_path TO "{schema}"')
+                connection.execute("DROP TABLE task_cancellations")
+                connection.execute("UPDATE portmark_schema SET version = 6")
+                connection.commit()
+            store = PostgresRuntimeStore(dsn, schema=schema)  # re-initialize as v7
+            with psycopg.connect(dsn) as connection:
+                connection.execute(f'SET search_path TO "{schema}"')
+                version = connection.execute("SELECT version FROM portmark_schema").fetchone()[0]
+                self.assertEqual(version, POSTGRES_SCHEMA_VERSION)
+                exists = connection.execute(
+                    "SELECT to_regclass(%s)", (f"{schema}.task_cancellations",)).fetchone()[0]
+                self.assertIsNotNone(exists)
+            store.cancel_task("t1")
+            self.assertTrue(store.is_task_cancelled("t1"))
+        finally:
+            self._drop_postgres_schema(dsn, schema)
 
     def test_wrong_audience_and_expired_permits_are_rejected(self):
         for mutate, message in [
@@ -3391,8 +3678,11 @@ class RuntimeTests(unittest.TestCase):
         object.__setattr__(envelope.permit, "grants", (ToolGrant("payments.reserve", {"max_amount": 100, "currency": "USD"}),))
         envelope.state.memory["approvals"] = {"payments.reserve": "bad-shape"}
         host.signer.seal(envelope)
-        with self.assertRaisesRegex(SecurityError, "approval token has invalid shape"):
-            host.run(envelope)
+        # Section 5 #4: a malformed approval in untrusted memory must NOT crash out of run() and
+        # strand the admitted task nonterminally -- it is a controlled approval.denied + terminal fail.
+        bad_result = host.run(envelope)
+        self.assertEqual(bad_result.status, "failed")
+        self.assertIn("approval.denied", [event["event"] for event in bad_result.audit])
 
     def test_stored_audit_head_mismatch_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

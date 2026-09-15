@@ -6,6 +6,42 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Section 5 — approvals
+
+- **An approval is now bound to the checkpoint generation it was issued for (finding #1, High —
+  BREAKING approval format).** Previously an approval minted for a task's suspended state at
+  generation N could be redeemed after the task legitimately advanced to a later generation M, as
+  long as the tool, arguments, permit nonce, and policy hash were unchanged — a stale authorization
+  taking effect in a context it never approved. The signed `ApprovalToken` now carries a required
+  `checkpoint_generation`, verified at the gate against the **durable store generation** captured at
+  admission (never the caller-asserted envelope value, which the admission persist advances before the
+  gate runs). The generation an approval must bind is the suspended checkpoint's generation, returned
+  to the operator on the awaiting-input run's checkpoint. This is a breaking change to the signed
+  approval format: any approval issued before the upgrade, or built without a generation, is refused.
+- **A malformed approval in mutable memory is now a controlled denial, not an uncaught crash (finding
+  #4, Low).** An approval token — and the `used_approval_ids` list — are read from untrusted wire
+  memory. A missing/extra key, a wrong-typed field, or a non-list id set used to raise out of `run()`
+  and strand the admitted task in a non-terminal state. The token is now validated against an exact
+  schema with type checks, and any malformation becomes a bounded `approval.denied` with a fixed reason
+  code (no attacker-chosen key names or exception text in the audit).
+- **A task can now be durably cancelled, and cancellation is enforced at the approval gate (finding
+  #3, Medium).** `AgentHost.cancel_task(task_id)` records a durable cancellation (new
+  `task_cancellations` table; SQLite schema v9, Postgres schema v7). An approval that has not yet been
+  redeemed is refused **inside the same transaction that consumes the approval nonce**, so a cancel
+  that wins the race atomically rolls the redemption back (nothing burned), and a cancel that lands
+  after the redemption is caught by a **pre-launch re-check** just before the tool runs. This narrows —
+  does not close — the window: a crash, or a cancel arriving between the re-check and the tool launch,
+  still burns the approval (the operator re-approves), and cancellation can never retract a tool effect
+  that has already committed. The supported entry point is the host method; a network-triggered cancel
+  endpoint (with its own auth) and idempotency keys for external effects are future work (the latter is
+  Section 7, tool boundary).
+- **Approval expiry is a redemption deadline.** Expiry is checked when the approval is redeemed at the
+  gate; the tool then runs. Portmark does not cap the tool's execution to the remaining approval
+  lifetime — even doing so could not roll back an external effect already committed after expiry. Keep
+  approval lifetimes short relative to expected tool duration.
+- Policy is an **immutable per-run snapshot**: it is loaded once at the start of a run and not
+  re-read at the approval gate, so a policy file changed mid-run does not affect the in-flight decision.
+
 ### Section 4 — migration challenge-passing protocol (finding #5 follow-up)
 
 - **Migration attestation freshness can now be closed with a source-verified challenge (finding #5,
