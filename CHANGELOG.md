@@ -47,9 +47,15 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
     `record_migration_attempt` now require `lease_expires_at > now`, so a worker whose lease lapsed
     can no longer dead-letter or inflate the attempt count on a row it no longer owns. (An expired
     holder's *release* is a harmless no-op — the lapsed lease already made the row reclaimable.)
-  - The time source for these operations is a private, test-only keyword (`_now`); production always
-    uses the wall clock, so a caller cannot pass a `now` that bypasses a live lease. `record_migration_attempt`
-    with no worker id still counts unscoped (back-compat for a single-dispatcher embedder).
+  - The lease clock is injected at store CONSTRUCTION (default: the wall clock), never a per-call
+    parameter — so a caller of claim/release/dead-letter/attempt cannot supply a forged `now` to
+    steal or bypass another worker's live lease. (An earlier iteration exposed a keyword-only `_now`;
+    that was NOT private — a caller could pass it — and has been removed from the public API. Tests
+    control time via a constructor-injected clock.) NOTE: the clock is the dispatcher HOST's; across
+    multiple dispatcher hosts, clock skew can shift when an expired lease becomes reclaimable — a
+    liveness window, not a break of claim exclusivity (which rests on `FOR UPDATE SKIP LOCKED` /
+    `BEGIN IMMEDIATE`). A future hardening can use DB time (`clock_timestamp()`) to remove cross-host
+    skew. `record_migration_attempt` with no worker id still counts unscoped (single-dispatcher back-compat).
 
 ### Section 4 (part 2) — signed migration delivery receipts + reconciliation
 

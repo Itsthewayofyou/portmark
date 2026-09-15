@@ -25,6 +25,10 @@ POSTGRES_SCHEMA_VERSION = 6
 MAX_MIGRATION_LEASE_SECONDS = 7 * 24 * 60 * 60  # 7 days
 
 
+def _wall_clock() -> int:
+    return int(time.time())
+
+
 def _validate_claim_args(worker_id: str, lease_seconds: int, limit: int) -> None:
     # Section 4 #3: exclusivity holds only for well-formed leases, so reject the inputs that would
     # silently break it rather than trusting every caller to pass sane values. bool is an int
@@ -177,26 +181,26 @@ class RuntimeStore(Protocol):
         """
         ...
 
-    def record_migration_attempt(self, task_id: str, worker_id: str | None = None, *, _now: int | None = None) -> None:
+    def record_migration_attempt(self, task_id: str, worker_id: str | None = None) -> None:
         """Count a delivery attempt. If `worker_id` is given, only the CURRENT (live-lease) holder
         counts -- a worker whose lease has expired is no longer the logical holder and cannot inflate
-        the count toward dead-letter; without a worker_id the count is unscoped (legacy). `_now` is a
-        private test-only clock; production uses the wall clock. Section 4 part 3a."""
+        the count toward dead-letter; without a worker_id the count is unscoped (legacy). The lease
+        clock is a store CONSTRUCTION dependency, never a per-call parameter. Section 4 part 3a."""
         ...
 
     def claim_migrations(
-        self, worker_id: str, lease_seconds: int, limit: int = 1, *, _now: int | None = None
+        self, worker_id: str, lease_seconds: int, limit: int = 1
     ) -> list[dict[str, Any]]:
         """Atomically claim up to `limit` deliverable rows under a `lease_seconds` lease and return
         them (section 4 #3). A row is claimable if pending AND (unclaimed OR its lease has expired),
         so a worker that dies mid-delivery has its rows reclaimed once the lease lapses. Claiming is
         race-safe: two concurrent dispatchers never receive the same row. `worker_id`, `lease_seconds`
         (0 < n <= MAX_MIGRATION_LEASE_SECONDS) and `limit` are validated -- a zero/negative lease would
-        defeat exclusivity. `_now` is a private test-only clock (keyword-only); production uses the
-        wall clock so a caller cannot pass a `now` that bypasses another worker's live lease."""
+        defeat exclusivity. The lease clock is injected at store CONSTRUCTION (default: wall clock), so
+        a caller of this method cannot supply a `now` that bypasses another worker's live lease."""
         ...
 
-    def release_migration(self, task_id: str, worker_id: str, *, _now: int | None = None) -> bool:
+    def release_migration(self, task_id: str, worker_id: str) -> bool:
         """Release a claim so another worker can take the row. Holder-scoped AND lease-live (uniform
         with dead_letter): returns False unless this worker still holds the row under an UNEXPIRED
         lease. An expired holder's release is therefore a no-op -- which is safe, not stranding,
@@ -204,7 +208,7 @@ class RuntimeStore(Protocol):
         need not release it. Section 4 #3."""
         ...
 
-    def dead_letter_migration(self, task_id: str, worker_id: str, reason: str, *, _now: int | None = None) -> bool:
+    def dead_letter_migration(self, task_id: str, worker_id: str, reason: str) -> bool:
         """Terminalize a pending row the current holder gave up on into a 'dead' state with a reason
         (section 4 #4). Holder-scoped AND lease-live like release: an EXPIRED holder cannot dead-letter
         (its authority lapsed with the lease). Returns False if not the live holder or not pending (not
@@ -242,7 +246,7 @@ class RuntimeStore(Protocol):
 class InMemoryRuntimeStore:
     is_durable = False
 
-    def __init__(self) -> None:
+    def __init__(self, clock: Callable[[], int] | None = None) -> None:
         self._lock = threading.RLock()
         self._nonces: dict[str, dict[str, Any]] = {}
         self._checkpoints: dict[str, dict[str, Any]] = {}
@@ -251,6 +255,10 @@ class InMemoryRuntimeStore:
         self._outbox: dict[str, dict[str, Any]] = {}
         self._migration_receipts: dict[str, str] = {}
         self._audit_head_verifier: AuditHeadVerifier | None = None
+        # Section 4 #3: the lease clock is a CONSTRUCTION dependency, never a per-call parameter --
+        # so a caller of claim/release/dead_letter cannot pass a forged "now" to steal a live lease.
+        # Production uses the wall clock; tests inject a controllable one at construction.
+        self._clock: Callable[[], int] = clock or _wall_clock
 
     def set_audit_head_verifier(self, verifier: AuditHeadVerifier) -> None:
         self._audit_head_verifier = verifier
@@ -276,8 +284,8 @@ class InMemoryRuntimeStore:
                 row["status"] = "delivered"
                 row["receipt_json"] = receipt_json
 
-    def record_migration_attempt(self, task_id: str, worker_id: str | None = None, *, _now: int | None = None) -> None:
-        moment = int(time.time()) if _now is None else int(_now)
+    def record_migration_attempt(self, task_id: str, worker_id: str | None = None) -> None:
+        moment = self._clock()
         with self._lock:
             row = self._outbox.get(task_id)
             if row is None:
@@ -293,10 +301,10 @@ class InMemoryRuntimeStore:
         return row.get("claimed_by") == worker_id and int(row.get("lease_expires_at") or 0) > moment
 
     def claim_migrations(
-        self, worker_id: str, lease_seconds: int, limit: int = 1, *, _now: int | None = None
+        self, worker_id: str, lease_seconds: int, limit: int = 1
     ) -> list[dict[str, Any]]:
         _validate_claim_args(worker_id, lease_seconds, limit)
-        moment = int(time.time()) if _now is None else int(_now)
+        moment = self._clock()
         with self._lock:
             candidates = [
                 row
@@ -312,10 +320,10 @@ class InMemoryRuntimeStore:
                 claimed.append(dict(row))
         return claimed
 
-    def release_migration(self, task_id: str, worker_id: str, *, _now: int | None = None) -> bool:
+    def release_migration(self, task_id: str, worker_id: str) -> bool:
         # Holder-scoped AND lease-live: returns False unless this worker still holds the row under an
         # unexpired lease, so neither a different worker nor an expired holder can clear a live claim.
-        moment = int(time.time()) if _now is None else int(_now)
+        moment = self._clock()
         with self._lock:
             row = self._outbox.get(task_id)
             if row is None or not self._is_live_holder(row, worker_id, moment):
@@ -324,9 +332,9 @@ class InMemoryRuntimeStore:
             row["lease_expires_at"] = None
             return True
 
-    def dead_letter_migration(self, task_id: str, worker_id: str, reason: str, *, _now: int | None = None) -> bool:
+    def dead_letter_migration(self, task_id: str, worker_id: str, reason: str) -> bool:
         # Holder-scoped AND lease-live like release: an expired holder's authority lapsed with the lease.
-        moment = int(time.time()) if _now is None else int(_now)
+        moment = self._clock()
         with self._lock:
             row = self._outbox.get(task_id)
             if row is None or not self._is_live_holder(row, worker_id, moment):
@@ -531,10 +539,12 @@ class _InMemoryTransaction:
 class SQLiteRuntimeStore:
     is_durable = True
 
-    def __init__(self, path: str | Path, audit_head_verifier: AuditHeadVerifier | None = None) -> None:
+    def __init__(self, path: str | Path, audit_head_verifier: AuditHeadVerifier | None = None, clock: Callable[[], int] | None = None) -> None:
         self.path = str(path)
         self._lock = threading.RLock()
         self._audit_head_verifier = audit_head_verifier
+        # Section 4 #3: lease clock is a construction dependency (see InMemoryRuntimeStore).
+        self._clock: Callable[[], int] = clock or _wall_clock
         self._initialize()
 
     def set_audit_head_verifier(self, verifier: AuditHeadVerifier) -> None:
@@ -763,8 +773,8 @@ class SQLiteRuntimeStore:
                 (receipt_json, task_id),
             )
 
-    def record_migration_attempt(self, task_id: str, worker_id: str | None = None, *, _now: int | None = None) -> None:
-        moment = int(time.time()) if _now is None else int(_now)
+    def record_migration_attempt(self, task_id: str, worker_id: str | None = None) -> None:
+        moment = self._clock()
         with self._connection() as connection:
             if worker_id is None:
                 connection.execute("UPDATE migration_outbox SET attempt_count = attempt_count + 1 WHERE task_id = ?", (task_id,))
@@ -778,14 +788,14 @@ class SQLiteRuntimeStore:
                 )
 
     def claim_migrations(
-        self, worker_id: str, lease_seconds: int, limit: int = 1, *, _now: int | None = None
+        self, worker_id: str, lease_seconds: int, limit: int = 1
     ) -> list[dict[str, Any]]:
         # Section 4 #3. Race-safety comes from BEGIN IMMEDIATE, which takes SQLite's single write
         # lock up front, so two concurrent claimers serialize (the second blocks until the first
         # commits) rather than both selecting and one silently losing its UPDATE. `_connect` opens
         # in autocommit (isolation_level=None), so the transaction is managed explicitly here.
         _validate_claim_args(worker_id, lease_seconds, limit)
-        moment = int(time.time()) if _now is None else int(_now)
+        moment = self._clock()
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
@@ -814,10 +824,10 @@ class SQLiteRuntimeStore:
                 raise
         return claimed
 
-    def release_migration(self, task_id: str, worker_id: str, *, _now: int | None = None) -> bool:
+    def release_migration(self, task_id: str, worker_id: str) -> bool:
         # Holder-scoped AND lease-live: neither a different worker nor an EXPIRED holder can clear a
         # live claim (an expired holder's authority lapsed with the lease).
-        moment = int(time.time()) if _now is None else int(_now)
+        moment = self._clock()
         with self._connection() as connection:
             cursor = connection.execute(
                 "UPDATE migration_outbox SET claimed_by = NULL, lease_expires_at = NULL "
@@ -826,9 +836,9 @@ class SQLiteRuntimeStore:
             )
             return cursor.rowcount > 0
 
-    def dead_letter_migration(self, task_id: str, worker_id: str, reason: str, *, _now: int | None = None) -> bool:
+    def dead_letter_migration(self, task_id: str, worker_id: str, reason: str) -> bool:
         # Holder-scoped AND lease-live terminalization of a pending row the worker gave up on (#4).
-        moment = int(time.time()) if _now is None else int(_now)
+        moment = self._clock()
         with self._connection() as connection:
             cursor = connection.execute(
                 "UPDATE migration_outbox SET status = 'dead', dead_reason = ?, claimed_by = NULL, "
@@ -952,7 +962,7 @@ class SQLiteRuntimeStore:
 class PostgresRuntimeStore:
     is_durable = True
 
-    def __init__(self, dsn: str, audit_head_verifier: AuditHeadVerifier | None = None, schema: str = "public") -> None:
+    def __init__(self, dsn: str, audit_head_verifier: AuditHeadVerifier | None = None, schema: str = "public", clock: Callable[[], int] | None = None) -> None:
         if not dsn:
             raise ValueError("Postgres DSN must not be empty")
         if not schema or "\x00" in schema:
@@ -960,6 +970,12 @@ class PostgresRuntimeStore:
         self.dsn = dsn
         self.schema = schema
         self._audit_head_verifier = audit_head_verifier
+        # Section 4 #3: lease clock is a construction dependency (see InMemoryRuntimeStore). NOTE: this
+        # is the dispatcher HOST's clock; across multiple dispatcher hosts, clock skew can shift when an
+        # expired lease becomes reclaimable (a liveness window, not a break of claim exclusivity, which
+        # rests on FOR UPDATE SKIP LOCKED). A future hardening can switch to DB time
+        # (EXTRACT(EPOCH FROM clock_timestamp())) inside the SQL to eliminate cross-host skew.
+        self._clock: Callable[[], int] = clock or _wall_clock
         self._initialize_schema()
 
     def set_audit_head_verifier(self, verifier: AuditHeadVerifier) -> None:
@@ -1155,8 +1171,8 @@ class PostgresRuntimeStore:
                 (receipt_json, task_id),
             )
 
-    def record_migration_attempt(self, task_id: str, worker_id: str | None = None, *, _now: int | None = None) -> None:
-        moment = int(time.time()) if _now is None else int(_now)
+    def record_migration_attempt(self, task_id: str, worker_id: str | None = None) -> None:
+        moment = self._clock()
         with self._connect() as connection:
             if worker_id is None:
                 connection.execute("UPDATE migration_outbox SET attempt_count = attempt_count + 1 WHERE task_id = %s", (task_id,))
@@ -1168,13 +1184,13 @@ class PostgresRuntimeStore:
                 )
 
     def claim_migrations(
-        self, worker_id: str, lease_seconds: int, limit: int = 1, *, _now: int | None = None
+        self, worker_id: str, lease_seconds: int, limit: int = 1
     ) -> list[dict[str, Any]]:
         # Section 4 #3. FOR UPDATE SKIP LOCKED is the standard Postgres queue claim: concurrent
         # claimers lock disjoint rows and skip each other's, so no row is handed to two workers and
         # claimers don't block. One statement claims and returns the rows atomically.
         _validate_claim_args(worker_id, lease_seconds, limit)
-        moment = int(time.time()) if _now is None else int(_now)
+        moment = self._clock()
         expiry = moment + int(lease_seconds)
         with self._connect() as connection:
             rows = connection.execute(
@@ -1194,8 +1210,8 @@ class PostgresRuntimeStore:
             ).fetchall()
             return [dict(row) for row in rows]
 
-    def release_migration(self, task_id: str, worker_id: str, *, _now: int | None = None) -> bool:
-        moment = int(time.time()) if _now is None else int(_now)
+    def release_migration(self, task_id: str, worker_id: str) -> bool:
+        moment = self._clock()
         with self._connect() as connection:
             cursor = connection.execute(
                 "UPDATE migration_outbox SET claimed_by = NULL, lease_expires_at = NULL "
@@ -1204,8 +1220,8 @@ class PostgresRuntimeStore:
             )
             return cursor.rowcount > 0
 
-    def dead_letter_migration(self, task_id: str, worker_id: str, reason: str, *, _now: int | None = None) -> bool:
-        moment = int(time.time()) if _now is None else int(_now)
+    def dead_letter_migration(self, task_id: str, worker_id: str, reason: str) -> bool:
+        moment = self._clock()
         with self._connect() as connection:
             cursor = connection.execute(
                 "UPDATE migration_outbox SET status = 'dead', dead_reason = %s, claimed_by = NULL, "
