@@ -36,6 +36,12 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   of an identical envelope the destination **regenerates** the receipt attestation — re-running the
   attester while keeping the admission's checkpoint / audit / generation bindings unchanged — so a
   corrected attester's evidence replaces the bad one and the source settles. No re-execution of the task.
+- **Regeneration is durable.** The regenerated receipt is atomically **persisted** (overwriting the stored
+  one; only the attestation and signature change, every binding is carried over), and a redelivery whose
+  attester is unavailable **falls back** to the stored receipt instead of failing. So once a correct
+  attester has produced one good receipt, recovery survives a lost acknowledgement, a restart, or a later
+  attester outage — the durable lost-ack guarantee holds. First admission still fails closed (there is no
+  stored receipt to fall back to).
 - **The attester call is host-bounded and rate-bounded.** The destination runs the attester on a daemon
   thread with a configurable timeout (`migration_attester_timeout`, default 5s); a hung attester fails
   admission closed rather than holding it open. Concurrent in-flight attester calls are capped

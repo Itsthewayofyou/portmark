@@ -146,6 +146,9 @@ Operational notes:
   a measurement only the source's policy rejects), redelivery of the identical envelope **regenerates**
   the attestation, so once a correct attester is in place the next delivery settles. Recovery therefore
   never requires deleting or editing stored state — just redelivering after fixing the attester.
+- The regenerated receipt is **persisted durably**, and a redelivery whose attester is unavailable falls
+  back to the stored receipt. So after a correct attester has produced one good receipt, settlement still
+  recovers across a lost acknowledgement, a destination restart, or a later attester outage.
 - Challenge mode is **mutually exclusive** with `required_for_execution=True` on the same destination:
   in challenge mode the migrated permit carries no execution attestation (the proof travels in the
   receipt), so a destination that also requires an execution attestation will refuse challenge

@@ -205,22 +205,39 @@ class AgentHost:
                     # unchanged. Keep-first storage would otherwise freeze the FIRST attester's evidence,
                     # so a first evidence the destination could not locally reject (e.g. signed by a key
                     # only the SOURCE knows it does not trust, or a source-only measurement policy) would
-                    # be returned forever and the source could never settle -- an unrecoverable wedge. A
-                    # corrected attester now supplies fresh evidence on the next delivery; if the attester
-                    # is still bad this fails closed (nothing changes) and the row stays pending to retry.
-                    delivered_receipt = self.signer.sign_migration_receipt(
-                        migration_receipt_payload(
-                            task_id=existing_receipt["task_id"],
-                            source_host_id=existing_receipt["source_host_id"],
-                            destination_host_id=self.host_id,
-                            permit_nonce=existing_receipt["permit_nonce"],
-                            envelope_digest=existing_receipt["envelope_digest"],
-                            destination_checkpoint_generation=existing_receipt["destination_checkpoint_generation"],
-                            destination_audit_head=existing_receipt["destination_audit_head"],
-                            accepted_at=existing_receipt["accepted_at"],
-                            destination_attestation=self._produce_challenge_evidence(envelope),
+                    # be returned forever and the source could never settle -- an unrecoverable wedge.
+                    try:
+                        fresh_evidence = self._produce_challenge_evidence(envelope)
+                    except SecurityError:
+                        # The attester is unavailable or still producing invalid evidence. Fall back to
+                        # the STORED receipt rather than raising, so a previously-regenerated VALID
+                        # receipt (persisted below) still settles a lost-ack redelivery even after the
+                        # attester goes down. A still-bad stored receipt just stays pending -- no worse
+                        # than before, and it recovers once the attester is back. First admission (no
+                        # existing receipt) still fails closed; only redelivery falls back.
+                        fresh_evidence = None
+                    if fresh_evidence is not None:
+                        delivered_receipt = self.signer.sign_migration_receipt(
+                            migration_receipt_payload(
+                                task_id=existing_receipt["task_id"],
+                                source_host_id=existing_receipt["source_host_id"],
+                                destination_host_id=self.host_id,
+                                permit_nonce=existing_receipt["permit_nonce"],
+                                envelope_digest=existing_receipt["envelope_digest"],
+                                destination_checkpoint_generation=existing_receipt["destination_checkpoint_generation"],
+                                destination_audit_head=existing_receipt["destination_audit_head"],
+                                accepted_at=existing_receipt["accepted_at"],
+                                destination_attestation=fresh_evidence,
+                            )
                         )
-                    )
+                        # Durability: persist the regenerated receipt (only the attestation + signature
+                        # change; every binding is carried over from the stored one), so recovery
+                        # survives a lost acknowledgement, a restart, or a later attester outage. Atomic
+                        # overwrite; concurrent regenerations are last-write-wins over equally-valid
+                        # receipts.
+                        self.store.replace_migration_receipt(
+                            envelope.state.task_id, canonical_json(delivered_receipt).decode("utf-8")
+                        )
                 stored_checkpoint = self.store.load_checkpoint(envelope.state.task_id)
                 status = stored_checkpoint["status"] if stored_checkpoint else envelope.state.status
                 result = stored_checkpoint.get("result") if stored_checkpoint else None

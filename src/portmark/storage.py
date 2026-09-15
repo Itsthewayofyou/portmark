@@ -171,6 +171,18 @@ class RuntimeStore(Protocol):
         """
         ...
 
+    def replace_migration_receipt(self, task_id: str, receipt_json: str) -> None:
+        """Atomically overwrite an existing migration receipt (section 4 #5, durability).
+
+        Used ONLY to persist a receipt whose challenge attestation was regenerated on redelivery of
+        the identical envelope. All admission bindings (envelope digest, permit nonce, checkpoint
+        generation, audit head, admission timestamp, task/source/destination) are unchanged -- only the
+        attestation and the destination signature over it differ -- so the durable receipt always
+        reflects the latest valid proof and a lost acknowledgement recovers even if the attester later
+        becomes unavailable. Distinct from the keep-first `store_migration_receipt` of first admission.
+        """
+        ...
+
     def mark_migration_delivered(self, task_id: str, receipt_json: str) -> None:
         """Settle a source outbox row against a verified destination receipt (section 4 #2).
 
@@ -276,6 +288,10 @@ class InMemoryRuntimeStore:
         with self._lock:
             stored = self._migration_receipts.get(task_id)
         return None if stored is None else json.loads(stored)
+
+    def replace_migration_receipt(self, task_id: str, receipt_json: str) -> None:
+        with self._lock:
+            self._migration_receipts[task_id] = receipt_json
 
     def mark_migration_delivered(self, task_id: str, receipt_json: str) -> None:
         with self._lock:
@@ -766,6 +782,16 @@ class SQLiteRuntimeStore:
             ).fetchone()
         return None if row is None else json.loads(row["receipt_json"])
 
+    def replace_migration_receipt(self, task_id: str, receipt_json: str) -> None:
+        # Overwrite only the receipt body (regenerated attestation + signature); created_at and every
+        # binding stay put. A single UPDATE is atomic under the connection lock, so concurrent
+        # regenerations are last-write-wins over equally-valid receipts, never a partial write.
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE migration_receipts SET receipt_json = ? WHERE task_id = ?",
+                (receipt_json, task_id),
+            )
+
     def mark_migration_delivered(self, task_id: str, receipt_json: str) -> None:
         with self._connection() as connection:
             connection.execute(
@@ -1162,6 +1188,16 @@ class PostgresRuntimeStore:
                 "SELECT receipt_json FROM migration_receipts WHERE task_id = %s", (task_id,)
             ).fetchone()
         return None if row is None else json.loads(row["receipt_json"])
+
+    def replace_migration_receipt(self, task_id: str, receipt_json: str) -> None:
+        # Overwrite only the receipt body (regenerated attestation + signature); created_at and every
+        # binding stay put. The single UPDATE takes the row lock, so concurrent regenerations are
+        # last-write-wins over equally-valid receipts, never a partial write.
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE migration_receipts SET receipt_json = %s WHERE task_id = %s",
+                (receipt_json, task_id),
+            )
 
     def mark_migration_delivered(self, task_id: str, receipt_json: str) -> None:
         with self._connect() as connection:
