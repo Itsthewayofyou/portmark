@@ -18,7 +18,9 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   dropped, and user/assistant messages cross in full so the task can still be resumed. Because the
   delegated permit is minted with `audience == destination` and carries exactly these grants, projecting
   to them is per-destination projection by construction. The source's own checkpoint keeps the full,
-  unprojected state.
+  unprojected state. The projection **fails closed**: `tool_results` is always replaced when present, so
+  a non-dict value (a list/string/number/null from signed, imported, or legacy state) is dropped to `{}`
+  rather than crossing the boundary unprojected.
   - **Bounds (unchanged behavior, stated):** the ceiling governs tool *output*; user/assistant message
     content is out of its scope and crosses unchanged. A share-nothing grant (empty projection) reduces
     a tool's output to a falsy-but-present `{}`, exactly as the provider path does today, so a

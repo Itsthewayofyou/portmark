@@ -70,12 +70,17 @@ def project_state_for_migration(state: AgentState, grants: tuple[ToolGrant, ...]
     projections = {grant.name: (grant.output_projection or ()) for grant in grants}
     projected_memory = dict(state.memory)
     raw_results = state.memory.get("tool_results")
-    if isinstance(raw_results, dict):
+    # Fail closed: tool_results is ALWAYS replaced when present, never passed through.
+    # A well-formed dict is projected per grant; ANY other shape (a list, string, number,
+    # null -- possible in signed/imported or legacy state) cannot be projected per grant,
+    # so it is dropped to {} rather than crossing the trust boundary unprojected. The key
+    # is replaced, not deleted, so a resumer sees an empty-but-present results bag.
+    if "tool_results" in projected_memory:
         projected_memory["tool_results"] = {
             name: project_tool_output(result, projections[name])
             for name, result in raw_results.items()
             if name in projections
-        }
+        } if isinstance(raw_results, dict) else {}
     projected_messages: list[dict[str, Any]] = []
     for message in state.messages:
         if message.get("role") != "tool":

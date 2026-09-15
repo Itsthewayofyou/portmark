@@ -2432,18 +2432,18 @@ class RuntimeTests(unittest.TestCase):
             goal="do the thing",
             memory={
                 "tool_results": {
-                    "keep.tool": {"public": "shown", "secret": "HIDDEN"},
+                    "keep.tool": {"public": "shown", "withheld_field": "not-for-destination"},
                     "drop.tool": {"anything": "ungranted"},
-                    "empty.tool": {"whatever": "withheld"},
+                    "empty.tool": {"whatever": "held-back"},
                 },
                 "other": "kept-verbatim",
             },
             messages=[
                 {"role": "user", "content": "the original prompt"},
                 {"role": "assistant", "content": "thinking"},
-                {"role": "tool", "name": "keep.tool", "content": {"public": "shown", "secret": "HIDDEN"}},
+                {"role": "tool", "name": "keep.tool", "content": {"public": "shown", "withheld_field": "not-for-destination"}},
                 {"role": "tool", "name": "drop.tool", "content": {"anything": "ungranted"}},
-                {"role": "tool", "name": "empty.tool", "content": {"whatever": "withheld"}},
+                {"role": "tool", "name": "empty.tool", "content": {"whatever": "held-back"}},
             ],
         )
         grants = (
@@ -2471,8 +2471,27 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(empty_msg["content"], {})
 
         # The source's own state is untouched (projection returns a copy).
-        self.assertIn("secret", state.memory["tool_results"]["keep.tool"])
+        self.assertIn("withheld_field", state.memory["tool_results"]["keep.tool"])
         self.assertEqual(len(state.messages), 5)
+
+    def test_project_state_for_migration_fails_closed_on_malformed_tool_results(self):
+        # Section 4 #6 fail-closed: a confidentiality boundary must not pass unknown
+        # shapes through. tool_results is normally a dict, but a signed/imported or
+        # legacy state can carry any JSON value. A non-dict tool_results cannot be
+        # projected per-grant, so it must be DROPPED (replaced with {}), never crossed
+        # unchanged. The KEY presence is preserved (replaced, not deleted) so a resumer
+        # sees an empty-but-present results bag rather than a missing one.
+        for malformed in ([{"leaked": "not-for-destination"}], "opaque-blob", 42, None):
+            with self.subTest(shape=type(malformed).__name__):
+                state = AgentState(
+                    task_id="t2",
+                    goal="malformed",
+                    memory={"tool_results": malformed, "other": "kept"},
+                    messages=[],
+                )
+                projected = project_state_for_migration(state, (ToolGrant("any.tool", output_projection=("x",)),))
+                self.assertEqual(projected.memory["tool_results"], {})
+                self.assertEqual(projected.memory["other"], "kept")
 
     def test_migration_writes_sealed_envelope_to_outbox_atomically(self):
         # Section 1, finding #2: the sealed destination envelope is stored durably in
