@@ -374,7 +374,12 @@ class AgentHost:
             # must also allow migration and allowlist this destination.
             active_policy.authorize_migration(envelope.permit, decision.destination)
             destination_attestation = self._migration_attestation(decision)
-            self.attestation_policy.verify_migration(destination_attestation, decision.destination, self.host_id)
+            # Section 4 #5: bind the destination attestation to this migration's permit nonce (the same
+            # nonce verify_execution binds to), so a valid attestation can't be replayed for another
+            # migration. Enforcement is gated by attestation_policy.require_migration_nonce.
+            self.attestation_policy.verify_migration(
+                destination_attestation, decision.destination, self.host_id, expected_nonce=effective.nonce
+            )
             state.status = "ready"
             state.memory["migration"] = {"from": self.host_id, "to": decision.destination}
             if destination_attestation is not None:

@@ -6,6 +6,25 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Section 4 (part 3b) — migration attestation freshness
+
+- **A migration attestation can no longer be replayed across migrations (finding #5).**
+  `AttestationPolicy.verify_migration` bound no nonce, so a valid, unexpired destination attestation
+  could be reused for a different migration to the same destination (the expiry window was the only
+  bound). It now binds to the migration's permit nonce (the same nonce execution attestation already
+  binds to), mirroring `require_execution_nonce`: a new `require_migration_nonce` (opt-in, off by
+  default) makes a non-empty nonce matching this migration's permit nonce mandatory, so evidence
+  minted for one migration is rejected for another. Even with the flag OFF a present-but-wrong nonce
+  is now rejected (previously any migration nonce was ignored); an absent nonce stays allowed off, so
+  legitimately-unbound measurement evidence keeps working. **Why opt-in, not default-on:** closing
+  replay automatically requires the destination attestation to be minted against the DELEGATED permit
+  nonce, which the source generates only after the provider returns the evidence — i.e. a
+  challenge-passing protocol change to the provider interface (the source issues a fresh per-migration
+  challenge the destination attests against). That is deferred to its own PR; today an operator whose
+  destinations already mint challenge-bound evidence can set `require_migration_nonce=True`. Scope: #5
+  only — #6 (payload confidentiality, decided: per-destination projection) and #7 (task-id namespacing,
+  a whole-store re-key) remain, each as its own PR.
+
 ### Section 4 (part 3a) — migration outbox reliability
 
 - **Concurrent dispatchers can no longer double-ship a migration (finding #3).** A dispatcher now

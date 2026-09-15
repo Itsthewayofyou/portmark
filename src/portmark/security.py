@@ -747,6 +747,7 @@ class AttestationPolicy:
         required_for_migration: bool = False,
         external_verifier: ExternalAttestationVerifierProtocol | None = None,
         require_execution_nonce: bool = False,
+        require_migration_nonce: bool = False,
     ) -> None:
         self._authorities = {authority.key_id: authority for authority in authorities}
         self.allowed_measurements = allowed_measurements
@@ -757,6 +758,18 @@ class AttestationPolicy:
         # permit nonce — an empty nonce is rejected rather than skipped. Off by
         # default because migrated measurement evidence is legitimately unbound.
         self.require_execution_nonce = require_execution_nonce
+        # Section 4 #5: freshness gate for MIGRATION attestation. Without it a valid, unexpired
+        # destination attestation can be replayed for a different migration to the same destination
+        # (verify_migration bound no nonce). When set, a PRESENT migration attestation must carry a
+        # non-empty nonce matching this migration's permit nonce, so evidence cannot be reused across
+        # migrations. Off by default (opt-in) for parity with execution: closing replay by default
+        # (require it ON) needs the attestation minted against the DELEGATED permit nonce, which is
+        # generated after the provider returns the evidence -- i.e. a challenge-passing protocol change
+        # to the provider interface, out of scope for this fix (tracked separately). Even OFF, a
+        # present-but-wrong nonce is now rejected rather than ignored, and a matching nonce is honoured;
+        # an operator whose destinations mint challenge-bound evidence can set this True today. A
+        # migration that carries NO attestation is unaffected unless required_for_migration is set.
+        self.require_migration_nonce = require_migration_nonce
 
     def verify_execution(self, permit: Permit, host_id: str, now: int | None = None) -> None:
         if not self.required_for_execution and permit.attestation is None:
@@ -770,10 +783,27 @@ class AttestationPolicy:
             require_nonce=self.require_execution_nonce,
         )
 
-    def verify_migration(self, evidence: AttestationEvidence | None, destination: str, source_host_id: str, now: int | None = None) -> None:
+    def verify_migration(
+        self,
+        evidence: AttestationEvidence | None,
+        destination: str,
+        source_host_id: str,
+        expected_nonce: str | None = None,
+        now: int | None = None,
+    ) -> None:
         if not self.required_for_migration and evidence is None:
             return
-        self.verify(evidence, expected_subject=destination, relying_party=source_host_id, now=now)
+        # Section 4 #5: bind the destination attestation to THIS migration's permit nonce so it can't
+        # be replayed for another migration. `require_migration_nonce` makes a matching non-empty nonce
+        # mandatory; when off, a present-but-wrong nonce is still rejected (an absent one stays allowed).
+        self.verify(
+            evidence,
+            expected_subject=destination,
+            relying_party=source_host_id,
+            expected_nonce=expected_nonce,
+            now=now,
+            require_nonce=self.require_migration_nonce,
+        )
 
     def verify(
         self,
