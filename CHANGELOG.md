@@ -14,16 +14,23 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   bound). It now binds to the migration's permit nonce (the same nonce execution attestation already
   binds to), mirroring `require_execution_nonce`: a new `require_migration_nonce` (opt-in, off by
   default) makes a non-empty nonce matching this migration's permit nonce mandatory, so evidence
-  minted for one migration is rejected for another. Even with the flag OFF a present-but-wrong nonce
-  is now rejected (previously any migration nonce was ignored); an absent nonce stays allowed off, so
-  legitimately-unbound measurement evidence keeps working. **Why opt-in, not default-on:** closing
-  replay automatically requires the destination attestation to be minted against the DELEGATED permit
-  nonce, which the source generates only after the provider returns the evidence — i.e. a
-  challenge-passing protocol change to the provider interface (the source issues a fresh per-migration
-  challenge the destination attests against). That is deferred to its own PR; today an operator whose
-  destinations already mint challenge-bound evidence can set `require_migration_nonce=True`. Scope: #5
-  only — #6 (payload confidentiality, decided: per-destination projection) and #7 (task-id namespacing,
-  a whole-store re-key) remain, each as its own PR.
+  minted for one migration is rejected for another — verified end-to-end (source proposes AND the
+  destination admits the same evidence, then a reuse is rejected). Even with the flag OFF a
+  present-but-wrong nonce is now rejected (previously any migration nonce was ignored); an absent
+  nonce stays allowed off, so legitimately-unbound measurement evidence keeps working.
+- **The delegated permit reuses this migration's incoming nonce** instead of minting a fresh one, so a
+  single destination attestation is verified against the SAME nonce at both the source
+  (`verify_migration`) and the destination (`verify_execution` on the migrated permit). Without this,
+  the strict path passed at the source but the destination re-checked the same evidence against a
+  different (fresh) nonce and refused admission, making the opt-in unusable. The nonce is still unique
+  per migration (so cross-migration replay is rejected) and unseen at the destination (so first
+  admission stays nonce-guarded); the deliberate consequence is that a task migrates to a given
+  destination **once** — its nonce is consumed there — rather than being re-migratable to the same
+  destination after a rollback/re-run.
+- **Why opt-in (off by default):** an operator may run destinations that provide legitimately-unbound
+  measurement evidence; `require_migration_nonce=True` opts into the strict binding, which now works
+  end-to-end. Scope: #5 only — #6 (payload confidentiality, decided: per-destination projection) and
+  #7 (task-id namespacing, a whole-store re-key) remain, each as its own PR.
 
 ### Section 4 (part 3a) — migration outbox reliability
 

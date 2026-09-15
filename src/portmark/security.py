@@ -762,13 +762,13 @@ class AttestationPolicy:
         # destination attestation can be replayed for a different migration to the same destination
         # (verify_migration bound no nonce). When set, a PRESENT migration attestation must carry a
         # non-empty nonce matching this migration's permit nonce, so evidence cannot be reused across
-        # migrations. Off by default (opt-in) for parity with execution: closing replay by default
-        # (require it ON) needs the attestation minted against the DELEGATED permit nonce, which is
-        # generated after the provider returns the evidence -- i.e. a challenge-passing protocol change
-        # to the provider interface, out of scope for this fix (tracked separately). Even OFF, a
-        # present-but-wrong nonce is now rejected rather than ignored, and a matching nonce is honoured;
-        # an operator whose destinations mint challenge-bound evidence can set this True today. A
-        # migration that carries NO attestation is unaffected unless required_for_migration is set.
+        # migrations. Works end-to-end: the delegated permit reuses this migration's incoming nonce
+        # (see AgentHost._run), so the SAME evidence is verified against the same nonce here and at the
+        # destination's verify_execution -- ON, the strict path both passes at the source and admits at
+        # the destination. Off by default (opt-in) because an operator may run destinations that provide
+        # legitimately-unbound measurement evidence; even OFF, a present-but-wrong nonce is rejected
+        # rather than ignored. A migration that carries NO attestation is unaffected unless
+        # required_for_migration is set.
         self.require_migration_nonce = require_migration_nonce
 
     def verify_execution(self, permit: Permit, host_id: str, now: int | None = None) -> None:

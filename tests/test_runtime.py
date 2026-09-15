@@ -4019,6 +4019,66 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(SecurityError, "nonce does not match"):
             source.run(envelope)
 
+    def test_migration_attestation_end_to_end_and_replay(self):
+        # Auditor-mandated (round 2): with require_migration_nonce, nonce-bound evidence must not only
+        # pass the SOURCE check but ADMIT at the destination, and reuse must be rejected. This fails
+        # against the current fresh-delegated-nonce code -- the destination re-verifies the same
+        # evidence via verify_execution against the delegated nonce, which differs from the source's.
+        authority = AttestationAuthority.generate()
+        policy = AttestationPolicy(
+            (authority.trusted_authority(),),
+            ("measurement:destination",),
+            required_for_migration=True,
+            require_migration_nonce=True,
+        )
+        source_signer = EnvelopeSigner.generate("source-key", "host:source", ("host:source", "host:destination"))
+        destination_signer = trust_signer(EnvelopeSigner.generate("destination-key", "host:destination", ("host:destination",)), source_signer)
+        source = make_host(host_id="host:source", signer=source_signer, attestation_policy=policy)
+        destination = make_host(host_id="host:destination", signer=destination_signer, attestation_policy=policy)
+        source.policy.migration = MigrationPolicy(allowed=True, destinations=(destination.host_id,))
+        envelope = make_demo_envelope(source, "enclave e2e", "attested-migrator")
+        object.__setattr__(envelope.permit, "delegation_allowed", True)
+        evidence = authority.issue(
+            subject=destination.host_id,
+            audience=source.host_id,
+            measurement="measurement:destination",
+            expires_at=int(time.time()) + 60,
+            nonce=envelope.permit.nonce,
+        )
+        provider = AttestedMigrateThenCompleteProvider(destination.host_id, evidence)
+        source.providers["attested-migrator"] = provider
+        destination.providers["attested-migrator"] = provider
+        source_signer.seal(envelope)
+
+        migrated = envelope_from_dict(source.run(envelope).migration_envelope)
+        second = destination.run(migrated)  # MUST admit + complete under require_migration_nonce
+        self.assertEqual(second.status, "completed")
+
+        # Replay: a second migration reusing the SAME evidence (bound to the first permit nonce) is rejected.
+        envelope2 = make_demo_envelope(source, "enclave e2e replay", "attested-migrator")
+        object.__setattr__(envelope2.permit, "delegation_allowed", True)
+        source_signer.seal(envelope2)
+        with self.assertRaisesRegex(SecurityError, "nonce does not match"):
+            source.run(envelope2)
+
+    def test_migration_delegated_permit_reuses_incoming_nonce(self):
+        # Section 4 #5 (option 2): the delegated permit reuses THIS migration's incoming nonce (not a
+        # fresh token), so one attestation binds at both the source and the destination. Pinned so a
+        # future change can't silently restore a fresh delegated nonce and reopen the source/destination
+        # mismatch. Accepted consequence (Josh): the migrated envelope carries the incoming nonce, so
+        # once the destination consumes it the task is not re-migratable to that destination under a new
+        # nonce. (An IDENTICAL re-delivery is still idempotent -- section 4 #2 returns the same receipt --
+        # so this is a re-migration bound, not a delivery-retry regression.)
+        source_signer = EnvelopeSigner.generate("nonce-reuse-key", "host:source", ("host:source", "host:destination"))
+        source = make_host(host_id="host:source", signer=source_signer, allow_ephemeral_signing_key=True)
+        source.policy.migration = MigrationPolicy(allowed=True, destinations=("host:destination",))
+        source.providers["migrator"] = MigrateThenCompleteProvider("host:destination")
+        envelope = make_demo_envelope(source, "nonce reuse", "migrator")
+        object.__setattr__(envelope.permit, "delegation_allowed", True)
+        source.signer.seal(envelope)
+        migrated = envelope_from_dict(source.run(envelope).migration_envelope)
+        self.assertEqual(migrated.permit.nonce, envelope.permit.nonce)
+
     def test_migration_attestation_nonce_optional_but_rejects_mismatch(self):
         # #5 back-compat: with require_migration_nonce OFF (default), legitimately-unbound measurement
         # evidence (empty nonce) is still accepted -- BUT a present-but-WRONG nonce is now rejected even
