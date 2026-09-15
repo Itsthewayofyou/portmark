@@ -849,6 +849,50 @@ class AttestationPolicy:
             require_nonce=True,
         )
 
+    def check_local_migration_evidence(
+        self,
+        evidence: AttestationEvidence,
+        subject: str,
+        audience: str,
+        challenge: str,
+        now: int | None = None,
+    ) -> None:
+        """Destination-side pre-persist sanity check of its OWN attester's output (section 4 #5).
+
+        A destination validates the evidence its attester produced BEFORE persisting the receipt, so a
+        defective attester's output is never frozen into the keep-first receipt store. Without this a
+        semantically-invalid receipt (e.g. wrong nonce) is stored, returned idempotently on every
+        redelivery, and rejected by the source forever -- an unrecoverable wedge that even a corrected
+        attester cannot clear. This checks the per-admission dimensions the destination authoritatively
+        owns (subject == this host, audience == the source, nonce == the source's challenge, temporal
+        validity), and ADDITIONALLY measurement/signature when the destination's own policy is configured
+        to (a destination that mirrors the source's policy gets a complete pre-persist check). It is a
+        fail-closed availability guard, not the trust boundary -- the source's `verify_migration_challenge`
+        remains the authority and still runs at settlement.
+        """
+        current_time = int(time.time()) if now is None else now
+        if evidence.subject != subject:
+            raise SecurityError("migration challenge evidence subject does not match this host")
+        if evidence.audience not in {audience, "*"}:
+            raise SecurityError("migration challenge evidence audience does not match the source")
+        if not evidence.nonce or not hmac.compare_digest(evidence.nonce, challenge):
+            raise SecurityError("migration challenge evidence nonce does not match the challenge")
+        if evidence.issued_at > current_time:
+            raise SecurityError("migration challenge evidence is not active yet")
+        if evidence.expires_at <= current_time:
+            raise SecurityError("migration challenge evidence has expired")
+        if self.allowed_measurements and evidence.measurement not in self.allowed_measurements:
+            raise SecurityError("migration challenge evidence measurement is not approved")
+        authority = self._authorities.get(evidence.signature_key_id) if evidence.signature_key_id else None
+        if authority is not None:
+            try:
+                Ed25519PublicKey.from_public_bytes(authority.public_key).verify(
+                    _b64url_decode(evidence.signature),
+                    canonical_json(evidence.unsigned_dict()),
+                )
+            except (InvalidSignature, ValueError) as error:
+                raise SecurityError("migration challenge evidence signature is invalid") from error
+
     def verify_execution(self, permit: Permit, host_id: str, now: int | None = None) -> None:
         if not self.required_for_execution and permit.attestation is None:
             return

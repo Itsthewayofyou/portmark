@@ -127,14 +127,20 @@ itself with fresh, non-replayable evidence before a source considers a migration
   a fresh challenge per migration and verifies the destination's evidence in the delivery receipt before
   settling.
 - On the **destination** host: pass a `migration_attester` (implements `MigrationAttesterProtocol`) that
-  produces the destination's own attestation over the challenge. The attester runs inside the admission
-  path, so its implementation **must be bounded** (timeout + response cap, like
-  `ExternalAttestationVerifier`); an attester that blocks holds admission open.
+  produces the destination's own attestation over the challenge. The host runs it on a daemon thread with
+  a timeout (`migration_attester_timeout`, default 5s) so a hung attester fails admission closed rather
+  than holding it open; the attester should still bound its own work (a leaked daemon thread from a hung
+  attester is not reclaimed). Set the timeout to `None` to opt out of the host bound.
 
 Operational notes:
 
-- A destination that receives a challenge-required migration but has **no** working attester refuses
-  admission (fail-closed) and persists nothing, so the source can re-deliver once the attester recovers.
+- A destination that receives a challenge-required migration but has **no** working attester — or whose
+  attester returns **semantically-invalid** evidence (wrong nonce/subject/audience/expiry) — refuses
+  admission (fail-closed) and persists nothing, so the source can re-deliver once the attester is fixed.
+  The destination validates its own attester's output before persisting precisely so a defective attester
+  cannot freeze a bad receipt into the idempotent receipt store (which would strand the migration
+  permanently). A destination whose `attestation_policy` is configured with the trusted authority and
+  allowed measurements gets a complete pre-persist check.
 - Challenge mode is **mutually exclusive** with `required_for_execution=True` on the same destination:
   in challenge mode the migrated permit carries no execution attestation (the proof travels in the
   receipt), so a destination that also requires an execution attestation will refuse challenge

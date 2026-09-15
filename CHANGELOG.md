@@ -18,12 +18,19 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   delivered. Because the source chose the challenge, pre-collected or stale evidence cannot satisfy it.
   Enable it with `AttestationPolicy(require_migration_challenge=True)` on the source and a
   `migration_attester` on the destination; both default off, so existing migrations are unchanged.
-- **A challenge-required migration fails admission closed when the destination cannot attest.** The
-  source's demand rides inside the sealed envelope, and a destination with no (or a failing) attester
-  refuses admission **before persisting anything** — so no evidence-less receipt is ever stored (receipts
-  are idempotent, so a stored one would strand the outbox row forever). A failing attester surfaces as a
-  `SecurityError`, not an uncaught error out of `run()`. The source can re-deliver once the attester
-  recovers.
+- **A challenge-required migration fails admission closed when the destination cannot produce valid
+  evidence.** The source's demand rides inside the sealed envelope, and a destination with no attester, a
+  failing attester, or an attester that returns **semantically-invalid** evidence (wrong nonce, subject,
+  audience, or expiry) refuses admission **before persisting anything** — so no bad or evidence-less
+  receipt is ever stored. This matters because receipts are idempotent: a stored bad receipt would be
+  returned unchanged on every redelivery, stranding the outbox row forever even after a corrected
+  attester is installed. Because nothing is persisted, the source re-delivers and settles once a working
+  attester is in place. A failing attester surfaces as a `SecurityError`, not an uncaught error out of
+  `run()`. The source's settlement check remains the trust authority (a malicious destination that
+  persists bad evidence anyway is still rejected there).
+- **The attester call is host-bounded.** The destination runs the attester on a daemon thread with a
+  configurable timeout (`migration_attester_timeout`, default 5s); a hung attester fails admission closed
+  rather than holding it open. Set it to `None` to opt out of the host bound.
 - **Supersedes #64's reuse only when enabled.** In challenge mode the delegated permit carries a fresh
   challenge nonce and **no** source-provided attestation (a source attestation bound to the incoming
   nonce would make the destination's `verify_execution` reject the fresh challenge); freshness moves from

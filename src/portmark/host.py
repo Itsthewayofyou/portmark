@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import threading
 import time
 from dataclasses import asdict, replace
 from collections.abc import Callable
@@ -57,6 +58,7 @@ class AgentHost:
         store: RuntimeStore | None = None,
         attestation_policy: AttestationPolicy | None = None,
         migration_attester: MigrationAttesterProtocol | None = None,
+        migration_attester_timeout: float | None = 5.0,
         policy_loader: Callable[[], HostPolicy] | None = None,
         reload_policy: bool = False,
         metrics: RuntimeMetrics | None = None,
@@ -76,6 +78,11 @@ class AgentHost:
         # the host uses this to attest to its own identity over the source's fresh challenge at admission.
         # None (default) => the host cannot satisfy a challenge-required migration and fails it closed.
         self.migration_attester = migration_attester
+        # Section 4 #5 (finding 2): the attester runs inside the admission path, so the host bounds it
+        # rather than trusting each implementation to self-bound. On timeout admission fails CLOSED
+        # (nothing persisted); the worker thread is a daemon so a hung attester leaks a thread but can
+        # never hold admission open. None disables the host bound (an explicit opt-out).
+        self.migration_attester_timeout = migration_attester_timeout
         self._policy_loader = policy_loader
         self._reload_policy = reload_policy
         self.metrics = metrics or RuntimeMetrics()
@@ -288,7 +295,7 @@ class AgentHost:
                 if self.migration_attester is None:
                     raise SecurityError("migration requires a challenge attestation but no attester is configured")
                 try:
-                    evidence = self.migration_attester.attest(
+                    evidence = self._attest_migration_challenge(
                         subject=self.host_id,
                         audience=envelope.previous_audit_host_id,
                         challenge=envelope.permit.nonce,
@@ -301,6 +308,19 @@ class AgentHost:
                     raise SecurityError("migration challenge attestation failed") from error
                 if not isinstance(evidence, AttestationEvidence):
                     raise SecurityError("migration attester returned invalid evidence")
+                # Finding: validate the attester's OWN output BEFORE persisting. Without this a
+                # semantically-invalid evidence (e.g. wrong nonce) is frozen into the keep-first receipt
+                # store and returned idempotently on every redelivery, so the source rejects it forever
+                # and even a corrected attester cannot recover -- a permanent wedge. The source's
+                # verify_migration_challenge remains the trust authority at settlement; this is the
+                # destination's fail-closed availability guard so a defective attester leaves nothing
+                # stored and the source can re-deliver.
+                self.attestation_policy.check_local_migration_evidence(
+                    evidence,
+                    subject=self.host_id,
+                    audience=envelope.previous_audit_host_id,
+                    challenge=envelope.permit.nonce,
+                )
                 receipt_binding["destination_attestation"] = asdict(evidence)
         audit.append("agent.accepted", accepted_details)
         persisted_events = self._persist(envelope, effective, state, audit, 0, consume_nonce=consume_nonce, receipt_binding=receipt_binding)
@@ -642,6 +662,35 @@ class AgentHost:
         if not isinstance(value, dict):
             raise SecurityError("migration attestation has invalid shape")
         return AttestationEvidence(**value)
+
+    def _attest_migration_challenge(self, *, subject: str, audience: str, challenge: str) -> AttestationEvidence:
+        # Section 4 #5 (finding 2): run the injected attester with a host-enforced timeout so a hung
+        # attester cannot hold admission open. The worker is a daemon thread; on timeout admission fails
+        # closed (nothing persisted) while the thread is abandoned (it cannot be force-killed, but it
+        # never blocks admission and does not keep the process alive). `migration_attester_timeout=None`
+        # is an explicit opt-out that calls the attester synchronously.
+        attester = self.migration_attester
+        if attester is None:  # guarded by the caller; re-checked so this helper is safe in isolation
+            raise SecurityError("migration requires a challenge attestation but no attester is configured")
+        timeout = self.migration_attester_timeout
+        if timeout is None:
+            return attester.attest(subject=subject, audience=audience, challenge=challenge)
+        outcome: dict[str, Any] = {}
+
+        def _invoke() -> None:
+            try:
+                outcome["value"] = attester.attest(subject=subject, audience=audience, challenge=challenge)
+            except Exception as error:  # surfaced to the caller below (fail closed)
+                outcome["error"] = error
+
+        worker = threading.Thread(target=_invoke, daemon=True)
+        worker.start()
+        worker.join(timeout)
+        if worker.is_alive():
+            raise SecurityError("migration challenge attestation timed out")
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["value"]
 
     def _result(self, envelope, audit, migration=None):
         # No size guard here: _result runs only right after a _persist that already

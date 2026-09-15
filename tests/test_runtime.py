@@ -114,21 +114,26 @@ class _StubMigrationAttester:
     """
 
     def __init__(self, authority, measurement="measurement:enclave", audience_override=None,
-                 nonce_override=None, expires_in=60, raise_error=False):
+                 nonce_override=None, subject_override=None, expires_in=60, raise_error=False,
+                 sleep_seconds=0.0):
         self._authority = authority
         self._measurement = measurement
         self._audience_override = audience_override
         self._nonce_override = nonce_override
+        self._subject_override = subject_override
         self._expires_in = expires_in
         self._raise_error = raise_error
+        self._sleep_seconds = sleep_seconds
         self.challenges = []
 
     def attest(self, *, subject, audience, challenge):
         self.challenges.append(challenge)
+        if self._sleep_seconds:
+            time.sleep(self._sleep_seconds)
         if self._raise_error:
             raise RuntimeError("attester unavailable")
         return self._authority.issue(
-            subject=subject,
+            subject=self._subject_override if self._subject_override is not None else subject,
             audience=self._audience_override if self._audience_override is not None else audience,
             measurement=self._measurement,
             expires_at=int(time.time()) + self._expires_in,
@@ -3862,20 +3867,31 @@ class RuntimeTests(unittest.TestCase):
                         self.assertEqual(source.store.list_pending_migrations(), [])
 
     def test_migration_challenge_evidence_must_bind_source_challenge(self):
-        # CALIBRATED (G1). The replay vector: a destination whose attestation binds to a nonce the
-        # SOURCE did not freshly mint (here a fixed "stale" nonce). Because the source verifies the
-        # evidence against the challenge IT minted (the sealed permit nonce), the mismatch is refused
-        # and the row stays pending. Pre-fix (no settle-time challenge check) it settled.
+        # CALIBRATED (G1, SOURCE-side defense in depth). A buggy/malicious destination could bypass its
+        # own pre-persist check and hand the source a receipt whose evidence binds a nonce the source did
+        # NOT mint. The source verifies the evidence against the challenge IT minted at settlement and
+        # refuses; the row stays pending. Pre-fix (no settle-time challenge check) it settled. (An HONEST
+        # destination's own pre-persist check catches this first -- see
+        # test_challenge_invalid_attester_output_does_not_strand_migration.)
+        from portmark.security import migration_receipt_payload
+
         with tempfile.TemporaryDirectory() as directory:
             source, destination, _, authority, envelope = self._challenge_migration_pair(directory)
-            # The destination's attester binds evidence to a stale value, NOT the source's fresh challenge.
-            destination.migration_attester = _StubMigrationAttester(authority, nonce_override="stale-nonce")
             migrated = envelope_from_dict(source.run(envelope).migration_envelope)
             original_id = migrated.state.task_id
-            receipt = destination.run(migrated).migration_receipt  # destination signs stale-bound evidence
-            self.assertEqual(receipt["destination_attestation"]["nonce"], "stale-nonce")
+            good = destination.run(migrated).migration_receipt  # honest receipt -> valid bindings to reuse
+            stale = asdict(authority.issue(
+                subject="host:destination", audience="host:source", measurement="measurement:enclave",
+                expires_at=int(time.time()) + 60, nonce="stale-nonce"))
+            forged = destination.signer.sign_migration_receipt(migration_receipt_payload(
+                task_id=good["task_id"], source_host_id=good["source_host_id"],
+                destination_host_id=good["destination_host_id"], permit_nonce=good["permit_nonce"],
+                envelope_digest=good["envelope_digest"],
+                destination_checkpoint_generation=good["destination_checkpoint_generation"],
+                destination_audit_head=good["destination_audit_head"], accepted_at=good["accepted_at"],
+                destination_attestation=stale))
             with self.assertRaisesRegex(SecurityError, "nonce"):
-                source.settle_migration(original_id, receipt)
+                source.settle_migration(original_id, forged)
             self.assertEqual(len(source.store.list_pending_migrations()), 1)  # stays pending
 
     def test_migration_challenge_is_fresh_per_migration(self):
@@ -3961,16 +3977,15 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(len(source.store.list_pending_migrations()), 1)
 
     def test_challenge_evidence_wrong_audience_refused(self):
-        # G7: the destination's evidence must be addressed to the SOURCE. Evidence addressed elsewhere
-        # is refused at settlement (the attester input carries audience=source for this reason).
+        # G7: the destination's evidence must be addressed to the SOURCE. Evidence addressed elsewhere is
+        # caught by the destination's own pre-persist check at admission (nothing persisted, source stays
+        # pending, so a corrected attester can re-deliver). The source's settle-time check is the same
+        # audience rule as defense in depth.
         with tempfile.TemporaryDirectory() as directory:
             source, destination, _, authority, envelope = self._challenge_migration_pair(directory)
             destination.migration_attester = _StubMigrationAttester(authority, audience_override="host:elsewhere")
-            migrated = envelope_from_dict(source.run(envelope).migration_envelope)
-            original_id = migrated.state.task_id
-            receipt = destination.run(migrated).migration_receipt
-            with self.assertRaisesRegex(SecurityError, "audience"):
-                source.settle_migration(original_id, receipt)
+            with self.assertRaisesRegex(SecurityError, "audience does not match the source"):
+                destination.run(envelope_from_dict(source.run(envelope).migration_envelope))
             self.assertEqual(len(source.store.list_pending_migrations()), 1)
 
     def test_challenge_flaky_attester_fails_closed_as_security_error(self):
@@ -4008,6 +4023,50 @@ class RuntimeTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(SecurityError, "attestation evidence is required"):
                 destination.run(envelope_from_dict(source.run(envelope).migration_envelope))
+
+    def test_challenge_invalid_attester_output_does_not_strand_migration(self):
+        # Auditor Medium (CALIBRATED). An attester that returns a valid AttestationEvidence INSTANCE but
+        # with a semantically-bad nonce must NOT be persisted -- otherwise the keep-first receipt store
+        # freezes it, redelivery returns it idempotently forever, the source rejects it, and even a
+        # corrected attester cannot recover (permanent wedge, the auditor's repro). The destination
+        # validates its OWN attester output before persist; bad output fails closed with nothing stored,
+        # and a corrected attester then admits + settles. CALIBRATED: with the pre-persist check disabled
+        # the bad receipt is stored and redelivery-after-repair returns it unchanged (the wedge).
+        from portmark.host import _namespaced_migration_task_id
+
+        with tempfile.TemporaryDirectory() as directory:
+            bad = _StubMigrationAttester(
+                AttestationAuthority.generate("dest-enclave-key", "verifier:enclave"), nonce_override="stale")
+            source, destination, _, authority, envelope = self._challenge_migration_pair(directory, attester=bad)
+            sealed = source.run(envelope).migration_envelope
+            original_id = envelope_from_dict(sealed).state.task_id
+            namespaced_id = _namespaced_migration_task_id("host:source", original_id)
+            with self.assertRaisesRegex(SecurityError, "nonce does not match the challenge"):
+                destination.run(envelope_from_dict(sealed))
+            self.assertIsNone(destination.store.get_migration_receipt(namespaced_id))  # NOT persisted
+            self.assertEqual(len(source.store.list_pending_migrations()), 1)
+            # Recovery: a correct attester on the source-trusted authority admits + settles the same envelope.
+            destination.migration_attester = _StubMigrationAttester(authority)
+            receipt = destination.run(envelope_from_dict(sealed)).migration_receipt
+            source.settle_migration(original_id, receipt)
+            self.assertEqual(source.store.list_pending_migrations(), [])
+
+    def test_challenge_attester_timeout_fails_closed(self):
+        # Finding 2: the host bounds the attester call, so a hung attester fails admission CLOSED (nothing
+        # persisted) instead of holding admission open indefinitely.
+        from portmark.host import _namespaced_migration_task_id
+
+        with tempfile.TemporaryDirectory() as directory:
+            authority = AttestationAuthority.generate("dest-enclave-key", "verifier:enclave")
+            slow = _StubMigrationAttester(authority, sleep_seconds=1.0)
+            source, destination, _, _, envelope = self._challenge_migration_pair(directory, attester=slow)
+            destination.migration_attester_timeout = 0.2
+            sealed = source.run(envelope).migration_envelope
+            namespaced_id = _namespaced_migration_task_id("host:source", envelope_from_dict(sealed).state.task_id)
+            with self.assertRaisesRegex(SecurityError, "timed out"):
+                destination.run(envelope_from_dict(sealed))
+            self.assertIsNone(destination.store.get_migration_receipt(namespaced_id))
+            self.assertEqual(len(source.store.list_pending_migrations()), 1)
 
     def test_migration_receipt_rejects_unsigned_fields(self):
         # Auditor follow-up (Medium): the signature covers only the body fields, so an unsigned extra
