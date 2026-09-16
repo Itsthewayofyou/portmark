@@ -32,6 +32,49 @@ Open questions that can change risk ranking:
 - Whether checkpoints or tool outputs include regulated data, credentials, or customer secrets.
 - Which real attestation platform and verifier implementation will be used.
 
+## Tool Execution Isolation Contract (Section 7)
+
+**Portmark's isolated tool executor is a resource-bounded, hard-deadline worker. It is NOT a
+hostile-code sandbox. Running hostile or untrusted tools requires an OS/container isolation
+profile supplied by the deployment.** This contract is deliberate; do not describe the executor
+as containment.
+
+What Portmark's runtime **does** guarantee for a registered tool:
+- Authorization (grant intersection, policy, approval tokens) and argument constraints.
+- A hard wall-clock **deadline**, enforced by running each isolated tool in a separate process the
+  host terminates at the deadline.
+- Bounded output (the parent reads the response stream bounded and re-checks the size cap) and
+  defense-in-depth kernel **resource caps** (POSIX `setrlimit`: address space, CPU time, file
+  size, open files — see `ToolRegistry(resource_limits=...)`).
+- Truthful auditing, including `effect_status: "unknown"` when a side-effecting tool is killed
+  mid-flight.
+
+What Portmark's runtime **does NOT** do — these are the deployment's responsibility:
+- **Process containment.** On POSIX, tree termination is `os.killpg` on the worker's session
+  group: **cooperative, not containment.** A descendant that calls `setsid()`/`start_new_session`
+  escapes the signal, and a background child left in the group can outlive a clean exit. (Windows'
+  Job Object *is* whole-tree containment and is materially stronger.) Only a container / PID
+  namespace + cgroup / dedicated supervisor actually contains a hostile descendant.
+- **Filesystem, identity, and credential isolation.** The worker runs as the **same OS user** in
+  the host working directory, with no namespace, chroot, or allowlist. It can read/modify any file
+  that user can — runtime stores, policy, signing material, SSH/cloud credentials — and follow
+  symlinks. Environment secrets are *not inherited as child env vars*, but that is **not** the same
+  as inaccessible: a same-uid tool can still read the parent's `/proc/<pid>/environ` and credential
+  files on the shared filesystem.
+- **Network isolation.** The worker has unrestricted outbound network, loopback, link-local and
+  metadata endpoints, Unix sockets, and DNS. A deadline limits duration, not destinations.
+
+**Target contract (not yet enforced).** The intended requirement is that a tool registered
+`side_effecting=True` must (a) implement Portmark's idempotency/reconciliation contract and (b) run
+under an operator-acknowledged isolation profile appropriate to the deployment. **Today the runtime
+does not enforce (a) or (b)** — `register_isolated` only checks that a process-tree termination
+primitive exists. The idempotency/reconciliation contract and the acknowledgment startup gate land
+with the Section 7 follow-up PRs. The deployment isolation profile (non-root, read-only root, private
+writable dir, dropped capabilities, `no-new-privileges`, PID/memory/CPU limits, restricted `/proc`,
+default-deny egress) is **documented as a requirement in DEPLOYMENT.md**; an executable, tested
+profile ships with the follow-up. Portmark does not configure or detect a supervisor today, so its
+POSIX tree termination is cooperative/best-effort as stated above.
+
 ## System Model
 
 ### Primary Components

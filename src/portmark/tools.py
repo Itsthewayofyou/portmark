@@ -24,11 +24,30 @@ Tool = Callable[[dict[str, Any]], Any]
 # it bounds host memory against a tool that writes to fd 1 directly.
 _RESPONSE_ENVELOPE_SLACK = 65_536
 
+# Section 7 #6: defense-in-depth kernel resource caps handed to each isolated worker, which
+# applies them (POSIX only) right before running the tool. Generous defaults that do not break
+# ordinary tools but cap runaway memory / fork bombs / disk / fd exhaustion. `cpu_seconds` is
+# filled per invocation from the tool's wall-clock deadline. NOT a containment boundary (they
+# are POSIX-only and do not constrain the network); real containment is the deployment substrate.
+_DEFAULT_TOOL_RLIMITS: dict[str, int] = {
+    "address_space": 1024 * 1024 * 1024,  # 1 GiB virtual memory (RLIMIT_AS)
+    "file_size": 64 * 1024 * 1024,          # 64 MiB largest file a tool may write (RLIMIT_FSIZE)
+    "open_files": 512,                      # RLIMIT_NOFILE
+    # NOT defaulted: "processes" (RLIMIT_NPROC) is PER-UID -- it counts every process the OS user
+    # already runs, so a fixed cap fails fork() with EAGAIN on a busy shared host and breaks
+    # legitimate tools. An operator running tools under a DEDICATED low-privilege uid can set it
+    # via ToolRegistry(resource_limits={..., "processes": N}); "cpu_seconds" is filled per call.
+}
+
 # Environment names the isolated worker is allowed to inherit. This is a
-# default-deny allowlist, not parent-minus-a-blocklist: a secret the host holds
-# in its own environment (API keys, tokens, DB URLs) never reaches an untrusted
-# tool unless the operator names it explicitly via `env=`. PYTHONPATH is required
-# for the worker to import portmark and the tool module at all.
+# default-deny allowlist, not parent-minus-a-blocklist: a secret the host holds in its own
+# environment (API keys, tokens, DB URLs) is NOT inherited as a child environment variable
+# unless the operator names it explicitly via `env=`. Section 7 #3: "not inherited as a child
+# env var" is NOT "inaccessible" -- because the worker runs under the SAME OS uid, a hostile
+# tool can still read the parent's /proc/<pid>/environ and any credential file on the shared
+# filesystem. Preventing that requires OS-level isolation (a separate uid, restricted /proc,
+# filesystem namespaces) supplied by the deployment, not this allowlist.
+# PYTHONPATH is required for the worker to import portmark and the tool module at all.
 _INHERITED_ENV_KEYS = ("PYTHONPATH", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "SYSTEMROOT")
 
 # Finding #5: the thread-timeout path cannot cancel a tool, so a timed-out tool leaks a
@@ -37,13 +56,15 @@ _INHERITED_ENV_KEYS = ("PYTHONPATH", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "SYST
 # closed. Long or side-effecting tools belong on the isolated (hard-killable) path.
 DEFAULT_MAX_INFLIGHT_THREADED_TOOLS = 64
 
-# The isolated executor's hard-kill guarantee rests on two things being true
-# together: the worker became its own session leader (start_new_session) and the
-# platform can signal a whole process group (os.killpg). On Windows both are
-# absent -- start_new_session is silently ignored and killpg does not exist -- so
-# a kill reaches only the worker, not a grandchild it spawned. We refuse to
-# *claim* the guarantee where we cannot keep it: this positive capability, tested
-# once here, gates both the side-effecting refusal and the kill itself.
+# POSIX process-group termination primitive: the worker is its own session leader
+# (start_new_session) and the platform can signal the whole group (os.killpg). This is
+# COOPERATIVE, not containment: a descendant that calls setsid()/start_new_session moves to
+# its own group and escapes the signal, and a background child left in the group after the
+# leader exits is only swept on a best-effort basis (see the isolated-executor docstring).
+# The contract (THREAT_MODEL): the isolated executor is a resource-bounded, hard-deadline
+# worker, NOT a hostile-code sandbox -- containing a hostile tool is the deployment's job
+# (container / PID namespace + cgroup / separate uid). Windows' Job Object (below) is
+# materially stronger: it terminates the whole tree as one unit with no breakaway.
 _CAN_KILL_PROCESS_GROUP = hasattr(os, "killpg") and hasattr(os, "getpgid")
 
 
@@ -73,6 +94,7 @@ class ToolRegistry:
         default_timeout: float = 5.0,
         max_output_bytes: int = 65_536,
         max_inflight_threaded: int = DEFAULT_MAX_INFLIGHT_THREADED_TOOLS,
+        resource_limits: dict[str, int] | None = None,
     ) -> None:
         self._tools: dict[str, Tool] = {}
         self._isolated: dict[str, _IsolatedSpec] = {}
@@ -81,6 +103,9 @@ class ToolRegistry:
         self._side_effecting: set[str] = set()
         self.default_timeout = default_timeout
         self.max_output_bytes = max_output_bytes
+        # Section 7 #6: defense-in-depth resource caps applied inside each isolated worker.
+        # None uses the generous defaults; pass {} to disable, or override individual keys.
+        self.resource_limits: dict[str, int] = dict(_DEFAULT_TOOL_RLIMITS if resource_limits is None else resource_limits)
         # Finding #5: the thread-timeout path cannot cancel a tool once it starts, so a
         # tool that exceeds its deadline leaves its daemon thread running. This bounded
         # semaphore caps how many such executions can be in flight at once. A slot is held
@@ -120,7 +145,7 @@ class ToolRegistry:
         module_name, separator, object_path = target.partition(":")
         if not separator or not module_name or not object_path:
             raise ValueError("register_isolated target must use module:function syntax")
-        if side_effecting and not _can_hard_kill_process_tree():
+        if side_effecting and not _has_tree_termination_primitive():
             # Fail closed at startup, not at the first payment: on a platform with no
             # tree-kill primitive the host cannot guarantee the tool and its descendants
             # stop at the deadline, so it must not promise to run a side-effecting one.
@@ -215,8 +240,14 @@ class ToolRegistry:
         return self._checked_output(value, cap)
 
     def _invoke_isolated(self, spec: _IsolatedSpec, arguments: dict[str, Any], timeout: float, cap: int) -> Any:
+        # Section 7 #6: hand the worker its resource caps. cpu_seconds is a kernel backstop for the
+        # wall-clock deadline (a CPU-bound tool that ignores the clock still dies), set a little
+        # above the timeout so it never fires before the host's own deadline does.
+        rlimits = dict(self.resource_limits)
+        if "cpu_seconds" not in rlimits:
+            rlimits["cpu_seconds"] = int(timeout) + 2
         request = json.dumps(
-            {"target": spec.target, "arguments": arguments, "max_output_bytes": cap}
+            {"target": spec.target, "arguments": arguments, "max_output_bytes": cap, "rlimits": rlimits}
         ).encode("utf-8")
         try:
             tree = _launch_process_tree(
@@ -319,25 +350,32 @@ class ToolRegistry:
         return env
 
 
-def _can_hard_kill_process_tree() -> bool:
-    # Whether this platform can kill a worker AND every descendant as one unit.
-    # POSIX: a new session (start_new_session) + os.killpg. Windows: a Job Object with
-    # KILL_ON_JOB_CLOSE (_WindowsJobProcessTree). Enforcement reads this, not a
-    # scattered platform check; a side-effecting isolated tool is refused only where
-    # neither primitive exists.
+def _has_tree_termination_primitive() -> bool:
+    # Whether this platform has ANY primitive to terminate a worker's descendants at the
+    # deadline -- Windows a Job Object (genuine, whole-tree, no breakaway), POSIX os.killpg on
+    # the worker's session group (COOPERATIVE: a setsid() descendant escapes). Enforcement reads
+    # this to refuse side-effecting isolated tools only where NO primitive exists at all. It does
+    # NOT assert containment of a hostile tool -- on POSIX the primitive is best-effort, and the
+    # real safety for side-effecting tools (idempotency + reconciliation, and an acknowledged
+    # isolation profile) is enforced separately. Named for what it checks, not an over-claim.
     return _CAN_KILL_PROCESS_GROUP or _windows_job.available()
 
 
 def _terminate_posix_process_group(process: subprocess.Popen[bytes]) -> None:
-    """Hard-kill the worker and every descendant via its process group.
+    """Best-effort sweep of the worker and descendants via its process group (COOPERATIVE).
 
-    The worker is its own session leader (start_new_session), so killing its
-    process group reaches grandchildren it spawned. Without this, a tool that
-    forks a helper would leave that helper running past the deadline -- and "the
-    host can hard-kill it", the whole premise of EV-002, would be false.
+    The worker is its own session leader (start_new_session), so signalling its process group
+    reaches grandchildren it left in that group. This is NOT containment: a descendant that
+    calls setsid()/start_new_session moves to its own group and survives, and a background child
+    left after the leader exits is only swept while the group still exists. Real containment of a
+    hostile tool is the deployment substrate's job (container / PID namespace + cgroup). A
+    dedicated normal-exit sweep of the group is a follow-up (the leader-exited early return below
+    currently leaves a background child that outlived a clean exit).
     """
     if process.poll() is not None:
-        # Already exited; signalling a reaped pid could hit an unrelated reused pid.
+        # Already exited; signalling a reaped pid could hit an unrelated reused pid. NOTE: this
+        # leaves a background child that outlived a NORMAL exit unswept -- a known best-effort gap
+        # fixed in a follow-up via a zombie-window sweep (kill the group before the pid is reaped).
         return
     try:
         os.killpg(os.getpgid(process.pid), signal.SIGKILL)
@@ -349,16 +387,16 @@ def _terminate_posix_process_group(process: subprocess.Popen[bytes]) -> None:
 
 
 class _ProcessTree:
-    """A launched isolated-tool worker with a tree-kill contract.
+    """A launched isolated-tool worker with a deadline-termination contract.
 
-    `terminate_tree()` stops the worker AND every descendant it spawned;
-    `kills_tree` states whether this implementation can actually guarantee that.
-    The isolated executor talks to this interface instead of scattering platform
-    branches through `_invoke_isolated`, so a Windows Job Object implementation
-    (`_WindowsJobProcessTree`) can be dropped in without touching the executor.
+    `terminate_tree()` attempts to stop the worker and its descendants at the deadline;
+    `terminates_whole_tree` states whether this backend GUARANTEES that against a hostile
+    tool. Windows' Job Object does (True). The POSIX process-group backend does NOT (False,
+    cooperative): a setsid() descendant escapes. The isolated executor talks to this interface
+    instead of scattering platform branches through `_invoke_isolated`.
     """
 
-    kills_tree: bool = False
+    terminates_whole_tree: bool = False
 
     def __init__(self, process: subprocess.Popen[bytes]) -> None:
         self._process = process
@@ -411,18 +449,21 @@ class _ProcessTree:
 
 
 class _PosixProcessTree(_ProcessTree):
-    kills_tree = True
+    # COOPERATIVE, not containment: killpg sweeps the worker's process group, but a setsid()
+    # descendant escapes and a background child can outlive a clean exit. False by design --
+    # POSIX does not guarantee whole-tree termination against a hostile tool (that is the
+    # deployment substrate's job). The termination PRIMITIVE still exists, which is what gates
+    # whether a side-effecting isolated tool may be registered (see _has_tree_termination_primitive).
+    terminates_whole_tree = False
 
     def terminate_tree(self) -> None:
         _terminate_posix_process_group(self._process)
 
 
 class _UnmanagedProcessTree(_ProcessTree):
-    # A platform with no tree-kill primitive: kills only the root process, so
-    # descendants may outlive it -- which is exactly why `kills_tree` is False and
-    # side-effecting isolated tools are refused here. Windows uses this until the Job
-    # Object executor lands.
-    kills_tree = False
+    # A platform with no tree-termination primitive at all: kills only the root process, so
+    # descendants may outlive it -- which is why side-effecting isolated tools are refused here.
+    terminates_whole_tree = False
 
     def terminate_tree(self) -> None:
         if self._process.poll() is not None:
@@ -437,8 +478,9 @@ class _WindowsJobProcessTree(_ProcessTree):
     # A worker created SUSPENDED, assigned to a kill-on-close Job Object before it can
     # spawn anything (race-free), then resumed. TerminateJobObject reaps the worker and
     # every descendant as one unit; closing the last job handle is a kill-on-close
-    # safety net if terminate_tree was never called.
-    kills_tree = True
+    # safety net if terminate_tree was never called. This IS whole-tree containment: no
+    # breakaway, assigned before the worker can spawn -- materially stronger than POSIX killpg.
+    terminates_whole_tree = True
 
     def __init__(self, process: subprocess.Popen[bytes], job_handle: int) -> None:
         super().__init__(process)
@@ -517,6 +559,9 @@ def _launch_process_tree(argv: list[str], env: dict[str, str]) -> _ProcessTree:
         "stdout": subprocess.PIPE,
         "stderr": subprocess.DEVNULL,
         "env": env,
+        # Section 7: explicit, though Python defaults close_fds=True. Only the protocol pipes
+        # (stdin/stdout) and discarded stderr reach the worker; no other host descriptor leaks in.
+        "close_fds": True,
     }
     if _CAN_KILL_PROCESS_GROUP:
         process = subprocess.Popen(argv, start_new_session=True, **common)  # nosec B603

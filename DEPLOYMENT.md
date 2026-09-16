@@ -32,6 +32,31 @@ If you load custom tools, set `PORTMARK_TOOLS=module:function` and provide a
 matching `PORTMARK_POLICY_PATH`. Tool modules must be present in the image or on
 the Python import path.
 
+## Tool Isolation Requirement
+
+Portmark's isolated tool executor is a **resource-bounded, hard-deadline worker — not a
+hostile-code sandbox** (see THREAT_MODEL.md, "Tool Execution Isolation Contract"). It enforces
+deadlines and defense-in-depth kernel resource caps, but a tool runs as the **same OS user** with
+normal filesystem and network access. **Containing an untrusted or hostile tool is the
+deployment's job.** Run the runtime under an OS/container isolation profile:
+
+- a **dedicated non-root user**, distinct from anything that owns host secrets;
+- a **read-only root filesystem** with a single **private writable** working directory per run;
+- application/config/key paths mounted **read-only or not at all**;
+- **dropped Linux capabilities** and **`no-new-privileges`**;
+- **PID, memory, and CPU limits** (cgroups) and a **restricted `/proc`**;
+- **default-deny egress** (network namespace / firewall / egress proxy), allowlisting only the
+  destinations a tool legitimately needs.
+
+Portmark applies POSIX `setrlimit` caps (address space, CPU time, file size, open files) inside
+each isolated worker as **defense in depth** — configurable via `ToolRegistry(resource_limits=...)`
+(`RLIMIT_NPROC` is off by default because it is per-uid; enable it only under a dedicated uid).
+These caps do not replace the container profile above and do not constrain the network.
+
+A tool registered `side_effecting=True` additionally requires Portmark's idempotency/reconciliation
+contract and an acknowledged isolation profile (Section 7 follow-up). An executable, tested
+container profile ships with that follow-up.
+
 ## Reverse Proxy Requirement
 
 Do not publish the container port directly to the public internet. Put nginx,
