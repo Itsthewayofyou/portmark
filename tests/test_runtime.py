@@ -1289,6 +1289,7 @@ class RuntimeTests(unittest.TestCase):
                 with open(marker, encoding="utf-8") as handle:
                     self.assertEqual(handle.read(), "True")
 
+    @unittest.skipUnless(_CAN_KILL_PROCESS_GROUP, "references signal.SIGKILL (absent on Windows)")
     def test_self_sweep_confirmed_decision_logic(self):
         # PR 1b (parent verification): the decision that gates accepting a reply. This unit test is
         # near-tautological ON ITS OWN -- the REAL coverage is that EVERY isolated-success test now
