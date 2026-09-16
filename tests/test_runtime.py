@@ -1149,6 +1149,57 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "either resource_limits or disable_resource_limits"):
             ToolRegistry(resource_limits={"file_size": 4096}, disable_resource_limits=True)
 
+    @unittest.skipUnless(_CAN_KILL_PROCESS_GROUP, "setrlimit fail-closed is POSIX-only")
+    def test_apply_resource_limits_reports_unappliable_without_mutating(self):
+        # Fail-open fix: the worker's cap application REPORTS what it could not put in force instead
+        # of silently skipping. Only the non-setrlimit paths are exercised here so the test process's
+        # own limits are never mutated: no requested caps -> nothing unapplied; an unknown key or a
+        # non-int value -> reported unapplied (both hit the filter before any setrlimit call).
+        from portmark.tool_subprocess_runner import _apply_resource_limits
+
+        # Empty/absent rlimits -> []: this is a DEFENSIVE branch, not a reachable config -- the host
+        # always fills cpu_seconds in _invoke_isolated, so a real worker request is never empty.
+        self.assertEqual(_apply_resource_limits({}), [])
+        self.assertEqual(_apply_resource_limits(None), [])
+        self.assertEqual(_apply_resource_limits({"bogus_cap": 1}), ["bogus_cap"])
+        self.assertEqual(_apply_resource_limits({"file_size": "not-an-int"}), ["file_size"])
+        self.assertEqual(
+            sorted(_apply_resource_limits({"bogus_cap": 1, "also_bogus": 2})),
+            ["also_bogus", "bogus_cap"],
+        )
+
+    @unittest.skipUnless(_CAN_KILL_PROCESS_GROUP, "setrlimit fail-closed is POSIX-only")
+    def test_worker_fails_closed_when_a_requested_cap_cannot_apply(self):
+        # Fail-open fix, CALIBRATED: if a requested cap cannot be put in force, the worker must
+        # REFUSE to run the tool (and name the cap), never run it under weaker caps than configured.
+        # Driven at the worker's JSON protocol directly (a bogus cap key cannot pass ToolRegistry's
+        # validation, so this is the honest way to exercise the worker's own fail-closed path).
+        # CALIBRATION: with the old silent-skip, the bogus key is ignored, the valid file_size cap
+        # applies, and echo runs -> {"ok": true, ...} instead of the refusal asserted here.
+        import subprocess  # nosec B404
+
+        env = dict(os.environ)
+        env["PYTHONPATH"] = self._isolated_env()["PYTHONPATH"]
+        request = json.dumps(
+            {
+                "target": "isolated_tool_fixtures:echo",
+                "arguments": {"x": 1},
+                "max_output_bytes": 65_536,
+                "rlimits": {"file_size": 4096, "bogus_cap": 1},
+            }
+        )
+        completed = subprocess.run(  # nosec B603
+            [sys.executable, "-m", "portmark.tool_subprocess_runner"],
+            input=request.encode("utf-8"),
+            capture_output=True,
+            env=env,
+            timeout=30,
+        )
+        response = json.loads(completed.stdout.decode("utf-8"))
+        self.assertFalse(response["ok"])
+        self.assertIn("worker could not apply resource limits", response["error"])
+        self.assertIn("bogus_cap", response["error"])
+
     def test_isolated_tool_timeout_hard_kills_and_fails_closed(self):
         from portmark.tools import ToolKilledError
 

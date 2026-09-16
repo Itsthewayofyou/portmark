@@ -36,6 +36,14 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
 - **Bounded stdout, in-child `setrlimit`, explicit `close_fds`.** The worker discards Python-level
   stdout via an `os.devnull` sink (not an unbounded buffer); the POSIX resource caps are applied
   in-child (never via the parent's threaded `preexec_fn`); the launch sets `close_fds=True` explicitly.
+- **Applying the resource caps is fail-closed, not best-effort.** Previously a requested cap that
+  could not be put in force (an unsupported limit on the platform, or a rejected `setrlimit`) was
+  silently skipped and the tool ran anyway — running under weaker caps than configured, with no
+  signal. The worker now **refuses to run the tool** and reports which caps failed
+  (`worker could not apply resource limits: <names>`), so a tool never runs believing it is capped
+  when it is not. This is POSIX-scoped: on Windows the Job Object is the containment mechanism and
+  the POSIX caps do not apply there (a documented platform limitation, not a fail-open). On Linux
+  (the supported POSIX target) all of these limits apply.
 - Still deferred to later PRs (documented, not silently done): the POSIX background-child /
   `setsid()`-escape termination gap (PR 1b), mandatory idempotency/reconciliation + the
   `side_effecting` startup gate (PR 2), and the capability-based path API plus an executable/tested

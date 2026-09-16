@@ -59,6 +59,10 @@ pass `disable_resource_limits=True` to turn the exhaustion caps off explicitly. 
 **before the tool module is imported**, so a hostile tool's module-scope code runs already capped —
 which also means `address_space` (virtual memory) now bounds module *import*: raise it for a tool
 whose module reserves large mmap-backed address space at import, or the worker will fail to load it.
+Applying the caps is **fail-closed**: if a configured cap cannot be put in force (an unsupported
+limit on the platform, or a rejected `setrlimit`), the worker refuses the tool with
+`worker could not apply resource limits: <names>` instead of running it under weaker caps than you
+set. On Linux all of these limits apply.
 
 A tool registered `side_effecting=True` additionally requires Portmark's idempotency/reconciliation
 contract and an acknowledged isolation profile (Section 7 follow-up). An executable, tested

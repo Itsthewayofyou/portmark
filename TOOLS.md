@@ -304,6 +304,14 @@ empty dict; the CPU-time backstop still applies.
 > `address_space` raised. An AS/CPU limit that fires during import surfaces to the
 > host as a worker that produced no response — raise the cap if a heavy tool module
 > fails to load.
+>
+> **Fail-closed, not best-effort:** applying the caps is fail-closed. If a requested
+> cap cannot be put in force — an unsupported limit on this platform, or a `setrlimit`
+> that is rejected — the worker **refuses to run the tool** and returns
+> `worker could not apply resource limits: <names>`, rather than silently running it
+> under weaker caps than you configured. On Linux (the supported POSIX target) all of
+> these limits apply, so this refusal only fires on a genuinely unsupported platform
+> or an impossible value.
 
 ## Credential Handling
 

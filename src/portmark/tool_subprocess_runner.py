@@ -43,31 +43,49 @@ except ImportError:  # pragma: no cover - platform dependent
     _resource = None  # type: ignore[assignment]
 
 
-def _apply_resource_limits(limits: Any) -> None:
-    """Defense-in-depth kernel resource caps for the tool (finding S7-#6).
+_RLIMIT_BY_NAME = {
+    "address_space": getattr(_resource, "RLIMIT_AS", None) if _resource else None,
+    "cpu_seconds": getattr(_resource, "RLIMIT_CPU", None) if _resource else None,
+    "processes": getattr(_resource, "RLIMIT_NPROC", None) if _resource else None,
+    "file_size": getattr(_resource, "RLIMIT_FSIZE", None) if _resource else None,
+    "open_files": getattr(_resource, "RLIMIT_NOFILE", None) if _resource else None,
+}
+
+
+def _apply_resource_limits(limits: Any) -> list[str]:
+    """Defense-in-depth kernel resource caps for the tool (findings S7-#6 / fail-open).
 
     Applied here, in the fresh single-threaded worker, AFTER the runner's own trusted imports
     (so a low RLIMIT_AS cannot kill the interpreter mid-bootstrap) but BEFORE the untrusted tool
     module is imported (finding S7-#1) -- so the tool's module-scope code, not just its function,
     runs under the caps. NOT applied via the parent's ``preexec_fn`` (unsafe in the parent's
-    threaded drain path). These are defense in depth, not a boundary: POSIX-only, not equivalent
-    across platforms, and no constraint on the network. Because the caps now also bound the tool's
-    *import*, RLIMIT_AS (virtual address space) and RLIMIT_CPU cover module import too -- a heavy
-    tool module may need ``address_space`` raised. Best-effort: a limit the platform rejects is
-    skipped, and the tool still runs under the remaining caps and the host's wall-clock deadline.
+    threaded drain path). Because the caps now also bound the tool's *import*, RLIMIT_AS (virtual
+    address space) and RLIMIT_CPU cover module import too -- a heavy tool module may need
+    ``address_space`` raised.
+
+    FAIL-CLOSED and OBSERVABLE: returns the names of the requested limits that could NOT be put in
+    force -- an unrecognised key, an unsupported/absent constant on this platform, a bad value, or a
+    ``setrlimit`` that raised. The caller REFUSES to run the tool when this list is non-empty, so a
+    tool never runs believing it is capped when a requested cap silently did not apply. A limit the
+    request does not mention is simply not requested; only keys present in ``limits`` are checked.
+    This fail-closed rule is POSIX-scoped: on Windows ``_resource`` is absent and the Job Object is
+    the containment mechanism, so requested rlimits do not apply there and this returns ``[]``
+    (their POSIX-only nature is a documented platform limitation, not a silent fail-open).
     """
-    if _resource is None or not isinstance(limits, dict):
-        return
-    by_name = {
-        "address_space": getattr(_resource, "RLIMIT_AS", None),
-        "cpu_seconds": getattr(_resource, "RLIMIT_CPU", None),
-        "processes": getattr(_resource, "RLIMIT_NPROC", None),
-        "file_size": getattr(_resource, "RLIMIT_FSIZE", None),
-        "open_files": getattr(_resource, "RLIMIT_NOFILE", None),
-    }
-    for key, rlimit in by_name.items():
-        value = limits.get(key)
+    if not limits:
+        return []
+    if _resource is None:
+        # No POSIX setrlimit on this platform (Windows): these caps are not the containment
+        # mechanism here -- the kill-on-close Job Object is -- so their absence is a documented
+        # platform limitation, NOT the fail-open this guards against. Do not refuse the tool.
+        return []
+    if not isinstance(limits, dict):
+        return ["<malformed rlimits>"]
+    unapplied: list[str] = []
+    for key, value in limits.items():
+        rlimit = _RLIMIT_BY_NAME.get(key)
         if rlimit is None or not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            unapplied.append(key)
             continue
         try:
             _soft, hard = _resource.getrlimit(rlimit)
@@ -75,8 +93,9 @@ def _apply_resource_limits(limits: Any) -> None:
             # forked child cannot restore a higher soft limit.
             new = value if hard == _resource.RLIM_INFINITY else min(value, hard)
             _resource.setrlimit(rlimit, (new, new))
-        except (ValueError, OSError):  # pragma: no cover - platform/limit dependent
-            continue
+        except (ValueError, OSError):  # a requested cap could not be applied -> fail closed above
+            unapplied.append(key)
+    return sorted(unapplied)
 
 
 def main() -> None:
@@ -110,9 +129,14 @@ def main() -> None:
     real_stdout = sys.stdout
 
     try:
-        # Caps THEN untrusted import, both after the trusted bootstrap above.
-        _apply_resource_limits(request.get("rlimits"))
-        ok, value = _import_and_run(module_name, object_path, arguments, sink)
+        # Caps THEN untrusted import, both after the trusted bootstrap above. FAIL CLOSED: if any
+        # requested cap could not be put in force, do NOT run the tool believing it is capped when
+        # it is not -- report which caps failed (observable), never silently run under weaker caps.
+        unapplied = _apply_resource_limits(request.get("rlimits"))
+        if unapplied:
+            ok, value = False, "worker could not apply resource limits: " + ", ".join(unapplied)
+        else:
+            ok, value = _import_and_run(module_name, object_path, arguments, sink)
     finally:
         sink.close()
 
