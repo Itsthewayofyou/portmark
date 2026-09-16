@@ -269,10 +269,12 @@ tool's own idempotency/reconciliation, covered in DEPLOYMENT.md and THREAT_MODEL
 CI runs the isolated-tool descendant-kill, side-effecting, and kill-audit tests on
 both Linux and Windows.
 
-**Two honest limits.** (1) *Escape:* on POSIX a `setsid()` descendant escapes the
-group signal (a background child of a *normally-exiting* worker is swept by the
-worker itself, so the residual escapees are a `setsid()` child and a worker that dies
-before its sweep). (2) *In-flight effect:* even where termination reaches the tool, it cannot undo a
+**Two honest limits.** (1) *Escape:* on POSIX a descendant that moves to its own
+process group — via `setsid()`/`start_new_session()` or `setpgid()`/`setpgrp()` —
+escapes the group signal (a background child of a *normally-exiting* worker is swept
+by the worker itself, and the host verifies that self-sweep ran before accepting the
+reply, so the residual escapees are a new-group child and a worker that dies before
+its sweep). (2) *In-flight effect:* even where termination reaches the tool, it cannot undo a
 side effect already sent when the deadline fires — a payment request already sent is
 already sent. When the host terminates a tool it audits `tool.killed` with
 `effect_status: "unknown"`, distinct from a clean `tool.failed`, so the audit trail

@@ -384,6 +384,17 @@ class ToolRegistry:
         if overflow.is_set():
             raise ToolExecutionError("tool output exceeds output budget")
 
+        # PR 1b verification: before accepting ANY reply (success or tool error), confirm the worker
+        # actually ran its process-group self-sweep -- i.e. it exited by SIGKILL on a self-sweep
+        # backend. If it exited any other way the sweep did not run and descendant containment is
+        # unconfirmed; fail closed, reporting the containment breach in preference to any tool error.
+        # This is the normal-exit analogue of the timeout "could not be confirmed terminated" branch.
+        if not _self_sweep_confirmed(tree):
+            raise ToolExecutionError(
+                f"isolated worker did not self-terminate its process group (exit {tree.returncode}); "
+                "descendant-containment sweep unconfirmed"
+            )
+
         try:
             response = json.loads(bytes(buffer).decode("utf-8"))
         except (ValueError, UnicodeDecodeError) as error:
@@ -447,6 +458,21 @@ def _terminate_posix_process_group(process: subprocess.Popen[bytes]) -> None:
             pass
 
 
+def _self_sweep_confirmed(tree: _ProcessTree) -> bool:
+    """Whether the worker's PR-1b self-sweep is confirmed for a reply we are about to accept.
+
+    A self-sweep backend (POSIX) SIGKILLs its own process group before exiting, so a worker that
+    produced a reply MUST have exited by SIGKILL. Any other exit -- a clean ``0`` (the sweep did not
+    run), a crash by another signal, or ``None`` (never reaped) -- means the descendant-containment
+    sweep is unconfirmed and the host must not silently accept the reply. Keep the explicit
+    ``== -SIGKILL`` equality: do NOT "simplify" it to a truthy check, which would read a clean ``0``
+    as confirmed. Non-self-sweep backends (Windows Job Object, unmanaged) are never gated here.
+    """
+    if not tree.expects_self_sweep:
+        return True
+    return tree.returncode == -signal.SIGKILL
+
+
 class _ProcessTree:
     """A launched isolated-tool worker with a deadline-termination contract.
 
@@ -459,9 +485,19 @@ class _ProcessTree:
 
     terminates_whole_tree: bool = False
 
+    # Whether this backend's worker SIGKILLs its OWN process group before a normal exit (PR 1b):
+    # True on POSIX. When True, a worker that produced a reply MUST have exited by SIGKILL, and the
+    # host verifies that before accepting the reply (see _self_sweep_confirmed). False backends
+    # (Windows Job Object, unmanaged) neither self-sweep nor get verified.
+    expects_self_sweep: bool = False
+
     def __init__(self, process: subprocess.Popen[bytes]) -> None:
         self._process = process
         self._closed = False
+
+    @property
+    def returncode(self) -> int | None:
+        return self._process.returncode
 
     @property
     def stdin(self) -> Any:
@@ -517,6 +553,9 @@ class _PosixProcessTree(_ProcessTree):
     # PRIMITIVE still exists, which is what gates whether a side-effecting isolated tool may be
     # registered (see _has_tree_termination_primitive).
     terminates_whole_tree = False
+    # The POSIX worker SIGKILLs its own process group before a normal exit (PR 1b), so a reply from
+    # it MUST come with a SIGKILL exit -- the host verifies this before accepting the reply.
+    expects_self_sweep = True
 
     def terminate_tree(self) -> None:
         _terminate_posix_process_group(self._process)

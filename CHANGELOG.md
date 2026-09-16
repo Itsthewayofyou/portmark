@@ -18,9 +18,16 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   exits by `SIGKILL` **by design**; the host reads the JSON response from the pipe, never the exit
   status. The sweep is guarded to fire **only when the worker leads its own process group** (the
   `start_new_session` launch path), so a worker run inside another process's group never signals it.
-  Three residuals remain, documented (the first tested): a `setsid()`/`start_new_session()` child
-  moves to its own group and escapes; a worker that dies before reaching the sweep cannot run it; and
-  the sweep is only effective because the parent launches the worker with `start_new_session` (a
+- **The host verifies the self-sweep before accepting a reply.** On a self-sweep (POSIX) backend the
+  host confirms the worker exited by `SIGKILL` before accepting its reply — success or tool error
+  alike; if it exited any other way the sweep did not run, so the host **fails closed**
+  (`worker did not self-terminate its process group … sweep unconfirmed`) rather than silently
+  accepting a result whose descendant containment is unconfirmed. This is the normal-exit analogue of
+  the timeout "process tree could not be confirmed terminated" check.
+- Three residuals remain, documented (the escape residual is **tested**): a child that moves to its
+  own process group — via `setsid()`/`start_new_session()` (new session) **or** `setpgid()`/`setpgrp()`
+  (new group, same session) — escapes the sweep; a worker that dies before reaching the sweep cannot
+  run it; and the sweep is only effective because the parent launches with `start_new_session` (a
   launch path that omits it gets no sweep — the guard makes that safe, not a foreign-group kill).
   POSIX only; on Windows the kill-on-close Job Object already contains the whole tree.
 

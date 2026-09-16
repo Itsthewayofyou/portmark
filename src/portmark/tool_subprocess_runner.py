@@ -183,12 +183,13 @@ def _sweep_own_process_group() -> None:
     process group holds only its own descendants; signalling group 0 (the caller's group) reaps them.
     This kills the worker too, so a SUCCESSFUL isolated tool exits by SIGKILL BY DESIGN -- the host
     reads the JSON response from the pipe (already flushed above), never the worker's exit status.
-    Three residual limits, all documented: a child that called ``setsid()``/``start_new_session()``
-    is in its own group and escapes this sweep; a worker that dies before reaching here cannot run it;
-    and this sweep is only EFFECTIVE because the parent launches the worker with ``start_new_session``
-    (so the worker leads its own group) -- a launch path that omits that gets no sweep (the guard
-    below makes that safe, not merely inert). On Windows there is no ``killpg`` and the kill-on-close
-    Job Object already contains the tree, so this is a no-op.
+    Three residual limits, all documented: a child that moved to its OWN process group -- via
+    ``setsid()``/``start_new_session()`` (new session) OR ``setpgid()``/``setpgrp()`` (new group in
+    the same session) -- is no longer in the worker's group and escapes this sweep; a worker that dies
+    before reaching here cannot run it; and this sweep is only EFFECTIVE because the parent launches
+    the worker with ``start_new_session`` (so the worker leads its own group) -- a launch path that
+    omits that gets no sweep (the guard below makes that safe, not merely inert). On Windows there is
+    no ``killpg`` and the kill-on-close Job Object already contains the tree, so this is a no-op.
 
     CRITICAL safety guard: only sweep when this worker is its OWN process-group leader (pgid == pid),
     which it is when the parent launched it with ``start_new_session`` (the real path) -- then group 0

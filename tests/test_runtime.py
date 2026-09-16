@@ -1265,24 +1265,50 @@ class RuntimeTests(unittest.TestCase):
             self.assertFalse(os.path.exists(marker))
 
     @unittest.skipUnless(_CAN_KILL_PROCESS_GROUP, "process-group sweep is POSIX-only")
-    def test_setsid_child_escapes_normal_exit_sweep_documented_residual(self):
-        # PR 1b: pin the DOCUMENTED residual. A child that calls setsid() is in its own process
-        # group, so the worker's killpg(0) sweep cannot reach it -- "alive" DOES appear. This test
-        # exists so a future claim of whole-tree containment fails loudly here.
+    def test_new_group_child_escapes_normal_exit_sweep_documented_residual(self):
+        # PR 1b: pin the DOCUMENTED escape residuals. A child that moves to its OWN process group --
+        # via setsid() (new session) OR setpgid(0,0) (new group, same session) -- is no longer in the
+        # worker's group, so the killpg(0) sweep cannot reach it: "alive" DOES appear. This matches
+        # the residual list one-to-one and fails loudly if a future change claims whole-tree kill.
         registry = ToolRegistry()
         registry.register_isolated(
-            "iso.bgsetsid", "isolated_tool_fixtures:spawn_bg_child_then_return_normally", env=self._isolated_env()
+            "iso.bgescape", "isolated_tool_fixtures:spawn_bg_child_then_return_normally", env=self._isolated_env()
         )
-        permit = self._isolated_permit("iso.bgsetsid")
-        with tempfile.TemporaryDirectory() as directory:
-            marker = os.path.join(directory, "setsid-alive")
-            self.assertEqual(
-                registry.invoke(permit, "iso.bgsetsid", {"marker": marker, "delay": 2.0, "setsid": True}),
-                {"spawned": True},
-            )
-            time.sleep(3.5)  # past the child's +2.0s "alive" write
-            self.assertTrue(os.path.exists(marker + ".started"))
-            self.assertTrue(os.path.exists(marker))  # escaped the sweep -- documented residual
+        permit = self._isolated_permit("iso.bgescape")
+        for escape in ("setsid", "setpgid"):
+            with self.subTest(escape=escape), tempfile.TemporaryDirectory() as directory:
+                marker = os.path.join(directory, f"{escape}-alive")
+                self.assertEqual(
+                    registry.invoke(permit, "iso.bgescape", {"marker": marker, "delay": 2.0, "escape": escape}),
+                    {"spawned": True},
+                )
+                time.sleep(3.5)  # past the child's +2.0s "alive" write
+                self.assertTrue(os.path.exists(marker + ".started"))
+                self.assertTrue(os.path.exists(marker))  # escaped the sweep -- documented residual
+                # ...and escaped BECAUSE it left the worker's group: it is now its own group leader.
+                with open(marker, encoding="utf-8") as handle:
+                    self.assertEqual(handle.read(), "True")
+
+    def test_self_sweep_confirmed_decision_logic(self):
+        # PR 1b (parent verification): the decision that gates accepting a reply. This unit test is
+        # near-tautological ON ITS OWN -- the REAL coverage is that EVERY isolated-success test now
+        # traverses this gate in _invoke_isolated, so an inverted check turns the whole isolated
+        # suite red. Kept explicit so a "tidy-up" to a truthy check (which would read a clean 0 as
+        # confirmed) fails here. See the gate ledger for the neutralize-the-sweep integration proof.
+        import signal as _signal
+
+        from portmark.tools import _self_sweep_confirmed
+
+        class _FakeTree:
+            def __init__(self, expects, rc):
+                self.expects_self_sweep = expects
+                self.returncode = rc
+
+        self.assertTrue(_self_sweep_confirmed(_FakeTree(True, -_signal.SIGKILL)))  # swept
+        self.assertFalse(_self_sweep_confirmed(_FakeTree(True, 0)))                # clean exit, no sweep
+        self.assertFalse(_self_sweep_confirmed(_FakeTree(True, None)))             # never reaped
+        self.assertFalse(_self_sweep_confirmed(_FakeTree(True, -_signal.SIGTERM)))  # wrong signal
+        self.assertTrue(_self_sweep_confirmed(_FakeTree(False, 0)))                # non-self-sweep backend: not gated
 
     @unittest.skipUnless(_has_tree_termination_primitive(), "requires a process-tree hard-kill primitive")
     def test_isolated_tool_kill_not_confirmed_fails_closed(self):

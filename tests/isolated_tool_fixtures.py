@@ -76,16 +76,23 @@ def spawn_bg_child_then_return_normally(arguments: dict[str, Any]) -> dict[str, 
     # worker SIGKILLs its own process group, which must kill this child before its `alive` write.
     # The tool waits until ".started" exists before returning, so the test can assert the child
     # really ran (started present) yet was swept (alive absent) -- it cannot pass merely because the
-    # child never spawned. With `setsid` true the child moves to its OWN group and ESCAPES the
-    # sweep (the documented residual), so `alive` DOES appear.
+    # child never spawned. With `escape`="setsid" (new session) or "setpgid" (new group in the same
+    # session) the child moves to its OWN process group and ESCAPES the sweep (documented residuals),
+    # so `alive` DOES appear. The group-change runs BEFORE the ".started" write, so that marker
+    # proves the escape already happened -- the test's "alive present" is real evidence, not luck.
     marker = str(arguments["marker"])
     started = marker + ".started"
     delay = float(arguments.get("delay", 3.0))
-    new_session = "os.setsid();" if arguments.get("setsid") else ""
+    escape = arguments.get("escape")
+    escape_call = {"setsid": "os.setsid();", "setpgid": "os.setpgid(0,0);"}.get(str(escape), "")
+    # The child records into the "alive" marker whether it is its OWN process-group leader
+    # (getpgrp()==getpid()) -- True exactly when it escaped the worker's group (setsid/setpgid made it
+    # a new group leader). The test asserts that content, so "alive present" means "survived BECAUSE
+    # it left the group," not merely "survived" (which timing or a failed setpgid could also produce).
     program = (
-        f"import os,time,pathlib;{new_session}"
+        f"import os,time,pathlib;{escape_call}"
         f"pathlib.Path({started!r}).write_text('x');"
-        f"time.sleep({delay});pathlib.Path({marker!r}).write_text('alive')"
+        f"time.sleep({delay});pathlib.Path({marker!r}).write_text(str(os.getpgrp()==os.getpid()))"
     )
     subprocess.Popen(  # nosec B603
         [sys.executable, "-c", program],
