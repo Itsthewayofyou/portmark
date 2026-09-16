@@ -53,6 +53,13 @@ each isolated worker as **defense in depth** — configurable via `ToolRegistry(
 (`RLIMIT_NPROC` is off by default because it is per-uid; enable it only under a dedicated uid).
 These caps do not replace the container profile above and do not constrain the network.
 
+`resource_limits` overrides are **validated at construction and merged over the defaults** (an
+unknown key or non-positive value fails startup, and setting one key keeps the other default caps);
+pass `disable_resource_limits=True` to turn the exhaustion caps off explicitly. The caps are applied
+**before the tool module is imported**, so a hostile tool's module-scope code runs already capped —
+which also means `address_space` (virtual memory) now bounds module *import*: raise it for a tool
+whose module reserves large mmap-backed address space at import, or the worker will fail to load it.
+
 A tool registered `side_effecting=True` additionally requires Portmark's idempotency/reconciliation
 contract and an acknowledged isolation profile (Section 7 follow-up). An executable, tested
 container profile ships with that follow-up.

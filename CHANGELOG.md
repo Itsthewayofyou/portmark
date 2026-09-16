@@ -6,6 +6,41 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Section 7 — tool execution isolation (PR 1 of 3)
+
+- **Honest contract: the isolated executor is a resource-bounded, hard-deadline worker — NOT a
+  hostile-code sandbox.** THREAT_MODEL.md and DEPLOYMENT.md now state that a tool runs as the same OS
+  user with normal filesystem/network access, and that containing an untrusted or hostile tool is the
+  **deployment's** job (separate uid, mounts, PID/cgroup isolation, restricted `/proc`, default-deny
+  egress). TOOLS.md's "Isolated Tools" section was corrected: on POSIX the deadline termination is
+  **cooperative/best-effort** (a `setsid()` descendant escapes the group signal; a background child can
+  outlive a clean exit), genuine whole-tree termination is Windows (Job Object) only, and the
+  termination is verified for the worker **root**, not asserted for the tree. `ToolKilledError` and
+  `register_isolated` docstrings no longer claim POSIX whole-tree containment.
+- **Resource caps and stdout redirect now apply BEFORE the untrusted tool is imported (High).** Python
+  runs a module's top-level code at import, so a hostile tool's **module scope** — not just its
+  function — is attacker-controlled. Previously the worker imported the tool first and applied the caps
+  and stdout sink afterward, so module-scope code ran uncapped and could write straight into the
+  response protocol. The worker now applies the caps and redirects stdout to a discard sink before
+  importing the tool. A cap that fires during import (or any module-scope failure) is caught and
+  reported as a controlled `tool import raised <Error>`, never a crashed, response-less worker.
+  Consequence: `address_space` and `cpu_seconds` now also bound module import — a heavy tool module may
+  need `address_space` raised.
+- **`resource_limits` is validated and merged, not silently replaced (Medium).**
+  `ToolRegistry(resource_limits=...)` now **fails startup** on an unknown key (catching a typo like
+  `adress_space` that used to silently disable a cap) or a non-positive/non-int value, and **merges**
+  overrides over the defaults so supplying one key no longer drops the others. `cpu_seconds` cannot be
+  set by an operator (it is derived per invocation from each tool's timeout). To turn the caps off,
+  pass the explicit `disable_resource_limits=True` — an empty `resource_limits={}` now means "defaults",
+  not "disabled".
+- **Bounded stdout, in-child `setrlimit`, explicit `close_fds`.** The worker discards Python-level
+  stdout via an `os.devnull` sink (not an unbounded buffer); the POSIX resource caps are applied
+  in-child (never via the parent's threaded `preexec_fn`); the launch sets `close_fds=True` explicitly.
+- Still deferred to later PRs (documented, not silently done): the POSIX background-child /
+  `setsid()`-escape termination gap (PR 1b), mandatory idempotency/reconciliation + the
+  `side_effecting` startup gate (PR 2), and the capability-based path API plus an executable/tested
+  container profile (PR 3).
+
 ### Section 5 — approvals
 
 - **An approval is now bound to the checkpoint generation it was issued for (finding #1, High —

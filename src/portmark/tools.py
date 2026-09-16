@@ -39,6 +39,43 @@ _DEFAULT_TOOL_RLIMITS: dict[str, int] = {
     # via ToolRegistry(resource_limits={..., "processes": N}); "cpu_seconds" is filled per call.
 }
 
+# Section 7 #3: resource-limit keys an OPERATOR may set on ToolRegistry. "cpu_seconds" is
+# deliberately NOT here -- it is derived per invocation from each tool's own wall-clock timeout
+# (a kernel backstop for the deadline), so letting an operator pin it could make it fire BEFORE
+# the host's own deadline. The worker still accepts cpu_seconds in the request; the host fills it.
+_OPERATOR_RESOURCE_LIMIT_KEYS = frozenset({"address_space", "processes", "file_size", "open_files"})
+
+
+def _merged_resource_limits(overrides: dict[str, int] | None) -> dict[str, int]:
+    """Validate operator resource-limit overrides and MERGE them over the defaults (finding #3).
+
+    Fails startup (ValueError) on an unknown key -- catching a typo like ``adress_space`` that
+    would otherwise silently disable the cap the operator meant to set -- or a value that is not a
+    positive integer. Merge, not replace: supplying one key keeps the other default caps, so
+    ``resource_limits={"file_size": N}`` does not silently drop the memory / fd caps. To turn OFF
+    all caps, pass ``disable_resource_limits=True`` -- an explicit switch, not an easily-mistyped
+    empty dict.
+    """
+    merged = dict(_DEFAULT_TOOL_RLIMITS)
+    if overrides is None:
+        return merged
+    if not isinstance(overrides, dict):
+        raise ValueError("resource_limits must be a dict of {name: positive int}")
+    for key, value in overrides.items():
+        if key not in _OPERATOR_RESOURCE_LIMIT_KEYS:
+            allowed = ", ".join(sorted(_OPERATOR_RESOURCE_LIMIT_KEYS))
+            raise ValueError(
+                f"unknown resource_limits key {key!r}; allowed: {allowed} "
+                "(cpu_seconds is derived from each tool's timeout and cannot be set here)"
+            )
+        # Order matters: bool is a subclass of int, so reject it FIRST -- otherwise True would
+        # sail through as 1. Do not reorder these three checks (same discipline as a fail-closed gate).
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"resource_limits[{key!r}] must be a positive integer, got {value!r}")
+        merged[key] = value
+    return merged
+
+
 # Environment names the isolated worker is allowed to inherit. This is a
 # default-deny allowlist, not parent-minus-a-blocklist: a secret the host holds in its own
 # environment (API keys, tokens, DB URLs) is NOT inherited as a child environment variable
@@ -73,12 +110,15 @@ class ToolExecutionError(SecurityError):
 
 
 class ToolKilledError(ToolExecutionError):
-    """An isolated tool was hard-killed at its deadline.
+    """An isolated tool was terminated at its deadline.
 
-    Distinct from a clean ToolExecutionError because the host cannot know whether
-    a side effect already landed before the kill: killing the process group stops
-    any *new* effect but does not roll back one already in flight. The host audits
-    this as a killed-at-deadline event with effect status unknown.
+    Distinct from a clean ToolExecutionError because the host cannot know whether a side
+    effect already landed before the termination. On Windows the Job Object reaps the whole
+    tree; on POSIX the group signal is COOPERATIVE (a setsid() descendant can escape and keep
+    running), so it does not even guarantee every *new* effect is stopped, let alone roll back
+    one already in flight. The host audits this as a killed-at-deadline event with effect status
+    unknown; the real guarantee against a hostile side-effecting tool is the deployment's
+    isolation profile plus the tool's own idempotency/reconciliation, not this termination.
     """
 
 
@@ -95,6 +135,7 @@ class ToolRegistry:
         max_output_bytes: int = 65_536,
         max_inflight_threaded: int = DEFAULT_MAX_INFLIGHT_THREADED_TOOLS,
         resource_limits: dict[str, int] | None = None,
+        disable_resource_limits: bool = False,
     ) -> None:
         self._tools: dict[str, Tool] = {}
         self._isolated: dict[str, _IsolatedSpec] = {}
@@ -103,9 +144,17 @@ class ToolRegistry:
         self._side_effecting: set[str] = set()
         self.default_timeout = default_timeout
         self.max_output_bytes = max_output_bytes
-        # Section 7 #6: defense-in-depth resource caps applied inside each isolated worker.
-        # None uses the generous defaults; pass {} to disable, or override individual keys.
-        self.resource_limits: dict[str, int] = dict(_DEFAULT_TOOL_RLIMITS if resource_limits is None else resource_limits)
+        # Section 7 #6/#3: defense-in-depth resource caps applied inside each isolated worker.
+        # None uses the generous defaults; resource_limits={...} validates its keys/values and
+        # MERGES over the defaults (an unknown key or non-positive value fails startup, not
+        # silently). disable_resource_limits=True turns the exhaustion caps off -- an explicit
+        # switch, never an overloaded {}; the CPU-time deadline backstop still applies per call.
+        if disable_resource_limits:
+            if resource_limits:
+                raise ValueError("pass either resource_limits or disable_resource_limits=True, not both")
+            self.resource_limits: dict[str, int] = {}
+        else:
+            self.resource_limits = _merged_resource_limits(resource_limits)
         # Finding #5: the thread-timeout path cannot cancel a tool once it starts, so a
         # tool that exceeds its deadline leaves its daemon thread running. This bounded
         # semaphore caps how many such executions can be in flight at once. A slot is held
@@ -133,7 +182,7 @@ class ToolRegistry:
         side_effecting: bool = False,
         env: dict[str, str] | None = None,
     ) -> None:
-        """Register a tool that runs in a hard-killable subprocess (EV-002).
+        """Register a tool that runs in a separate, deadline-terminated subprocess (EV-002).
 
         `target` is a `module:function` import path resolved inside the worker,
         not a callable, because a closure cannot be shipped to a fresh process.
@@ -141,6 +190,14 @@ class ToolRegistry:
         worker sees only a minimal allowlist and none of the host's secrets.
         Only an isolated tool may be `side_effecting`: the thread path cannot
         cancel a running tool, so it still refuses side-effecting tools.
+
+        NOTE: this subprocess is a resource-bounded, hard-deadline worker, NOT a
+        hostile-code sandbox. At the deadline the host terminates the worker's
+        process tree -- genuinely on Windows (a kill-on-close Job Object, no
+        breakaway), but only COOPERATIVELY on POSIX (a setsid()/start_new_session
+        descendant escapes the group signal). Containing a hostile tool is the
+        deployment's job (see THREAT_MODEL.md); this flag only requires that SOME
+        tree-termination primitive exists on the platform.
         """
         module_name, separator, object_path = target.partition(":")
         if not separator or not module_name or not object_path:

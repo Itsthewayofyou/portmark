@@ -1023,7 +1023,7 @@ class RuntimeTests(unittest.TestCase):
                 capped.invoke(permit, "iso.write", {"path": target, "size": big})
 
             # CALIBRATION: caps disabled -> the identical write succeeds.
-            uncapped = ToolRegistry(resource_limits={})
+            uncapped = ToolRegistry(disable_resource_limits=True)
             uncapped.register_isolated("iso.write", "isolated_tool_fixtures:write_file", env=self._isolated_env())
             self.assertEqual(
                 uncapped.invoke(permit, "iso.write", {"path": target, "size": big}),
@@ -1040,6 +1040,114 @@ class RuntimeTests(unittest.TestCase):
         self.assertFalse(tools_module._PosixProcessTree.terminates_whole_tree)
         self.assertFalse(tools_module._UnmanagedProcessTree.terminates_whole_tree)
         self.assertTrue(tools_module._WindowsJobProcessTree.terminates_whole_tree)
+
+    def test_module_scope_stdout_flood_is_discarded_before_import(self):
+        # Section 7 #1, CALIBRATED: a hostile tool's harmful behavior can run at MODULE SCOPE
+        # (Python executes top-level code during import), not only in the tool function. Here the
+        # module prints ~20 MiB the moment the worker imports it. The worker must redirect stdout
+        # to a discard sink BEFORE importing the tool; the tiny real result still round-trips.
+        # CALIBRATION: with the redirect applied only AROUND the function call (the old order),
+        # the module-scope flood lands in the protocol stream and overflows -> invoke() raises.
+        registry = ToolRegistry()
+        registry.register_isolated(
+            "iso.mod_flood", "isolated_tool_module_scope_flood:run", env=self._isolated_env()
+        )
+        permit = self._isolated_permit("iso.mod_flood")
+        self.assertEqual(
+            registry.invoke(permit, "iso.mod_flood", {}),
+            {"ok": True, "scope": "module-flood"},
+        )
+
+    @unittest.skipUnless(_CAN_KILL_PROCESS_GROUP, "RLIMIT_FSIZE is POSIX-only")
+    def test_module_scope_filesystem_write_is_capped_before_import(self):
+        # Section 7 #1, CALIBRATED: the resource caps must apply BEFORE the untrusted module is
+        # imported, so module-scope code cannot act uncapped. This fixture writes a large file at
+        # import time. Under a tiny RLIMIT_FSIZE the kernel refuses the write and the worker
+        # reports a CONTROLLED failure ("tool import raised OSError") -- not a crashed, response-
+        # less worker (the EV-010 class) and not a write that already succeeded.
+        # CALIBRATION: caps applied AFTER import (the old order) -> the write lands and the tool
+        # returns {"ok": True, ...} instead of failing.
+        from portmark.tools import ToolExecutionError
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = os.path.join(directory, "module-scope.bin")
+            big = 8 * 1024 * 1024  # 8 MiB, far over the 4 KiB cap
+            registry = ToolRegistry(resource_limits={"file_size": 4096})
+            registry.register_isolated(
+                "iso.mod_write",
+                "isolated_tool_module_scope_write:run",
+                env={
+                    **self._isolated_env(),
+                    "PORTMARK_TEST_MODULE_WRITE_PATH": target,
+                    "PORTMARK_TEST_MODULE_WRITE_SIZE": str(big),
+                },
+            )
+            permit = self._isolated_permit("iso.mod_write")
+            with self.assertRaisesRegex(ToolExecutionError, "tool import raised OSError"):
+                registry.invoke(permit, "iso.mod_write", {})
+
+    def test_resource_limits_unknown_key_fails_startup(self):
+        # Section 7 #3: a typo like "adress_space" must fail LOUDLY at construction, not silently
+        # disable the cap the operator meant to set.
+        with self.assertRaisesRegex(ValueError, "unknown resource_limits key"):
+            ToolRegistry(resource_limits={"adress_space": 1024})
+
+    def test_resource_limits_non_positive_or_bool_fails_startup(self):
+        # Section 7 #3: zero, negative, and bool are all rejected (zero open_files is as bad as
+        # negative; bool is an int subclass and would sneak through a naive isinstance check).
+        for bad in (0, -1, True, 1.5, "4096"):
+            with self.assertRaisesRegex(ValueError, "positive integer"):
+                ToolRegistry(resource_limits={"file_size": bad})
+
+    def test_resource_limits_cpu_seconds_is_not_an_operator_key(self):
+        # Section 7 #3: cpu_seconds is derived per invocation from each tool's timeout (a deadline
+        # backstop); letting an operator pin it could make it fire before the host's own deadline.
+        with self.assertRaisesRegex(ValueError, "unknown resource_limits key 'cpu_seconds'"):
+            ToolRegistry(resource_limits={"cpu_seconds": 5})
+
+    def test_resource_limits_merge_keeps_other_defaults(self):
+        # Section 7 #3: supplying one key MERGES over the defaults -- it must not silently drop the
+        # memory / fd caps (the old replace-everything behavior).
+        registry = ToolRegistry(resource_limits={"file_size": 4096})
+        self.assertEqual(registry.resource_limits["file_size"], 4096)
+        self.assertEqual(registry.resource_limits["address_space"], 1024 * 1024 * 1024)
+        self.assertEqual(registry.resource_limits["open_files"], 512)
+        # RLIMIT_NPROC stays opt-in through the validated path: absent by default, settable under a
+        # dedicated uid, and merged in without dropping the other defaults.
+        self.assertNotIn("processes", ToolRegistry().resource_limits)
+        opted_in = ToolRegistry(resource_limits={"processes": 128})
+        self.assertEqual(opted_in.resource_limits["processes"], 128)
+        self.assertEqual(opted_in.resource_limits["address_space"], 1024 * 1024 * 1024)
+
+    def test_isolated_worker_error_messages_survive_the_stdout_redirect(self):
+        # Section 7 #1: the import/resolve error paths now return through a tuple and are reported
+        # AFTER the redirect block -- prove the actual message text still reaches the parent (writing
+        # it inside the redirect would send it to the discard sink and surface as "invalid output").
+        from portmark.tools import ToolExecutionError
+
+        registry = ToolRegistry()
+        registry.register_isolated(
+            "iso.badmod", "portmark_no_such_module_xyz:run", env=self._isolated_env()
+        )
+        registry.register_isolated(
+            "iso.notcallable", "isolated_tool_fixtures:__doc__", env=self._isolated_env()
+        )
+        permit = self._isolated_permit("iso.badmod", "iso.notcallable")
+        with self.assertRaisesRegex(ToolExecutionError, "could not import tool target"):
+            registry.invoke(permit, "iso.badmod", {})
+        with self.assertRaisesRegex(ToolExecutionError, "tool target is not callable"):
+            registry.invoke(permit, "iso.notcallable", {})
+
+    def test_disable_resource_limits_empties_the_caps(self):
+        # Section 7 #3: the explicit off switch, replacing the overloaded empty dict.
+        registry = ToolRegistry(disable_resource_limits=True)
+        self.assertEqual(registry.resource_limits, {})
+        # And {} now MEANS defaults, not disabled -- an empty dict can no longer silently disable.
+        self.assertEqual(ToolRegistry(resource_limits={}).resource_limits["address_space"], 1024 * 1024 * 1024)
+
+    def test_disable_and_resource_limits_together_fails(self):
+        with self.assertRaisesRegex(ValueError, "either resource_limits or disable_resource_limits"):
+            ToolRegistry(resource_limits={"file_size": 4096}, disable_resource_limits=True)
 
     def test_isolated_tool_timeout_hard_kills_and_fails_closed(self):
         from portmark.tools import ToolKilledError

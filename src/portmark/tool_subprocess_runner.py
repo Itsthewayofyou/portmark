@@ -15,9 +15,12 @@ network access; a hostile tool can still read host-accessible files and open soc
 Containing a hostile tool is the DEPLOYMENT's job (container / PID namespace + cgroup /
 separate uid / network policy). See THREAT_MODEL.md.
 
-The tool's own ``print`` output is redirected to a discarding sink so it cannot forge or
-corrupt the response and cannot exhaust memory via an unbounded buffer. The parent still reads
-stdout bounded and re-checks the size, because a hostile tool can write to fd 1 directly.
+The tool is UNTRUSTED code, and Python runs a module's top-level statements during import --
+so the tool's module scope, not just its function, is attacker-controlled (finding S7-#1).
+The caps are therefore applied, and stdout is redirected to a discarding sink, BEFORE the tool
+module is imported: a hostile module body then runs already capped and cannot forge or corrupt
+the response stream. The parent still reads stdout bounded and re-checks the size, because a
+hostile tool can write to fd 1 directly, past the Python-level redirect.
 """
 from __future__ import annotations
 
@@ -28,7 +31,13 @@ import sys
 from contextlib import redirect_stdout
 from typing import Any
 
-try:  # POSIX only; absent on Windows (which uses a Job Object with hard limits instead)
+# Trusted bootstrap import, hoisted to module scope on purpose: everything the runner itself
+# needs must be imported BEFORE the resource caps are applied in main(), so a low RLIMIT_AS can
+# never fire mid-bootstrap. Only the untrusted tool module is imported after the caps.
+from .security import canonical_json
+
+try:  # POSIX only. On Windows the host contains the worker with a kill-on-close Job Object
+    # (whole-tree termination) -- NOT kernel resource limits; the caps below are POSIX-only.
     import resource as _resource
 except ImportError:  # pragma: no cover - platform dependent
     _resource = None  # type: ignore[assignment]
@@ -37,12 +46,15 @@ except ImportError:  # pragma: no cover - platform dependent
 def _apply_resource_limits(limits: Any) -> None:
     """Defense-in-depth kernel resource caps for the tool (finding S7-#6).
 
-    Applied here, in the fresh single-threaded worker, right before the tool runs -- NOT via
-    the parent's ``preexec_fn`` (unsafe in the parent's threaded drain path) and NOT before the
-    runner's own imports (a low RLIMIT_AS would kill the interpreter mid-import). These are
-    defense in depth, not a boundary: they are POSIX-only, not equivalent across platforms, and
-    do not constrain network access. Best-effort -- a limit the platform rejects is skipped, the
-    tool still runs under the remaining caps and the host's wall-clock deadline.
+    Applied here, in the fresh single-threaded worker, AFTER the runner's own trusted imports
+    (so a low RLIMIT_AS cannot kill the interpreter mid-bootstrap) but BEFORE the untrusted tool
+    module is imported (finding S7-#1) -- so the tool's module-scope code, not just its function,
+    runs under the caps. NOT applied via the parent's ``preexec_fn`` (unsafe in the parent's
+    threaded drain path). These are defense in depth, not a boundary: POSIX-only, not equivalent
+    across platforms, and no constraint on the network. Because the caps now also bound the tool's
+    *import*, RLIMIT_AS (virtual address space) and RLIMIT_CPU cover module import too -- a heavy
+    tool module may need ``address_space`` raised. Best-effort: a limit the platform rejects is
+    skipped, and the tool still runs under the remaining caps and the host's wall-clock deadline.
     """
     if _resource is None or not isinstance(limits, dict):
         return
@@ -85,62 +97,86 @@ def main() -> None:
     if not separator or not module_name or not object_path:
         _respond_error("target must use module:function syntax")
         return
-    try:
-        loaded: Any = importlib.import_module(module_name)
-        for part in object_path.split("."):
-            if not part:
-                raise AttributeError
-            loaded = getattr(loaded, part)
-    except (ImportError, AttributeError):
-        _respond_error("could not import tool target")
-        return
-    if not callable(loaded):
-        _respond_error("tool target is not callable")
-        return
 
-    # Defense-in-depth kernel caps, applied after the runner's own imports and the tool import
-    # (so neither is constrained by RLIMIT_AS) but before the tool executes.
-    _apply_resource_limits(request.get("rlimits"))
-
-    # The tool must never write to the response stream. Redirect Python-level stdout to a
-    # DISCARDING sink (os.devnull), not an in-memory buffer: a hostile tool that prints
-    # without bound would otherwise grow an io.StringIO until it exhausts worker memory
-    # (finding S7-#6). This sink is not a containment boundary -- a tool can still write to
-    # fd 1 directly, past this redirect; the PARENT reads stdout bounded and re-checks the
-    # size, which is what actually caps fd-1 abuse. Only this module writes protocol JSON to fd 1.
+    # Open the discard sink FIRST, while still trusted (finding S7-#1): a low RLIMIT_NOFILE
+    # could otherwise make this open() fail after the caps apply and take out the only
+    # protocol-safe stdout path. Keep a handle to the real stdout for the reply -- under the
+    # redirect, sys.stdout is the sink, so the reply must be written here, never inside it.
     try:
-        with open(os.devnull, "w", encoding="utf-8") as sink, redirect_stdout(sink):
-            result = loaded(arguments)
-    except BaseException as error:  # noqa: BLE001 - any tool failure fails closed
-        _respond_error(f"tool raised {type(error).__name__}")
+        sink = open(os.devnull, "w", encoding="utf-8")
+    except OSError:
+        _respond_error("worker could not open output sink")
         return
+    real_stdout = sys.stdout
 
     try:
-        from .security import canonical_json
+        # Caps THEN untrusted import, both after the trusted bootstrap above.
+        _apply_resource_limits(request.get("rlimits"))
+        ok, value = _import_and_run(module_name, object_path, arguments, sink)
+    finally:
+        sink.close()
 
-        encoded_size = len(canonical_json(result))
+    if not ok:
+        _respond_error(value, stream=real_stdout)
+        return
+    try:
+        encoded_size = len(canonical_json(value))
     except (TypeError, ValueError):
-        _respond_error("tool output is not JSON serializable")
+        _respond_error("tool output is not JSON serializable", stream=real_stdout)
         return
     if encoded_size > max_output_bytes:
-        _respond_error("tool output exceeds output budget")
+        _respond_error("tool output exceeds output budget", stream=real_stdout)
         return
-    _respond_ok(result)
+    _respond_ok(value, stream=real_stdout)
 
 
-def _respond_ok(result: Any) -> None:
+def _import_and_run(
+    module_name: str, object_path: str, arguments: dict[str, Any], sink: Any
+) -> tuple[bool, Any]:
+    """Import the untrusted tool and run it, with Python stdout redirected to a discard sink.
+
+    Returns ``(True, result)`` or ``(False, error_message)``. It NEVER writes the protocol reply
+    itself: under ``redirect_stdout`` that would land in the sink, not the parent's pipe, so the
+    caller reports every outcome on the real stdout. Both the import and the call are wrapped in
+    ``except BaseException`` and fail CLOSED with a controlled reason (the EV-010 non-terminal
+    crash class): now that the caps bound the import, module-scope code can raise anything -- an
+    FSIZE/AS cap firing, a hostile ``sys.exit()`` at import, a recursion bomb -- and none of that
+    may escape as a dead worker with no response.
+    """
+    with redirect_stdout(sink):
+        try:
+            loaded: Any = importlib.import_module(module_name)
+            for part in object_path.split("."):
+                if not part:
+                    raise AttributeError
+                loaded = getattr(loaded, part)
+        except (ImportError, AttributeError):
+            return False, "could not import tool target"
+        except BaseException as error:  # noqa: BLE001 - module-scope code failed; fail closed
+            return False, f"tool import raised {type(error).__name__}"
+        if not callable(loaded):
+            return False, "tool target is not callable"
+        try:
+            return True, loaded(arguments)
+        except BaseException as error:  # noqa: BLE001 - any tool failure fails closed
+            return False, f"tool raised {type(error).__name__}"
+
+
+def _respond_ok(result: Any, stream: Any = None) -> None:
+    out = sys.stdout if stream is None else stream
     try:
         payload = json.dumps({"ok": True, "result": result})
     except (TypeError, ValueError):
-        _respond_error("tool output is not JSON serializable")
+        _respond_error("tool output is not JSON serializable", stream=out)
         return
-    sys.stdout.write(payload)
-    sys.stdout.flush()
+    out.write(payload)
+    out.flush()
 
 
-def _respond_error(message: str) -> None:
-    sys.stdout.write(json.dumps({"ok": False, "error": message}))
-    sys.stdout.flush()
+def _respond_error(message: str, stream: Any = None) -> None:
+    out = sys.stdout if stream is None else stream
+    out.write(json.dumps({"ok": False, "error": message}))
+    out.flush()
 
 
 if __name__ == "__main__":
