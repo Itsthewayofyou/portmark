@@ -67,3 +67,24 @@ def spawn_grandchild_then_sleep(arguments: dict[str, Any]) -> dict[str, Any]:
     )
     time.sleep(30.0)
     return {"done": True}
+
+
+def flood_stdout_then_return(arguments: dict[str, Any]) -> dict[str, Any]:
+    # Print far more than any output budget via Python-level stdout. Section 7 #6: the worker must
+    # DISCARD this (redirect to a sink), not buffer it in memory, and it must not corrupt the JSON
+    # response. The returned result is tiny -- the test asserts it round-trips intact.
+    line = "x" * 1024
+    for _ in range(int(arguments.get("lines", 20_000))):  # ~20 MiB of prints
+        print(line)
+    return {"ok": True}
+
+
+def write_file(arguments: dict[str, Any]) -> dict[str, Any]:
+    # Write a file of a requested size. Section 7 #6: under a small RLIMIT_FSIZE the write is
+    # refused by the kernel (the tool fails); under a generous limit it succeeds. Used to prove
+    # the worker actually applies the resource caps handed to it.
+    path = str(arguments["path"])
+    size = int(arguments["size"])
+    with open(path, "wb") as handle:
+        handle.write(b"x" * size)
+    return {"written": size}

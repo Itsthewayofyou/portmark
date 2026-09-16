@@ -175,15 +175,32 @@ reduced value, so `"tool" not in results` remains a correct "have I run this yet
 check. But a value projected to `{}` (or `[]`) is *falsy* — test key **presence**,
 not truthiness, or a re-proposal guard like `if not results.get("tool")` can loop.
 
-## Isolated Tools (Hard-Kill Executor)
+## Isolated Tools (Resource-Bounded, Hard-Deadline Executor)
+
+> **What this executor is, and is not.** The isolated executor is a
+> **resource-bounded, hard-deadline worker. It is NOT a hostile-code sandbox.**
+> It runs the tool as the **same OS user**, in the host's working directory, with
+> normal filesystem and network access, so a hostile tool can still read
+> host-accessible files (including the parent's `/proc/<pid>/environ`) and open
+> sockets. What isolation buys you is a hard wall-clock deadline, a separate
+> process to terminate at that deadline, a minimal inherited environment, bounded
+> output, and defense-in-depth kernel resource caps — **not** containment of
+> attacker code. **Running an untrusted or hostile tool safely requires an
+> OS/container isolation profile supplied by the deployment** (a separate uid,
+> filesystem namespaces, a PID namespace + cgroup, a network policy, restricted
+> `/proc`). See THREAT_MODEL.md and the "Tool Isolation Requirement" in
+> DEPLOYMENT.md. Isolating a tool is *not*, by itself, the answer to "this tool is
+> untrusted."
 
 By default a tool runs in-process on a worker thread. That path cannot cancel a
 tool once it has started: if the deadline fires, the host records failure but the
 thread keeps running. To keep such leaked threads bounded, `ToolRegistry` caps how
 many thread-path executions may be in flight at once (`max_inflight_threaded`,
-default 64); beyond the cap a tool invocation fails closed. For untrusted tools,
-any tool with a side effect, or any tool that may run long, register it isolated
-instead:
+default 64); beyond the cap a tool invocation fails closed. Any tool with a side
+effect, or any tool that may run long, must be registered isolated so the host can
+enforce its deadline in a separate process — and an untrusted tool must ALSO run
+under the deployment isolation profile above, because the isolated worker alone
+does not contain it:
 
 ```python
 tools.register_isolated(
@@ -200,45 +217,101 @@ fresh Python process (`portmark.tool_subprocess_runner`) that imports the target
 itself. The process talks to the host with one JSON document each way and nothing
 else. What this buys you:
 
-- **Hard-kill at the deadline.** The host kills the whole worker process tree, so
-  the tool and anything it spawned stop at the deadline -- the thread path cannot
-  do this. The tree kill uses a POSIX process group on Unix and a Windows Job Object
-  on Windows.
-- **Minimal environment.** The worker inherits only a small allowlist
+- **Deadline termination.** At the deadline the host terminates the worker's
+  process tree -- the thread path cannot do this at all. **The strength of that
+  termination is platform-dependent, and on POSIX it is best-effort, not a
+  guarantee** (see "Platform support" below). Keep this in mind for what the tool
+  may spawn.
+- **Minimal *inherited* environment.** The worker inherits only a small allowlist
   (`PYTHONPATH`, `PATH`, locale, `SYSTEMROOT`). Host secrets in the environment
-  (API keys, tokens, database URLs) are **not** passed. Add exactly what the tool
-  needs with `env=`; nothing else crosses.
+  (API keys, tokens, database URLs) are **not** passed as the child's environment.
+  Add exactly what the tool needs with `env=`; nothing else crosses. This is not
+  secrecy: because the worker runs under the same uid, a hostile tool can still
+  read the parent's `/proc/<pid>/environ` and any credential file on disk. Only
+  OS-level isolation (a separate uid, restricted `/proc`) hides those.
 - **Bounded output.** The worker refuses output over the budget before sending it,
   and the host reads bounded, so a tool cannot balloon host memory.
+- **Defense-in-depth resource caps.** On POSIX the worker applies kernel `setrlimit`
+  caps (address space, CPU time, file size, open files) handed to it by the host --
+  a backstop against runaway memory / CPU / disk / fd use. These are POSIX-only and
+  do not constrain the network, so they are defense in depth, not a boundary. They
+  now also bound the tool's *module import* (see the note under "Configuring the
+  caps"), so a heavy tool module may need `address_space` raised.
 
 Only an isolated tool may be `side_effecting=True`. A side-effecting tool
 registered on the plain thread path is refused, because that path cannot be
 cancelled.
 
-**Platform support.** The hard-kill guarantee needs a primitive that terminates a
-whole process tree as one unit. POSIX provides it with a session + `os.killpg`;
-Windows provides it with a Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`): the
-worker is created suspended, assigned to the job before it can spawn anything, then
-resumed, so a descendant cannot escape, and `TerminateJobObject` reaps the whole
-tree. `register_isolated(..., side_effecting=True)` is therefore supported on both
-POSIX and Windows. It is still **refused at registration** on any platform that has
-neither primitive — the host will not promise a guarantee it cannot keep. CI runs
-the isolated-tool descendant-kill, side-effecting, and kill-audit tests on both
-Linux and Windows.
+**Platform support — and the honest difference between the two backends.** Deadline
+termination needs *some* primitive to reach the worker's descendants. The two
+platforms are NOT equivalent:
 
-**One honest limit.** Hard-kill stops any *new* side effect, but it cannot undo
-one already in flight when the deadline fires -- a payment request already sent is
-already sent. When the host kills a tool it audits `tool.killed` with
-`effect_status: "unknown"`, distinct from a clean `tool.failed`, so the audit
-trail never claims an effect did not happen when it might have. Keep tool
-deadlines comfortably above normal completion time so the kill path is the rare
-exception, not the norm.
+- **Windows (genuine whole-tree termination).** A Job Object
+  (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`): the worker is created suspended, assigned
+  to the job before it can spawn anything, then resumed, so a descendant **cannot**
+  break away, and `TerminateJobObject` reaps the whole tree as one unit.
+- **POSIX (cooperative, best-effort — NOT containment).** A session +
+  `os.killpg` signals the worker's process group. A well-behaved descendant that
+  stays in the group is reached; but a descendant that calls
+  `setsid()`/`start_new_session()` moves to its own group and **escapes the signal
+  and keeps running**, and a background child left in the group after the leader
+  exits normally is only swept on a best-effort basis. So on POSIX the host does
+  **not** guarantee the tool and everything it spawned actually stop at the deadline.
 
-The kill is also **verified, not assumed**: after issuing the terminate the host
-waits for the tree to exit, and if the kill cannot be issued or the process
-outlives that wait it raises `ToolExecutionError` ("process tree could not be
-confirmed terminated") rather than reporting a clean kill — the host never claims
-containment it did not confirm.
+`register_isolated(..., side_effecting=True)` is allowed on both platforms because
+*a* termination primitive exists on both; it is **refused at registration** only on
+a platform with neither. That gate is about primitive existence, **not** a promise
+of hostile-tool containment — which POSIX does not provide. Real containment of an
+untrusted side-effecting tool comes from the deployment isolation profile plus the
+tool's own idempotency/reconciliation, covered in DEPLOYMENT.md and THREAT_MODEL.md.
+CI runs the isolated-tool descendant-kill, side-effecting, and kill-audit tests on
+both Linux and Windows.
+
+**Two honest limits.** (1) *Escape:* as above, on POSIX a `setsid()` descendant or a
+backgrounded child can outlive the termination — the group signal is cooperative.
+(2) *In-flight effect:* even where termination reaches the tool, it cannot undo a
+side effect already sent when the deadline fires — a payment request already sent is
+already sent. When the host terminates a tool it audits `tool.killed` with
+`effect_status: "unknown"`, distinct from a clean `tool.failed`, so the audit trail
+never claims an effect did not happen when it might have. Keep tool deadlines
+comfortably above normal completion time so termination is the rare exception.
+
+Termination is **verified only for the root, not asserted for the tree**: after
+issuing the terminate the host waits for the worker (the root) to exit, and if that
+cannot be confirmed it raises `ToolExecutionError` ("process tree could not be
+confirmed terminated") rather than reporting a clean kill. On Windows the Job Object
+makes root-exit equivalent to tree-exit; on POSIX it does not — an escaped `setsid()`
+descendant can still be running after the root is confirmed dead. The host confirms
+what it can (the root) and does not overclaim the rest.
+
+**Configuring the caps.** `ToolRegistry(resource_limits={...})` overrides the
+POSIX resource caps applied inside each worker. Keys: `address_space` (RLIMIT_AS,
+virtual memory), `file_size` (RLIMIT_FSIZE), `open_files` (RLIMIT_NOFILE), and
+`processes` (RLIMIT_NPROC — off by default because it is *per-uid*: a fixed cap
+breaks `fork()` on a busy shared host; set it only when tools run under a dedicated
+uid). Overrides are **validated at construction and MERGED over the defaults** — an
+unknown key (e.g. a typo `adress_space`) or a non-positive value raises immediately,
+and setting one key keeps the other default caps rather than silently dropping them.
+`cpu_seconds` cannot be set here; it is derived per invocation from each tool's own
+timeout as a deadline backstop. To turn the exhaustion caps OFF entirely, pass
+`ToolRegistry(disable_resource_limits=True)` — an explicit switch, not an overloaded
+empty dict; the CPU-time backstop still applies.
+
+> **Behavior note:** the caps are applied **before the tool's module is imported**
+> (so a hostile module body runs already capped), which means `address_space` and
+> `cpu_seconds` now also bound module *import*. A tool whose module reserves a lot of
+> virtual address space at import (large mmap-backed libraries) may need
+> `address_space` raised. An AS/CPU limit that fires during import surfaces to the
+> host as a worker that produced no response — raise the cap if a heavy tool module
+> fails to load.
+>
+> **Fail-closed, not best-effort:** applying the caps is fail-closed. If a requested
+> cap cannot be put in force — an unsupported limit on this platform, or a `setrlimit`
+> that is rejected — the worker **refuses to run the tool** and returns
+> `worker could not apply resource limits: <names>`, rather than silently running it
+> under weaker caps than you configured. On Linux (the supported POSIX target) all of
+> these limits apply, so this refusal only fires on a genuinely unsupported platform
+> or an impossible value.
 
 ## Credential Handling
 

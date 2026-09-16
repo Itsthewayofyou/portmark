@@ -56,7 +56,7 @@ from portmark.security import (
 )
 from portmark.storage import POSTGRES_SCHEMA_VERSION, SQLITE_BUSY_TIMEOUT_MS, SQLITE_SCHEMA_VERSION, InMemoryRuntimeStore, PostgresRuntimeStore, SQLiteRuntimeStore
 from portmark.cli import main as cli_main
-from portmark.tools import ToolRegistry, _CAN_KILL_PROCESS_GROUP, _can_hard_kill_process_tree
+from portmark.tools import ToolRegistry, _CAN_KILL_PROCESS_GROUP, _has_tree_termination_primitive
 from examples.tools import http_fetch
 from fuzz_a2a_parser import run_fuzz_cases
 
@@ -994,6 +994,212 @@ class RuntimeTests(unittest.TestCase):
             os.environ.pop(key, None)
         self.assertEqual(result, {"value": None})
 
+    def test_isolated_worker_discards_flooded_stdout_without_corrupting_response(self):
+        # Section 7 #6: a tool that prints ~20 MiB via Python stdout must not buffer it in memory
+        # (io.StringIO grew unbounded before) and must not corrupt the JSON protocol. The tiny
+        # real result still round-trips intact.
+        registry = ToolRegistry()
+        registry.register_isolated("iso.flood", "isolated_tool_fixtures:flood_stdout_then_return", env=self._isolated_env())
+        permit = self._isolated_permit("iso.flood")
+        self.assertEqual(registry.invoke(permit, "iso.flood", {"lines": 20_000}), {"ok": True})
+
+    @unittest.skipUnless(_CAN_KILL_PROCESS_GROUP, "RLIMIT_FSIZE is POSIX-only")
+    def test_isolated_worker_applies_file_size_rlimit(self):
+        # Section 7 #6, CALIBRATED: the worker applies the resource caps it is handed. Under a tiny
+        # RLIMIT_FSIZE a large write is refused by the kernel (the tool fails); with the caps
+        # disabled the same write succeeds -- proving the failure is the cap, not the tool.
+        from portmark.tools import ToolExecutionError
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = os.path.join(directory, "big.bin")
+            big = 8 * 1024 * 1024  # 8 MiB, far over the 4 KiB cap below
+
+            capped = ToolRegistry(resource_limits={"file_size": 4096})
+            capped.register_isolated("iso.write", "isolated_tool_fixtures:write_file", env=self._isolated_env())
+            permit = self._isolated_permit("iso.write")
+            # The write raises inside the tool (OSError/EFBIG) because the kernel refuses it under
+            # RLIMIT_FSIZE -- confirming the rlimit mechanism, not a kill-confirmation timeout path.
+            with self.assertRaisesRegex(ToolExecutionError, "tool raised OSError"):
+                capped.invoke(permit, "iso.write", {"path": target, "size": big})
+
+            # CALIBRATION: caps disabled -> the identical write succeeds.
+            uncapped = ToolRegistry(disable_resource_limits=True)
+            uncapped.register_isolated("iso.write", "isolated_tool_fixtures:write_file", env=self._isolated_env())
+            self.assertEqual(
+                uncapped.invoke(permit, "iso.write", {"path": target, "size": big}),
+                {"written": big},
+            )
+
+    def test_process_tree_termination_honesty(self):
+        # Section 7 #1: the executor no longer CLAIMS whole-tree termination on POSIX. POSIX killpg
+        # is cooperative (a setsid child escapes) -> False; the Windows Job Object genuinely
+        # contains the tree -> True. This flag is the honest counterpart to the prose contract.
+        # Class-attribute reads: this asserts the DECLARED contract on each backend, not observed
+        # Windows behavior (the Job Object class is never constructed on this Linux CI).
+        import portmark.tools as tools_module
+        self.assertFalse(tools_module._PosixProcessTree.terminates_whole_tree)
+        self.assertFalse(tools_module._UnmanagedProcessTree.terminates_whole_tree)
+        self.assertTrue(tools_module._WindowsJobProcessTree.terminates_whole_tree)
+
+    def test_module_scope_stdout_flood_is_discarded_before_import(self):
+        # Section 7 #1, CALIBRATED: a hostile tool's harmful behavior can run at MODULE SCOPE
+        # (Python executes top-level code during import), not only in the tool function. Here the
+        # module prints ~20 MiB the moment the worker imports it. The worker must redirect stdout
+        # to a discard sink BEFORE importing the tool; the tiny real result still round-trips.
+        # CALIBRATION: with the redirect applied only AROUND the function call (the old order),
+        # the module-scope flood lands in the protocol stream and overflows -> invoke() raises.
+        registry = ToolRegistry()
+        registry.register_isolated(
+            "iso.mod_flood", "isolated_tool_module_scope_flood:run", env=self._isolated_env()
+        )
+        permit = self._isolated_permit("iso.mod_flood")
+        self.assertEqual(
+            registry.invoke(permit, "iso.mod_flood", {}),
+            {"ok": True, "scope": "module-flood"},
+        )
+
+    @unittest.skipUnless(_CAN_KILL_PROCESS_GROUP, "RLIMIT_FSIZE is POSIX-only")
+    def test_module_scope_filesystem_write_is_capped_before_import(self):
+        # Section 7 #1, CALIBRATED: the resource caps must apply BEFORE the untrusted module is
+        # imported, so module-scope code cannot act uncapped. This fixture writes a large file at
+        # import time. Under a tiny RLIMIT_FSIZE the kernel refuses the write and the worker
+        # reports a CONTROLLED failure ("tool import raised OSError") -- not a crashed, response-
+        # less worker (the EV-010 class) and not a write that already succeeded.
+        # CALIBRATION: caps applied AFTER import (the old order) -> the write lands and the tool
+        # returns {"ok": True, ...} instead of failing.
+        from portmark.tools import ToolExecutionError
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = os.path.join(directory, "module-scope.bin")
+            big = 8 * 1024 * 1024  # 8 MiB, far over the 4 KiB cap
+            registry = ToolRegistry(resource_limits={"file_size": 4096})
+            registry.register_isolated(
+                "iso.mod_write",
+                "isolated_tool_module_scope_write:run",
+                env={
+                    **self._isolated_env(),
+                    "PORTMARK_TEST_MODULE_WRITE_PATH": target,
+                    "PORTMARK_TEST_MODULE_WRITE_SIZE": str(big),
+                },
+            )
+            permit = self._isolated_permit("iso.mod_write")
+            with self.assertRaisesRegex(ToolExecutionError, "tool import raised OSError"):
+                registry.invoke(permit, "iso.mod_write", {})
+
+    def test_resource_limits_unknown_key_fails_startup(self):
+        # Section 7 #3: a typo like "adress_space" must fail LOUDLY at construction, not silently
+        # disable the cap the operator meant to set.
+        with self.assertRaisesRegex(ValueError, "unknown resource_limits key"):
+            ToolRegistry(resource_limits={"adress_space": 1024})
+
+    def test_resource_limits_non_positive_or_bool_fails_startup(self):
+        # Section 7 #3: zero, negative, and bool are all rejected (zero open_files is as bad as
+        # negative; bool is an int subclass and would sneak through a naive isinstance check).
+        for bad in (0, -1, True, 1.5, "4096"):
+            with self.assertRaisesRegex(ValueError, "positive integer"):
+                ToolRegistry(resource_limits={"file_size": bad})
+
+    def test_resource_limits_cpu_seconds_is_not_an_operator_key(self):
+        # Section 7 #3: cpu_seconds is derived per invocation from each tool's timeout (a deadline
+        # backstop); letting an operator pin it could make it fire before the host's own deadline.
+        with self.assertRaisesRegex(ValueError, "unknown resource_limits key 'cpu_seconds'"):
+            ToolRegistry(resource_limits={"cpu_seconds": 5})
+
+    def test_resource_limits_merge_keeps_other_defaults(self):
+        # Section 7 #3: supplying one key MERGES over the defaults -- it must not silently drop the
+        # memory / fd caps (the old replace-everything behavior).
+        registry = ToolRegistry(resource_limits={"file_size": 4096})
+        self.assertEqual(registry.resource_limits["file_size"], 4096)
+        self.assertEqual(registry.resource_limits["address_space"], 1024 * 1024 * 1024)
+        self.assertEqual(registry.resource_limits["open_files"], 512)
+        # RLIMIT_NPROC stays opt-in through the validated path: absent by default, settable under a
+        # dedicated uid, and merged in without dropping the other defaults.
+        self.assertNotIn("processes", ToolRegistry().resource_limits)
+        opted_in = ToolRegistry(resource_limits={"processes": 128})
+        self.assertEqual(opted_in.resource_limits["processes"], 128)
+        self.assertEqual(opted_in.resource_limits["address_space"], 1024 * 1024 * 1024)
+
+    def test_isolated_worker_error_messages_survive_the_stdout_redirect(self):
+        # Section 7 #1: the import/resolve error paths now return through a tuple and are reported
+        # AFTER the redirect block -- prove the actual message text still reaches the parent (writing
+        # it inside the redirect would send it to the discard sink and surface as "invalid output").
+        from portmark.tools import ToolExecutionError
+
+        registry = ToolRegistry()
+        registry.register_isolated(
+            "iso.badmod", "portmark_no_such_module_xyz:run", env=self._isolated_env()
+        )
+        registry.register_isolated(
+            "iso.notcallable", "isolated_tool_fixtures:__doc__", env=self._isolated_env()
+        )
+        permit = self._isolated_permit("iso.badmod", "iso.notcallable")
+        with self.assertRaisesRegex(ToolExecutionError, "could not import tool target"):
+            registry.invoke(permit, "iso.badmod", {})
+        with self.assertRaisesRegex(ToolExecutionError, "tool target is not callable"):
+            registry.invoke(permit, "iso.notcallable", {})
+
+    def test_disable_resource_limits_empties_the_caps(self):
+        # Section 7 #3: the explicit off switch, replacing the overloaded empty dict.
+        registry = ToolRegistry(disable_resource_limits=True)
+        self.assertEqual(registry.resource_limits, {})
+        # And {} now MEANS defaults, not disabled -- an empty dict can no longer silently disable.
+        self.assertEqual(ToolRegistry(resource_limits={}).resource_limits["address_space"], 1024 * 1024 * 1024)
+
+    def test_disable_and_resource_limits_together_fails(self):
+        with self.assertRaisesRegex(ValueError, "either resource_limits or disable_resource_limits"):
+            ToolRegistry(resource_limits={"file_size": 4096}, disable_resource_limits=True)
+
+    @unittest.skipUnless(_CAN_KILL_PROCESS_GROUP, "setrlimit fail-closed is POSIX-only")
+    def test_apply_resource_limits_reports_unappliable_without_mutating(self):
+        # Fail-open fix: the worker's cap application REPORTS what it could not put in force instead
+        # of silently skipping. Only the non-setrlimit paths are exercised here so the test process's
+        # own limits are never mutated: no requested caps -> nothing unapplied; an unknown key or a
+        # non-int value -> reported unapplied (both hit the filter before any setrlimit call).
+        from portmark.tool_subprocess_runner import _apply_resource_limits
+
+        # Empty/absent rlimits -> []: this is a DEFENSIVE branch, not a reachable config -- the host
+        # always fills cpu_seconds in _invoke_isolated, so a real worker request is never empty.
+        self.assertEqual(_apply_resource_limits({}), [])
+        self.assertEqual(_apply_resource_limits(None), [])
+        self.assertEqual(_apply_resource_limits({"bogus_cap": 1}), ["bogus_cap"])
+        self.assertEqual(_apply_resource_limits({"file_size": "not-an-int"}), ["file_size"])
+        self.assertEqual(
+            sorted(_apply_resource_limits({"bogus_cap": 1, "also_bogus": 2})),
+            ["also_bogus", "bogus_cap"],
+        )
+
+    @unittest.skipUnless(_CAN_KILL_PROCESS_GROUP, "setrlimit fail-closed is POSIX-only")
+    def test_worker_fails_closed_when_a_requested_cap_cannot_apply(self):
+        # Fail-open fix, CALIBRATED: if a requested cap cannot be put in force, the worker must
+        # REFUSE to run the tool (and name the cap), never run it under weaker caps than configured.
+        # Driven at the worker's JSON protocol directly (a bogus cap key cannot pass ToolRegistry's
+        # validation, so this is the honest way to exercise the worker's own fail-closed path).
+        # CALIBRATION: with the old silent-skip, the bogus key is ignored, the valid file_size cap
+        # applies, and echo runs -> {"ok": true, ...} instead of the refusal asserted here.
+        import subprocess  # nosec B404
+
+        env = dict(os.environ)
+        env["PYTHONPATH"] = self._isolated_env()["PYTHONPATH"]
+        request = json.dumps(
+            {
+                "target": "isolated_tool_fixtures:echo",
+                "arguments": {"x": 1},
+                "max_output_bytes": 65_536,
+                "rlimits": {"file_size": 4096, "bogus_cap": 1},
+            }
+        )
+        completed = subprocess.run(  # nosec B603
+            [sys.executable, "-m", "portmark.tool_subprocess_runner"],
+            input=request.encode("utf-8"),
+            capture_output=True,
+            env=env,
+            timeout=30,
+        )
+        response = json.loads(completed.stdout.decode("utf-8"))
+        self.assertFalse(response["ok"])
+        self.assertIn("worker could not apply resource limits", response["error"])
+        self.assertIn("bogus_cap", response["error"])
+
     def test_isolated_tool_timeout_hard_kills_and_fails_closed(self):
         from portmark.tools import ToolKilledError
 
@@ -1005,7 +1211,7 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaises(ToolKilledError):
             registry.invoke(permit, "iso.slow", {"seconds": 30})
 
-    @unittest.skipUnless(_can_hard_kill_process_tree(), "requires a process-tree hard-kill primitive")
+    @unittest.skipUnless(_has_tree_termination_primitive(), "requires a process-tree hard-kill primitive")
     def test_isolated_tool_kill_reaches_grandchildren(self):
         # The kill must reach the whole process group, not just the worker: a
         # grandchild the tool spawned would otherwise survive and write a marker.
@@ -1031,7 +1237,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertTrue(os.path.exists(marker + ".started"))
             self.assertFalse(os.path.exists(marker))
 
-    @unittest.skipUnless(_can_hard_kill_process_tree(), "requires a process-tree hard-kill primitive")
+    @unittest.skipUnless(_has_tree_termination_primitive(), "requires a process-tree hard-kill primitive")
     def test_isolated_tool_kill_not_confirmed_fails_closed(self):
         # Fail-closed: if the deadline fires but the tree cannot be CONFIRMED dead --
         # the kill fails to issue, or the process outlives the post-kill wait -- the host
@@ -1154,7 +1360,7 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(ToolExecutionError, "output budget"):
             registry.invoke(permit, "iso.big", {"size": 100_000})
 
-    @unittest.skipUnless(_can_hard_kill_process_tree(), "requires a process-tree hard-kill primitive")
+    @unittest.skipUnless(_has_tree_termination_primitive(), "requires a process-tree hard-kill primitive")
     def test_side_effecting_tool_runs_when_registered_isolated(self):
         # The thread path refuses side-effecting tools; the isolated path is the
         # sanctioned way to run one, because the host can hard-kill it. Skipped
@@ -1174,7 +1380,7 @@ class RuntimeTests(unittest.TestCase):
         # since Windows now has its own Job Object primitive) so this proves the throw
         # on every CI rather than leaving it unreachable.
         registry = ToolRegistry()
-        with patch("portmark.tools._can_hard_kill_process_tree", return_value=False):
+        with patch("portmark.tools._has_tree_termination_primitive", return_value=False):
             with self.assertRaisesRegex(SecurityError, "hard-kill|process tree"):
                 registry.register_isolated(
                     "iso.pay", "isolated_tool_fixtures:echo", side_effecting=True, env=self._isolated_env()
@@ -1185,7 +1391,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("iso.safe", registry.names())
         self.assertNotIn("iso.pay", registry.names())
 
-    @unittest.skipUnless(_can_hard_kill_process_tree(), "requires a process-tree hard-kill primitive")
+    @unittest.skipUnless(_has_tree_termination_primitive(), "requires a process-tree hard-kill primitive")
     def test_host_audits_isolated_tool_kill_as_effect_status_unknown(self):
         # The honest audit trail: a hard-kill stops new effects but cannot prove
         # an in-flight one did not land, so the host records effect status as
@@ -1614,7 +1820,7 @@ class RuntimeTests(unittest.TestCase):
                 with reopened.transaction() as transaction:
                     transaction.save_checkpoint(task, envelope.state, envelope.state.checkpoint_generation, closed=False)
 
-    @unittest.skipUnless(_can_hard_kill_process_tree(), "requires a process-tree hard-kill primitive")
+    @unittest.skipUnless(_has_tree_termination_primitive(), "requires a process-tree hard-kill primitive")
     def test_killed_tool_near_ceiling_terminalizes_and_keeps_kill_reason(self):
         # Finding 1, the dangerous case: a hard-killed side-effecting tool near the
         # checkpoint ceiling. The kill sets a small terminal failure state that tips a
