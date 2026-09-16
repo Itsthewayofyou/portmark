@@ -517,7 +517,7 @@ class AgentHost:
             eid = None
             replay_result: Any = _NO_REPLAY
             if self.tools.is_side_effecting(decision.tool) and self.tools.is_isolated(decision.tool):
-                eid = effect_id(state.task_id, decision.tool, decision.arguments, state.tool_calls)
+                eid = effect_id(state.task_id, state.tool_calls)
                 mode, payload = self._effect_pre_launch(eid, state.task_id, decision.tool, decision.arguments)
                 if mode == "refuse":
                     return self._effect_refused(state, audit, decision, payload)

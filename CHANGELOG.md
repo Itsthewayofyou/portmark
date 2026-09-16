@@ -17,11 +17,20 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   tool error, or a non-serializable result (the effect may have landed before the failure). On resume
   the host replays a `confirmed` effect, proceeds for a `prepared` one (never launched), and **refuses**
   a `started`/`unknown`/`reconciled` one — it **never auto-retries** an unknown effect.
-- **The effect id is bound to the per-call sequence, not the checkpoint generation.** The sequence is
-  `state.tool_calls`, which is monotonic per task, never reset, and rebound from the durable checkpoint
-  on resume — so the same logical call re-derives the same id and a distinct call cannot collide with
-  it. It is deliberately not bound to the admission generation (which identifies the *run*, not the
-  call, and would differ across a resume).
+- **The effect id identifies the logical call POSITION — `hash(task_id, per-call sequence)` — and
+  nothing else.** The sequence is `state.tool_calls`, monotonic per task, never reset, and rebound from
+  the durable checkpoint on resume, so the same position re-derives the same id and a distinct call
+  cannot collide with it. It is bound to neither the checkpoint generation (which identifies the *run*,
+  not the call) **nor the tool/arguments**: binding those would let a provider that re-proposes the
+  same position with different arguments (or a different tool) mint a NEW id and run a **second** effect
+  while the first at that position is unresolved. The invariant is **at most one effect per position**.
+  Consequence: on such provider drift the host replays the position's recorded result even though the
+  current decision names different arguments/tool. The ledger row still records the tool and arguments
+  for reconcile and audit.
+- **The invoke boundary fails closed.** `ToolRegistry.invoke` refuses a side-effecting tool called
+  without an `effect_id`, so a caller cannot bypass the ledger by invoking a side-effecting tool
+  directly instead of through `AgentHost`. (The registry has no store, so this forces callers onto a
+  ledger-aware path; it does not by itself prove the ledger recorded the effect.)
 - **Side-effecting tools receive the effect id as an idempotency key.** The isolated worker calls a
   side-effecting tool as `tool(arguments, effect_id)` (the id travels in the request envelope, outside
   `arguments`, so the argument-name allowlist does not reject it); the tool must use it as its external

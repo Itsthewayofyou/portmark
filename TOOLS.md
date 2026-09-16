@@ -324,7 +324,9 @@ A tool registered `side_effecting=True` (which must be isolated) runs under a du
 ledger** so a crash-and-resume never re-applies an external effect it cannot be sure landed.
 
 **How it works.** Before the tool launches, the host derives an **effect id** — a hash of
-`(task_id, tool, canonical arguments, per-call sequence)` — and records a `prepared` row, then
+`(task_id, per-call sequence)`, i.e. the logical call **position** (deliberately *not* the tool or
+arguments, so the invariant is **at most one effect per position** and provider drift cannot mint a
+second effect at a position whose first effect is unresolved) — and records a `prepared` row, then
 advances it to `started` immediately before launch. After the call it settles the row:
 
 - **success → `confirmed`** (the result is stored; a later identical call *replays* it instead of

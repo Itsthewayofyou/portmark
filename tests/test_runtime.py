@@ -1461,7 +1461,17 @@ class RuntimeTests(unittest.TestCase):
             "iso.pay", "isolated_tool_fixtures:echo", side_effecting=True, env=self._isolated_env()
         )
         permit = self._isolated_permit("iso.pay")
-        self.assertEqual(registry.invoke(permit, "iso.pay", {"amount": 10}), {"echo": {"amount": 10}})
+        # Section 7 PR 2a: a side-effecting tool must be reached through the effect ledger, which
+        # supplies a host-derived effect_id. A DIRECT invoke without one now fails closed at the
+        # registry boundary (it cannot bypass the ledger).
+        from portmark.tools import ToolExecutionError
+        with self.assertRaisesRegex(ToolExecutionError, "must run through the effect ledger"):
+            registry.invoke(permit, "iso.pay", {"amount": 10})
+        # With an effect_id (as AgentHost supplies) it runs, and the id reaches the tool.
+        self.assertEqual(
+            registry.invoke(permit, "iso.pay", {"amount": 10}, effect_id="e-test"),
+            {"echo": {"amount": 10}},
+        )
 
     def test_side_effecting_isolated_tool_refused_without_process_group_kill(self):
         # Fail-closed on a platform with no process-tree hard-kill primitive: a
@@ -1539,9 +1549,9 @@ class RuntimeTests(unittest.TestCase):
         return host, envelope
 
     def _charge_eid(self, envelope, directory):
-        return effect_id(envelope.state.task_id, "iso.charge", {"dir": directory, "amount": 5}, 0)
+        return effect_id(envelope.state.task_id, 0)  # first tool call -> sequence 0
 
-    @unittest.skipUnless(_CAN_KILL_PROCESS_GROUP, "isolated side-effecting tools need a POSIX/Windows worker")
+    @unittest.skipUnless(_has_tree_termination_primitive(), "isolated side-effecting tools need a process-tree termination primitive")
     def test_side_effecting_effect_is_confirmed_and_recorded(self):
         with tempfile.TemporaryDirectory() as directory:
             store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
@@ -1554,7 +1564,7 @@ class RuntimeTests(unittest.TestCase):
             with open(Path(directory) / "attempts.log", encoding="utf-8") as handle:
                 self.assertEqual(len(handle.read().splitlines()), 1)  # ran exactly once
 
-    @unittest.skipUnless(_CAN_KILL_PROCESS_GROUP, "isolated side-effecting tools need a POSIX/Windows worker")
+    @unittest.skipUnless(_has_tree_termination_primitive(), "isolated side-effecting tools need a process-tree termination primitive")
     def test_confirmed_effect_replays_without_rerunning(self):
         # CALIBRATED: a prior identical call already CONFIRMED -> the host returns the stored result
         # and does NOT run the tool. Proves the effect_id derivation matches across a resume (same
@@ -1573,7 +1583,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertFalse((Path(directory) / "attempts.log").exists())  # tool NEVER ran
             self.assertTrue(any(event["event"] == "tool.replayed" for event in result.audit))
 
-    @unittest.skipUnless(_CAN_KILL_PROCESS_GROUP, "isolated side-effecting tools need a POSIX/Windows worker")
+    @unittest.skipUnless(_has_tree_termination_primitive(), "isolated side-effecting tools need a process-tree termination primitive")
     def test_unknown_effect_refuses_rerun(self):
         with tempfile.TemporaryDirectory() as directory:
             store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
@@ -1587,7 +1597,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertFalse((Path(directory) / "attempts.log").exists())  # never auto-retried
             self.assertTrue(any(event["event"] == "tool.refused" for event in result.audit))
 
-    @unittest.skipUnless(_CAN_KILL_PROCESS_GROUP, "isolated side-effecting tools need a POSIX/Windows worker")
+    @unittest.skipUnless(_has_tree_termination_primitive(), "isolated side-effecting tools need a process-tree termination primitive")
     def test_error_settles_unknown_then_reconcile_confirms_a_landed_effect(self):
         with tempfile.TemporaryDirectory() as directory:
             store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
@@ -1600,7 +1610,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(host.reconcile_effect(eid, envelope.state.task_id), "confirmed")
             self.assertEqual(store.get_effect(eid)["state"], "confirmed")
 
-    @unittest.skipUnless(_CAN_KILL_PROCESS_GROUP, "isolated side-effecting tools need a POSIX/Windows worker")
+    @unittest.skipUnless(_has_tree_termination_primitive(), "isolated side-effecting tools need a process-tree termination primitive")
     def test_reconcile_settles_reconciled_when_effect_did_not_land(self):
         with tempfile.TemporaryDirectory() as directory:
             store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
@@ -1610,7 +1620,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(store.get_effect(eid)["state"], "unknown")
             self.assertEqual(host.reconcile_effect(eid, envelope.state.task_id), "reconciled")
 
-    @unittest.skipUnless(_CAN_KILL_PROCESS_GROUP, "isolated side-effecting tools need a POSIX/Windows worker")
+    @unittest.skipUnless(_has_tree_termination_primitive(), "isolated side-effecting tools need a process-tree termination primitive")
     def test_side_effecting_tool_missing_effect_id_param_fails_controlled(self):
         with tempfile.TemporaryDirectory() as directory:
             store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
@@ -1621,7 +1631,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertIn("does not accept effect_id", failed["details"]["error"])
             self.assertEqual(store.get_effect(self._charge_eid(envelope, directory))["state"], "unknown")
 
-    @unittest.skipUnless(_CAN_KILL_PROCESS_GROUP, "isolated side-effecting tools need a POSIX/Windows worker")
+    @unittest.skipUnless(_has_tree_termination_primitive(), "isolated side-effecting tools need a process-tree termination primitive")
     def test_reconcile_rejects_a_foreign_task(self):
         with tempfile.TemporaryDirectory() as directory:
             store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
@@ -1631,13 +1641,14 @@ class RuntimeTests(unittest.TestCase):
             with self.assertRaisesRegex(SecurityError, "does not belong to task"):
                 host.reconcile_effect(eid, "some-other-task")
 
-    def test_effect_id_is_deterministic_and_distinct(self):
-        base = effect_id("task", "pay", {"amount": 5}, 0)
-        self.assertEqual(base, effect_id("task", "pay", {"amount": 5}, 0))       # deterministic
-        self.assertNotEqual(base, effect_id("task", "pay", {"amount": 5}, 1))    # sequence distinguishes
-        self.assertNotEqual(base, effect_id("task", "pay", {"amount": 6}, 0))    # arguments distinguish
-        self.assertNotEqual(base, effect_id("other", "pay", {"amount": 5}, 0))   # task distinguishes
-        self.assertNotEqual(base, effect_id("task", "refund", {"amount": 5}, 0))  # tool distinguishes
+    def test_effect_id_is_bound_only_to_task_and_position(self):
+        # The id identifies the logical call POSITION: task_id + sequence, and NOTHING else. Tool and
+        # arguments are deliberately excluded so provider drift at one position cannot mint a second id
+        # (the auditor's argument-drift hole). The host passes only (task_id, sequence).
+        base = effect_id("task", 0)
+        self.assertEqual(base, effect_id("task", 0))        # deterministic
+        self.assertNotEqual(base, effect_id("task", 1))     # position (sequence) distinguishes
+        self.assertNotEqual(base, effect_id("other", 0))    # task distinguishes
 
     def test_sqlite_v9_to_v10_adds_tool_effects(self):
         # Section 7 PR 2a (G2, upgrade path). An existing v9 SQLite store opened by v10 code migrates

@@ -277,6 +277,17 @@ class ToolRegistry:
         timeout = self._timeouts.get(name, self.default_timeout)
         cap = max_output_bytes if max_output_bytes is not None else self._max_output.get(name, self.max_output_bytes)
 
+        if name in self._side_effecting and effect_id is None:
+            # Fail closed at the invoke boundary: a side-effecting tool must be reached through the
+            # effect ledger, which supplies the host-derived effect_id. This does NOT prove the ledger
+            # actually recorded the effect (the registry has no store); it forces callers onto a
+            # ledger-aware path (AgentHost) instead of silently running a side-effecting tool with no
+            # idempotency key by calling invoke() directly.
+            raise ToolExecutionError(
+                f"tool {name!r} is side-effecting and must run through the effect ledger via AgentHost "
+                "(which supplies its effect_id); it cannot be invoked directly without one."
+            )
+
         if is_isolated:
             return self._invoke_isolated(self._isolated[name], arguments, timeout, cap, effect_id=effect_id)
 

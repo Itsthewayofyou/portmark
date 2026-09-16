@@ -1086,34 +1086,31 @@ def arguments_hash(arguments: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_json(arguments)).hexdigest()
 
 
-def effect_id(task_id: str, tool: str, arguments: dict[str, Any], sequence: int) -> str:
-    """Host-derived idempotency key for one side-effecting tool invocation (Section 7 PR 2).
+def effect_id(task_id: str, sequence: int) -> str:
+    """Host-derived idempotency key for the side-effecting call at one logical POSITION (Section 7 PR 2).
 
-    Deterministic over the identity of the *logical* call, so a genuine retry re-derives the SAME id
-    and is deduplicated by the effect ledger, while a distinct later call gets a distinct id and is
-    never collapsed into the first.
+    The invariant is **at most one effect per logical call position**: the id is bound ONLY to the
+    task and the per-call `sequence`, NOT to the tool or the arguments. So a given position has exactly
+    one effect id, and a retry of that position re-derives it and is deduplicated by the effect ledger.
 
-    STABILITY (the whole correctness proof): `sequence` is the pre-increment `state.tool_calls` at the
-    call site. `tool_calls` is monotonic per task and never reset, and on a RESUME it is rebound from
-    the DURABLE checkpoint (`state.tool_calls = int(stored["tool_calls"])`), not the caller-asserted
-    envelope -- so the same logical call re-derives this id across a crash-and-resume, and a distinct
-    call (a later, higher `tool_calls`) cannot collide with it. It is deliberately NOT bound to the
-    checkpoint generation: `admission_generation` is captured once per RUN, so it identifies the run,
-    not the call, and would differ across a resume (a different run) for any call after the first --
-    binding it would make the ledger decorative. `sequence` already provides both uniqueness and
-    resume-stability, so generation adds nothing and only re-introduces instability.
+    STABILITY (the correctness proof): `sequence` is the pre-increment `state.tool_calls` at the call
+    site. `tool_calls` is monotonic per task and never reset, and on a RESUME it is rebound from the
+    DURABLE checkpoint (`state.tool_calls = int(stored["tool_calls"])`), not the caller-asserted
+    envelope -- so the same position re-derives this id across a crash-and-resume, and a distinct call
+    (a later, higher `tool_calls`) cannot collide with it. It is deliberately NOT bound to the
+    checkpoint generation (captured once per RUN, so it identifies the run not the call and is unstable
+    across a resume).
 
-    The id also binds the ARGUMENTS: `(task, sequence)` identifies one call, and binding the arguments
-    too means a non-deterministic provider that re-proposes the SAME sequence with DIFFERENT arguments
-    on a resume is treated as a DISTINCT effect (it runs), leaving the abandoned attempt's row for the
-    reconcile pass -- "same inputs => same effect" is the intended idempotency property.
+    Why NOT the tool/arguments: binding them would let a provider that re-proposes the same position
+    with DIFFERENT arguments (or a different tool) on a resume derive a NEW id and run a SECOND effect
+    while the first effect at that position is still unresolved -- the argument-drift hole. CONSEQUENCE
+    of excluding them: on such provider drift the host replays position K's RECORDED result even though
+    the current decision names different arguments (or a different tool), and `tool_results` is then
+    keyed by the new decision's tool with the recorded result. That is the deliberate trade -- one
+    unresolved effect per position beats a second effect. The ledger ROW still records the tool and
+    arguments (for reconcile and audit); only the id excludes them.
     """
-    material = {
-        "task_id": task_id,
-        "tool": tool,
-        "arguments_hash": arguments_hash(arguments),
-        "sequence": sequence,
-    }
+    material = {"task_id": task_id, "sequence": sequence}
     return hashlib.sha256(canonical_json(material)).hexdigest()
 
 
