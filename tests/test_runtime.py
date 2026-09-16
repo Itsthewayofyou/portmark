@@ -1174,6 +1174,9 @@ class RuntimeTests(unittest.TestCase):
         # REFUSE to run the tool (and name the cap), never run it under weaker caps than configured.
         # Driven at the worker's JSON protocol directly (a bogus cap key cannot pass ToolRegistry's
         # validation, so this is the honest way to exercise the worker's own fail-closed path).
+        # NOTE: this launches the worker WITHOUT start_new_session, so it shares this test's process
+        # group -- the exit-time group sweep therefore correctly no-ops (its getpgrp==getpid guard),
+        # and this test covers the fail-closed REPLY, not the sweep (that is test_normal_exit_sweeps_*).
         # CALIBRATION: with the old silent-skip, the bogus key is ignored, the valid file_size cap
         # applies, and echo runs -> {"ok": true, ...} instead of the refusal asserted here.
         import subprocess  # nosec B404
@@ -1236,6 +1239,77 @@ class RuntimeTests(unittest.TestCase):
             time.sleep(6.0)
             self.assertTrue(os.path.exists(marker + ".started"))
             self.assertFalse(os.path.exists(marker))
+
+    @unittest.skipUnless(_CAN_KILL_PROCESS_GROUP, "process-group sweep is POSIX-only")
+    def test_normal_exit_sweeps_background_child(self):
+        # PR 1b, CALIBRATED: a tool that spawns a background child and then RETURNS NORMALLY used to
+        # leave that child running (the worker exited cleanly, the parent's already-exited kill path
+        # early-returned). The worker now SIGKILLs its own process group before exiting, so the child
+        # dies too. Returns normally (no ToolKilledError). "started" proves the child ran; "alive"
+        # absent proves the sweep reached it.
+        # CALIBRATION: remove the _sweep_own_process_group() call -> the child survives its delay and
+        # writes "alive". (Proven by neutralizing the runner: see the gate ledger.)
+        registry = ToolRegistry()
+        registry.register_isolated(
+            "iso.bgspawn", "isolated_tool_fixtures:spawn_bg_child_then_return_normally", env=self._isolated_env()
+        )
+        permit = self._isolated_permit("iso.bgspawn")
+        with tempfile.TemporaryDirectory() as directory:
+            marker = os.path.join(directory, "bgchild-alive")
+            self.assertEqual(
+                registry.invoke(permit, "iso.bgspawn", {"marker": marker, "delay": 3.0}),
+                {"spawned": True},
+            )
+            time.sleep(4.5)  # past the child's +3.0s "alive" write
+            self.assertTrue(os.path.exists(marker + ".started"))
+            self.assertFalse(os.path.exists(marker))
+
+    @unittest.skipUnless(_CAN_KILL_PROCESS_GROUP, "process-group sweep is POSIX-only")
+    def test_new_group_child_escapes_normal_exit_sweep_documented_residual(self):
+        # PR 1b: pin the DOCUMENTED escape residuals. A child that moves to its OWN process group --
+        # via setsid() (new session) OR setpgid(0,0) (new group, same session) -- is no longer in the
+        # worker's group, so the killpg(0) sweep cannot reach it: "alive" DOES appear. This matches
+        # the residual list one-to-one and fails loudly if a future change claims whole-tree kill.
+        registry = ToolRegistry()
+        registry.register_isolated(
+            "iso.bgescape", "isolated_tool_fixtures:spawn_bg_child_then_return_normally", env=self._isolated_env()
+        )
+        permit = self._isolated_permit("iso.bgescape")
+        for escape in ("setsid", "setpgid"):
+            with self.subTest(escape=escape), tempfile.TemporaryDirectory() as directory:
+                marker = os.path.join(directory, f"{escape}-alive")
+                self.assertEqual(
+                    registry.invoke(permit, "iso.bgescape", {"marker": marker, "delay": 2.0, "escape": escape}),
+                    {"spawned": True},
+                )
+                time.sleep(3.5)  # past the child's +2.0s "alive" write
+                self.assertTrue(os.path.exists(marker + ".started"))
+                self.assertTrue(os.path.exists(marker))  # escaped the sweep -- documented residual
+                # ...and escaped BECAUSE it left the worker's group: it is now its own group leader.
+                with open(marker, encoding="utf-8") as handle:
+                    self.assertEqual(handle.read(), "True")
+
+    @unittest.skipUnless(_CAN_KILL_PROCESS_GROUP, "references signal.SIGKILL (absent on Windows)")
+    def test_self_sweep_confirmed_decision_logic(self):
+        # PR 1b (parent verification): the decision that gates accepting a reply. This unit test is
+        # near-tautological ON ITS OWN -- the REAL coverage is that EVERY isolated-success test now
+        # traverses this gate in _invoke_isolated, so an inverted check turns the whole isolated
+        # suite red. Kept explicit so a "tidy-up" to a truthy check (which would read a clean 0 as
+        # confirmed) fails here. See the gate ledger for the neutralize-the-sweep integration proof.
+        import signal as _signal
+
+        from portmark.tools import _self_sweep_confirmed
+
+        class _FakeTree:
+            def __init__(self, expects, rc):
+                self.expects_self_sweep = expects
+                self.returncode = rc
+
+        self.assertTrue(_self_sweep_confirmed(_FakeTree(True, -_signal.SIGKILL)))  # swept
+        self.assertFalse(_self_sweep_confirmed(_FakeTree(True, 0)))                # clean exit, no sweep
+        self.assertFalse(_self_sweep_confirmed(_FakeTree(True, None)))             # never reaped
+        self.assertFalse(_self_sweep_confirmed(_FakeTree(True, -_signal.SIGTERM)))  # wrong signal
+        self.assertTrue(_self_sweep_confirmed(_FakeTree(False, 0)))                # non-self-sweep backend: not gated
 
     @unittest.skipUnless(_has_tree_termination_primitive(), "requires a process-tree hard-kill primitive")
     def test_isolated_tool_kill_not_confirmed_fails_closed(self):

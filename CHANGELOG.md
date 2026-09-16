@@ -6,6 +6,31 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Section 7 — tool execution isolation (PR 1b)
+
+- **The normal-exit background-child leak is closed at the source.** A tool that spawned a background
+  child (not `setsid`) and then returned normally used to leave that child running: the worker exited
+  cleanly, and the parent's process-group kill early-returns once the leader is reaped (signalling a
+  reaped pid could hit an unrelated reused pid). The **trusted worker now `SIGKILL`s its own process
+  group before it exits** (`tool_subprocess_runner._sweep_own_process_group`), after its reply is
+  written and flushed to the host — so the child dies with it. This runs on every post-tool reply path
+  (success, tool error, over-budget, the fail-closed rlimit refusal). A successful isolated tool now
+  exits by `SIGKILL` **by design**; the host reads the JSON response from the pipe, never the exit
+  status. The sweep is guarded to fire **only when the worker leads its own process group** (the
+  `start_new_session` launch path), so a worker run inside another process's group never signals it.
+- **The host verifies the self-sweep before accepting a reply.** On a self-sweep (POSIX) backend the
+  host confirms the worker exited by `SIGKILL` before accepting its reply — success or tool error
+  alike; if it exited any other way the sweep did not run, so the host **fails closed**
+  (`worker did not self-terminate its process group … sweep unconfirmed`) rather than silently
+  accepting a result whose descendant containment is unconfirmed. This is the normal-exit analogue of
+  the timeout "process tree could not be confirmed terminated" check.
+- Three residuals remain, documented (the escape residual is **tested**): a child that moves to its
+  own process group — via `setsid()`/`start_new_session()` (new session) **or** `setpgid()`/`setpgrp()`
+  (new group, same session) — escapes the sweep; a worker that dies before reaching the sweep cannot
+  run it; and the sweep is only effective because the parent launches with `start_new_session` (a
+  launch path that omits it gets no sweep — the guard makes that safe, not a foreign-group kill).
+  POSIX only; on Windows the kill-on-close Job Object already contains the whole tree.
+
 ### Section 7 — tool execution isolation (PR 1 of 3)
 
 - **Honest contract: the isolated executor is a resource-bounded, hard-deadline worker — NOT a

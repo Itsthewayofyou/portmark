@@ -96,8 +96,10 @@ DEFAULT_MAX_INFLIGHT_THREADED_TOOLS = 64
 # POSIX process-group termination primitive: the worker is its own session leader
 # (start_new_session) and the platform can signal the whole group (os.killpg). This is
 # COOPERATIVE, not containment: a descendant that calls setsid()/start_new_session moves to
-# its own group and escapes the signal, and a background child left in the group after the
-# leader exits is only swept on a best-effort basis (see the isolated-executor docstring).
+# its own group and escapes the signal. A background child left in the group after a NORMAL exit
+# is swept at the source (the worker SIGKILLs its own group before exiting -- see
+# tool_subprocess_runner._sweep_own_process_group); the residual escapees are a setsid() child and
+# a worker that dies before its sweep.
 # The contract (THREAT_MODEL): the isolated executor is a resource-bounded, hard-deadline
 # worker, NOT a hostile-code sandbox -- containing a hostile tool is the deployment's job
 # (container / PID namespace + cgroup / separate uid). Windows' Job Object (below) is
@@ -382,6 +384,17 @@ class ToolRegistry:
         if overflow.is_set():
             raise ToolExecutionError("tool output exceeds output budget")
 
+        # PR 1b verification: before accepting ANY reply (success or tool error), confirm the worker
+        # actually ran its process-group self-sweep -- i.e. it exited by SIGKILL on a self-sweep
+        # backend. If it exited any other way the sweep did not run and descendant containment is
+        # unconfirmed; fail closed, reporting the containment breach in preference to any tool error.
+        # This is the normal-exit analogue of the timeout "could not be confirmed terminated" branch.
+        if not _self_sweep_confirmed(tree):
+            raise ToolExecutionError(
+                f"isolated worker did not self-terminate its process group (exit {tree.returncode}); "
+                "descendant-containment sweep unconfirmed"
+            )
+
         try:
             response = json.loads(bytes(buffer).decode("utf-8"))
         except (ValueError, UnicodeDecodeError) as error:
@@ -423,16 +436,18 @@ def _terminate_posix_process_group(process: subprocess.Popen[bytes]) -> None:
 
     The worker is its own session leader (start_new_session), so signalling its process group
     reaches grandchildren it left in that group. This is NOT containment: a descendant that
-    calls setsid()/start_new_session moves to its own group and survives, and a background child
-    left after the leader exits is only swept while the group still exists. Real containment of a
-    hostile tool is the deployment substrate's job (container / PID namespace + cgroup). A
-    dedicated normal-exit sweep of the group is a follow-up (the leader-exited early return below
-    currently leaves a background child that outlived a clean exit).
+    calls setsid()/start_new_session moves to its own group and survives. Real containment of a
+    hostile tool is the deployment substrate's job (container / PID namespace + cgroup). This runs
+    on the TIMEOUT path, where the worker is still alive: killpg then reaches the whole group. The
+    NORMAL-exit background-child leak is closed at the source -- the worker SIGKILLs its own process
+    group before it exits (see tool_subprocess_runner._sweep_own_process_group) -- so the
+    already-exited early return below is now correct, not a leak.
     """
     if process.poll() is not None:
-        # Already exited; signalling a reaped pid could hit an unrelated reused pid. NOTE: this
-        # leaves a background child that outlived a NORMAL exit unswept -- a known best-effort gap
-        # fixed in a follow-up via a zombie-window sweep (kill the group before the pid is reaped).
+        # Already exited: signalling a reaped pid could hit an unrelated reused pid, so do not.
+        # This no longer leaks a background child -- on a NORMAL exit the worker already swept its
+        # own group before dying; the residuals (a setsid() escapee, a worker that died before its
+        # sweep) are documented best-effort limits, not fixed here by signalling a reaped pid.
         return
     try:
         os.killpg(os.getpgid(process.pid), signal.SIGKILL)
@@ -441,6 +456,21 @@ def _terminate_posix_process_group(process: subprocess.Popen[bytes]) -> None:
             process.kill()
         except (ProcessLookupError, OSError):
             pass
+
+
+def _self_sweep_confirmed(tree: _ProcessTree) -> bool:
+    """Whether the worker's PR-1b self-sweep is confirmed for a reply we are about to accept.
+
+    A self-sweep backend (POSIX) SIGKILLs its own process group before exiting, so a worker that
+    produced a reply MUST have exited by SIGKILL. Any other exit -- a clean ``0`` (the sweep did not
+    run), a crash by another signal, or ``None`` (never reaped) -- means the descendant-containment
+    sweep is unconfirmed and the host must not silently accept the reply. Keep the explicit
+    ``== -SIGKILL`` equality: do NOT "simplify" it to a truthy check, which would read a clean ``0``
+    as confirmed. Non-self-sweep backends (Windows Job Object, unmanaged) are never gated here.
+    """
+    if not tree.expects_self_sweep:
+        return True
+    return tree.returncode == -signal.SIGKILL
 
 
 class _ProcessTree:
@@ -455,9 +485,19 @@ class _ProcessTree:
 
     terminates_whole_tree: bool = False
 
+    # Whether this backend's worker SIGKILLs its OWN process group before a normal exit (PR 1b):
+    # True on POSIX. When True, a worker that produced a reply MUST have exited by SIGKILL, and the
+    # host verifies that before accepting the reply (see _self_sweep_confirmed). False backends
+    # (Windows Job Object, unmanaged) neither self-sweep nor get verified.
+    expects_self_sweep: bool = False
+
     def __init__(self, process: subprocess.Popen[bytes]) -> None:
         self._process = process
         self._closed = False
+
+    @property
+    def returncode(self) -> int | None:
+        return self._process.returncode
 
     @property
     def stdin(self) -> Any:
@@ -507,11 +547,15 @@ class _ProcessTree:
 
 class _PosixProcessTree(_ProcessTree):
     # COOPERATIVE, not containment: killpg sweeps the worker's process group, but a setsid()
-    # descendant escapes and a background child can outlive a clean exit. False by design --
-    # POSIX does not guarantee whole-tree termination against a hostile tool (that is the
-    # deployment substrate's job). The termination PRIMITIVE still exists, which is what gates
-    # whether a side-effecting isolated tool may be registered (see _has_tree_termination_primitive).
+    # descendant escapes. False by design -- POSIX does not guarantee whole-tree termination against
+    # a hostile tool (that is the deployment substrate's job). The normal-exit background-child leak
+    # is closed at the source (the worker sweeps its own group before exiting). The termination
+    # PRIMITIVE still exists, which is what gates whether a side-effecting isolated tool may be
+    # registered (see _has_tree_termination_primitive).
     terminates_whole_tree = False
+    # The POSIX worker SIGKILLs its own process group before a normal exit (PR 1b), so a reply from
+    # it MUST come with a SIGKILL exit -- the host verifies this before accepting the reply.
+    expects_self_sweep = True
 
     def terminate_tree(self) -> None:
         _terminate_posix_process_group(self._process)
