@@ -96,8 +96,10 @@ DEFAULT_MAX_INFLIGHT_THREADED_TOOLS = 64
 # POSIX process-group termination primitive: the worker is its own session leader
 # (start_new_session) and the platform can signal the whole group (os.killpg). This is
 # COOPERATIVE, not containment: a descendant that calls setsid()/start_new_session moves to
-# its own group and escapes the signal, and a background child left in the group after the
-# leader exits is only swept on a best-effort basis (see the isolated-executor docstring).
+# its own group and escapes the signal. A background child left in the group after a NORMAL exit
+# is swept at the source (the worker SIGKILLs its own group before exiting -- see
+# tool_subprocess_runner._sweep_own_process_group); the residual escapees are a setsid() child and
+# a worker that dies before its sweep.
 # The contract (THREAT_MODEL): the isolated executor is a resource-bounded, hard-deadline
 # worker, NOT a hostile-code sandbox -- containing a hostile tool is the deployment's job
 # (container / PID namespace + cgroup / separate uid). Windows' Job Object (below) is
@@ -423,16 +425,18 @@ def _terminate_posix_process_group(process: subprocess.Popen[bytes]) -> None:
 
     The worker is its own session leader (start_new_session), so signalling its process group
     reaches grandchildren it left in that group. This is NOT containment: a descendant that
-    calls setsid()/start_new_session moves to its own group and survives, and a background child
-    left after the leader exits is only swept while the group still exists. Real containment of a
-    hostile tool is the deployment substrate's job (container / PID namespace + cgroup). A
-    dedicated normal-exit sweep of the group is a follow-up (the leader-exited early return below
-    currently leaves a background child that outlived a clean exit).
+    calls setsid()/start_new_session moves to its own group and survives. Real containment of a
+    hostile tool is the deployment substrate's job (container / PID namespace + cgroup). This runs
+    on the TIMEOUT path, where the worker is still alive: killpg then reaches the whole group. The
+    NORMAL-exit background-child leak is closed at the source -- the worker SIGKILLs its own process
+    group before it exits (see tool_subprocess_runner._sweep_own_process_group) -- so the
+    already-exited early return below is now correct, not a leak.
     """
     if process.poll() is not None:
-        # Already exited; signalling a reaped pid could hit an unrelated reused pid. NOTE: this
-        # leaves a background child that outlived a NORMAL exit unswept -- a known best-effort gap
-        # fixed in a follow-up via a zombie-window sweep (kill the group before the pid is reaped).
+        # Already exited: signalling a reaped pid could hit an unrelated reused pid, so do not.
+        # This no longer leaks a background child -- on a NORMAL exit the worker already swept its
+        # own group before dying; the residuals (a setsid() escapee, a worker that died before its
+        # sweep) are documented best-effort limits, not fixed here by signalling a reaped pid.
         return
     try:
         os.killpg(os.getpgid(process.pid), signal.SIGKILL)
@@ -507,10 +511,11 @@ class _ProcessTree:
 
 class _PosixProcessTree(_ProcessTree):
     # COOPERATIVE, not containment: killpg sweeps the worker's process group, but a setsid()
-    # descendant escapes and a background child can outlive a clean exit. False by design --
-    # POSIX does not guarantee whole-tree termination against a hostile tool (that is the
-    # deployment substrate's job). The termination PRIMITIVE still exists, which is what gates
-    # whether a side-effecting isolated tool may be registered (see _has_tree_termination_primitive).
+    # descendant escapes. False by design -- POSIX does not guarantee whole-tree termination against
+    # a hostile tool (that is the deployment substrate's job). The normal-exit background-child leak
+    # is closed at the source (the worker sweeps its own group before exiting). The termination
+    # PRIMITIVE still exists, which is what gates whether a side-effecting isolated tool may be
+    # registered (see _has_tree_termination_primitive).
     terminates_whole_tree = False
 
     def terminate_tree(self) -> None:

@@ -69,6 +69,35 @@ def spawn_grandchild_then_sleep(arguments: dict[str, Any]) -> dict[str, Any]:
     return {"done": True}
 
 
+def spawn_bg_child_then_return_normally(arguments: dict[str, Any]) -> dict[str, Any]:
+    # PR 1b: the tool spawns a background child and then RETURNS NORMALLY (it does not sleep like
+    # spawn_grandchild_then_sleep, which tests the timeout path). The child writes a ".started"
+    # marker at once, sleeps `delay`, then writes the "alive" marker. On a normal worker exit the
+    # worker SIGKILLs its own process group, which must kill this child before its `alive` write.
+    # The tool waits until ".started" exists before returning, so the test can assert the child
+    # really ran (started present) yet was swept (alive absent) -- it cannot pass merely because the
+    # child never spawned. With `setsid` true the child moves to its OWN group and ESCAPES the
+    # sweep (the documented residual), so `alive` DOES appear.
+    marker = str(arguments["marker"])
+    started = marker + ".started"
+    delay = float(arguments.get("delay", 3.0))
+    new_session = "os.setsid();" if arguments.get("setsid") else ""
+    program = (
+        f"import os,time,pathlib;{new_session}"
+        f"pathlib.Path({started!r}).write_text('x');"
+        f"time.sleep({delay});pathlib.Path({marker!r}).write_text('alive')"
+    )
+    subprocess.Popen(  # nosec B603
+        [sys.executable, "-c", program],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    deadline = time.time() + 10.0
+    while not os.path.exists(started) and time.time() < deadline:
+        time.sleep(0.02)
+    return {"spawned": True}
+
+
 def flood_stdout_then_return(arguments: dict[str, Any]) -> dict[str, Any]:
     # Print far more than any output budget via Python-level stdout. Section 7 #6: the worker must
     # DISCARD this (redirect to a sink), not buffer it in memory, and it must not corrupt the JSON

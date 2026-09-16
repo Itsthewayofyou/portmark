@@ -52,8 +52,10 @@ What Portmark's runtime **does** guarantee for a registered tool:
 What Portmark's runtime **does NOT** do — these are the deployment's responsibility:
 - **Process containment.** On POSIX, tree termination is `os.killpg` on the worker's session
   group: **cooperative, not containment.** A descendant that calls `setsid()`/`start_new_session`
-  escapes the signal, and a background child left in the group can outlive a clean exit. (Windows'
-  Job Object *is* whole-tree containment and is materially stronger.) Only a container / PID
+  escapes the signal. (A background child of a *normally-exiting* worker is swept at the source —
+  the worker `SIGKILL`s its own process group before exiting — so it no longer outlives a clean
+  exit; the residuals are a `setsid()` escapee and a worker that dies before its sweep.) Windows'
+  Job Object *is* whole-tree containment and is materially stronger. Only a container / PID
   namespace + cgroup / dedicated supervisor actually contains a hostile descendant.
 - **Filesystem, identity, and credential isolation.** The worker runs as the **same OS user** in
   the host working directory, with no namespace, chroot, or allowlist. It can read/modify any file

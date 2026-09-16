@@ -27,6 +27,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import signal
 import sys
 from contextlib import redirect_stdout
 from typing import Any
@@ -140,18 +141,73 @@ def main() -> None:
     finally:
         sink.close()
 
+    # Decide the reply, then send it through ONE path (_finish) so the process-group sweep runs on
+    # EVERY post-tool outcome -- success, tool error, non-serializable output, over-budget, and the
+    # fail-closed rlimit refusal. A tool whose module scope spawned a background child and then blew
+    # up leaks today; the sweep must cover it too. (The pre-tool early returns above cannot have
+    # spawned anything, so they neither reach here nor need the sweep.)
     if not ok:
-        _respond_error(value, stream=real_stdout)
+        _finish(_respond_error, value, real_stdout)
         return
     try:
         encoded_size = len(canonical_json(value))
     except (TypeError, ValueError):
-        _respond_error("tool output is not JSON serializable", stream=real_stdout)
+        _finish(_respond_error, "tool output is not JSON serializable", real_stdout)
         return
     if encoded_size > max_output_bytes:
-        _respond_error("tool output exceeds output budget", stream=real_stdout)
+        _finish(_respond_error, "tool output exceeds output budget", real_stdout)
         return
-    _respond_ok(value, stream=real_stdout)
+    _finish(_respond_ok, value, real_stdout)
+
+
+def _finish(responder: Any, payload: Any, stream: Any) -> None:
+    """Send the reply, guarantee it is flushed to the pipe, then sweep the worker's process group.
+
+    The flush is redundant with the responder's own flush BUT deliberate: the sweep is an
+    unrecoverable SIGKILL, and flushed pipe bytes survive the sender's death while an unflushed
+    buffer does not -- so pay the extra flush before the sweep can never truncate the reply.
+    """
+    responder(payload, stream=stream)
+    try:
+        stream.flush()
+    except (OSError, ValueError):  # pragma: no cover - stream already closed
+        pass
+    _sweep_own_process_group()
+
+
+def _sweep_own_process_group() -> None:
+    """POSIX: SIGKILL the worker's own process group before it exits, to sweep any background child
+    the tool left in the group (the normal-exit leak: finding S7-#1's descendant-escape class).
+
+    The worker is its own session leader (the parent launches it with ``start_new_session``), so its
+    process group holds only its own descendants; signalling group 0 (the caller's group) reaps them.
+    This kills the worker too, so a SUCCESSFUL isolated tool exits by SIGKILL BY DESIGN -- the host
+    reads the JSON response from the pipe (already flushed above), never the worker's exit status.
+    Three residual limits, all documented: a child that called ``setsid()``/``start_new_session()``
+    is in its own group and escapes this sweep; a worker that dies before reaching here cannot run it;
+    and this sweep is only EFFECTIVE because the parent launches the worker with ``start_new_session``
+    (so the worker leads its own group) -- a launch path that omits that gets no sweep (the guard
+    below makes that safe, not merely inert). On Windows there is no ``killpg`` and the kill-on-close
+    Job Object already contains the tree, so this is a no-op.
+
+    CRITICAL safety guard: only sweep when this worker is its OWN process-group leader (pgid == pid),
+    which it is when the parent launched it with ``start_new_session`` (the real path) -- then group 0
+    holds only its descendants. If it is NOT the leader (the worker was run directly inside another
+    process's group, as a test harness or an unusual caller might), ``killpg(0)`` would signal THAT
+    foreign group. Never do that; skip the sweep instead. This makes the sweep safe regardless of how
+    the worker was started.
+    """
+    if not hasattr(os, "killpg") or not hasattr(os, "getpgrp"):
+        return
+    try:
+        if os.getpgrp() != os.getpid():
+            return
+    except OSError:  # pragma: no cover - platform dependent
+        return
+    try:
+        os.killpg(0, signal.SIGKILL)
+    except OSError:  # pragma: no cover - group already gone
+        pass
 
 
 def _import_and_run(

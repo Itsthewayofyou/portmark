@@ -254,9 +254,11 @@ platforms are NOT equivalent:
   `os.killpg` signals the worker's process group. A well-behaved descendant that
   stays in the group is reached; but a descendant that calls
   `setsid()`/`start_new_session()` moves to its own group and **escapes the signal
-  and keeps running**, and a background child left in the group after the leader
-  exits normally is only swept on a best-effort basis. So on POSIX the host does
-  **not** guarantee the tool and everything it spawned actually stop at the deadline.
+  and keeps running**. A background child left in the group after a **normal** worker
+  exit is swept at the source — the worker `SIGKILL`s its own process group before it
+  exits — so it no longer outlives a clean exit; the residual escapees are a `setsid()`
+  child and a worker that dies before it can sweep. So on POSIX the host still does
+  **not** guarantee the tool and everything it spawned actually stop.
 
 `register_isolated(..., side_effecting=True)` is allowed on both platforms because
 *a* termination primitive exists on both; it is **refused at registration** only on
@@ -267,9 +269,10 @@ tool's own idempotency/reconciliation, covered in DEPLOYMENT.md and THREAT_MODEL
 CI runs the isolated-tool descendant-kill, side-effecting, and kill-audit tests on
 both Linux and Windows.
 
-**Two honest limits.** (1) *Escape:* as above, on POSIX a `setsid()` descendant or a
-backgrounded child can outlive the termination — the group signal is cooperative.
-(2) *In-flight effect:* even where termination reaches the tool, it cannot undo a
+**Two honest limits.** (1) *Escape:* on POSIX a `setsid()` descendant escapes the
+group signal (a background child of a *normally-exiting* worker is swept by the
+worker itself, so the residual escapees are a `setsid()` child and a worker that dies
+before its sweep). (2) *In-flight effect:* even where termination reaches the tool, it cannot undo a
 side effect already sent when the deadline fires — a payment request already sent is
 already sent. When the host terminates a tool it audits `tool.killed` with
 `effect_status: "unknown"`, distinct from a clean `tool.failed`, so the audit trail

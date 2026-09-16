@@ -1174,6 +1174,9 @@ class RuntimeTests(unittest.TestCase):
         # REFUSE to run the tool (and name the cap), never run it under weaker caps than configured.
         # Driven at the worker's JSON protocol directly (a bogus cap key cannot pass ToolRegistry's
         # validation, so this is the honest way to exercise the worker's own fail-closed path).
+        # NOTE: this launches the worker WITHOUT start_new_session, so it shares this test's process
+        # group -- the exit-time group sweep therefore correctly no-ops (its getpgrp==getpid guard),
+        # and this test covers the fail-closed REPLY, not the sweep (that is test_normal_exit_sweeps_*).
         # CALIBRATION: with the old silent-skip, the bogus key is ignored, the valid file_size cap
         # applies, and echo runs -> {"ok": true, ...} instead of the refusal asserted here.
         import subprocess  # nosec B404
@@ -1236,6 +1239,50 @@ class RuntimeTests(unittest.TestCase):
             time.sleep(6.0)
             self.assertTrue(os.path.exists(marker + ".started"))
             self.assertFalse(os.path.exists(marker))
+
+    @unittest.skipUnless(_CAN_KILL_PROCESS_GROUP, "process-group sweep is POSIX-only")
+    def test_normal_exit_sweeps_background_child(self):
+        # PR 1b, CALIBRATED: a tool that spawns a background child and then RETURNS NORMALLY used to
+        # leave that child running (the worker exited cleanly, the parent's already-exited kill path
+        # early-returned). The worker now SIGKILLs its own process group before exiting, so the child
+        # dies too. Returns normally (no ToolKilledError). "started" proves the child ran; "alive"
+        # absent proves the sweep reached it.
+        # CALIBRATION: remove the _sweep_own_process_group() call -> the child survives its delay and
+        # writes "alive". (Proven by neutralizing the runner: see the gate ledger.)
+        registry = ToolRegistry()
+        registry.register_isolated(
+            "iso.bgspawn", "isolated_tool_fixtures:spawn_bg_child_then_return_normally", env=self._isolated_env()
+        )
+        permit = self._isolated_permit("iso.bgspawn")
+        with tempfile.TemporaryDirectory() as directory:
+            marker = os.path.join(directory, "bgchild-alive")
+            self.assertEqual(
+                registry.invoke(permit, "iso.bgspawn", {"marker": marker, "delay": 3.0}),
+                {"spawned": True},
+            )
+            time.sleep(4.5)  # past the child's +3.0s "alive" write
+            self.assertTrue(os.path.exists(marker + ".started"))
+            self.assertFalse(os.path.exists(marker))
+
+    @unittest.skipUnless(_CAN_KILL_PROCESS_GROUP, "process-group sweep is POSIX-only")
+    def test_setsid_child_escapes_normal_exit_sweep_documented_residual(self):
+        # PR 1b: pin the DOCUMENTED residual. A child that calls setsid() is in its own process
+        # group, so the worker's killpg(0) sweep cannot reach it -- "alive" DOES appear. This test
+        # exists so a future claim of whole-tree containment fails loudly here.
+        registry = ToolRegistry()
+        registry.register_isolated(
+            "iso.bgsetsid", "isolated_tool_fixtures:spawn_bg_child_then_return_normally", env=self._isolated_env()
+        )
+        permit = self._isolated_permit("iso.bgsetsid")
+        with tempfile.TemporaryDirectory() as directory:
+            marker = os.path.join(directory, "setsid-alive")
+            self.assertEqual(
+                registry.invoke(permit, "iso.bgsetsid", {"marker": marker, "delay": 2.0, "setsid": True}),
+                {"spawned": True},
+            )
+            time.sleep(3.5)  # past the child's +2.0s "alive" write
+            self.assertTrue(os.path.exists(marker + ".started"))
+            self.assertTrue(os.path.exists(marker))  # escaped the sweep -- documented residual
 
     @unittest.skipUnless(_has_tree_termination_primitive(), "requires a process-tree hard-kill primitive")
     def test_isolated_tool_kill_not_confirmed_fails_closed(self):
