@@ -1640,15 +1640,24 @@ class RuntimeTests(unittest.TestCase):
         self.assertNotEqual(base, effect_id("task", "refund", {"amount": 5}, 0))  # tool distinguishes
 
     def test_sqlite_v9_to_v10_adds_tool_effects(self):
+        # Section 7 PR 2a (G2, upgrade path). An existing v9 SQLite store opened by v10 code migrates
+        # to v10 and gains the tool_effects table -- the path a real deployment takes.
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runtime.sqlite"
-            SQLiteRuntimeStore(path)  # migrates a fresh store to v10
-            import sqlite3
-            with sqlite3.connect(path) as connection:
-                version = connection.execute("PRAGMA user_version").fetchone()[0]
-                names = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            self.assertEqual(version, 10)
-            self.assertIn("tool_effects", names)
+            SQLiteRuntimeStore(path)  # build a full v10 store, then roll it back to look like v9
+            with self._raw_sqlite(str(path)) as connection:
+                connection.execute("DROP TABLE tool_effects")
+                connection.execute("PRAGMA user_version = 9")
+            with self._raw_sqlite(str(path)) as connection:
+                self.assertEqual(int(connection.execute("PRAGMA user_version").fetchone()[0]), 9)
+
+            store = SQLiteRuntimeStore(path)  # v10 code opens a v9 db -> migrates
+            with self._raw_sqlite(str(path)) as connection:
+                self.assertEqual(int(connection.execute("PRAGMA user_version").fetchone()[0]), SQLITE_SCHEMA_VERSION)
+                self.assertIsNotNone(connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='tool_effects'").fetchone())
+            store.record_effect_prepared("e1", "t1", "pay", "{}")
+            self.assertEqual(store.get_effect("e1")["state"], "prepared")
 
     def test_constrained_grant_denies_unknown_arguments_without_an_explicit_flag(self):
         # Regression: a grant that constrains ANY argument thereby whitelists the
