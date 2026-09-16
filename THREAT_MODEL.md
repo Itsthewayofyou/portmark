@@ -68,12 +68,17 @@ What Portmark's runtime **does NOT** do — these are the deployment's responsib
 - **Network isolation.** The worker has unrestricted outbound network, loopback, link-local and
   metadata endpoints, Unix sockets, and DNS. A deadline limits duration, not destinations.
 
-**Target contract (not yet enforced).** The intended requirement is that a tool registered
-`side_effecting=True` must (a) implement Portmark's idempotency/reconciliation contract and (b) run
-under an operator-acknowledged isolation profile appropriate to the deployment. **Today the runtime
-does not enforce (a) or (b)** — `register_isolated` only checks that a process-tree termination
-primitive exists. The idempotency/reconciliation contract and the acknowledgment startup gate land
-with the Section 7 follow-up PRs. The deployment isolation profile (non-root, read-only root, private
+**Target contract (mechanism shipped; mandatory enforcement pending).** The intended requirement is
+that a tool registered `side_effecting=True` must (a) implement Portmark's idempotency/reconciliation
+contract and (b) run under an operator-acknowledged isolation profile appropriate to the deployment.
+As of Section 7 **PR 2a**, the runtime PROVIDES (a): a side-effecting isolated tool runs under a
+durable effect ledger (effect id derived per call, recorded before launch; `confirmed` effects replay
+instead of re-running; `unknown` effects are never auto-retried and are resolved by
+`AgentHost.reconcile_effect`), and the tool receives the effect id as its idempotency key. What is
+**not yet enforced** is that (a) and (b) are MANDATORY: `register_isolated` still accepts a
+`side_effecting=True` tool without a `reconcile` function and without an acknowledged isolation
+profile (it only checks that a process-tree termination primitive exists). That startup gate lands
+with **PR 2b**. The deployment isolation profile (non-root, read-only root, private
 writable dir, dropped capabilities, `no-new-privileges`, PID/memory/CPU limits, restricted `/proc`,
 default-deny egress) is **documented as a requirement in DEPLOYMENT.md**; an executable, tested
 profile ships with the follow-up. Portmark does not configure or detect a supervisor today, so its

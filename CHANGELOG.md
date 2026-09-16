@@ -6,6 +6,34 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Section 7 — tool execution isolation (PR 2a): idempotency/reconciliation effect ledger
+
+- **Side-effecting isolated tools now run under a durable effect ledger** (new `tool_effects` table;
+  SQLite schema v10, Postgres schema v8) so a crash-and-resume never re-applies an external effect it
+  cannot be sure landed. The host derives an **effect id** — `hash(task_id, tool, canonical arguments,
+  per-call sequence)` — records a `prepared` row before launch, advances it to `started` immediately
+  before the tool runs, and settles it afterward: `confirmed` on success (the result is stored and a
+  later identical call **replays** it instead of re-running), `unknown` on a deadline kill, a clean
+  tool error, or a non-serializable result (the effect may have landed before the failure). On resume
+  the host replays a `confirmed` effect, proceeds for a `prepared` one (never launched), and **refuses**
+  a `started`/`unknown`/`reconciled` one — it **never auto-retries** an unknown effect.
+- **The effect id is bound to the per-call sequence, not the checkpoint generation.** The sequence is
+  `state.tool_calls`, which is monotonic per task, never reset, and rebound from the durable checkpoint
+  on resume — so the same logical call re-derives the same id and a distinct call cannot collide with
+  it. It is deliberately not bound to the admission generation (which identifies the *run*, not the
+  call, and would differ across a resume).
+- **Side-effecting tools receive the effect id as an idempotency key.** The isolated worker calls a
+  side-effecting tool as `tool(arguments, effect_id)` (the id travels in the request envelope, outside
+  `arguments`, so the argument-name allowlist does not reject it); the tool must use it as its external
+  idempotency key. A tool that does not accept the parameter is failed with a controlled
+  `tool does not accept effect_id` and is never called (never called twice).
+- **Reconciliation API.** `AgentHost.reconcile_effect(effect_id, task_id)` (task-scoped) resolves an
+  `unknown` effect by running the tool's registered `reconcile` function
+  (`reconcile(arguments, effect_id) -> {"landed": bool, "result"?: ...}`): a landed effect settles to
+  `confirmed`, a not-landed effect to `reconciled`. The host never auto-retries; the operator drives it.
+- Making the `reconcile` contract and an acknowledged isolation profile **mandatory** at registration
+  for `side_effecting=True` is the immediately following change (Section 7 PR 2b).
+
 ### Section 7 — tool execution isolation (PR 1b)
 
 - **The normal-exit background-child leak is closed at the source.** A tool that spawned a background

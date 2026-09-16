@@ -128,6 +128,9 @@ class ToolKilledError(ToolExecutionError):
 class _IsolatedSpec:
     target: str
     env: dict[str, str] = field(default_factory=dict)
+    # Section 7 PR 2: a module:function the host runs (isolated, with the effect_id) to determine
+    # whether a side-effecting tool's external effect actually landed, for the reconcile pass.
+    reconcile: str | None = None
 
 
 class ToolRegistry:
@@ -183,6 +186,7 @@ class ToolRegistry:
         max_output_bytes: int | None = None,
         side_effecting: bool = False,
         env: dict[str, str] | None = None,
+        reconcile: str | None = None,
     ) -> None:
         """Register a tool that runs in a separate, deadline-terminated subprocess (EV-002).
 
@@ -204,6 +208,10 @@ class ToolRegistry:
         module_name, separator, object_path = target.partition(":")
         if not separator or not module_name or not object_path:
             raise ValueError("register_isolated target must use module:function syntax")
+        if reconcile is not None:
+            r_module, r_sep, r_object = reconcile.partition(":")
+            if not r_sep or not r_module or not r_object:
+                raise ValueError("register_isolated reconcile must use module:function syntax")
         if side_effecting and not _has_tree_termination_primitive():
             # Fail closed at startup, not at the first payment: on a platform with no
             # tree-kill primitive the host cannot guarantee the tool and its descendants
@@ -213,7 +221,7 @@ class ToolRegistry:
                 "process tree, so the host cannot guarantee it stops at its deadline; refusing "
                 "to register it. Non-side-effecting isolated tools are allowed."
             )
-        self._isolated[name] = _IsolatedSpec(target=target, env=dict(env or {}))
+        self._isolated[name] = _IsolatedSpec(target=target, env=dict(env or {}), reconcile=reconcile)
         self._tools.pop(name, None)
         if timeout is not None:
             self._timeouts[name] = timeout
@@ -222,10 +230,36 @@ class ToolRegistry:
         if side_effecting:
             self._side_effecting.add(name)
 
+    def is_side_effecting(self, name: str) -> bool:
+        """Whether the tool is registered side-effecting (the host wraps it in the effect ledger)."""
+        return name in self._side_effecting
+
+    def is_isolated(self, name: str) -> bool:
+        """Whether the tool runs in an isolated worker (the only path that can carry an effect_id)."""
+        return name in self._isolated
+
+    def has_reconcile(self, name: str) -> bool:
+        """Whether an isolated tool has a reconcile function registered (Section 7 PR 2)."""
+        spec = self._isolated.get(name)
+        return spec is not None and spec.reconcile is not None
+
+    def reconcile(self, name: str, arguments: dict[str, Any], effect_id: str) -> Any:
+        """Run a tool's registered reconcile function (isolated, with the effect_id) to determine
+        whether its external effect landed. Host-invoked during the reconcile pass -- NOT an
+        agent-facing tool call, so it does not go through the permit/constraint check. Returns the
+        reconcile function's result (by contract, a dict like {"landed": bool, "result"?: ...})."""
+        spec = self._isolated.get(name)
+        if spec is None or spec.reconcile is None:
+            raise ToolExecutionError(f"tool {name!r} has no reconcile function registered")
+        reconcile_spec = _IsolatedSpec(target=spec.reconcile, env=dict(spec.env))
+        timeout = self._timeouts.get(name, self.default_timeout)
+        cap = self._max_output.get(name, self.max_output_bytes)
+        return self._invoke_isolated(reconcile_spec, arguments, timeout, cap, effect_id=effect_id)
+
     def names(self) -> tuple[str, ...]:
         return tuple(sorted(set(self._tools) | set(self._isolated)))
 
-    def invoke(self, permit: Permit, name: str, arguments: dict[str, Any], max_output_bytes: int | None = None) -> Any:
+    def invoke(self, permit: Permit, name: str, arguments: dict[str, Any], max_output_bytes: int | None = None, effect_id: str | None = None) -> Any:
         grant = next((grant for grant in permit.grants if grant.name == name), None)
         if grant is None:
             # Only the effective permit is visible here, so this cannot say which
@@ -244,7 +278,7 @@ class ToolRegistry:
         cap = max_output_bytes if max_output_bytes is not None else self._max_output.get(name, self.max_output_bytes)
 
         if is_isolated:
-            return self._invoke_isolated(self._isolated[name], arguments, timeout, cap)
+            return self._invoke_isolated(self._isolated[name], arguments, timeout, cap, effect_id=effect_id)
 
         if name in self._side_effecting:
             # Finding #3 / EV-002: the thread + queue-timeout path below cannot
@@ -298,15 +332,24 @@ class ToolRegistry:
             raise ToolExecutionError("tool execution failed") from value
         return self._checked_output(value, cap)
 
-    def _invoke_isolated(self, spec: _IsolatedSpec, arguments: dict[str, Any], timeout: float, cap: int) -> Any:
+    def _invoke_isolated(
+        self, spec: _IsolatedSpec, arguments: dict[str, Any], timeout: float, cap: int, effect_id: str | None = None
+    ) -> Any:
         # Section 7 #6: hand the worker its resource caps. cpu_seconds is a kernel backstop for the
         # wall-clock deadline (a CPU-bound tool that ignores the clock still dies), set a little
         # above the timeout so it never fires before the host's own deadline does.
         rlimits = dict(self.resource_limits)
         if "cpu_seconds" not in rlimits:
             rlimits["cpu_seconds"] = int(timeout) + 2
-        request = json.dumps(
-            {"target": spec.target, "arguments": arguments, "max_output_bytes": cap, "rlimits": rlimits}
+        payload: dict[str, Any] = {
+            "target": spec.target, "arguments": arguments, "max_output_bytes": cap, "rlimits": rlimits
+        }
+        # Section 7 PR 2: side-effecting tools (and their reconcile fns) receive a host-derived
+        # idempotency key OUTSIDE `arguments` -- the deny-by-default argument-name whitelist in
+        # check_constraints would reject an injected key. The worker passes it as tool(arguments, effect_id).
+        if effect_id is not None:
+            payload["effect_id"] = effect_id
+        request = json.dumps(payload
         ).encode("utf-8")
         try:
             tree = _launch_process_tree(

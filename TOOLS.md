@@ -318,6 +318,62 @@ empty dict; the CPU-time backstop still applies.
 > these limits apply, so this refusal only fires on a genuinely unsupported platform
 > or an impossible value.
 
+## Side-Effecting Tools And The Effect Ledger
+
+A tool registered `side_effecting=True` (which must be isolated) runs under a durable **effect
+ledger** so a crash-and-resume never re-applies an external effect it cannot be sure landed.
+
+**How it works.** Before the tool launches, the host derives an **effect id** — a hash of
+`(task_id, tool, canonical arguments, per-call sequence)` — and records a `prepared` row, then
+advances it to `started` immediately before launch. After the call it settles the row:
+
+- **success → `confirmed`** (the result is stored; a later identical call *replays* it instead of
+  running the tool again);
+- **killed at the deadline → `unknown`**, and a **clean tool error → `unknown` too** — because the
+  effect may have landed before the tool reported failure;
+- a non-serializable result → `unknown`.
+
+On a resume, the same logical call re-derives the **same** effect id (the sequence is the
+per-task `tool_calls`, rebound from the durable checkpoint, monotonic and never reset — it is
+deliberately **not** bound to the checkpoint generation, which identifies the run, not the call).
+The host then: replays a `confirmed` effect; proceeds for a `prepared` row (a prior attempt never
+launched); and **refuses** a `started`/`unknown`/`reconciled` row — it **never auto-retries** an
+effect whose status is unknown, because a second run could double a real effect.
+
+**The tool contract.** A side-effecting tool is called as `tool(arguments, effect_id)` and **must
+use the `effect_id` as its idempotency key** with the external system (e.g. a payment idempotency
+key), so that even a retry it does see cannot double the effect. A tool that does not accept a
+second parameter is failed with a controlled `tool does not accept effect_id` and never called.
+
+```python
+def charge(arguments: dict, effect_id: str) -> dict:
+    return payment_api.charge(arguments["amount"], idempotency_key=effect_id)
+
+tools.register_isolated(
+    "billing.charge", "mytools:charge",
+    side_effecting=True,
+    reconcile="mytools:reconcile_charge",  # queries whether the effect landed
+)
+```
+
+**Reconciliation.** An `unknown` effect is resolved by `AgentHost.reconcile_effect(effect_id,
+task_id)` (task-scoped: the effect must belong to that task). It runs the tool's registered
+`reconcile` function — `reconcile(arguments, effect_id) -> {"landed": bool, "result"?: ...}` —
+which asks the external system whether the effect landed: a landed effect settles to `confirmed`
+(with the reconciled result), a not-landed effect to `reconciled` (terminal; a retry is a fresh
+call). The host never auto-retries; the operator drives reconciliation.
+
+> **Known cost.** The `started` state is settled `unknown` on resume even if the tool never
+> actually launched (a crash in the microsecond window between the durable `started` write and the
+> launch). That is the conservative choice — an operator pays one reconcile round-trip for an
+> effect that did not happen, rather than the host silently assuming it did not and re-running.
+
+> **Not yet enforced here.** PR 2a ships the ledger and the reconcile mechanism; making the
+> `reconcile` contract and an acknowledged isolation profile **mandatory** at registration for
+> `side_effecting=True` is the immediately following change (Section 7 PR 2b). Until then a
+> side-effecting tool may be registered without a `reconcile` function, and its `unknown` effects
+> cannot be reconciled.
+
 ## Credential Handling
 
 Tools may use local credentials internally, but returned data is audit material

@@ -16,8 +16,8 @@ from .models import AgentState
 from .security import AUDIT_HASH_VERSION, AuditHeadVerifier, SecurityError, _audit_head_payload_for, audit_event_record, canonical_json
 
 
-SQLITE_SCHEMA_VERSION = 9
-POSTGRES_SCHEMA_VERSION = 7
+SQLITE_SCHEMA_VERSION = 10
+POSTGRES_SCHEMA_VERSION = 8
 
 # Section 4 #3: a migration lease is bounded. Zero/negative would defeat exclusivity (two workers
 # could claim the same row at the same instant); an unbounded lease would let a dead worker hold a
@@ -147,6 +147,30 @@ class RuntimeStore(Protocol):
 
     def is_task_cancelled(self, task_id: str) -> bool:
         """Whether a task is durably cancelled (non-transactional read for the pre-launch re-check)."""
+        ...
+
+    # Effect ledger (Section 7 PR 2): durable idempotency/reconciliation record for one side-effecting
+    # tool invocation, keyed by a host-derived effect_id. Persisted BEFORE the tool launches so a
+    # crash-and-resume can tell "never launched" (prepared) from "may have landed" (started).
+    def get_effect(self, effect_id: str) -> dict[str, Any] | None:
+        """The ledger row for effect_id, or None. Keys: effect_id, task_id, tool, state,
+        arguments_json, result_json, reason, created_at, updated_at."""
+        ...
+
+    def record_effect_prepared(self, effect_id: str, task_id: str, tool: str, arguments_json: str) -> None:
+        """Insert a `prepared` effect row if none exists (idempotent on effect_id). Records intent to
+        run a side-effecting tool BEFORE launch; `prepared` means it has not launched yet."""
+        ...
+
+    def mark_effect_started(self, effect_id: str) -> None:
+        """Transition a `prepared` effect row to `started`, durably, immediately before the tool
+        launches. A crash while `started` is treated as `unknown` (the effect may have landed)."""
+        ...
+
+    def settle_effect(self, effect_id: str, state: str, result_json: str | None, reason: str | None) -> None:
+        """Settle a `started` effect to a terminal-ish state: `confirmed` (success, with result_json),
+        `unknown` (killed / errored / crashed while started), or `reconciled` (reconcile determined the
+        effect did not land). Idempotent overwrite of state/result/reason with a fresh updated_at."""
         ...
 
     def consumed_nonce_exists(self, nonce: str) -> bool:
@@ -287,6 +311,7 @@ class InMemoryRuntimeStore:
         # approval transaction (which holds self._lock for its whole duration, so a concurrent
         # cancel cannot interleave with a redeem) and again before the tool launches.
         self._cancelled: set[str] = set()
+        self._effects: dict[str, dict[str, Any]] = {}
         self._audit_head_verifier: AuditHeadVerifier | None = None
         # Section 4 #3: the lease clock is a CONSTRUCTION dependency, never a per-call parameter --
         # so a caller of claim/release/dead_letter cannot pass a forged "now" to steal a live lease.
@@ -321,6 +346,38 @@ class InMemoryRuntimeStore:
     def is_task_cancelled(self, task_id: str) -> bool:
         with self._lock:
             return task_id in self._cancelled
+
+    def get_effect(self, effect_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._effects.get(effect_id)
+            return None if row is None else dict(row)
+
+    def record_effect_prepared(self, effect_id: str, task_id: str, tool: str, arguments_json: str) -> None:
+        now = int(time.time())
+        with self._lock:
+            if effect_id in self._effects:
+                return
+            self._effects[effect_id] = {
+                "effect_id": effect_id, "task_id": task_id, "tool": tool, "state": "prepared",
+                "arguments_json": arguments_json, "result_json": None, "reason": None,
+                "created_at": now, "updated_at": now,
+            }
+
+    def mark_effect_started(self, effect_id: str) -> None:
+        with self._lock:
+            row = self._effects.get(effect_id)
+            if row is not None and row["state"] == "prepared":
+                row["state"] = "started"
+                row["updated_at"] = int(time.time())
+
+    def settle_effect(self, effect_id: str, state: str, result_json: str | None, reason: str | None) -> None:
+        with self._lock:
+            row = self._effects.get(effect_id)
+            if row is not None:
+                row["state"] = state
+                row["result_json"] = result_json
+                row["reason"] = reason
+                row["updated_at"] = int(time.time())
 
     def mark_migration_delivered(self, task_id: str, receipt_json: str) -> None:
         with self._lock:
@@ -643,6 +700,7 @@ class SQLiteRuntimeStore:
             6: self._migrate_to_v7,
             7: self._migrate_to_v8,
             8: self._migrate_to_v9,
+            9: self._migrate_to_v10,
         }
         migration = migrations.get(version)
         if migration is None:
@@ -814,6 +872,30 @@ class SQLiteRuntimeStore:
             """
         )
 
+    def _migrate_to_v10(self, connection: sqlite3.Connection) -> None:
+        # Section 7 PR 2: the effect ledger. One row per side-effecting tool invocation, keyed by a
+        # host-derived effect_id, written BEFORE the tool launches (prepared -> started) so a
+        # crash-and-resume can tell "never launched" from "may have landed". State machine:
+        # prepared | started | confirmed | unknown | reconciled. arguments_json is kept so the
+        # reconcile pass can re-query the external system; result_json holds a confirmed result.
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS tool_effects (
+                effect_id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                tool TEXT NOT NULL,
+                state TEXT NOT NULL,
+                arguments_json TEXT NOT NULL,
+                result_json TEXT,
+                reason TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_tool_effects_task ON tool_effects (task_id);
+            PRAGMA user_version = 10;
+            """
+        )
+
     def transaction(self) -> AbstractContextManager[RuntimeTransaction]:
         return _SQLiteTransaction(self)
 
@@ -864,6 +946,45 @@ class SQLiteRuntimeStore:
                 (task_id,),
             ).fetchone()
         return row is not None
+
+    def get_effect(self, effect_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT effect_id, task_id, tool, state, arguments_json, result_json, reason, "
+                "created_at, updated_at FROM tool_effects WHERE effect_id = ?",
+                (effect_id,),
+            ).fetchone()
+        return None if row is None else dict(row)
+
+    def record_effect_prepared(self, effect_id: str, task_id: str, tool: str, arguments_json: str) -> None:
+        # Idempotent on effect_id: a prepared row for a call already recorded is left as-is (the
+        # host checks state first). Presence of a prepared row means "intent recorded, not launched".
+        now = int(time.time())
+        with self._connection() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO tool_effects "
+                "(effect_id, task_id, tool, state, arguments_json, result_json, reason, created_at, updated_at) "
+                "VALUES (?, ?, ?, 'prepared', ?, NULL, NULL, ?, ?)",
+                (effect_id, task_id, tool, arguments_json, now, now),
+            )
+
+    def mark_effect_started(self, effect_id: str) -> None:
+        # Only advance a prepared row to started (durable, right before launch). A row already
+        # started/settled is not moved back.
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE tool_effects SET state = 'started', updated_at = ? "
+                "WHERE effect_id = ? AND state = 'prepared'",
+                (int(time.time()), effect_id),
+            )
+
+    def settle_effect(self, effect_id: str, state: str, result_json: str | None, reason: str | None) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE tool_effects SET state = ?, result_json = ?, reason = ?, updated_at = ? "
+                "WHERE effect_id = ?",
+                (state, result_json, reason, int(time.time()), effect_id),
+            )
 
     def record_migration_attempt(self, task_id: str, worker_id: str | None = None) -> None:
         moment = self._clock()
@@ -1241,6 +1362,24 @@ class PostgresRuntimeStore:
         )
         connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS tool_effects (
+                effect_id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                tool TEXT NOT NULL,
+                state TEXT NOT NULL,
+                arguments_json TEXT NOT NULL,
+                result_json TEXT,
+                reason TEXT,
+                created_at BIGINT NOT NULL,
+                updated_at BIGINT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tool_effects_task ON tool_effects (task_id)"
+        )
+        connection.execute(
+            """
             INSERT INTO portmark_schema (singleton, version)
             VALUES (TRUE, %s)
             ON CONFLICT (singleton) DO UPDATE SET version = EXCLUDED.version
@@ -1306,6 +1445,45 @@ class PostgresRuntimeStore:
                 (task_id,),
             ).fetchone()
         return row is not None
+
+    def get_effect(self, effect_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT effect_id, task_id, tool, state, arguments_json, result_json, reason, "
+                "created_at, updated_at FROM tool_effects WHERE effect_id = %s",
+                (effect_id,),
+            ).fetchone()
+        return None if row is None else dict(row)
+
+    def record_effect_prepared(self, effect_id: str, task_id: str, tool: str, arguments_json: str) -> None:
+        # Keyed by the effect_id PRIMARY KEY; idempotent on it. The host serializes effect writes per
+        # task in its run loop, so no per-task advisory lock is needed (unlike cancellation, which
+        # races the approval redemption).
+        now = int(time.time())
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO tool_effects "
+                "(effect_id, task_id, tool, state, arguments_json, result_json, reason, created_at, updated_at) "
+                "VALUES (%s, %s, %s, 'prepared', %s, NULL, NULL, %s, %s) "
+                "ON CONFLICT (effect_id) DO NOTHING",
+                (effect_id, task_id, tool, arguments_json, now, now),
+            )
+
+    def mark_effect_started(self, effect_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE tool_effects SET state = 'started', updated_at = %s "
+                "WHERE effect_id = %s AND state = 'prepared'",
+                (int(time.time()), effect_id),
+            )
+
+    def settle_effect(self, effect_id: str, state: str, result_json: str | None, reason: str | None) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE tool_effects SET state = %s, result_json = %s, reason = %s, updated_at = %s "
+                "WHERE effect_id = %s",
+                (state, result_json, reason, int(time.time()), effect_id),
+            )
 
     # Section 4 #3 (round 3): every lease comparison and every new-lease expiry on Postgres is
     # computed from DATABASE time -- EXTRACT(EPOCH FROM clock_timestamp())::bigint -- NOT the

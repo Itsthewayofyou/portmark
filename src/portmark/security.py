@@ -1086,6 +1086,37 @@ def arguments_hash(arguments: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_json(arguments)).hexdigest()
 
 
+def effect_id(task_id: str, tool: str, arguments: dict[str, Any], sequence: int) -> str:
+    """Host-derived idempotency key for one side-effecting tool invocation (Section 7 PR 2).
+
+    Deterministic over the identity of the *logical* call, so a genuine retry re-derives the SAME id
+    and is deduplicated by the effect ledger, while a distinct later call gets a distinct id and is
+    never collapsed into the first.
+
+    STABILITY (the whole correctness proof): `sequence` is the pre-increment `state.tool_calls` at the
+    call site. `tool_calls` is monotonic per task and never reset, and on a RESUME it is rebound from
+    the DURABLE checkpoint (`state.tool_calls = int(stored["tool_calls"])`), not the caller-asserted
+    envelope -- so the same logical call re-derives this id across a crash-and-resume, and a distinct
+    call (a later, higher `tool_calls`) cannot collide with it. It is deliberately NOT bound to the
+    checkpoint generation: `admission_generation` is captured once per RUN, so it identifies the run,
+    not the call, and would differ across a resume (a different run) for any call after the first --
+    binding it would make the ledger decorative. `sequence` already provides both uniqueness and
+    resume-stability, so generation adds nothing and only re-introduces instability.
+
+    The id also binds the ARGUMENTS: `(task, sequence)` identifies one call, and binding the arguments
+    too means a non-deterministic provider that re-proposes the SAME sequence with DIFFERENT arguments
+    on a resume is treated as a DISTINCT effect (it runs), leaving the abandoned attempt's row for the
+    reconcile pass -- "same inputs => same effect" is the intended idempotency property.
+    """
+    material = {
+        "task_id": task_id,
+        "tool": tool,
+        "arguments_hash": arguments_hash(arguments),
+        "sequence": sequence,
+    }
+    return hashlib.sha256(canonical_json(material)).hexdigest()
+
+
 class ApprovalAuthority:
     def __init__(self, key_id: str, approver: str, private_key: Ed25519PrivateKey) -> None:
         self.key_id = key_id

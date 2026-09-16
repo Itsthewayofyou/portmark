@@ -25,6 +25,7 @@ hostile tool can write to fd 1 directly, past the Python-level redirect.
 from __future__ import annotations
 
 import importlib
+import inspect
 import json
 import os
 import signal
@@ -112,6 +113,10 @@ def main() -> None:
     if not isinstance(target, str) or not isinstance(arguments, dict) or max_output_bytes < 1:
         _respond_error("invalid request")
         return
+    effect_id = request.get("effect_id")  # Section 7 PR 2: optional idempotency key for side-effecting tools
+    if effect_id is not None and not isinstance(effect_id, str):
+        _respond_error("invalid request")
+        return
 
     module_name, separator, object_path = target.partition(":")
     if not separator or not module_name or not object_path:
@@ -137,7 +142,7 @@ def main() -> None:
         if unapplied:
             ok, value = False, "worker could not apply resource limits: " + ", ".join(unapplied)
         else:
-            ok, value = _import_and_run(module_name, object_path, arguments, sink)
+            ok, value = _import_and_run(module_name, object_path, arguments, sink, effect_id)
     finally:
         sink.close()
 
@@ -211,8 +216,26 @@ def _sweep_own_process_group() -> None:
         pass
 
 
+def _accepts_effect_id(fn: Any) -> bool:
+    """Whether `fn` can be called as fn(arguments, effect_id) -- i.e. it takes a second positional
+    parameter or accepts *args. Used to check the side-effecting-tool contract BEFORE the call, so a
+    tool that does not accept the effect_id fails with a controlled reply and is NEVER called twice
+    (a second call would double a real side effect)."""
+    try:
+        signature = inspect.signature(fn)
+    except (TypeError, ValueError):  # pragma: no cover - C builtins etc.
+        return False
+    positional = 0
+    for parameter in signature.parameters.values():
+        if parameter.kind in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD):
+            positional += 1
+        elif parameter.kind == parameter.VAR_POSITIONAL:
+            return True
+    return positional >= 2
+
+
 def _import_and_run(
-    module_name: str, object_path: str, arguments: dict[str, Any], sink: Any
+    module_name: str, object_path: str, arguments: dict[str, Any], sink: Any, effect_id: str | None = None
 ) -> tuple[bool, Any]:
     """Import the untrusted tool and run it, with Python stdout redirected to a discard sink.
 
@@ -237,8 +260,13 @@ def _import_and_run(
             return False, f"tool import raised {type(error).__name__}"
         if not callable(loaded):
             return False, "tool target is not callable"
+        if effect_id is not None and not _accepts_effect_id(loaded):
+            # Contract violation for a side-effecting tool: fail closed with a controlled reply,
+            # never call it (a call without the key, or a double call, could mis-apply the effect).
+            return False, "tool does not accept effect_id"
         try:
-            return True, loaded(arguments)
+            result = loaded(arguments, effect_id) if effect_id is not None else loaded(arguments)
+            return True, result
         except BaseException as error:  # noqa: BLE001 - any tool failure fails closed
             return False, f"tool raised {type(error).__name__}"
 
