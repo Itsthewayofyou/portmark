@@ -8916,6 +8916,40 @@ class HttpProviderTransportTests(unittest.TestCase):
                 results = list(pool.map(call, range(48)))
         self.assertEqual(results, ["complete"] * 48)
 
+    def test_pool_wait_and_worker_share_one_absolute_deadline(self):  # G27 (CALIBRATED)
+        # The slot wait and the worker join must draw from ONE absolute deadline: time spent waiting for
+        # a slot must not be re-spent in the join, or a contended call takes up to twice its timeout.
+        import portmark.providers as providers_module
+
+        def drip(handler):
+            # Dribble header bytes forever: the per-phase socket arm resets on each byte, so ONLY the
+            # join bounds the worker -- which is where the acquire/join double-spend would show.
+            raw = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"
+            for byte in raw:
+                try:
+                    handler.wfile.write(bytes([byte]))
+                    handler.wfile.flush()
+                except OSError:
+                    return
+                time.sleep(0.05)
+
+        real_acquire = providers_module._TRANSACTION_SLOTS.acquire
+
+        def slow_acquire(*_args, **_kwargs):
+            time.sleep(0.3)  # consume most of the 0.4s budget waiting for a slot
+            return real_acquire(blocking=False)  # actually take a slot so the worker's release balances
+
+        with local_provider_server(drip) as (_server, url):
+            provider = self._provider(url, timeout=0.4)
+            with patch.object(providers_module._TRANSACTION_SLOTS, "acquire", side_effect=slow_acquire):
+                started = time.monotonic()
+                with self.assertRaises(ProviderError):
+                    provider.decide(AgentState("task", "goal"), ())
+                elapsed = time.monotonic() - started
+        # ~one deadline (0.4), NOT acquire(0.3) + a fresh join(0.4) = 0.7 (calibration: the pre-fix code
+        # passes self.timeout to the join and lands near 0.7).
+        self.assertLess(elapsed, 0.6)
+
     def test_ipv6_host_header_is_bracketed(self):  # G19
         self.assertEqual(GenericHttpProvider("https://[::1]/run", allow_local_endpoint=True)._host_header, "[::1]")
         self.assertEqual(GenericHttpProvider("http://[::1]:8080/run", allow_local_endpoint=True)._host_header, "[::1]:8080")

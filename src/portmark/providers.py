@@ -232,8 +232,11 @@ class GenericHttpProvider(ModelProvider):
         # Acquire with a bounded WAIT, not a hard refusal: a healthy burst above the pool size waits a
         # moment for a fast completion to free a slot, and only genuinely-stalled accumulation (the pool
         # full of lingering DNS/TLS-drip leaks) is refused. The slot is released by the worker thread's
-        # finally, so a leaked thread holds its slot until it finally dies.
-        if not _TRANSACTION_SLOTS.acquire(timeout=max(0.0, self.timeout)):
+        # finally, so a leaked thread holds its slot until it finally dies. Both this wait AND the join
+        # below are bounded by the SAME absolute deadline -- otherwise time spent waiting for a slot
+        # would be spent AGAIN in the join, letting a contended call take up to twice its timeout.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not _TRANSACTION_SLOTS.acquire(timeout=remaining):
             raise ProviderError("provider transaction pool exhausted (too many stalled requests in flight)")
         holder: dict[str, Any] = {}
         result: dict[str, Any] = {}
@@ -248,7 +251,7 @@ class GenericHttpProvider(ModelProvider):
 
         thread = threading.Thread(target=_run, daemon=True)
         thread.start()
-        thread.join(timeout=max(0.0, self.timeout))
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))  # remaining budget, not a fresh timeout
         if thread.is_alive():
             connection = holder.get("connection")
             if connection is not None:
