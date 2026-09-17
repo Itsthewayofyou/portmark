@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from . import _windows_job
+from . import _windows_job, safe_paths
 from .models import Permit
 from .security import SecurityError, canonical_json, check_constraints
 
@@ -230,6 +230,7 @@ class ToolRegistry:
         resource_limits: dict[str, int] | None = None,
         disable_resource_limits: bool = False,
         isolation_profile: IsolationProfile | None = None,
+        filesystem_root: str | None = None,
     ) -> None:
         # Section 7 PR 2b: the operator's containment acknowledgement for side-effecting tools.
         # None means "not acknowledged" -- registering a side-effecting isolated tool then fails
@@ -239,6 +240,15 @@ class ToolRegistry:
         if isolation_profile is not None and not isinstance(isolation_profile, IsolationProfile):
             raise ValueError("isolation_profile must be an IsolationProfile or None")
         self._isolation_profile = isolation_profile
+        # Section 7 PR 3: the pre-opened root for the capability-based safe-path helper. When set,
+        # every isolated worker inherits an open descriptor to THIS directory (via pass_fds +
+        # PORTMARK_ROOT_FD), and the tool reaches it only through safe_paths.SafeRoot.from_runtime().
+        # The tool never names the root -- the runtime opens it -- so a tool cannot widen its own
+        # filesystem authority. None means no ambient filesystem authority is granted; from_runtime()
+        # then refuses. The descriptor is passed only on POSIX, where openat2(RESOLVE_BENEATH) exists.
+        if filesystem_root is not None and not os.path.isdir(filesystem_root):
+            raise ValueError(f"filesystem_root must be an existing directory: {filesystem_root!r}")
+        self._filesystem_root = filesystem_root
         self._tools: dict[str, Tool] = {}
         self._isolated: dict[str, _IsolatedSpec] = {}
         self._timeouts: dict[str, float] = {}
@@ -484,6 +494,14 @@ class ToolRegistry:
         the claimed containment on an effect-unknown audit event."""
         return self._isolation_profile
 
+    @property
+    def filesystem_root(self) -> str | None:
+        """The pre-opened root granted to isolated tools via the safe-path capability, or None if
+        no ambient filesystem authority is granted (Section 7 PR 3). Read-only; set once at
+        construction. When set, each isolated worker inherits an open descriptor to this directory
+        and reaches it only through safe_paths.SafeRoot.from_runtime()."""
+        return self._filesystem_root
+
     def _assert_isolation_profile(self, name: str) -> None:
         """Fail closed unless the deployment's IsolationProfile is acknowledged AND its mechanism is
         appropriate for this platform (Section 7 PR 2b). Name-agnostic to the tool's reconcile state,
@@ -671,13 +689,38 @@ class ToolRegistry:
             payload["effect_id"] = effect_id
         request = json.dumps(payload
         ).encode("utf-8")
+        # Section 7 PR 3: when a filesystem_root is configured, pre-open it HERE (the runtime), and
+        # hand the worker the open descriptor via pass_fds + PORTMARK_ROOT_FD. The tool reaches it
+        # only through safe_paths.SafeRoot.from_runtime(); it never names the root. Passed only on
+        # POSIX, where openat2(RESOLVE_BENEATH) makes race-free beneath-root opens possible; on other
+        # platforms SafeRoot refuses rather than degrade, so passing a descriptor would be useless.
+        child_env = self._child_env(spec.env)
+        root_fd: int | None = None
+        pass_fds: tuple[int, ...] = ()
+        if self._filesystem_root is not None and os.name == "posix":
+            try:
+                root_fd = os.open(self._filesystem_root, os.O_RDONLY | os.O_DIRECTORY)
+            except OSError as error:
+                raise ToolExecutionError("could not open the configured filesystem_root") from error
+            child_env = {**child_env, safe_paths.ROOT_FD_ENV: str(root_fd)}
+            pass_fds = (root_fd,)
         try:
             tree = _launch_process_tree(
                 [sys.executable, "-m", "portmark.tool_subprocess_runner"],
-                self._child_env(spec.env),
+                child_env,
+                pass_fds=pass_fds,
             )
         except OSError as error:
             raise ToolExecutionError("could not start isolated tool worker") from error
+        finally:
+            # The worker inherited its own copy across the exec (pass_fds), so the runtime's copy is
+            # closed immediately -- on the launch-failure path too. The descriptor never lingers in
+            # the host process.
+            if root_fd is not None:
+                try:
+                    os.close(root_fd)
+                except OSError:
+                    pass
 
         hard_cap = cap + _RESPONSE_ENVELOPE_SLACK
         buffer = bytearray()
@@ -1017,7 +1060,7 @@ def _close_job_quietly(job_handle: int) -> None:
         pass
 
 
-def _launch_process_tree(argv: list[str], env: dict[str, str]) -> _ProcessTree:
+def _launch_process_tree(argv: list[str], env: dict[str, str], pass_fds: tuple[int, ...] = ()) -> _ProcessTree:
     common: dict[str, Any] = {
         "stdin": subprocess.PIPE,
         "stdout": subprocess.PIPE,
@@ -1025,7 +1068,11 @@ def _launch_process_tree(argv: list[str], env: dict[str, str]) -> _ProcessTree:
         "env": env,
         # Section 7: explicit, though Python defaults close_fds=True. Only the protocol pipes
         # (stdin/stdout) and discarded stderr reach the worker; no other host descriptor leaks in.
+        # Section 7 PR 3: pass_fds is the ONE deliberate exception -- the pre-opened safe-path root
+        # descriptor, when a filesystem_root is configured. subprocess makes exactly those fds
+        # inheritable across the exec; every other descriptor stays closed.
         "close_fds": True,
+        "pass_fds": pass_fds,
     }
     if _CAN_KILL_PROCESS_GROUP:
         process = subprocess.Popen(argv, start_new_session=True, **common)  # nosec B603

@@ -1,0 +1,21 @@
+# Portmark hardened runner profile (Section 7 PR 3) -- declarative form of the EXTERNAL_CONTAINER
+# isolation an operator acknowledges via ToolRegistry(isolation_profile=...). Verify with:
+#   docker compose -f deploy/docker-compose.hardened.yml run --rm runner python /app/deploy/verify_profile.py
+services:
+  runner:
+    image: portmark:latest
+    read_only: true                       # read-only root filesystem
+    user: "1000:1000"                     # non-root
+    pids_limit: 128                       # bounded process count
+    mem_limit: 512m
+    cpus: 1.0
+    network_mode: none                    # default-deny egress (replace with an allowlisting proxy if needed)
+    cap_drop:
+      - ALL                               # no Linux capabilities
+    security_opt:
+      - no-new-privileges:true            # no privilege escalation
+    environment:
+      PORTMARK_WORKDIR: /work
+    tmpfs:
+      - /work:rw,noexec,nosuid,nodev,size=64m   # the one private writable directory
+    command: ["python", "/app/deploy/verify_profile.py"]

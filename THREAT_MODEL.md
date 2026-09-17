@@ -91,9 +91,27 @@ unconstrained side-effecting launch OR reconcile; it is **not** containment of a
 Python, and the `IsolationProfile` records a claim it cannot verify.
 The deployment isolation profile (non-root, read-only root, private
 writable dir, dropped capabilities, `no-new-privileges`, PID/memory/CPU limits, restricted `/proc`,
-default-deny egress) is **documented as a requirement in DEPLOYMENT.md**; an executable, tested
-profile ships with the follow-up. Portmark does not configure or detect a supervisor today, so its
-POSIX tree termination is cooperative/best-effort as stated above.
+default-deny egress) is **documented as a requirement in DEPLOYMENT.md** and now ships **executable
+and tested** in `deploy/` (the `Dockerfile`, `deploy/docker-compose.hardened.yml`, and the in-container
+probe `deploy/verify_profile.py`). Each property is verified by a calibrated CI test that runs the
+probe inside the built image with the full hardening flags (every property must hold) and again with
+each flag removed (that property must flip). This `deploy/` profile is the concrete meaning of the
+`IsolationMechanism.EXTERNAL_CONTAINER` an operator acknowledges. Portmark does not configure or detect
+a supervisor today, so its POSIX tree termination is cooperative/best-effort as stated above.
+
+**Capability-based safe paths.** An isolated tool that must touch the filesystem does so only through
+a `portmark.safe_paths.SafeRoot` capability. The runtime pre-opens a configured `filesystem_root`
+(`ToolRegistry(filesystem_root=...)`) and hands the worker the open directory descriptor via `pass_fds`
++ `PORTMARK_ROOT_FD`; the tool calls `SafeRoot.from_runtime()` and never names the root, so it cannot
+widen its own filesystem authority. Every open resolves through `openat2(2)` with
+`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS` — the kernel refuses any `..`, absolute,
+or symlink escape **race-free**. A `resolve()`-then-prefix-compare (TOCTOU-vulnerable) is forbidden, and
+the strictly-weaker component-wise `O_NOFOLLOW` walk is deliberately **not** shipped as a fallback.
+`openat2` needs Linux ≥ 5.6 and a seccomp policy that permits it; where it is unavailable
+`SafeRoot.from_runtime()` **refuses** rather than degrade to a race-vulnerable check, so a tool needing a
+safe root fails closed. Claim boundary: `SafeRoot` removes the *accidental* escape; it does not stop a
+tool from calling `open("/etc/passwd")` directly — the deployment's mount namespace / read-only rootfs is
+what makes the SafeRoot the only reachable path.
 
 ## System Model
 

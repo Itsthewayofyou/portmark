@@ -12,6 +12,9 @@ RUN groupadd --system portmark \
 COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
 COPY examples ./examples
+# Section 7 PR 3: the hardened-profile probe ships in the image so the deployment recipe is
+# executable and testable (deploy/README.md documents the `docker run` hardening flags it verifies).
+COPY deploy ./deploy
 
 RUN python -m pip install --upgrade pip==26.2.1 setuptools==83.0.0 \
     && python -m pip install --no-cache-dir .

@@ -303,6 +303,46 @@ in DEPLOYMENT.md and THREAT_MODEL.md.
 CI runs the isolated-tool descendant-kill, side-effecting, and kill-audit tests on
 both Linux and Windows.
 
+### Capability-based safe paths
+
+An isolated tool that must read or write files should do so through a **`SafeRoot`
+capability**, never by joining an operator string to a path. Grant the workspace once
+on the registry:
+
+```python
+registry = ToolRegistry(filesystem_root="/work")   # the private writable dir
+registry.register_isolated("files.write", "mytools:save_report")
+```
+
+The tool receives nothing in `arguments` naming the root. It asks the runtime for the
+capability and opens strictly beneath it:
+
+```python
+from portmark.safe_paths import SafeRoot, SafePathEscape
+
+def save_report(arguments):
+    root = SafeRoot.from_runtime()                 # the runtime-provided root; refuses if none
+    with root.open_beneath(arguments["name"], "w") as handle:  # relative path only
+        handle.write(arguments["body"])
+    return {"saved": arguments["name"]}
+```
+
+`open_beneath` resolves through `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`, so a
+`..`, an absolute path, or a symlink pointing outside the root is refused by the kernel
+**race-free** (raising `SafePathEscape`); a plain missing file raises `FileNotFoundError`
+as usual. Because the tool takes the root from the runtime rather than choosing it, it
+cannot widen its own filesystem authority — and because the descriptor is close-on-exec,
+a process the tool spawns does not inherit it.
+
+Two limits, stated plainly: (1) the capability needs **Linux ≥ 5.6 with a seccomp policy
+that permits `openat2`** — where it is unavailable `from_runtime()` **refuses** rather
+than fall back to a race-vulnerable check, so plan the deployment's seccomp accordingly
+(the `deploy/` profile keeps `openat2` available); (2) `SafeRoot` prevents the *accidental*
+escape — it does not stop a tool from calling `open("/etc/passwd")` directly. The
+deployment's read-only rootfs / mount namespace is what makes the SafeRoot the only
+reachable path. With no `filesystem_root` configured, `from_runtime()` refuses: the default
+is no ambient filesystem authority.
+
 **Two honest limits.** (1) *Escape:* on POSIX a descendant that moves to its own
 process group — via `setsid()`/`start_new_session()` or `setpgid()`/`setpgrp()` —
 escapes the group signal (a background child of a *normally-exiting* worker is swept

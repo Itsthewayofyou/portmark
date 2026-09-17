@@ -6,6 +6,36 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Section 7 — tool execution isolation (PR 3): capability-based safe paths + tested container profile
+
+- **Capability-based safe-path helper (`portmark.safe_paths.SafeRoot`).** An isolated tool that must
+  touch the filesystem now does so only through a runtime-provided capability. Configure a workspace
+  with `ToolRegistry(filesystem_root="/work")`; the runtime pre-opens that directory and hands the
+  worker its open descriptor (via `pass_fds` + `PORTMARK_ROOT_FD`), and the tool calls
+  `SafeRoot.from_runtime()` — it never names the root, so it cannot widen its own filesystem authority.
+  `root.open_beneath("rel/path", mode)` resolves through `openat2(2)` with
+  `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`, so a `..`, absolute, or symlink escape
+  is refused by the kernel **race-free** (`SafePathEscape`). A `resolve()`-then-prefix-compare is
+  forbidden (TOCTOU-vulnerable); the strictly-weaker component-wise `O_NOFOLLOW` walk is **not** shipped
+  as a fallback.
+- **Fails closed where `openat2` is unavailable.** `openat2(RESOLVE_BENEATH)` needs Linux ≥ 5.6 and a
+  seccomp policy that permits it. Where it is absent (old kernel, non-Linux, or blocked by seccomp),
+  `SafeRoot.from_runtime()` **refuses** rather than degrade to a race-vulnerable path check. Usability is
+  decided by *attempting the syscall and reading errno*, never a version string. The descriptor is
+  close-on-exec, so a process the tool spawns does not inherit filesystem authority. With no
+  `filesystem_root` configured, `from_runtime()` refuses — the default is no ambient filesystem authority.
+- **Executable, tested deployment container profile (`deploy/`).** The hardened profile ships as
+  `deploy/README.md` (the exact `docker run` flags), `deploy/docker-compose.hardened.yml`, and
+  `deploy/verify_profile.py` — an in-container probe that checks each property (read-only rootfs, private
+  writable dir, non-root, `no-new-privileges`, dropped capabilities, PID limit, default-deny egress) by
+  attempting the operation it governs. A CI test runs the probe inside the built image with the full
+  flags (every property must hold) and again with each flag removed (that property must flip), and proves
+  `openat2` is **not** blocked by the image's seccomp profile. This `deploy/` profile is the concrete
+  meaning of the `IsolationMechanism.EXTERNAL_CONTAINER` an operator acknowledges (PR 2b).
+- Claim boundary (unchanged stance): `SafeRoot` removes the *accidental* filesystem escape; it does not
+  stop a tool from calling `open("/etc/passwd")` directly. The deployment's mount namespace / read-only
+  rootfs is what makes the SafeRoot the only reachable path.
+
 ### Section 7 — tool execution isolation (PR 2b): mandatory side-effecting startup gate
 
 - **BREAKING API change.** Registering a side-effecting tool now REQUIRES two things it did not before,

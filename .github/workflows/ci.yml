@@ -61,6 +61,11 @@ jobs:
         run: python -m compileall -q src tests
       - name: Build Docker image
         run: docker build -t portmark-ci:${{ matrix.python-version }} .
+      - name: Verify hardened deployment profile (Section 7 PR 3)
+        # Runs the profile probe inside the just-built image with the full hardening flags (every
+        # property must hold) and re-runs with each flag removed (that property must flip). Also
+        # proves openat2(RESOLVE_BENEATH) is not blocked by the image's seccomp profile.
+        run: PORTMARK_TEST_IMAGE=portmark-ci:${{ matrix.python-version }} python -m unittest discover -s tests -k DeploymentProfileTests -v
 
   postgres-store:
     runs-on: ubuntu-latest

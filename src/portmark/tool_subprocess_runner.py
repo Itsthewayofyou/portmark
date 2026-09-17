@@ -100,7 +100,24 @@ def _apply_resource_limits(limits: Any) -> list[str]:
     return sorted(unapplied)
 
 
+def _harden_inherited_root_fd() -> None:
+    # Section 7 PR 3: the runtime passes the safe-path root descriptor via pass_fds, which clears
+    # close-on-exec so this worker inherits it. Re-set close-on-exec at once so that ANY process the
+    # tool spawns does NOT inherit filesystem authority -- even if the tool never calls
+    # SafeRoot.from_runtime(). from_runtime() still works: it uses the descriptor as a dir_fd
+    # (inheritability is irrelevant there) and then re-opens its own close-on-exec copy.
+    # The env-var name is safe_paths.ROOT_FD_ENV, inlined to keep the worker bootstrap import-light.
+    raw_fd = os.environ.get("PORTMARK_ROOT_FD")
+    if not raw_fd:
+        return
+    try:
+        os.set_inheritable(int(raw_fd), False)
+    except (ValueError, OSError):
+        pass
+
+
 def main() -> None:
+    _harden_inherited_root_fd()
     raw = sys.stdin.read()
     try:
         request = json.loads(raw)
