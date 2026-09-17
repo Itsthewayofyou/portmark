@@ -343,16 +343,27 @@ On a resume, the same logical call re-derives the **same** effect id (the sequen
 per-task `tool_calls`, rebound from the durable checkpoint, monotonic and never reset — it is
 deliberately **not** bound to the checkpoint generation, which identifies the run, not the call).
 The host then: replays a `confirmed` effect; proceeds for a `prepared` row (a prior attempt never
-launched); and **refuses** a `started`/`unknown`/`reconciled` row — it **never auto-retries** an
-effect whose status is unknown, because a second run could double a real effect. On a `confirmed` or
-`prepared` row the host also checks the current decision's tool + arguments against the row's recorded
-tool + arguments and **refuses on any drift** — it never replays another call's result or re-runs at a
-bound position.
+launched); and **refuses** a `started`/`unknown`/`reconciled`/`reconciling` row — it **never
+auto-retries** an effect whose status is unknown or under reconciliation, because a second run could
+double a real effect. On a `confirmed` or `prepared` row the host also checks the current decision's
+tool + arguments against the row's recorded tool + arguments and **refuses on any drift** — it never
+replays another call's result or re-runs at a bound position.
 
-**The invoke gate is un-forgeable.** `ToolRegistry.invoke` runs a side-effecting tool only for an
-`effect_id` the host has recorded and marked `started` in the ledger — it checks that at the gate via
-a host-injected predicate (`bind_effect_ledger`), so a **caller-fabricated id cannot authorize a
-side-effecting call**. No id, an unbound registry, or an id that names no started row all fail closed.
+**Launch authority is a one-use capability, not knowledge of the effect_id.** An effect_id is
+deterministic (`hash(task_id, sequence)`) and therefore *not* a secret, so knowing one must not let
+anything launch a side-effecting tool. Instead, right before the call the host **arms** a random,
+one-use launch capability bound to `(effect_id, tool, canonical arguments)` — arming first validates
+that a durable `started` ledger row matches, so a fabricated id cannot be armed — and
+`ToolRegistry.invoke` **consumes** it atomically, only on an exact `(tool, arguments)` match. A
+fabricated capability, a capability reused after its single launch, one armed for a different tool, or
+one armed with different arguments all fail closed. The read-only ledger view the registry uses to
+validate arming is attached once by the host and cannot be re-attached. **What this does *not* cover:**
+a caller that can execute arbitrary code in-process against the registry object (mutating its private
+state) is outside this gate — that is the deployment sandbox's job, per the resource-bounded-worker
+contract above; the runtime gate defends against a fabricated/guessed/replayed *value*, not against
+arbitrary in-process code. (The host's own reconcile pass calls the reconcile function directly, not
+through this gate; that is intentional — a reconcile function is registered separately and is not
+itself `side_effecting`.)
 
 **The tool contract.** A side-effecting tool is called as `tool(arguments, effect_id)` and **must
 use the `effect_id` as its idempotency key** with the external system (e.g. a payment idempotency
@@ -376,6 +387,14 @@ task_id)` (task-scoped: the effect must belong to that task). It runs the tool's
 which asks the external system whether the effect landed: a landed effect settles to `confirmed`
 (with the reconciled result), a not-landed effect to `reconciled` (terminal; a retry is a fresh
 call). The host never auto-retries; the operator drives reconciliation.
+
+Reconciliation is **concurrency-safe**: the host **claims** the effect atomically (`unknown →
+reconciling`) before running the reconcile function and settles only *from* that claimed state, so two
+operators reconciling at once cannot clobber each other — a late "not landed" can never overwrite an
+already-recorded `confirmed`. The claim carries a **lease**: a `reconciling` row left behind by a
+reconciler whose process died is reclaimable after the lease window, so a crash mid-reconcile never
+strands the effect (it returns to being reconcilable rather than stuck). If the reconcile function
+itself raises, the claim is released back to `unknown` for the operator to retry.
 
 > **Known cost.** The `started` state is settled `unknown` on resume even if the tool never
 > actually launched (a crash in the microsecond window between the durable `started` write and the

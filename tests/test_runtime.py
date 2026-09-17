@@ -1460,32 +1460,50 @@ class RuntimeTests(unittest.TestCase):
         registry.register_isolated(
             "iso.pay", "isolated_tool_fixtures:echo", side_effecting=True, env=self._isolated_env()
         )
-        permit = self._isolated_permit("iso.pay")
-        # Section 7 PR 2 (round 2): a side-effecting tool runs ONLY for an effect the host recorded and
-        # marked `started`. The registry checks that at the gate via an injected predicate, so a
-        # caller-supplied string can no longer authorize a side-effecting call (the auditor's P1).
+        registry.register_isolated(
+            "iso.other", "isolated_tool_fixtures:echo", side_effecting=True, env=self._isolated_env()
+        )
+        permit = self._isolated_permit("iso.pay", "iso.other")
+        # Section 7 PR 2 (round 3): launching a side-effecting tool requires a ONE-USE launch capability
+        # the host armed and bound to (effect_id, tool, canonical args). Knowledge of a (deterministic,
+        # non-secret) effect_id is NOT launch authority -- the auditor's round-3 P1s. There is no public
+        # rebindable predicate any more.
         from portmark.tools import ToolExecutionError
-        # (a) No effect_id at all -> refuse.
+        self.assertFalse(hasattr(registry, "bind_effect_ledger"))  # the rebindable-predicate hole is gone
+        # Attach a read-only ledger view, exactly as AgentHost does. arm validates against it.
+        ledger: dict[str, dict] = {}
+        registry.attach_effect_ledger(lambda eid: ledger.get(eid))
+        self.assertRaises(RuntimeError, registry.attach_effect_ledger, lambda eid: None)  # set-once
+        pay_args = {"amount": 10}
+        canonical_pay = canonical_json(pay_args).decode("utf-8")
+        # (a) No launch capability at all -> refuse.
         with self.assertRaisesRegex(ToolExecutionError, "must run through the effect ledger"):
-            registry.invoke(permit, "iso.pay", {"amount": 10})
-        # (b) An UNBOUND registry cannot verify the ledger, so even WITH an id it fails closed -- it
-        #     never trusts the caller's string on faith.
-        with self.assertRaisesRegex(ToolExecutionError, "not bound to an effect ledger"):
-            registry.invoke(permit, "iso.pay", {"amount": 10}, effect_id="e-test")
-        # Bind the gate to a ledger view, exactly as AgentHost does.
-        started: set[str] = set()
-        registry.bind_effect_ledger(lambda eid: eid in started)
-        # (c) CALIBRATED: a FABRICATED id names no started effect -> refuse. Calibration (gate ledger):
-        #     neutralize the `if not self._effect_started(effect_id)` check in invoke -> the forged id
-        #     runs the tool, and this assertion fails.
-        with self.assertRaisesRegex(SecurityError, "does not name a started effect"):
-            registry.invoke(permit, "iso.pay", {"amount": 10}, effect_id="forged")
-        # (d) An id the host recorded and marked started -> runs, and the id reaches the tool.
-        started.add("e-real")
+            registry.invoke(permit, "iso.pay", pay_args)
+        # (b) A fabricated effect_id has no `started` row -> cannot even be armed.
+        with self.assertRaisesRegex(SecurityError, "no `started` ledger row matches|not launch authority"):
+            registry.arm_effect_launch("forged", "iso.pay", pay_args)
+        # Record a real started row and arm a capability for it (as the host does pre-launch).
+        ledger["e-real"] = {"effect_id": "e-real", "state": "started", "tool": "iso.pay", "arguments_json": canonical_pay}
+        cap = registry.arm_effect_launch("e-real", "iso.pay", pay_args)
+        # (c) A fabricated capability string never armed -> refuse.
+        with self.assertRaisesRegex(SecurityError, "does not authorize"):
+            registry.invoke(permit, "iso.pay", pay_args, launch_capability="fabricated-cap")
+        # (d) The capability is bound to iso.pay -- using it to launch a DIFFERENT tool -> refuse.
+        with self.assertRaisesRegex(SecurityError, "does not authorize"):
+            registry.invoke(permit, "iso.other", pay_args, launch_capability=cap)
+        # (e) The capability is bound to these arguments -- drifted arguments -> refuse.
+        with self.assertRaisesRegex(SecurityError, "does not authorize"):
+            registry.invoke(permit, "iso.pay", {"amount": 999}, launch_capability=cap)
+        # (f) Exact match -> runs once, and the effect_id reaches the tool.
         self.assertEqual(
-            registry.invoke(permit, "iso.pay", {"amount": 10}, effect_id="e-real"),
+            registry.invoke(permit, "iso.pay", pay_args, launch_capability=cap),
             {"echo": {"amount": 10}},
         )
+        # (g) CALIBRATED one-use: the SAME capability is consumed, so a replay -> refuse. Calibration
+        #     (gate ledger): drop the `del self._armed[launch_capability]` line in invoke -> the reused
+        #     capability runs the tool a SECOND time and this assertion fails.
+        with self.assertRaisesRegex(SecurityError, "does not authorize"):
+            registry.invoke(permit, "iso.pay", pay_args, launch_capability=cap)
 
     def test_side_effecting_isolated_tool_refused_without_process_group_kill(self):
         # Fail-closed on a platform with no process-tree hard-kill primitive: a
@@ -1522,6 +1540,7 @@ class RuntimeTests(unittest.TestCase):
             )
             host = make_host(store=store, allow_ephemeral_signing_key=True)
             host.tools = tools
+            host.tools.attach_effect_ledger(host._effect_ledger_row)  # plain-attribute swap: re-attach the ledger view (round 3)
             # Under B-lite the host policy must name the argument it allows; a bare
             # policy grant now denies unnamed arguments. This test is about the kill
             # audit, not argument policy, so the grant declares `seconds` explicitly.
@@ -1550,6 +1569,7 @@ class RuntimeTests(unittest.TestCase):
         )
         host = make_host(store=store, allow_ephemeral_signing_key=True)
         host.tools = tools
+        host.tools.attach_effect_ledger(host._effect_ledger_row)  # plain-attribute swap: re-attach the ledger view (round 3)
         host.policy = HostPolicy(
             host.host_id,
             (ToolGrant("iso.charge", {"arguments": {"dir": {"type": "string"}, "amount": {"type": "integer"}}}),),
@@ -1706,6 +1726,110 @@ class RuntimeTests(unittest.TestCase):
             self.assertIn("tool", refused["details"]["reason"])
             self.assertFalse((Path(directory) / "attempts.log").exists())  # the tool never ran
             self.assertFalse(any(event["event"] == "tool.replayed" for event in result.audit))  # not replayed
+
+    @unittest.skipUnless(_has_tree_termination_primitive(), "isolated side-effecting tools need a process-tree termination primitive")
+    def test_reconciling_effect_refuses_relaunch(self):
+        # CALIBRATED (P3 round 3, the re-run bug the fix pass must not introduce). A row left `reconciling`
+        # (a reconcile pass in flight) must REFUSE a fresh launch -- launching now would run the tool WHILE
+        # reconciliation resolves whether the prior effect landed, the double-effect the ledger prevents.
+        # Calibration (gate ledger): drop "reconciling" from the refuse set in _effect_pre_launch -> the
+        # row falls through to the drift/run path and the tool RUNS, so status is not "failed".
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            host, envelope = self._charge_host(store, directory)
+            eid = self._charge_eid(envelope, directory)
+            store.record_effect_prepared(eid, envelope.state.task_id, "iso.charge",
+                                         canonical_json({"dir": directory, "amount": 5}).decode("utf-8"))
+            store.mark_effect_started(eid)
+            store.settle_effect(eid, "reconciling", None, "a reconcile is in flight")
+            result = host.run(envelope)
+            self.assertEqual(result.status, "failed")
+            self.assertFalse((Path(directory) / "attempts.log").exists())  # never launched under reconciliation
+            self.assertTrue(any(event["event"] == "tool.refused" for event in result.audit))
+
+    def test_effect_reconcile_claim_is_cas_lease_bounded_and_race_safe(self):
+        # P3 round 3: reconciliation must not let two operators clobber each other. The claim is a CAS
+        # (unknown -> reconciling) with a lease, and settlement is CAS from the claimed state, so a late
+        # "not landed" cannot overwrite an already-recorded `confirmed`. Runs on SQLite AND (when a DSN is
+        # set) Postgres via two real synchronized connections -- the bar the Section-6 auditor set for a
+        # concurrency claim ("sequential conflicts only" was rejected there).
+        for context in self._store_case_contexts():
+            with context as (backend, store):
+                with self.subTest(backend=backend):
+                    now = int(time.time())
+                    far_past, far_future = now - 10_000, now + 10_000
+
+                    def seed_unknown(eid: str) -> None:
+                        store.record_effect_prepared(eid, "t", "iso.charge", "{}")
+                        store.mark_effect_started(eid)
+                        store.settle_effect(eid, "unknown", None, "kill")
+
+                    # Lease semantics: unknown is claimable; a FRESH reconciling is not (lease live); a
+                    # reconciling older than the bound IS reclaimable (dead reconciler never strands it).
+                    seed_unknown("lease-1")
+                    self.assertTrue(store.claim_effect_for_reconcile("lease-1", far_past))   # unknown -> reconciling
+                    self.assertFalse(store.claim_effect_for_reconcile("lease-1", far_past))  # fresh reconciling: lease live
+                    self.assertTrue(store.claim_effect_for_reconcile("lease-1", far_future))  # lease-expired -> reclaim
+
+                    # CAS settle: a claimant settles from `reconciling`; a late loser cannot clobber it.
+                    seed_unknown("cas-1")
+                    self.assertTrue(store.claim_effect_for_reconcile("cas-1", far_past))
+                    self.assertTrue(store.settle_effect_from("cas-1", "reconciling", "confirmed",
+                                                             canonical_json({"charged": 5}).decode("utf-8"), "landed"))
+                    # A late "not landed" from a stale reconciler: state is `confirmed`, not `reconciling` -> no-op.
+                    self.assertFalse(store.settle_effect_from("cas-1", "reconciling", "reconciled", None, "did not land"))
+                    final = store.get_effect("cas-1")
+                    self.assertEqual(final["state"], "confirmed")
+                    self.assertEqual(json.loads(final["result_json"])["charged"], 5)  # confirmed result intact
+
+                    # Two real connections race to claim the SAME unknown effect; exactly one wins.
+                    seed_unknown("race-1")
+                    barrier = threading.Barrier(2)
+                    wins: list[bool] = []
+                    lock = threading.Lock()
+
+                    def claim() -> None:
+                        barrier.wait()
+                        won = store.claim_effect_for_reconcile("race-1", far_past)
+                        with lock:
+                            wins.append(won)
+
+                    threads = [threading.Thread(target=claim) for _ in range(2)]
+                    for thread in threads:
+                        thread.start()
+                    for thread in threads:
+                        thread.join(timeout=30)
+                    self.assertEqual(sorted(wins), [False, True])  # exactly one claimant wins the race
+
+    @unittest.skipUnless(_has_tree_termination_primitive(), "isolated side-effecting tools need a process-tree termination primitive")
+    def test_reconcile_effect_refuses_a_live_reconciling_claim(self):
+        # A host-level reconcile cannot start while another reconcile holds a live claim: the CAS claim
+        # fails and reconcile_effect raises rather than running a second reconciler concurrently.
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            host, envelope = self._charge_host(store, directory, target="fail_without_landing")
+            host.run(envelope)
+            eid = self._charge_eid(envelope, directory)
+            self.assertEqual(store.get_effect(eid)["state"], "unknown")
+            # Simulate a reconcile already in flight (claim held, lease live).
+            self.assertTrue(store.claim_effect_for_reconcile(eid, int(time.time()) - 10_000))
+            with self.assertRaisesRegex(SecurityError, "only an unknown"):
+                host.reconcile_effect(eid, envelope.state.task_id)
+
+    @unittest.skipUnless(_has_tree_termination_primitive(), "isolated side-effecting tools need a process-tree termination primitive")
+    def test_launch_capability_is_disarmed_when_not_consumed(self):
+        # A capability armed but not consumed (invoke failed before the gate) must not outlive its one
+        # intended launch. disarm() drops it, so a later invoke with it is refused.
+        registry = ToolRegistry()
+        registry.register_isolated("iso.pay", "isolated_tool_fixtures:echo", side_effecting=True, env=self._isolated_env())
+        permit = self._isolated_permit("iso.pay")
+        args = {"amount": 3}
+        canonical_args = canonical_json(args).decode("utf-8")
+        registry.attach_effect_ledger(lambda eid: {"effect_id": eid, "state": "started", "tool": "iso.pay", "arguments_json": canonical_args} if eid == "e-1" else None)
+        cap = registry.arm_effect_launch("e-1", "iso.pay", args)
+        registry.disarm(cap)  # the host's `finally` path
+        with self.assertRaisesRegex(SecurityError, "does not authorize"):
+            registry.invoke(permit, "iso.pay", args, launch_capability=cap)
 
     def test_sqlite_v9_to_v10_adds_tool_effects(self):
         # Section 7 PR 2a (G2, upgrade path). An existing v9 SQLite store opened by v10 code migrates
@@ -2144,6 +2268,7 @@ class RuntimeTests(unittest.TestCase):
             )
             host = make_host(store=store, allow_ephemeral_signing_key=True)
             host.tools = tools
+            host.tools.attach_effect_ledger(host._effect_ledger_row)  # plain-attribute swap: re-attach the ledger view (round 3)
             budget = ResourceBudget(max_steps=6, max_tool_calls=2, max_output_bytes=32768)
             host.policy = HostPolicy(
                 host.host_id,
@@ -2191,6 +2316,7 @@ class RuntimeTests(unittest.TestCase):
             tools.register("noop", lambda arguments: {"ok": True})
             host = make_host(store=store, allow_ephemeral_signing_key=True)
             host.tools = tools
+            host.tools.attach_effect_ledger(host._effect_ledger_row)  # plain-attribute swap: re-attach the ledger view (round 3)
             budget = ResourceBudget(max_steps=6, max_tool_calls=2, max_output_bytes=32768)
             host.policy = HostPolicy(host.host_id, (ToolGrant("noop", {"arguments": {"n": {"type": "number"}}}),), budget)
             host.providers["big"] = OversizedResultProvider()  # never reached; admission fails first

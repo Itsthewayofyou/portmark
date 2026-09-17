@@ -45,6 +45,10 @@ _MIGRATION_TASK_NAMESPACE = "mig::"
 # Sentinel distinguishing "no confirmed effect to replay" from a genuine tool result of None
 # (a side-effecting tool may legitimately return None). Section 7 PR 2.
 _NO_REPLAY = object()
+# Section 7 PR 2 (round 3): a reconcile claim (unknown -> reconciling) is leased. A `reconciling` row
+# older than this window is reclaimable, so a reconciler whose process died never strands the effect
+# (it was retryable as `unknown` before the claim existed; this preserves that liveness).
+_RECONCILE_LEASE_SECONDS = 300
 
 
 def _namespaced_migration_task_id(source_host_id: str, task_id: str) -> str:
@@ -81,6 +85,12 @@ class AgentHost:
         self.tools = tools
         self.providers = providers
         self.store = store or InMemoryRuntimeStore()
+        # Section 7 PR 2 (round 3): give the tool registry a READ-ONLY view of this host's durable
+        # ledger so it can validate a launch-arm request against the real `started` row. `tools` is a
+        # plain attribute again (the round-2 auto-binding property setter is gone -- the gate no longer
+        # rests on a rebindable predicate; authority is the one-use launch capability). A registry
+        # swapped in after construction (as some tests do) must be re-attached explicitly.
+        self.tools.attach_effect_ledger(self._effect_ledger_row)
         if hasattr(self.store, "set_audit_head_verifier"):
             self.store.set_audit_head_verifier(self.signer)  # type: ignore[attr-defined]  # guarded by hasattr; not on the base RuntimeStore protocol
         self.attestation_policy = attestation_policy or AttestationPolicy()
@@ -102,21 +112,6 @@ class AgentHost:
         self._policy_loader = policy_loader
         self._reload_policy = reload_policy
         self.metrics = metrics or RuntimeMetrics()
-
-    @property
-    def tools(self) -> ToolRegistry:
-        return self._tools
-
-    @tools.setter
-    def tools(self, registry: ToolRegistry) -> None:
-        # Section 7 PR 2 (round 2): whenever the host's registry is set -- at construction or a later
-        # swap -- bind its side-effecting gate to THIS host's durable ledger. invoke() then admits a
-        # side-effecting tool only for an effect_id the host recorded and marked `started`; a fabricated
-        # id names no such row and is refused at the gate. Binding on the setter (not once in __init__)
-        # is what makes it impossible to silently unbind by reassigning host.tools -- the registry holds
-        # no store, so this predicate is its only, host-controlled view of the ledger.
-        self._tools = registry
-        registry.bind_effect_ledger(self._effect_is_started)
 
     def run(self, envelope: AgentEnvelope) -> RunResult:
         started = time.monotonic()
@@ -213,8 +208,11 @@ class AgentHost:
         with the effect_id) which returns ``{"landed": bool, "result"?: <json>}``: a landed effect
         settles to `confirmed` (with the reconciled result, so a later replay returns it); a
         not-landed effect settles to `reconciled` (terminal -- a retry is a fresh call, not this id).
-        Only an `unknown` effect can be reconciled; anything else raises. If the reconcile function
-        itself fails, the effect stays `unknown` and the error propagates for the operator to retry.
+        Only an `unknown` effect (or a `reconciling` row whose lease expired) can be reconciled; the
+        effect is CLAIMED (`unknown` -> `reconciling`) atomically before the reconciler runs and settled
+        only FROM that claimed state, so two concurrent operators cannot clobber each other. If the
+        reconcile function itself fails, the claim is released back to `unknown` and the error propagates
+        for the operator to retry.
 
         `task_id` scopes the call: the effect row must belong to it, so a caller cannot reconcile an
         effect of a different task by guessing an id (the analogue of the Section 4 cross-row check).
@@ -224,22 +222,50 @@ class AgentHost:
             raise SecurityError(f"no effect {effect_id!r} to reconcile")
         if row["task_id"] != task_id:
             raise SecurityError(f"effect {effect_id!r} does not belong to task {task_id!r}")
-        if row["state"] != "unknown":
-            raise SecurityError(f"effect {effect_id!r} is {row['state']}, only unknown effects can be reconciled")
         tool = row["tool"]
         if not self.tools.has_reconcile(tool):
             raise SecurityError(f"tool {tool!r} has no reconcile function registered; cannot reconcile its effects")
+        # Round 3: CLAIM the effect atomically (unknown -> reconciling) before running the reconciler,
+        # and settle only FROM the claimed state, so two concurrent operators cannot both reconcile and
+        # clobber each other (a late "not landed" overwriting an already-recorded `confirmed`). The claim
+        # carries a lease: a `reconciling` row whose updated_at is older than the lease window is
+        # reclaimable, so a reconciler whose process died does not strand the effect forever (it stayed
+        # retryable as `unknown` before -- we must not regress that).
+        stale_before = int(time.time()) - _RECONCILE_LEASE_SECONDS
+        if not self.store.claim_effect_for_reconcile(effect_id, stale_before):
+            current = self.store.get_effect(effect_id)
+            state = current["state"] if current is not None else "missing"
+            raise SecurityError(
+                f"effect {effect_id!r} is {state}; only an unknown (or lease-expired reconciling) effect "
+                "can be reconciled -- another reconciler holds a live claim, or it is already settled."
+            )
         arguments = json.loads(row["arguments_json"])
-        outcome = self.tools.reconcile(tool, arguments, effect_id)
-        if not isinstance(outcome, dict) or not isinstance(outcome.get("landed"), bool):
-            raise SecurityError("reconcile function must return {'landed': bool, 'result'?: ...}")
-        if outcome["landed"]:
-            result = outcome.get("result")
-            result_json = canonical_json(result).decode("utf-8") if "result" in outcome else None
-            self.store.settle_effect(effect_id, "confirmed", result_json, "reconciled: effect landed")
-            return "confirmed"
-        self.store.settle_effect(effect_id, "reconciled", None, "reconciled: effect did not land")
-        return "reconciled"
+        try:
+            outcome = self.tools.reconcile(tool, arguments, effect_id)
+            if not isinstance(outcome, dict) or not isinstance(outcome.get("landed"), bool):
+                raise SecurityError("reconcile function must return {'landed': bool, 'result'?: ...}")
+            if outcome["landed"]:
+                result = outcome.get("result")
+                result_json = canonical_json(result).decode("utf-8") if "result" in outcome else None
+                if not self.store.settle_effect_from(effect_id, "reconciling", "confirmed", result_json, "reconciled: effect landed"):
+                    return self._effect_state_after_lost_claim(effect_id)
+                return "confirmed"
+            if not self.store.settle_effect_from(effect_id, "reconciling", "reconciled", None, "reconciled: effect did not land"):
+                return self._effect_state_after_lost_claim(effect_id)
+            return "reconciled"
+        except Exception:
+            # Release the claim so the effect is retryable (back to unknown), not stranded `reconciling`.
+            # Only release if WE still hold it (settle_effect_from is a no-op if another reconciler's
+            # lease-expiry reclaim already moved it on), so we never overwrite a newer holder.
+            self.store.settle_effect_from(effect_id, "reconciling", "unknown", None, "reconcile failed; claim released")
+            raise
+
+    def _effect_state_after_lost_claim(self, effect_id: str) -> str:
+        """Our CAS settle did not move the row: our lease expired and another reconciler took over and
+        settled it. Report the current state WITHOUT overwriting their result -- the whole point of the
+        CAS (round 3). The row exists (we just claimed it); `unknown` is a defensive fallback only."""
+        current = self.store.get_effect(effect_id)
+        return current["state"] if current is not None else "unknown"
 
     def _run(self, envelope: AgentEnvelope) -> RunResult:
         active_policy = self._active_policy()
@@ -548,14 +574,22 @@ class AgentHost:
                     self.metrics.increment("tools.failed")
                     return self._fail_unserializable(state, audit, "tool", decision.tool)
             else:
+                # Section 7 PR 2 (round 3): arm a ONE-USE launch capability bound to this exact
+                # (effect_id, tool, canonical arguments) immediately before invoke, which consumes it.
+                # The `finally` disarms it on every non-consuming exit (a permit/constraint error raised
+                # before the side-effecting gate, a kill, an exec error) so a capability never outlives
+                # its single intended launch. eid is None for a non-side-effecting or non-isolated tool,
+                # in which case no capability is armed and invoke takes launch_capability=None.
+                launch_cap = self.tools.arm_effect_launch(eid, decision.tool, decision.arguments) if eid is not None else None
                 try:
                     tool_started = time.monotonic()
                     try:
                         result = self.tools.invoke(
-                            effective, decision.tool, decision.arguments, effective.budget.max_output_bytes, effect_id=eid
+                            effective, decision.tool, decision.arguments, effective.budget.max_output_bytes, launch_capability=launch_cap
                         )
                     finally:
                         self.metrics.observe_duration("tool_invocation_duration_seconds", time.monotonic() - tool_started)
+                        self.tools.disarm(launch_cap)
                 except ToolKilledError as error:
                     # EV-002: the isolated tool was hard-killed at its deadline. The kill stops any
                     # *new* side effect, but a call already in flight (a payment POST mid-request) may
@@ -810,12 +844,12 @@ class AgentHost:
         audit.append("agent.failed", state.result)
         return True, None
 
-    def _effect_is_started(self, effect_id: str) -> bool:
-        """The registry's gate predicate (bound in __init__): True only for an effect this host has
-        recorded and marked `started`. A fabricated effect_id names no row -> False -> the invoke gate
-        refuses the side-effecting call. Read-only; the effect_id PRIMARY KEY makes the lookup exact."""
-        row = self.store.get_effect(effect_id)
-        return row is not None and row["state"] == "started"
+    def _effect_ledger_row(self, effect_id: str) -> dict[str, Any] | None:
+        """The registry's read-only view of this host's durable ledger (attached in __init__). Returns
+        the ledger row for effect_id (or None). arm_effect_launch validates a launch request against it
+        -- it must find a `started` row whose tool + canonical arguments match -- so a fabricated
+        effect_id cannot be armed. Read-only; the effect_id PRIMARY KEY makes the lookup exact."""
+        return self.store.get_effect(effect_id)
 
     def _effect_pre_launch(self, eid: str, task_id: str, tool: str, arguments: dict[str, Any]) -> tuple[str, Any]:
         """Effect-ledger state machine for a side-effecting tool BEFORE it launches (Section 7 PR 2).
@@ -844,7 +878,10 @@ class AgentHost:
                 # permanently unreconcilable.
                 self.store.settle_effect(eid, "unknown", None, "host interrupted while the effect was in flight")
                 return "refuse", "effect is unknown after an interrupted run; reconcile before re-running"
-            if existing in ("unknown", "reconciled"):
+            if existing in ("unknown", "reconciled", "reconciling"):
+                # `reconciling` = a reconcile pass is in flight (or its lease is live). Launching now
+                # would run the tool WHILE reconciliation is resolving whether the prior effect landed --
+                # exactly the double-effect this ledger exists to prevent. Refuse; never auto-retry.
                 return "refuse", f"effect is {existing}; reconcile it or issue a new call -- never auto-retry"
             # `confirmed` or `prepared`: this position is already BOUND to a (tool, arguments). The
             # effect_id is position-only, so a provider re-proposing the same position with a different

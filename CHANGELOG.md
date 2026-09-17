@@ -30,11 +30,18 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   re-runs at a bound position. A deterministic resume re-proposes the same tool+args and replays
   cleanly; a drifted re-proposal hard-fails the task, and reconcile (or a fresh call) resolves it. The
   ledger row records the tool and arguments for exactly this drift check plus reconcile and audit.
-- **The invoke gate is un-forgeable.** `ToolRegistry.invoke` runs a side-effecting tool only for an
-  `effect_id` the host recorded and marked `started` in the ledger — checked at the gate via a
-  host-injected predicate (`bind_effect_ledger`), so a caller-fabricated id cannot authorize one. No
-  id, an unbound registry, or an id that names no started row all fail closed. (The registry has no
-  store; the predicate is its only, host-controlled view of the ledger.)
+- **Launch authority is a one-use capability, not knowledge of the effect_id.** An effect_id is
+  deterministic (`hash(task_id, sequence)`) and not a secret, so knowing one must not authorize a
+  launch. Right before the call the host **arms** a random, one-use capability bound to
+  `(effect_id, tool, canonical arguments)` — arming first validates that a durable `started` ledger row
+  matches, so a fabricated id cannot be armed — and `ToolRegistry.invoke` **consumes** it atomically,
+  only on an exact `(tool, arguments)` match. A fabricated capability, a reused one, one armed for a
+  different tool, or one armed with different arguments all fail closed. The registry's read-only ledger
+  view is attached once and cannot be re-attached. This defends against a fabricated/guessed/replayed
+  *value*; a caller that runs arbitrary in-process code against the registry object is outside this gate
+  (the deployment sandbox's job, per the resource-bounded-worker contract). Replaces the round-2
+  "is it started?" predicate, which a holder of a `started` id could reuse, transfer to another tool, or
+  replay after a crash.
 - **Side-effecting tools receive the effect id as an idempotency key.** The isolated worker calls a
   side-effecting tool as `tool(arguments, effect_id)` (the id travels in the request envelope, outside
   `arguments`, so the argument-name allowlist does not reject it); the tool must use it as its external
@@ -44,6 +51,12 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   `unknown` effect by running the tool's registered `reconcile` function
   (`reconcile(arguments, effect_id) -> {"landed": bool, "result"?: ...}`): a landed effect settles to
   `confirmed`, a not-landed effect to `reconciled`. The host never auto-retries; the operator drives it.
+  Reconciliation is concurrency-safe: the effect is **claimed** atomically (`unknown → reconciling`,
+  compare-and-set) before the reconcile function runs and settled only *from* that claimed state, so
+  two concurrent operators cannot clobber each other (a late "not landed" cannot overwrite a recorded
+  `confirmed`). The claim is **leased**: a `reconciling` row left by a crashed reconciler is reclaimable
+  after the lease window, so a mid-reconcile crash never strands the effect; a failing reconcile
+  function releases the claim back to `unknown`.
 - Making the `reconcile` contract and an acknowledged isolation profile **mandatory** at registration
   for `side_effecting=True` is the immediately following change (Section 7 PR 2b).
 

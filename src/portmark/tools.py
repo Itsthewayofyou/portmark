@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import secrets
 import signal
 import subprocess  # nosec B404
 import sys
@@ -147,13 +148,23 @@ class ToolRegistry:
         self._timeouts: dict[str, float] = {}
         self._max_output: dict[str, int] = {}
         self._side_effecting: set[str] = set()
-        # Section 7 PR 2 (round 2): the registry's only view of the durable effect ledger. AgentHost
-        # binds this to a predicate that answers "did the host record this effect_id and mark it
-        # `started`?" (bind_effect_ledger). invoke() then runs a side-effecting tool ONLY for such an
-        # id -- a fabricated string names no started row and is refused AT THE GATE. Left None the
-        # gate fails closed: an unbound registry cannot verify the ledger, so it refuses every
-        # side-effecting call rather than trusting the caller.
-        self._effect_started: Callable[[str], bool] | None = None
+        # Section 7 PR 2 (round 3): launching a side-effecting tool requires a one-use, in-memory
+        # LAUNCH CAPABILITY that AgentHost arms right before the call and invoke() consumes atomically.
+        # Knowledge of a (deterministic, non-secret) effect_id is NOT launch authority -- round 2's
+        # "is it started?" predicate let any holder of a started id reuse it, transfer it to another
+        # tool, or replay it after a crash. Now:
+        #   * `_effect_ledger_row` is the registry's ONLY (read-only) view of the durable ledger,
+        #     attached ONCE by the host (attach_effect_ledger, no public re-attach). Arming validates
+        #     against it, so a fabricated effect_id cannot be armed.
+        #   * `_armed` maps a random capability -> (effect_id, tool, canonical_args). invoke() pops the
+        #     capability on an exact (tool, args) match: one-use, non-transferable, non-replayable.
+        # After a crash the in-memory `_armed` is empty, so a durable `started` row alone authorizes
+        # nothing. The residual (a caller that mutates these private attributes / calls internal methods
+        # on the registry object) is the standard Python boundary -- outside the runtime gate and the
+        # deployment sandbox's job per the locked Section 7 contract.
+        self._effect_ledger_row: Callable[[str], dict[str, Any] | None] | None = None
+        self._armed: dict[str, tuple[str, str, str]] = {}
+        self._arm_lock = threading.Lock()
         self.default_timeout = default_timeout
         self.max_output_bytes = max_output_bytes
         # Section 7 #6/#3: defense-in-depth resource caps applied inside each isolated worker.
@@ -237,14 +248,45 @@ class ToolRegistry:
         if side_effecting:
             self._side_effecting.add(name)
 
-    def bind_effect_ledger(self, effect_started: Callable[[str], bool]) -> None:
-        """Bind this registry's side-effecting gate to the host's durable effect ledger (Section 7
-        PR 2, round 2). `effect_started(effect_id)` returns True only for an effect the host has
-        recorded and marked `started`. AgentHost calls this at construction; invoke() then admits a
-        side-effecting tool ONLY for such an id, so a caller-fabricated string (or a bare call that
-        skips the ledger) is refused at the gate rather than trusted. One registry serves one host's
-        ledger; a re-bind points the gate at the most recently bound host's store."""
-        self._effect_started = effect_started
+    def attach_effect_ledger(self, effect_ledger_row: Callable[[str], dict[str, Any] | None]) -> None:
+        """Attach the host's read-only durable-ledger view ONCE (Section 7 PR 2, round 3). AgentHost
+        calls this at construction with a lookup that returns the ledger row for an effect_id (or None).
+        Arming a launch validates the current decision against this row, so a fabricated effect_id
+        cannot be armed. Set-once: a second attach raises, so the arming validator cannot be swapped for
+        a permissive one through this method (the round-2 rebindable-predicate hole). It is a read-only
+        row lookup, not launch authority -- authority is the one-use capability from arm_effect_launch."""
+        if self._effect_ledger_row is not None:
+            raise RuntimeError("effect ledger already attached; the ledger view is set once and cannot be re-attached")
+        self._effect_ledger_row = effect_ledger_row
+
+    def arm_effect_launch(self, effect_id: str, tool: str, arguments: dict[str, Any]) -> str:
+        """Mint a one-use launch capability for a side-effecting tool (Section 7 PR 2, round 3). The
+        host calls this immediately before invoke, after it has recorded a `started` ledger row. Arming
+        REQUIRES a durable row that is `started` AND whose recorded tool + canonical arguments match the
+        request -- so a fabricated or drifted effect_id cannot be armed. Returns a random capability
+        bound to (effect_id, tool, canonical arguments); invoke() consumes it exactly once."""
+        if self._effect_ledger_row is None:
+            raise ToolExecutionError("registry has no effect ledger attached; construct it via AgentHost before arming a side-effecting launch")
+        row = self._effect_ledger_row(effect_id)
+        canonical_args = canonical_json(arguments).decode("utf-8")
+        if row is None or row["state"] != "started" or row["tool"] != tool or row["arguments_json"] != canonical_args:
+            raise SecurityError(
+                f"cannot arm a launch for effect {effect_id!r}: no `started` ledger row matches this "
+                "(tool, arguments). Knowledge of an effect_id is not launch authority."
+            )
+        capability = secrets.token_urlsafe(32)
+        with self._arm_lock:
+            self._armed[capability] = (effect_id, tool, canonical_args)
+        return capability
+
+    def disarm(self, capability: str | None) -> None:
+        """Drop an armed capability that was not consumed (e.g. invoke failed before the gate). A no-op
+        if it was already consumed or never armed. The host calls this in a `finally` so a capability
+        never outlives its single intended launch."""
+        if capability is None:
+            return
+        with self._arm_lock:
+            self._armed.pop(capability, None)
 
     def is_side_effecting(self, name: str) -> bool:
         """Whether the tool is registered side-effecting (the host wraps it in the effect ledger)."""
@@ -275,7 +317,7 @@ class ToolRegistry:
     def names(self) -> tuple[str, ...]:
         return tuple(sorted(set(self._tools) | set(self._isolated)))
 
-    def invoke(self, permit: Permit, name: str, arguments: dict[str, Any], max_output_bytes: int | None = None, effect_id: str | None = None) -> Any:
+    def invoke(self, permit: Permit, name: str, arguments: dict[str, Any], max_output_bytes: int | None = None, launch_capability: str | None = None) -> Any:
         grant = next((grant for grant in permit.grants if grant.name == name), None)
         if grant is None:
             # Only the effective permit is visible here, so this cannot say which
@@ -293,32 +335,31 @@ class ToolRegistry:
         timeout = self._timeouts.get(name, self.default_timeout)
         cap = max_output_bytes if max_output_bytes is not None else self._max_output.get(name, self.max_output_bytes)
 
+        effect_id: str | None = None
         if name in self._side_effecting:
-            # Fail closed at the invoke boundary. A side-effecting tool runs ONLY for an effect the
-            # host recorded and marked `started` in the durable ledger. The gate CHECKS that fact via
-            # an injected predicate (bind_effect_ledger) -- it never trusts the caller to have done the
-            # recording. This closes the round-1 hole where any non-None effect_id string satisfied the
-            # gate: a fabricated id names no started row and is refused here; no id, or an unbound
-            # registry, also fails closed. The registry still holds no store, so this proves the effect
-            # is host-recorded, not (by itself) that the whole ledger lifecycle ran -- but a bare public
-            # string can no longer authorize a side-effecting call.
-            if effect_id is None:
+            # Fail closed at the invoke boundary. Launching a side-effecting tool requires a one-use
+            # LAUNCH CAPABILITY the host armed (arm_effect_launch) right before this call and bound to
+            # THIS (effect_id, tool, canonical arguments). Knowledge of the (deterministic, non-secret)
+            # effect_id is NOT launch authority -- so a fabricated id, a capability reused after its one
+            # launch, one armed for a different tool, or one armed with different arguments all fail
+            # here. The capability is consumed ONLY on an exact match, so a mismatch never burns a valid
+            # one. This is the authority the round-2 "is it started?" predicate failed to be.
+            if launch_capability is None:
                 raise ToolExecutionError(
                     f"tool {name!r} is side-effecting and must run through the effect ledger via AgentHost "
-                    "(which supplies its effect_id); it cannot be invoked directly without one."
+                    "(which arms a one-use launch capability); it cannot be invoked directly without one."
                 )
-            if self._effect_started is None:
-                raise ToolExecutionError(
-                    f"tool {name!r} is side-effecting but this ToolRegistry is not bound to an effect "
-                    "ledger; construct it via AgentHost (which calls bind_effect_ledger) so invoke can "
-                    "verify the host recorded the effect."
-                )
-            if not self._effect_started(effect_id):
-                raise SecurityError(
-                    f"effect_id {effect_id!r} does not name a started effect in the ledger; a "
-                    "side-effecting tool runs only for an effect the host has recorded and marked "
-                    "started -- a fabricated id cannot authorize one."
-                )
+            with self._arm_lock:
+                armed = self._armed.get(launch_capability)
+                canonical_args = canonical_json(arguments).decode("utf-8")
+                if armed is None or armed[1] != name or armed[2] != canonical_args:
+                    raise SecurityError(
+                        f"launch capability does not authorize this call to {name!r}; a fabricated, "
+                        "already-consumed, cross-tool, or argument-mismatched capability cannot launch a "
+                        "side-effecting tool. Knowledge of an effect_id is not launch authority."
+                    )
+                effect_id = armed[0]
+                del self._armed[launch_capability]  # one-use: consume on the exact match
 
         if is_isolated:
             return self._invoke_isolated(self._isolated[name], arguments, timeout, cap, effect_id=effect_id)

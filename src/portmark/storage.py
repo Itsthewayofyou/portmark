@@ -173,6 +173,20 @@ class RuntimeStore(Protocol):
         effect did not land). Idempotent overwrite of state/result/reason with a fresh updated_at."""
         ...
 
+    def settle_effect_from(self, effect_id: str, expected_state: str, new_state: str, result_json: str | None, reason: str | None) -> bool:
+        """Compare-and-set settle: move the row from `expected_state` to `new_state` (with result/reason)
+        ONLY if it is currently in `expected_state`. Returns True iff exactly one row moved. Used so a
+        concurrent reconciler cannot overwrite another's already-recorded settlement (Section 7 PR 2,
+        round 3)."""
+        ...
+
+    def claim_effect_for_reconcile(self, effect_id: str, stale_before: int) -> bool:
+        """Atomically claim an effect for reconciliation: move it to `reconciling` iff it is currently
+        `unknown`, OR it is a `reconciling` row whose updated_at is older than `stale_before` (a
+        lease-expired claim from a reconciler that died). Returns True iff this caller won the claim.
+        The lease bound keeps a dead reconciler from stranding the row forever (Section 7 PR 2, r3)."""
+        ...
+
     def consumed_nonce_exists(self, nonce: str) -> bool:
         ...
 
@@ -378,6 +392,29 @@ class InMemoryRuntimeStore:
                 row["result_json"] = result_json
                 row["reason"] = reason
                 row["updated_at"] = int(time.time())
+
+    def settle_effect_from(self, effect_id: str, expected_state: str, new_state: str, result_json: str | None, reason: str | None) -> bool:
+        with self._lock:
+            row = self._effects.get(effect_id)
+            if row is None or row["state"] != expected_state:
+                return False
+            row["state"] = new_state
+            row["result_json"] = result_json
+            row["reason"] = reason
+            row["updated_at"] = int(time.time())
+            return True
+
+    def claim_effect_for_reconcile(self, effect_id: str, stale_before: int) -> bool:
+        with self._lock:
+            row = self._effects.get(effect_id)
+            if row is None:
+                return False
+            state = row["state"]
+            if state == "unknown" or (state == "reconciling" and int(row["updated_at"]) < stale_before):
+                row["state"] = "reconciling"
+                row["updated_at"] = int(time.time())
+                return True
+            return False
 
     def mark_migration_delivered(self, task_id: str, receipt_json: str) -> None:
         with self._lock:
@@ -986,6 +1023,24 @@ class SQLiteRuntimeStore:
                 (state, result_json, reason, int(time.time()), effect_id),
             )
 
+    def settle_effect_from(self, effect_id: str, expected_state: str, new_state: str, result_json: str | None, reason: str | None) -> bool:
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE tool_effects SET state = ?, result_json = ?, reason = ?, updated_at = ? "
+                "WHERE effect_id = ? AND state = ?",
+                (new_state, result_json, reason, int(time.time()), effect_id, expected_state),
+            )
+            return cursor.rowcount == 1
+
+    def claim_effect_for_reconcile(self, effect_id: str, stale_before: int) -> bool:
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE tool_effects SET state = 'reconciling', updated_at = ? "
+                "WHERE effect_id = ? AND (state = 'unknown' OR (state = 'reconciling' AND updated_at < ?))",
+                (int(time.time()), effect_id, stale_before),
+            )
+            return cursor.rowcount == 1
+
     def record_migration_attempt(self, task_id: str, worker_id: str | None = None) -> None:
         moment = self._clock()
         with self._connection() as connection:
@@ -1484,6 +1539,24 @@ class PostgresRuntimeStore:
                 "WHERE effect_id = %s",
                 (state, result_json, reason, int(time.time()), effect_id),
             )
+
+    def settle_effect_from(self, effect_id: str, expected_state: str, new_state: str, result_json: str | None, reason: str | None) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE tool_effects SET state = %s, result_json = %s, reason = %s, updated_at = %s "
+                "WHERE effect_id = %s AND state = %s",
+                (new_state, result_json, reason, int(time.time()), effect_id, expected_state),
+            )
+            return cursor.rowcount == 1
+
+    def claim_effect_for_reconcile(self, effect_id: str, stale_before: int) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE tool_effects SET state = 'reconciling', updated_at = %s "
+                "WHERE effect_id = %s AND (state = 'unknown' OR (state = 'reconciling' AND updated_at < %s))",
+                (int(time.time()), effect_id, stale_before),
+            )
+            return cursor.rowcount == 1
 
     # Section 4 #3 (round 3): every lease comparison and every new-lease expiry on Postgres is
     # computed from DATABASE time -- EXTRACT(EPOCH FROM clock_timestamp())::bigint -- NOT the
