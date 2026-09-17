@@ -168,8 +168,3 @@ def fail_without_landing(arguments: dict[str, Any], effect_id: str | None = None
     # Raises WITHOUT writing the landed marker -- the effect did not land. Settles `unknown`, and
     # reconcile then finds no marker -> not landed -> `reconciled`.
     raise RuntimeError("charge failed before any external effect")
-
-
-# Section 7 PR 2b round 2: a NON-CALLABLE module attribute, so the reconcile-target preflight can
-# assert it refuses a target that imports but is not callable.
-not_a_callable = {"this": "is not a function"}

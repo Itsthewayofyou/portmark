@@ -210,6 +210,16 @@ class RuntimeStore(Protocol):
         rather than stranded `reconciling`. Returns True iff it moved."""
         ...
 
+    def renew_effect_claim(self, effect_id: str, claim_id: str, lease_seconds: int) -> bool:
+        """Re-stamp the lease on an OWNED `reconciling` claim, atomically, using the store's authoritative
+        clock (DB time on Postgres). Requires the `claim_id` match (state `reconciling`); NOT a live lease
+        -- if you still own it (no one has reclaimed), extending is safe; if a reclaimer already took it
+        the claim_id will differ and this returns False. The host calls it immediately BEFORE running a
+        reconcile so a holder that was paused past its lease cannot execute concurrently with a reclaimer:
+        whichever of renew and a reclaim reaches the row first wins atomically, and neither ordering yields
+        two concurrent reconcile executions. Returns True iff the lease was extended."""
+        ...
+
     def consumed_nonce_exists(self, nonce: str) -> bool:
         ...
 
@@ -461,6 +471,17 @@ class InMemoryRuntimeStore:
             row["reconcile_claim_id"] = None
             row["reconcile_lease_expires_at"] = None
             row["updated_at"] = self._clock()
+            return True
+
+    def renew_effect_claim(self, effect_id: str, claim_id: str, lease_seconds: int) -> bool:
+        _validate_reconcile_claim_args(claim_id, lease_seconds)
+        with self._lock:
+            row = self._effects.get(effect_id)
+            if row is None or row["state"] != "reconciling" or row.get("reconcile_claim_id") != claim_id:
+                return False  # claim match only (no live-lease requirement): still-owned -> safe to extend
+            now = self._clock()
+            row["reconcile_lease_expires_at"] = now + int(lease_seconds)
+            row["updated_at"] = now
             return True
 
     def mark_migration_delivered(self, task_id: str, receipt_json: str) -> None:
@@ -1126,6 +1147,19 @@ class SQLiteRuntimeStore:
             )
             return cursor.rowcount == 1
 
+    def renew_effect_claim(self, effect_id: str, claim_id: str, lease_seconds: int) -> bool:
+        # Embedded single-host store: the injected clock is authoritative. Claim match only (no live-lease
+        # requirement): still-owned -> safe to extend; if a reclaimer took it the claim_id differs -> no row.
+        _validate_reconcile_claim_args(claim_id, lease_seconds)
+        now = self._clock()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE tool_effects SET reconcile_lease_expires_at = ?, updated_at = ? "
+                "WHERE effect_id = ? AND state = 'reconciling' AND reconcile_claim_id = ?",
+                (now + int(lease_seconds), now, effect_id, claim_id),
+            )
+            return cursor.rowcount == 1
+
     def record_migration_attempt(self, task_id: str, worker_id: str | None = None) -> None:
         moment = self._clock()
         with self._connection() as connection:
@@ -1668,6 +1702,21 @@ class PostgresRuntimeStore:
                 "reconcile_lease_expires_at = NULL, updated_at = EXTRACT(EPOCH FROM clock_timestamp())::bigint "
                 "WHERE effect_id = %s AND state = 'reconciling' AND reconcile_claim_id = %s",
                 (effect_id, claim_id),
+            )
+            return cursor.rowcount == 1
+
+    def renew_effect_claim(self, effect_id: str, claim_id: str, lease_seconds: int) -> bool:
+        # New lease expiry uses DATABASE time (clock_timestamp), not the app host clock, so a host whose
+        # clock runs fast cannot extend past what the DB will honour. Claim match only (no live-lease
+        # requirement): still-owned -> safe to extend; a reclaimer's different claim_id -> no row.
+        _validate_reconcile_claim_args(claim_id, lease_seconds)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE tool_effects SET "
+                "reconcile_lease_expires_at = EXTRACT(EPOCH FROM clock_timestamp())::bigint + %s, "
+                "updated_at = EXTRACT(EPOCH FROM clock_timestamp())::bigint "
+                "WHERE effect_id = %s AND state = 'reconciling' AND reconcile_claim_id = %s",
+                (lease_seconds, effect_id, claim_id),
             )
             return cursor.rowcount == 1
 

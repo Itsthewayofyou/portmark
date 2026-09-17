@@ -441,11 +441,13 @@ tools.register_isolated(
 checks — registering the effectful tool as its own reconcile target is refused at registration
 (a reconcile execution would then fire the effect). The runtime cannot verify a target is genuinely
 read-only, so it enforces the one thing it can (distinctness) and this read-only requirement is an
-operator **contract**. At registration a **worker-based preflight** confirms the reconcile target is
-importable, callable and accepts `(arguments, effect_id)` — a broken reconcile is caught at startup,
-not when a real effect first becomes `unknown`. The preflight proves the target is *declared* and
-correctly *shaped*; only a deployment test against the real external system can prove it is
-semantically correct.
+operator **contract**. Registration validates only the `module:function` **syntax** and this
+distinctness — it does **not** import or otherwise run the reconcile target. (An earlier revision
+preflighted it by importing it in a worker; importing arbitrary module code executes untrusted
+top-level code before any ledger/permit/claim exists, so that automatic import was removed.) The
+reconcile is therefore a **declared** target; verifying that it is importable, correctly shaped, and
+genuinely read-only is the operator's own integration test, which should run in a credential-free,
+egress-denied environment.
 
 **Reconciliation.** An `unknown` effect is resolved by `AgentHost.reconcile_effect(effect_id,
 task_id)` (task-scoped: the effect must belong to that task). It runs the tool's registered
@@ -464,9 +466,14 @@ whose process died is reclaimable after the lease window, so a crash mid-reconci
 effect. If the reconcile function itself raises, the owner releases its claim back to `unknown` for
 retry (release needs only the owner id, so an expired holder can always safely relinquish). Lease
 creation and expiry use **database time** on Postgres (a shared central clock), so a host whose clock
-runs fast cannot prematurely steal another host's live claim. *Known bound:* a reconcile that runs
-longer than the lease window makes the effect reclaimable — a slow reconciler may lose its claim (its
-terminal settle then no-ops); this is a liveness bound, not a double-settle.
+runs fast cannot prematurely steal another host's live claim. To stop a holder that was **paused past
+its lease** from executing concurrently with a reclaimer, the host **renews** its claim atomically
+(`renew_effect_claim`, database time on Postgres) immediately before running the reconcile and proceeds
+only if renewal succeeds: if it still owns the row the lease is extended (and, since the reconcile
+timeout ≪ lease, it finishes within that window); if a reclaimer already took the row its owner id no
+longer matches and renewal fails, so it aborts without running. *Known bound:* a reconcile that runs
+longer than the (renewed) lease window makes the effect reclaimable — a slow reconciler may lose its
+claim (its terminal settle then no-ops); this is a liveness bound, not a double-settle or double-run.
 
 > **Known cost.** The `started` state is settled `unknown` on resume even if the tool never
 > actually launched (a crash in the microsecond window between the durable `started` write and the
@@ -474,9 +481,10 @@ terminal settle then no-ops); this is a liveness bound, not a double-settle.
 > effect that did not happen, rather than the host silently assuming it did not and re-running.
 
 > **Enforced at registration (PR 2b).** A `reconcile` target and an acknowledged, platform-appropriate
-> `IsolationProfile` are now **mandatory** for `side_effecting=True`; the reconcile target is
-> preflighted in a worker and must be distinct from the tool. A side-effecting tool can no longer be
-> registered without a reconcile function, so its `unknown` effects are always reconcilable.
+> `IsolationProfile` are now **mandatory** for `side_effecting=True`; the reconcile target's
+> `module:function` syntax is checked and it must be distinct from the tool (registration does not
+> import it). A side-effecting tool can no longer be registered without a reconcile function, so its
+> `unknown` effects are always reconcilable.
 
 ## Credential Handling
 

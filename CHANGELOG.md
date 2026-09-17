@@ -47,11 +47,21 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   its owned lease, and only when the row's recorded tool and arguments match. The reconcile target must be
   **distinct** from the tool (the self-target exploit is refused at registration), and it must be
   observational/read-only — a contract the runtime documents but cannot verify.
-- **The reconcile target is preflighted at registration (round 2).** A worker imports it and checks it is
-  callable and accepts `(arguments, effect_id)` **without running it**, so a non-importable / missing /
-  non-callable / wrong-signature reconcile is caught at startup instead of when a real effect first
-  becomes `unknown`. Docs describe the reconcile as a **declared** target, not a verified implementation;
-  semantic correctness still requires a deployment test against the real system.
+- **Registration executes NO reconcile-target code (round 3 — fixes an unintended consequence of round 2).**
+  Round 2 preflighted the reconcile target by importing it in a worker at registration, but importing
+  arbitrary module code runs untrusted top-level code before any ledger/permit/claim exists (a
+  filesystem/network effect that resource caps and process-tree kill do not prevent). That automatic
+  import is **removed**. Registration keeps only the `module:function` **syntax** check and the
+  tool-≠-reconcile **distinctness** check (both pure, no import). The reconcile is a **declared** target;
+  its semantic/read-only correctness is the operator's own integration test, run in a credential-free,
+  egress-denied environment — not a runtime import.
+- **Reconcile renews its owned claim immediately before running (round 3).** `run_reconcile` validated
+  ownership but not lease liveness, so a holder paused past its 5-minute lease could execute concurrently
+  with a reclaimer. The host now calls a new `renew_effect_claim(effect_id, claim_id, lease_seconds)`
+  (all three backends; database time on Postgres) right before running the reconcile and proceeds only if
+  it succeeds — whichever of renew and a reclaim reaches the row first wins atomically, so no two
+  reconcile functions run concurrently. A reconcile that itself outruns the renewed lease remains a
+  documented liveness bound, not a double-execution hole.
 - **`effect_status:"unknown"` is recorded on all three effect-unknown audit events (round 2).** Previously
   only `tool.killed` carried it; `tool.failed` and `content.rejected` now do too when a side-effecting
   effect settled unknown, so incident analysis is self-contained.

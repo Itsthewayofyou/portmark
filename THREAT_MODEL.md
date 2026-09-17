@@ -76,10 +76,11 @@ durable effect ledger (effect id derived per call, recorded before launch; `conf
 instead of re-running; `unknown` effects are never auto-retried and are resolved by
 `AgentHost.reconcile_effect`), and the tool receives the effect id as its idempotency key. As of
 **PR 2b**, both (a) and (b) are now MANDATORY at registration: `register_isolated(side_effecting=True)`
-fails closed unless a `reconcile` target is **declared** (and preflighted in a worker for importability,
-callability and signature — the runtime cannot verify the reconcile is semantically correct or
-read-only, only that it is declared and shaped correctly; a deployment test against the real system
-must establish correctness) AND the registry carries an operator-acknowledged `IsolationProfile` whose
+fails closed unless a `reconcile` target is **declared** (a `module:function` syntax check plus a
+tool-≠-reconcile distinctness check; registration does NOT import or run the target — importing
+arbitrary module code would execute untrusted top-level code before any ledger/permit/claim exists, so
+verifying the reconcile is importable, correctly shaped and read-only is the operator's own integration
+test in a credential-free, egress-denied environment) AND the registry carries an operator-acknowledged `IsolationProfile` whose
 mechanism is appropriate for the platform (external containment on POSIX, where the runtime's own
 tree-termination is only cooperative; the Windows Job Object counts as runtime-contained). The thread
 path refuses side-effecting tools at registration, the gate is re-asserted at the launch boundary, and

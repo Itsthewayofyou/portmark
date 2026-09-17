@@ -1881,6 +1881,54 @@ class RuntimeTests(unittest.TestCase):
                     self.assertTrue(store.settle_effect_from_claim("e", "C", "reconciled", None, "did not land"))
                     self.assertEqual(store.get_effect("e")["state"], "reconciled")
 
+    def test_renew_effect_claim_extends_owner_and_fails_after_reclaim(self):  # G22 store (CALIBRATED)
+        # PR 2b round 3: the host renews its claim immediately before running a reconcile. renew re-stamps
+        # the lease for the OWNING claim (claim-id match, authoritative clock) and FAILS once a reclaimer
+        # has taken the row -- so a paused/expired holder that lost the row aborts instead of running
+        # concurrently. CALIBRATED: make renew_effect_claim return True unconditionally and the
+        # post-reclaim renew succeeds (both holders would proceed), so this test fails.
+        now = {"t": 1000}
+        clock = lambda: now["t"]  # noqa: E731
+        with tempfile.TemporaryDirectory() as directory:
+            stores = [("memory", InMemoryRuntimeStore(clock=clock)),
+                      ("sqlite", SQLiteRuntimeStore(Path(directory) / "eff.sqlite", clock=clock))]
+            for backend, store in stores:
+                with self.subTest(backend=backend):
+                    now["t"] = 1000
+                    store.record_effect_prepared("e", "t", "iso.charge", "{}")
+                    store.mark_effect_started("e")
+                    store.settle_effect("e", "unknown", None, "kill")
+                    self.assertTrue(store.claim_effect_for_reconcile("e", "A", 100))    # lease -> 1100
+                    now["t"] = 1050                                                     # still owned + live
+                    self.assertTrue(store.renew_effect_claim("e", "A", 100))            # extend -> 1150
+                    self.assertEqual(store.get_effect("e")["reconcile_lease_expires_at"], 1150)
+                    self.assertFalse(store.claim_effect_for_reconcile("e", "B", 100))   # A's renewed lease keeps B out
+                    now["t"] = 1200                                                     # A paused past the renewed lease
+                    self.assertTrue(store.claim_effect_for_reconcile("e", "B", 100))    # B reclaims, new owner id
+                    self.assertEqual(store.get_effect("e")["reconcile_claim_id"], "B")
+                    # A resumes and tries to renew before running -> FAILS (B owns) -> A aborts, no concurrent run.
+                    self.assertFalse(store.renew_effect_claim("e", "A", 100))
+                    self.assertEqual(store.get_effect("e")["reconcile_claim_id"], "B")  # B untouched
+                    now["t"] = 1250
+                    self.assertTrue(store.renew_effect_claim("e", "B", 100))            # the live owner can renew
+
+    @unittest.skipUnless(_has_tree_termination_primitive(), "isolated side-effecting tools need a process-tree termination primitive")
+    def test_reconcile_effect_aborts_when_claim_renewal_fails(self):  # G22 host (CALIBRATED)
+        # If the claim cannot be renewed right before running (a reclaimer took the row during a pause),
+        # reconcile_effect must NOT run the reconcile target. CALIBRATED: remove the renew-or-abort guard
+        # in host.reconcile_effect and the effect settles `confirmed` even though renewal failed.
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            host, envelope = self._charge_host(store, directory, target="charge_then_fail")
+            host.run(envelope)  # settles `unknown` (effect landed, tool then raised)
+            eid = self._charge_eid(envelope, directory)
+            with patch.object(store, "renew_effect_claim", return_value=False):
+                state = host.reconcile_effect(eid, envelope.state.task_id)
+            # The reconcile did NOT run: the claim (state `reconciling`) is left untouched, and the
+            # returned state is that same non-terminal state -- not `confirmed`/`reconciled`.
+            self.assertEqual(store.get_effect(eid)["state"], "reconciling")
+            self.assertEqual(state, "reconciling")
+
     def test_reconcile_claim_rejects_invalid_lease_or_owner(self):
         # Round-4 hardening (auditor note): the store validates its OWN inputs so a zero/negative lease
         # (which would make the claim instantly reclaimable, defeating exclusivity) or an empty owner id
@@ -7949,16 +7997,9 @@ class IsolationProfileGateTests(unittest.TestCase):
     """Section 7 PR 2b: the MANDATORY side-effecting startup gate (reconcile + acknowledged,
     platform-appropriate IsolationProfile) and its launch-time re-check. The registration-gate tests
     patch _has_tree_termination_primitive to True so they isolate the 2b logic and run on every
-    platform; they never spawn a worker (registration and the pre-capability re-check raise first)."""
-
-    def setUp(self):
-        # These tests exercise the GATE LOGIC (reconcile presence, profile, platform, membership, launch
-        # re-check) with lightweight fake targets ("m:f"/"m:r"). The reconcile-target PREFLIGHT (its own
-        # subprocess, which would reject "m:r" as non-importable) is exercised separately in
-        # ReconcilePreflightTests, so patch it to a no-op here to keep these fast and target-agnostic.
-        preflight_patch = patch.object(ToolRegistry, "_preflight_reconcile_target", lambda self, *a, **k: None)
-        preflight_patch.start()
-        self.addCleanup(preflight_patch.stop)
+    platform; they never spawn a worker (registration imports nothing and the pre-capability re-check
+    raises first). Fake module:function targets ("m:f"/"m:r") are valid at registration because it does
+    only a SYNTAX check -- it never imports them (PR 2b round 3 removed the import-based preflight)."""
 
     def _profile(self, mechanism=IsolationMechanism.EXTERNAL_CONTAINER, by="ops"):
         return IsolationProfile(mechanism=mechanism, acknowledged_by=by)
@@ -8068,9 +8109,9 @@ class IsolationProfileGateTests(unittest.TestCase):
         self.assertIn("pay", registry.names())
 
 
-class ReconcilePreflightTests(unittest.TestCase):
-    """Section 7 PR 2b round 2: the private reconcile authority (G15) and the worker-based reconcile
-    preflight (G17). These spawn real workers, so they need a process-tree termination primitive."""
+class ReconcileAuthorityAndSafetyTests(unittest.TestCase):
+    """Section 7 PR 2b: the private reconcile authority (G15) and registration that imports nothing (G21).
+    The authority test spawns a real worker, so it needs a process-tree termination primitive."""
 
     def _env(self):
         import portmark
@@ -8113,30 +8154,24 @@ class ReconcilePreflightTests(unittest.TestCase):
             outcome = authority.run_reconcile("e-1", "iso.charge", args, "claim-1")
             self.assertIn("landed", outcome)
 
-    @unittest.skipUnless(_has_tree_termination_primitive(), "reconcile preflight spawns a worker")
-    def test_preflight_refuses_a_broken_reconcile_target(self):  # G17 (CALIBRATED)
-        registry = ToolRegistry(isolation_profile=_TEST_ISOLATION_PROFILE)
-        broken = [
-            "definitely_not_a_real_module_xyz:fn",               # not importable
-            "isolated_tool_fixtures:does_not_exist",             # missing function
-            "isolated_tool_fixtures:not_a_callable",             # imports but not callable
-            "isolated_tool_fixtures:no_effect_id_param",         # wrong signature (no effect_id)
-        ]
-        for i, bad in enumerate(broken):
-            # CALIBRATED: neutralize the preflight (make _preflight_reconcile_target a no-op) and each
-            # of these broken targets registers successfully, discovered only at first `unknown` effect.
-            with self.assertRaisesRegex(SecurityError, "failed preflight"):
+    def test_registration_does_not_import_the_reconcile_module(self):  # G21 (CALIBRATED)
+        # The auditor's round-3 repro, turned into a regression test: registering a side-effecting tool
+        # whose reconcile target is a module that WRITES A MARKER at import time must NOT write the marker
+        # -- registration executes no untrusted module-level code (module:function is a SYNTAX check only).
+        # CALIBRATED: add any import of the reconcile module to register_isolated and the marker appears.
+        with tempfile.TemporaryDirectory() as directory:
+            marker = os.path.join(directory, "imported.marker")
+            with patch.dict(os.environ, {"RECONCILE_IMPORT_MARKER": marker}):
+                registry = ToolRegistry(isolation_profile=_TEST_ISOLATION_PROFILE)
                 registry.register_isolated(
-                    f"iso.bad{i}", "isolated_tool_fixtures:idempotent_charge", side_effecting=True,
-                    reconcile=bad, env=self._env(),
+                    "iso.charge", "isolated_tool_fixtures:idempotent_charge", side_effecting=True,
+                    reconcile="reconcile_import_marker:reconcile", env=self._env(),
                 )
-            self.assertNotIn(f"iso.bad{i}", registry.names())
-        # A good reconcile target passes preflight and registers.
-        registry.register_isolated(
-            "iso.ok", "isolated_tool_fixtures:idempotent_charge", side_effecting=True,
-            reconcile="isolated_tool_fixtures:reconcile_charge", env=self._env(),
-        )
-        self.assertIn("iso.ok", registry.names())
+                self.assertIn("iso.charge", registry.names())  # registration succeeded
+                self.assertFalse(
+                    os.path.exists(marker),
+                    "registration must NOT import the reconcile module (no unledgered code execution)",
+                )
 
 
 if __name__ == "__main__":

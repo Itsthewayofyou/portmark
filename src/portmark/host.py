@@ -244,6 +244,16 @@ class AgentHost:
                 "can be reconciled -- another reconciler holds a live claim, or it is already settled."
             )
         arguments = json.loads(row["arguments_json"])
+        # PR 2b round 3: RENEW the claim atomically (authoritative/DB clock) immediately before running.
+        # claim_effect_for_reconcile above set a fresh lease, but the process could have been paused
+        # (VM suspend) between the claim and here past the lease window; a reclaimer could then take the
+        # row and BOTH reconcile functions would run. Renewing right before execution closes that: if we
+        # still own the row the lease is extended (and, since the reconcile timeout << lease, it finishes
+        # within the fresh window so no reclaim can race it); if a reclaimer already took it our claim_id
+        # no longer matches and renewal fails -> we abort without running. A slow reconcile that itself
+        # outruns the renewed lease remains the documented liveness bound, not a double-execution hole.
+        if not self.store.renew_effect_claim(effect_id, claim_id, _RECONCILE_LEASE_SECONDS):
+            return self._effect_state_after_lost_claim(effect_id)
         try:
             # Run the reconcile target through the PRIVATE authority, bound to this effect_id, tool, the
             # STORED arguments, and the owned claim_id (PR 2b round 2). The public ToolRegistry.reconcile()

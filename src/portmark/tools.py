@@ -377,9 +377,13 @@ class ToolRegistry:
                     "be resolved. (Section 7 PR 2b -- reconcile is mandatory for side-effecting tools.)"
                 )
             self._assert_isolation_profile(name)
-            # PR 2b round 2: preflight the reconcile target in a worker (import + callable + signature)
-            # so a broken reconcile is caught HERE, not when a real effect first becomes `unknown`.
-            self._preflight_reconcile_target(name, reconcile, env or {})
+            # NOTE (PR 2b round 3): registration does NOT import or otherwise EXECUTE the reconcile target.
+            # An earlier round preflighted it in a worker, but importing arbitrary module code at
+            # registration runs untrusted top-level code before any ledger/permit/claim exists (a
+            # filesystem/network effect that resource caps + tree-kill do not prevent). Registration keeps
+            # only the module:function SYNTAX check and the tool!=reconcile distinctness check (both pure,
+            # no import). Semantic/read-only correctness of the reconcile is the operator's own integration
+            # test, run in a credential-free, egress-denied environment -- not a runtime import.
         self._isolated[name] = _IsolatedSpec(target=target, env=dict(env or {}), reconcile=reconcile)
         self._tools.pop(name, None)
         if timeout is not None:
@@ -523,34 +527,6 @@ class ToolRegistry:
         spec = self._isolated.get(name)
         return spec is not None and spec.reconcile is not None
 
-    def _preflight_reconcile_target(self, name: str, reconcile_target: str, env: dict[str, str]) -> None:
-        """Spawn a worker to verify a side-effecting tool's reconcile target is importable, callable and
-        accepts (arguments, effect_id) -- WITHOUT running it -- at registration (Section 7 PR 2b round 2).
-        Registration otherwise validated only module:function SYNTAX, so a nonexistent module, missing
-        function, non-callable object or wrong signature was discovered only when a real effect became
-        `unknown` and the reconcile then failed, stranding it. Fail closed. The two failure classes are
-        DISTINGUISHED in the message: a worker that could not START (a sandbox blocking subprocess spawn)
-        is not a bad target -- but the tool itself could not run there either, so registration is still
-        refused. This proves the target is DECLARED, importable and shaped correctly; it cannot prove the
-        reconcile is semantically correct or read-only (only a deployment test against the real system can)."""
-        spec = _IsolatedSpec(target=reconcile_target, env=dict(env))
-        try:
-            self._invoke_isolated(spec, {}, self.default_timeout, 4096, preflight=True)
-        except ToolKilledError as error:
-            raise SecurityError(
-                f"reconcile preflight for tool {name!r} (target {reconcile_target!r}) did not complete "
-                "within the deadline; refusing to register."
-            ) from error
-        except ToolExecutionError as error:
-            # Carries the worker's own reason, which distinguishes a broken TARGET ("reconcile target
-            # could not be imported / is not callable / does not accept (arguments, effect_id)") from a
-            # preflight worker that COULD NOT START ("could not start isolated tool worker").
-            raise SecurityError(
-                f"reconcile target {reconcile_target!r} for tool {name!r} failed preflight: {error}. A "
-                "side-effecting tool's reconcile target must be importable, callable, and accept "
-                "(arguments, effect_id); refusing to register."
-            ) from error
-
     def _run_reconcile_target(self, name: str, arguments: dict[str, Any], effect_id: str) -> Any:
         """Run a tool's registered reconcile function (isolated, with the effect_id) to determine whether
         its external effect landed. PRIVATE (PR 2b round 2): reachable ONLY through the run_reconcile
@@ -677,8 +653,7 @@ class ToolRegistry:
         return self._checked_output(value, cap)
 
     def _invoke_isolated(
-        self, spec: _IsolatedSpec, arguments: dict[str, Any], timeout: float, cap: int, effect_id: str | None = None,
-        preflight: bool = False,
+        self, spec: _IsolatedSpec, arguments: dict[str, Any], timeout: float, cap: int, effect_id: str | None = None
     ) -> Any:
         # Section 7 #6: hand the worker its resource caps. cpu_seconds is a kernel backstop for the
         # wall-clock deadline (a CPU-bound tool that ignores the clock still dies), set a little
@@ -689,10 +664,6 @@ class ToolRegistry:
         payload: dict[str, Any] = {
             "target": spec.target, "arguments": arguments, "max_output_bytes": cap, "rlimits": rlimits
         }
-        # Section 7 PR 2b round 2: preflight mode imports + type-checks the target WITHOUT running it,
-        # so register_isolated can catch a broken reconcile target at startup, not at first `unknown`.
-        if preflight:
-            payload["preflight"] = True
         # Section 7 PR 2: side-effecting tools (and their reconcile fns) receive a host-derived
         # idempotency key OUTSIDE `arguments` -- the deny-by-default argument-name whitelist in
         # check_constraints would reject an injected key. The worker passes it as tool(arguments, effect_id).
