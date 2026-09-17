@@ -3457,6 +3457,35 @@ class RuntimeTests(unittest.TestCase):
         with psycopg.connect(dsn, autocommit=True) as connection:
             connection.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema)))
 
+    @unittest.skipUnless(
+        os.environ.get("PORTMARK_TEST_POSTGRES_DSN") and PostgresRuntimeStore.available(),
+        "requires a real PostgreSQL",
+    )
+    def test_renew_effect_claim_on_postgres_uses_database_time(self):  # G22 Postgres (DB-time path)
+        # The DB-time renew statement (EXTRACT(EPOCH FROM clock_timestamp())) is a DIFFERENT code path
+        # from the injected-clock embedded stores, so exercise it against a live Postgres with a short
+        # REAL lease (auditor round-3 coverage note). Mirrors the SQLite/InMemory renew race: renew
+        # extends an owned claim, refuses a foreign claim, and -- once the lease expires and a reclaimer
+        # takes the row -- refuses the superseded holder (which must then NOT run its reconcile). The
+        # sleep is longer than the lease, so expiry is deterministic on wall-clock/DB time.
+        dsn = os.environ["PORTMARK_TEST_POSTGRES_DSN"]
+        schema = "portmark_renew_" + secrets.token_hex(8)
+        try:
+            store = PostgresRuntimeStore(dsn, schema=schema)
+            store.record_effect_prepared("e", "t", "iso.charge", "{}")
+            store.mark_effect_started("e")
+            store.settle_effect("e", "unknown", None, "kill")
+            self.assertTrue(store.claim_effect_for_reconcile("e", "A", 1))     # ~1s lease (database time)
+            self.assertTrue(store.renew_effect_claim("e", "A", 1))             # the owner can renew
+            self.assertFalse(store.renew_effect_claim("e", "WRONG", 1))        # a foreign claim is refused
+            time.sleep(1.4)                                                    # A's renewed lease expires
+            self.assertTrue(store.claim_effect_for_reconcile("e", "B", 5))     # B reclaims -> new owner id
+            self.assertEqual(store.get_effect("e")["reconcile_claim_id"], "B")
+            self.assertFalse(store.renew_effect_claim("e", "A", 1))            # superseded holder -> aborts (no concurrent run)
+            self.assertTrue(store.renew_effect_claim("e", "B", 5))             # the live owner can renew
+        finally:
+            self._drop_postgres_schema(dsn, schema)
+
     def _reopen_store(self, backend, store, verifier=None):
         if backend == "sqlite":
             return SQLiteRuntimeStore(store.path, verifier)
