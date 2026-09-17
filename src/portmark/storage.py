@@ -45,6 +45,20 @@ def _validate_claim_args(worker_id: str, lease_seconds: int, limit: int) -> None
         raise SecurityError("claim_migrations: limit must be a positive int")
 
 
+def _validate_reconcile_claim_args(claim_id: str, lease_seconds: int) -> None:
+    # Section 7 PR 2 (round 4 hardening): a reconcile claim's exclusivity holds only for a well-formed
+    # owner + lease, so the store validates its own inputs rather than trusting the caller. AgentHost
+    # always passes a random claim_id + the fixed positive lease, but a zero/negative lease would make
+    # the claim instantly reclaimable (defeating exclusivity) and an empty owner id would collide. bool
+    # is an int subclass, so it is rejected explicitly.
+    if not isinstance(claim_id, str) or not claim_id.strip():
+        raise SecurityError("claim_effect_for_reconcile: claim_id must be a non-empty string")
+    if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int):
+        raise SecurityError("claim_effect_for_reconcile: lease_seconds must be an int")
+    if lease_seconds <= 0:
+        raise SecurityError("claim_effect_for_reconcile: lease_seconds must be positive")
+
+
 def _advisory_lock_key(name: str) -> int:
     # A stable 64-bit signed key for pg_advisory_lock(bigint), derived Python-side so
     # it does not depend on a server function (hashtextextended is PG 11+); blake2b is
@@ -404,11 +418,12 @@ class InMemoryRuntimeStore:
                 row["updated_at"] = int(time.time())
 
     def claim_effect_for_reconcile(self, effect_id: str, claim_id: str, lease_seconds: int) -> bool:
+        _validate_reconcile_claim_args(claim_id, lease_seconds)
         with self._lock:
             row = self._effects.get(effect_id)
             if row is None:
                 return False
-            now = int(time.time())
+            now = self._clock()
             state = row["state"]
             lease = row.get("reconcile_lease_expires_at")
             eligible = state == "unknown" or (state == "reconciling" and (lease is None or int(lease) <= now))
@@ -423,7 +438,7 @@ class InMemoryRuntimeStore:
     def settle_effect_from_claim(self, effect_id: str, claim_id: str, new_state: str, result_json: str | None, reason: str | None) -> bool:
         with self._lock:
             row = self._effects.get(effect_id)
-            now = int(time.time())
+            now = self._clock()
             if (row is None or row["state"] != "reconciling" or row.get("reconcile_claim_id") != claim_id
                     or int(row.get("reconcile_lease_expires_at") or 0) <= now):
                 return False  # terminal settle needs the owning claim AND a LIVE lease
@@ -445,7 +460,7 @@ class InMemoryRuntimeStore:
             row["reason"] = "reconcile failed; claim released"
             row["reconcile_claim_id"] = None
             row["reconcile_lease_expires_at"] = None
-            row["updated_at"] = int(time.time())
+            row["updated_at"] = self._clock()
             return True
 
     def mark_migration_delivered(self, task_id: str, receipt_json: str) -> None:
@@ -1073,8 +1088,9 @@ class SQLiteRuntimeStore:
             )
 
     def claim_effect_for_reconcile(self, effect_id: str, claim_id: str, lease_seconds: int) -> bool:
-        # Embedded single-host store: the local clock is authoritative (no cross-host lease comparison).
-        now = int(time.time())
+        # Embedded single-host store: the injected clock is authoritative (no cross-host lease comparison).
+        _validate_reconcile_claim_args(claim_id, lease_seconds)
+        now = self._clock()
         with self._connection() as connection:
             cursor = connection.execute(
                 "UPDATE tool_effects SET state = 'reconciling', reconcile_claim_id = ?, "
@@ -1086,7 +1102,7 @@ class SQLiteRuntimeStore:
             return cursor.rowcount == 1
 
     def settle_effect_from_claim(self, effect_id: str, claim_id: str, new_state: str, result_json: str | None, reason: str | None) -> bool:
-        now = int(time.time())
+        now = self._clock()
         with self._connection() as connection:
             cursor = connection.execute(
                 "UPDATE tool_effects SET state = ?, result_json = ?, reason = ?, "
@@ -1106,7 +1122,7 @@ class SQLiteRuntimeStore:
                 "reason = 'reconcile failed; claim released', reconcile_claim_id = NULL, "
                 "reconcile_lease_expires_at = NULL, updated_at = ? "
                 "WHERE effect_id = ? AND state = 'reconciling' AND reconcile_claim_id = ?",
-                (int(time.time()), effect_id, claim_id),
+                (self._clock(), effect_id, claim_id),
             )
             return cursor.rowcount == 1
 
@@ -1618,6 +1634,7 @@ class PostgresRuntimeStore:
     def claim_effect_for_reconcile(self, effect_id: str, claim_id: str, lease_seconds: int) -> bool:
         # Lease creation + eligibility use DATABASE time (clock_timestamp), not the app host clock, so a
         # host whose clock runs ahead cannot prematurely reclaim another host's live reconcile claim.
+        _validate_reconcile_claim_args(claim_id, lease_seconds)
         with self._connect() as connection:
             cursor = connection.execute(
                 "UPDATE tool_effects SET state = 'reconciling', reconcile_claim_id = %s, "

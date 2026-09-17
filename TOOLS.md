@@ -368,6 +368,12 @@ against arbitrary malicious in-process Python. (The host's own reconcile pass ca
 through this gate; that is intentional — a reconcile function is registered separately and is not
 itself `side_effecting`.)
 
+> **The tool registry is immutable after host construction.** `AgentHost` binds the private armer to
+> the registry it is given at construction. Replacing `host.tools` afterward is **not supported**: the
+> new registry has no armer, so every side-effecting launch through it **fails closed** (safe, but
+> broken). Configure the registry before constructing the host; do not swap it later. (There is no
+> runtime registry-replacement API today; if one is ever needed it must re-bind the armer explicitly.)
+
 **The tool contract.** A side-effecting tool is called as `tool(arguments, effect_id)` and **must
 use the `effect_id` as its idempotency key** with the external system (e.g. a payment idempotency
 key), so that even a retry it does see cannot double the effect. A tool that does not accept a

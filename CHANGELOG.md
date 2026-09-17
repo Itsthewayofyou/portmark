@@ -61,8 +61,12 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   (a reclaim mints a *different* owner id). The claim is **leased**: a `reconciling` row left by a crashed
   reconciler is reclaimable after the window, so a mid-reconcile crash never strands the effect; a
   failing reconcile releases the claim (owner-id match only, so an expired holder can always relinquish).
-  Lease creation and expiry use **database time** on Postgres, so a fast host clock cannot steal a live
-  claim. New store columns `reconcile_claim_id` + `reconcile_lease_expires_at` (SQLite v11, Postgres v9).
+  Lease creation and expiry use **database time** on Postgres (and the store's injected clock on the
+  embedded backends), so a fast host clock cannot steal a live claim. The store validates its own claim
+  inputs (non-empty owner id, positive integer lease) rather than trusting the caller. New store columns
+  `reconcile_claim_id` + `reconcile_lease_expires_at` (SQLite v11, Postgres v9). The tool registry is
+  **immutable after host construction** — the private armer binds to the registry given at construction,
+  so swapping `host.tools` afterward fails closed for side-effecting tools (configure it before, not after).
 - Making the `reconcile` contract and an acknowledged isolation profile **mandatory** at registration
   for `side_effecting=True` is the immediately following change (Section 7 PR 2b).
 

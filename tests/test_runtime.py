@@ -1757,11 +1757,12 @@ class RuntimeTests(unittest.TestCase):
 
     def test_effect_reconcile_claim_is_owned_lease_bounded_and_race_safe(self):
         # P3 round 3 remediation: a reconcile claim has an OWNER (reconcile_claim_id). Two operators
-        # cannot clobber each other -- a stale/expired holder can neither overwrite a recorded settlement
-        # nor reset a newer holder's claim, because a reclaim mints a DIFFERENT claim_id and the terminal
-        # settle requires the owning id AND a live lease. Runs on InMemory (the DEFAULT store, so its
-        # owned-lease methods are covered too) AND SQLite AND (when a DSN is set) Postgres via two real
-        # synchronized connections -- the bar the Section-6 auditor set for a concurrency claim.
+        # cannot clobber each other -- a settle requires the owning id AND a live lease, so a non-owner
+        # (or a superseded holder) can neither overwrite a recorded settlement nor reset the claim. This
+        # test covers the owner semantics with LIVE leases; lease EXPIRY + reclaim is covered
+        # deterministically by test_effect_reconcile_expiry_reclaims_with_a_new_owner (injected clock).
+        # Runs on InMemory (the DEFAULT store, so its owned-lease methods are covered too) AND SQLite AND
+        # (when a DSN is set) Postgres via two real synchronized connections -- the Section-6 bar.
         for context in [nullcontext(("memory", InMemoryRuntimeStore()))] + self._store_case_contexts():
             with context as (backend, store):
                 with self.subTest(backend=backend):
@@ -1775,17 +1776,6 @@ class RuntimeTests(unittest.TestCase):
                     self.assertTrue(store.claim_effect_for_reconcile("live-1", "A", 10_000))    # unknown -> reconciling (A)
                     self.assertFalse(store.claim_effect_for_reconcile("live-1", "B", 10_000))   # A's lease live -> B refused
 
-                    # An EXPIRED claim is reclaimable, and the reclaim mints a NEW owner id (A is seeded
-                    # with an already-expired lease, since we cannot wait out a real lease window here).
-                    seed_unknown("exp-1")
-                    self.assertTrue(store.claim_effect_for_reconcile("exp-1", "A", -1))         # claim, immediately expired
-                    self.assertTrue(store.claim_effect_for_reconcile("exp-1", "C", 10_000))     # A expired -> C reclaims
-                    self.assertEqual(store.get_effect("exp-1")["reconcile_claim_id"], "C")      # reclaim minted a NEW owner
-                    # A (the original, now-superseded holder) can no longer settle OR reset C's live claim.
-                    self.assertFalse(store.settle_effect_from_claim("exp-1", "A", "confirmed", None, "stale settle"))
-                    self.assertFalse(store.release_effect_claim("exp-1", "A"))                  # nor reset it to unknown
-                    self.assertEqual(store.get_effect("exp-1")["state"], "reconciling")         # C's claim untouched
-
                     # Owned CAS settle: the owner settles; a late loser with its OWN id cannot clobber it.
                     seed_unknown("cas-1")
                     self.assertTrue(store.claim_effect_for_reconcile("cas-1", "W", 10_000))
@@ -1797,10 +1787,11 @@ class RuntimeTests(unittest.TestCase):
                     self.assertEqual(final["state"], "confirmed")
                     self.assertEqual(json.loads(final["result_json"])["charged"], 5)  # confirmed result intact
 
-                    # Expired holder may RELEASE its own claim back to unknown (liveness) when NOT reclaimed.
+                    # The claim OWNER may RELEASE its claim back to unknown (liveness); a non-owner cannot.
                     seed_unknown("rel-1")
-                    self.assertTrue(store.claim_effect_for_reconcile("rel-1", "R", -10_000))  # immediately-expired claim
-                    self.assertTrue(store.release_effect_claim("rel-1", "R"))                 # its own holder relinquishes
+                    self.assertTrue(store.claim_effect_for_reconcile("rel-1", "R", 10_000))
+                    self.assertFalse(store.release_effect_claim("rel-1", "not-R"))             # non-owner cannot reset
+                    self.assertTrue(store.release_effect_claim("rel-1", "R"))                  # owner relinquishes
                     self.assertEqual(store.get_effect("rel-1")["state"], "unknown")           # retryable, not stranded
 
                     # Two real connections race to claim the SAME unknown effect; exactly one wins.
@@ -1821,6 +1812,59 @@ class RuntimeTests(unittest.TestCase):
                     for thread in threads:
                         thread.join(timeout=30)
                     self.assertEqual(sorted(wins), [False, True])  # exactly one claimant wins the race
+
+    def test_effect_reconcile_expiry_reclaims_with_a_new_owner(self):
+        # Round-4 hardening: lease EXPIRY tested deterministically with an INJECTED clock (no negative
+        # lease, no sleep) on the embedded stores -- the store's reconcile methods read self._clock().
+        # An expired claim is reclaimable, the reclaim mints a DIFFERENT owner id, and the superseded
+        # holder can then neither settle nor reset the new claim. (Postgres uses DB time, not the injected
+        # clock; its owner-scoped settle is covered by the race test above.)
+        now = {"t": 1000}
+        clock = lambda: now["t"]  # noqa: E731
+        with tempfile.TemporaryDirectory() as directory:
+            stores = [("memory", InMemoryRuntimeStore(clock=clock)),
+                      ("sqlite", SQLiteRuntimeStore(Path(directory) / "eff.sqlite", clock=clock))]
+            for backend, store in stores:
+                with self.subTest(backend=backend):
+                    now["t"] = 1000
+                    store.record_effect_prepared("e", "t", "iso.charge", "{}")
+                    store.mark_effect_started("e")
+                    store.settle_effect("e", "unknown", None, "kill")
+                    self.assertTrue(store.claim_effect_for_reconcile("e", "A", 100))   # lease -> 1100
+                    now["t"] = 1050                                                    # still live
+                    self.assertFalse(store.claim_effect_for_reconcile("e", "B", 100))  # B refused, A's lease live
+                    now["t"] = 1200                                                    # A's lease expired
+                    self.assertTrue(store.claim_effect_for_reconcile("e", "C", 100))   # C reclaims
+                    self.assertEqual(store.get_effect("e")["reconcile_claim_id"], "C")  # a NEW owner id
+                    # A, superseded, can neither settle nor reset C's live claim.
+                    self.assertFalse(store.settle_effect_from_claim("e", "A", "confirmed", None, "stale"))
+                    self.assertFalse(store.release_effect_claim("e", "A"))
+                    self.assertEqual(store.get_effect("e")["state"], "reconciling")     # C's claim untouched
+                    # C, the live owner, settles it.
+                    self.assertTrue(store.settle_effect_from_claim("e", "C", "reconciled", None, "did not land"))
+                    self.assertEqual(store.get_effect("e")["state"], "reconciled")
+
+    def test_reconcile_claim_rejects_invalid_lease_or_owner(self):
+        # Round-4 hardening (auditor note): the store validates its OWN inputs so a zero/negative lease
+        # (which would make the claim instantly reclaimable, defeating exclusivity) or an empty owner id
+        # is rejected at the boundary, not trusted from the caller. CALIBRATED: neutralize the validator
+        # call and a negative lease is accepted (the claim's lease lands in the past -> instantly
+        # reclaimable), so this test fails; restored -> passes.
+        with tempfile.TemporaryDirectory() as directory:
+            stores = [("memory", InMemoryRuntimeStore()),
+                      ("sqlite", SQLiteRuntimeStore(Path(directory) / "eff.sqlite"))]
+            for backend, store in stores:
+                with self.subTest(backend=backend):
+                    store.record_effect_prepared("e", "t", "iso.charge", "{}")
+                    store.mark_effect_started("e")
+                    store.settle_effect("e", "unknown", None, "kill")
+                    for bad in (0, -1, True, 1.5):
+                        with self.assertRaisesRegex(SecurityError, "lease_seconds"):
+                            store.claim_effect_for_reconcile("e", "owner", bad)
+                    for bad_id in ("", "   ", None):
+                        with self.assertRaisesRegex(SecurityError, "claim_id"):
+                            store.claim_effect_for_reconcile("e", bad_id, 100)
+                    self.assertTrue(store.claim_effect_for_reconcile("e", "owner", 100))  # a well-formed claim still works
 
     @unittest.skipUnless(_has_tree_termination_primitive(), "isolated side-effecting tools need a process-tree termination primitive")
     def test_reconcile_effect_refuses_a_live_reconciling_claim(self):

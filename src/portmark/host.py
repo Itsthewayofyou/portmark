@@ -88,8 +88,10 @@ class AgentHost:
         # Section 7 PR 2 (round 3): give the tool registry a READ-ONLY view of this host's durable
         # ledger so it can validate a launch-arm request against the real `started` row. `tools` is a
         # plain attribute again (the round-2 auto-binding property setter is gone -- the gate no longer
-        # rests on a rebindable predicate; authority is the one-use launch capability). A registry
-        # swapped in after construction (as some tests do) must be re-attached explicitly.
+        # rests on a rebindable predicate; authority is the one-use launch capability). The armer binds
+        # to THIS registry: `host.tools` is IMMUTABLE after construction -- swapping it leaves the new
+        # registry with no armer, so every side-effecting launch through it fails closed (a test that
+        # swaps host.tools must re-attach explicitly). See TOOLS.md.
         self._effect_armer = self.tools.attach_effect_ledger(self._effect_ledger_row)
         if hasattr(self.store, "set_audit_head_verifier"):
             self.store.set_audit_head_verifier(self.signer)  # type: ignore[attr-defined]  # guarded by hasattr; not on the base RuntimeStore protocol
