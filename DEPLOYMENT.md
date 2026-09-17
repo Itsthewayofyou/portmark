@@ -65,8 +65,26 @@ limit on the platform, or a rejected `setrlimit`), the worker refuses the tool w
 set. On Linux all of these limits apply.
 
 A tool registered `side_effecting=True` additionally requires Portmark's idempotency/reconciliation
-contract and an acknowledged isolation profile (Section 7 follow-up). An executable, tested
-container profile ships with that follow-up.
+contract and an acknowledged isolation profile. **The executable, tested container profile is in
+`deploy/`** — the `Dockerfile`, `deploy/docker-compose.hardened.yml`, the exact `docker run` flag set
+in `deploy/README.md`, and `deploy/verify_profile.py`, which runs inside the container and confirms each
+property (read-only rootfs, private writable dir, non-root, `no-new-privileges`, dropped capabilities,
+PID limit, default-deny egress) by attempting the operation it governs. A CI test runs that probe with
+the full flags (every property must hold) and again with each flag removed (that property must flip), so
+the profile is proven, not merely written down. This `deploy/` profile is the concrete meaning of the
+`IsolationMechanism.EXTERNAL_CONTAINER` you acknowledge via `ToolRegistry(isolation_profile=...)`.
+
+### Capability-based safe paths for isolated tools
+
+Grant an isolated tool a filesystem workspace with `ToolRegistry(filesystem_root="/work")`. The runtime
+pre-opens that directory and hands the worker its open descriptor; the tool reaches it **only** through
+`portmark.safe_paths.SafeRoot.from_runtime()` and opens files with `root.open_beneath("rel/path", "w")`.
+The tool never names the root, and `openat2(RESOLVE_BENEATH)` refuses any `..`, absolute, or symlink
+escape race-free. With no `filesystem_root` configured, `from_runtime()` refuses — the default is no
+ambient filesystem authority. This needs Linux ≥ 5.6 and a **seccomp policy that permits `openat2`**;
+Docker's and Kubernetes' `RuntimeDefault` seccomp profiles allow it, and the `deploy/` profile keeps it
+available. If you install a custom seccomp profile it must allow `openat2`, or `from_runtime()` fails
+closed (it never degrades to a race-vulnerable path check). See `deploy/README.md` and TOOLS.md.
 
 ## Reverse Proxy Requirement
 

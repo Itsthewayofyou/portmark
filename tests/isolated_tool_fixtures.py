@@ -168,3 +168,89 @@ def fail_without_landing(arguments: dict[str, Any], effect_id: str | None = None
     # Raises WITHOUT writing the landed marker -- the effect did not land. Settles `unknown`, and
     # reconcile then finds no marker -> not landed -> `reconciled`.
     raise RuntimeError("charge failed before any external effect")
+
+
+# ---- Section 7 PR 3: capability-based safe-path fixtures ----------------------------------------
+
+def safe_write_read(arguments: dict[str, Any]) -> dict[str, Any]:
+    # Uses the runtime-provided SafeRoot capability to write then read a file beneath the root.
+    # Proves the worker inherited the root descriptor and can use it. The tool never names the root.
+    from portmark.safe_paths import SafeRoot
+
+    root = SafeRoot.from_runtime()
+    name = str(arguments["name"])
+    with root.open_beneath(name, "w") as handle:
+        handle.write(str(arguments["content"]))
+    with root.open_beneath(name, "r") as handle:
+        return {"read_back": handle.read(), "mechanism": root.mechanism()}
+
+
+def safe_escape_attempt(arguments: dict[str, Any]) -> dict[str, Any]:
+    # Attempts to open a path that should escape the root, through the runtime SafeRoot. Returns
+    # whether the capability refused it (SafePathEscape) -- proving beneath-root enforcement runs in
+    # the real worker, not just in a unit test.
+    from portmark.safe_paths import SafePathEscape, SafeRoot
+
+    root = SafeRoot.from_runtime()
+    try:
+        root.open_beneath(str(arguments["path"]), "r")
+        return {"refused": False}
+    except SafePathEscape:
+        return {"refused": True}
+
+
+def safe_no_root_probe(arguments: dict[str, Any]) -> dict[str, Any]:
+    # Calls from_runtime() with no filesystem_root configured. Proves the default is NO ambient
+    # filesystem authority: the capability refuses rather than handing back a usable root.
+    from portmark.safe_paths import SafePathUnavailable, SafeRoot
+
+    try:
+        SafeRoot.from_runtime()
+        return {"refused": False}
+    except SafePathUnavailable:
+        return {"refused": True}
+
+
+def safe_grandchild_cannot_inherit(arguments: dict[str, Any]) -> dict[str, Any]:
+    # Takes the SafeRoot (which re-opens the inherited descriptor close-on-exec and closes the raw
+    # one), then execs a grandchild that tries to fstat the descriptor number the runtime named in
+    # PORTMARK_ROOT_FD. The grandchild must NOT have it: the raw fd was closed and the owned copy is
+    # close-on-exec, so a spawned process inherits no filesystem authority. Returns the grandchild's
+    # verdict ("EBADF" == could not access).
+    import subprocess  # nosec B404
+
+    from portmark.safe_paths import SafeRoot
+
+    # Capture the descriptor number BEFORE from_runtime() -- it consumes (pops) PORTMARK_ROOT_FD.
+    fd_number = os.environ["PORTMARK_ROOT_FD"]
+    root = SafeRoot.from_runtime()  # noqa: F841 -- held so the owned fd stays open in THIS process
+    program = (
+        "import os,sys\n"
+        f"try:\n os.fstat({fd_number}); sys.stdout.write('INHERITED')\n"
+        "except OSError as e:\n sys.stdout.write('EBADF' if e.errno==9 else 'ERR%d'%e.errno)\n"
+    )
+    proc = subprocess.run(  # nosec B603
+        [sys.executable, "-c", program], capture_output=True, text=True, timeout=10
+    )
+    return {"grandchild": proc.stdout.strip()}
+
+
+def safe_spawn_without_from_runtime(arguments: dict[str, Any]) -> dict[str, Any]:
+    # A hostile/careless tool that spawns a child WITHOUT ever calling SafeRoot.from_runtime(), and
+    # deliberately with close_fds=False so the child inherits every inheritable descriptor. The worker
+    # sets the inherited root descriptor close-on-exec at startup, so the child must STILL NOT inherit
+    # it -- proving the fd does not leak just because the tool skipped the capability API and passed
+    # its descriptors on. Without the worker hardening, pass_fds leaves the fd inheritable and this
+    # child would report INHERITED, so the assertion is load-bearing.
+    import subprocess  # nosec B404
+
+    fd_number = os.environ.get("PORTMARK_ROOT_FD", "-1")
+    program = (
+        "import os,sys\n"
+        f"try:\n os.fstat({fd_number}); sys.stdout.write('INHERITED')\n"
+        "except OSError as e:\n sys.stdout.write('EBADF' if e.errno==9 else 'ERR%d'%e.errno)\n"
+    )
+    proc = subprocess.run(  # nosec B603
+        [sys.executable, "-c", program], capture_output=True, text=True, timeout=10, close_fds=False
+    )
+    return {"grandchild": proc.stdout.strip()}

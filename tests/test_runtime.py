@@ -10,6 +10,7 @@ import logging
 import os
 import secrets
 import sqlite3
+import subprocess  # nosec B404
 import sys
 import tempfile
 import socket
@@ -8201,6 +8202,433 @@ class ReconcileAuthorityAndSafetyTests(unittest.TestCase):
                     os.path.exists(marker),
                     "registration must NOT import the reconcile module (no unledgered code execution)",
                 )
+
+
+def _openat2_available_here() -> bool:
+    # Decide openat2 usability by attempting it, once, at import (tests only). POSIX-gated so a
+    # non-POSIX box never touches os.uname/openat2.
+    if os.name != "posix":
+        return False
+    from portmark import safe_paths
+
+    directory = tempfile.mkdtemp()
+    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        return safe_paths._openat2_usable(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+HAS_OPENAT2 = _openat2_available_here()
+
+
+class SafePathCapabilityTests(unittest.TestCase):
+    """Section 7 PR 3: the capability-based safe-path helper. Unit tests exercise SafeRoot directly;
+    end-to-end tests drive it through a real isolated worker that inherits the runtime-provided root
+    descriptor. openat2(RESOLVE_BENEATH) is Linux>=5.6 only, so those tests skip where it is absent."""
+
+    def _env(self):
+        import portmark
+
+        src_dir = os.path.dirname(os.path.dirname(os.path.abspath(portmark.__file__)))
+        tests_dir = os.path.dirname(os.path.abspath(__file__))
+        return {"PYTHONPATH": os.pathsep.join([src_dir, tests_dir])}
+
+    def _permit(self, *names):
+        return Permit(
+            issuer="issuer", subject="agent", audience="host",
+            expires_at=int(time.time()) + 60, nonce="nonce-sp",
+            grants=tuple(ToolGrant(name) for name in names),
+        )
+
+    def _root_under(self, directory):
+        # Build a SafeRoot around a dir descriptor and register its close as cleanup, so a mid-test
+        # assertion failure never leaks the descriptor (no ResourceWarning).
+        from portmark import safe_paths
+
+        root = safe_paths.SafeRoot(os.open(directory, os.O_RDONLY | os.O_DIRECTORY))
+        self.addCleanup(root.close)
+        return root
+
+    # ---- unit: capability shape ------------------------------------------------------------------
+
+    def test_from_runtime_is_the_only_constructor_and_refuses_without_a_root_fd(self):  # G1 + G2
+        from portmark import safe_paths
+
+        # No public PATH-taking constructor -- a tool cannot choose its own root. from_runtime() is
+        # the only way in.
+        self.assertTrue(hasattr(safe_paths.SafeRoot, "from_runtime"))
+        self.assertFalse(hasattr(safe_paths.SafeRoot, "from_path"))
+        self.assertFalse(hasattr(safe_paths.SafeRoot, "open"))
+        # No runtime root descriptor -> refuse (no ambient filesystem authority).
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(safe_paths.ROOT_FD_ENV, None)
+            with self.assertRaises(safe_paths.SafePathUnavailable):
+                safe_paths.SafeRoot.from_runtime()
+
+    @unittest.skipUnless(HAS_OPENAT2, "openat2(RESOLVE_BENEATH) not usable here")
+    def test_from_runtime_adopts_the_inherited_fd_and_closes_the_raw_one(self):  # G1 + G9 (unit)
+        from portmark import safe_paths
+
+        directory = tempfile.mkdtemp()
+        raw = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        os.set_inheritable(raw, True)
+        with patch.dict(os.environ, {safe_paths.ROOT_FD_ENV: str(raw)}):
+            root = safe_paths.SafeRoot.from_runtime()
+        self.addCleanup(root.close)
+        # The raw inherited descriptor is closed (from_runtime re-opened its own copy).
+        with self.assertRaises(OSError):
+            os.fstat(raw)
+        # The owned descriptor is close-on-exec, so a spawned process does not inherit it.
+        self.assertFalse(os.get_inheritable(root._dirfd))
+        with root.open_beneath("f", "w") as handle:
+            handle.write("ok")
+
+    @unittest.skipUnless(HAS_OPENAT2, "openat2(RESOLVE_BENEATH) not usable here")
+    def test_open_beneath_reads_and_writes_a_file_under_the_root(self):  # G3
+        directory = tempfile.mkdtemp()
+        root = self._root_under(directory)
+        with root.open_beneath("sub_created_by_tool.txt", "w") as handle:
+            handle.write("payload")
+        # The write really landed on disk beneath the root.
+        with open(os.path.join(directory, "sub_created_by_tool.txt")) as landed:
+            self.assertEqual(landed.read(), "payload")
+        with root.open_beneath("sub_created_by_tool.txt", "r") as handle:
+            self.assertEqual(handle.read(), "payload")
+
+    @unittest.skipUnless(HAS_OPENAT2, "openat2(RESOLVE_BENEATH) not usable here")
+    def test_open_beneath_refuses_escape_and_the_resolve_flags_are_load_bearing(self):  # G4 + G5 (CALIBRATED)
+        from portmark import safe_paths
+
+        directory = tempfile.mkdtemp()
+        os.mkdir(os.path.join(directory, "sub"))
+        os.symlink("/etc/passwd", os.path.join(directory, "link"))
+        root = self._root_under(directory)
+        # Absolute path and empty path are refused before any syscall.
+        with self.assertRaises(safe_paths.SafePathEscape):
+            root.open_beneath("/etc/passwd", "r")
+        with self.assertRaises(safe_paths.SafePathEscape):
+            root.open_beneath("", "r")
+        # `..` escape via a real directory, and a symlink out, are refused by the kernel.
+        for escaping in ("../escape", "sub/../../x", ".."):
+            with self.assertRaises(safe_paths.SafePathEscape):
+                root.open_beneath(escaping, "r")
+        with self.assertRaises(safe_paths.SafePathEscape):
+            root.open_beneath("link", "r")
+        # CALIBRATION: the RESOLVE_BENEATH|NO_SYMLINKS flags are what refuse. Neutralize them (0) and
+        # the identical symlink now resolves out of the root -- proving the flags carry the guarantee.
+        with patch.object(safe_paths, "_SAFE_RESOLVE", 0):
+            with root.open_beneath("link", "r") as leaked:
+                self.assertIn("root:", leaked.read(4096))  # /etc/passwd content leaked through
+
+    @unittest.skipUnless(HAS_OPENAT2, "openat2(RESOLVE_BENEATH) not usable here")
+    def test_openat2_usability_is_decided_by_the_syscall_not_the_version(self):  # G6 (CALIBRATED)
+        from portmark import safe_paths
+
+        directory = tempfile.mkdtemp()
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            self.assertTrue(safe_paths._openat2_usable(descriptor))
+            # CALIBRATION: usability is proven by ATTEMPTING the syscall. Point the syscall at a
+            # bogus number (as an unknown-arch/blocked kernel would surface via errno) and the SAME
+            # probe reports unusable -- no version string is consulted.
+            with patch.object(safe_paths, "_syscall_number", lambda: 0xDEAD):
+                self.assertFalse(safe_paths._openat2_usable(descriptor))
+        finally:
+            os.close(descriptor)
+
+    @unittest.skipUnless(os.name == "posix", "opens a directory fd (O_DIRECTORY) -- POSIX only")
+    def test_import_touches_no_libc_or_filesystem(self):  # G8 (CALIBRATED)
+        import importlib
+
+        from portmark import safe_paths
+
+        boom = lambda *a, **k: (_ for _ in ()).throw(AssertionError("import loaded libc"))  # noqa: E731
+        with patch("ctypes.CDLL", boom):
+            importlib.reload(safe_paths)  # succeeds: importing the module loads no C library
+            # CALIBRATION: the tripwire is armed -- code that DOES load libc raises under this patch,
+            # so the reload's success proves import itself performed no such call.
+            directory = tempfile.mkdtemp()
+            descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with self.assertRaises(AssertionError):
+                    safe_paths._openat2_usable(descriptor)
+            finally:
+                os.close(descriptor)
+        importlib.reload(safe_paths)  # restore the real module for other tests
+
+    @unittest.skipUnless(os.name == "posix", "opens a directory fd (O_DIRECTORY) -- POSIX only")
+    def test_from_runtime_refuses_when_openat2_is_unusable(self):  # G7 + G11
+        from portmark import safe_paths
+
+        directory = tempfile.mkdtemp()
+        raw = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        os.set_inheritable(raw, True)
+        # Simulate a platform/kernel/seccomp where openat2 is not usable: from_runtime REFUSES rather
+        # than degrade to a race-vulnerable check.
+        with patch.object(safe_paths, "_openat2_usable", lambda fd: False):
+            with patch.dict(os.environ, {safe_paths.ROOT_FD_ENV: str(raw)}):
+                with self.assertRaises(safe_paths.SafePathUnavailable):
+                    safe_paths.SafeRoot.from_runtime()
+        # from_runtime closed the raw inherited descriptor itself; do not double-close it here.
+
+    # ---- end-to-end through a real isolated worker ----------------------------------------------
+
+    @unittest.skipUnless(HAS_OPENAT2 and _CAN_KILL_PROCESS_GROUP, "needs POSIX worker + openat2")
+    def test_isolated_tool_reaches_the_runtime_root_and_writes_beneath_it(self):  # G9 (e2e)
+        with tempfile.TemporaryDirectory() as directory:
+            registry = ToolRegistry(filesystem_root=directory)
+            registry.register_isolated(
+                "iso.safe", "isolated_tool_fixtures:safe_write_read", env=self._env()
+            )
+            result = registry.invoke(self._permit("iso.safe"), "iso.safe", {"name": "note.txt", "content": "hi-from-tool"})
+            self.assertEqual(result["read_back"], "hi-from-tool")
+            self.assertEqual(result["mechanism"], "openat2")
+            # The tool wrote through the inherited descriptor, so the file exists on the host side.
+            with open(os.path.join(directory, "note.txt")) as landed:
+                self.assertEqual(landed.read(), "hi-from-tool")
+
+    @unittest.skipUnless(HAS_OPENAT2 and _CAN_KILL_PROCESS_GROUP, "needs POSIX worker + openat2")
+    def test_isolated_tool_escape_is_refused_inside_the_worker(self):  # G4 (e2e)
+        with tempfile.TemporaryDirectory() as directory:
+            os.symlink("/etc/passwd", os.path.join(directory, "link"))
+            registry = ToolRegistry(filesystem_root=directory)
+            registry.register_isolated(
+                "iso.esc", "isolated_tool_fixtures:safe_escape_attempt", env=self._env()
+            )
+            permit = self._permit("iso.esc")
+            for escaping in ("../escape", "link"):
+                self.assertEqual(
+                    registry.invoke(permit, "iso.esc", {"path": escaping}), {"refused": True}
+                )
+
+    @unittest.skipUnless(_CAN_KILL_PROCESS_GROUP, "needs a POSIX worker")
+    def test_no_filesystem_root_means_no_ambient_authority(self):  # G10
+        # No filesystem_root configured -> the worker inherits no root fd -> from_runtime() refuses.
+        registry = ToolRegistry()
+        registry.register_isolated(
+            "iso.noroot", "isolated_tool_fixtures:safe_no_root_probe", env=self._env()
+        )
+        self.assertEqual(
+            registry.invoke(self._permit("iso.noroot"), "iso.noroot", {}), {"refused": True}
+        )
+
+    @unittest.skipUnless(HAS_OPENAT2 and _CAN_KILL_PROCESS_GROUP, "needs POSIX worker + openat2")
+    def test_spawned_grandchild_does_not_inherit_the_root_descriptor(self):  # G9 (grandchild)
+        with tempfile.TemporaryDirectory() as directory:
+            registry = ToolRegistry(filesystem_root=directory)
+            registry.register_isolated(
+                "iso.gc", "isolated_tool_fixtures:safe_grandchild_cannot_inherit", env=self._env()
+            )
+            result = registry.invoke(self._permit("iso.gc"), "iso.gc", {})
+            # The grandchild could not fstat the root descriptor number: it was closed/close-on-exec.
+            self.assertEqual(result["grandchild"], "EBADF")
+
+    @unittest.skipUnless(HAS_OPENAT2 and _CAN_KILL_PROCESS_GROUP, "needs POSIX worker + openat2")
+    def test_root_fd_does_not_leak_to_a_child_spawned_before_from_runtime(self):  # G9 (worker hardening)
+        # Even a tool that spawns a child WITHOUT calling from_runtime must not leak the root fd: the
+        # worker sets it close-on-exec at startup. Without that, pass_fds leaves it inheritable.
+        with tempfile.TemporaryDirectory() as directory:
+            registry = ToolRegistry(filesystem_root=directory)
+            registry.register_isolated(
+                "iso.leak", "isolated_tool_fixtures:safe_spawn_without_from_runtime", env=self._env()
+            )
+            result = registry.invoke(self._permit("iso.leak"), "iso.leak", {})
+            self.assertEqual(result["grandchild"], "EBADF")
+
+    # ---- descriptor lifecycle (auditor round 1, finding 1) --------------------------------------
+
+    @unittest.skipUnless(HAS_OPENAT2, "openat2(RESOLVE_BENEATH) not usable here")
+    def test_from_runtime_is_one_shot_and_a_reused_fd_cannot_retarget_it(self):  # G19 (CALIBRATED)
+        from portmark import safe_paths
+
+        first = tempfile.mkdtemp()
+        second = tempfile.mkdtemp()
+        with open(os.path.join(second, "SECOND"), "w"):
+            pass
+        raw = os.open(first, os.O_RDONLY | os.O_DIRECTORY)
+        os.set_inheritable(raw, True)
+        with patch.dict(os.environ, {safe_paths.ROOT_FD_ENV: str(raw)}):
+            root = safe_paths.SafeRoot.from_runtime()  # consumes env (pop) and closes `raw`
+            self.addCleanup(root.close)
+            # The env var was consumed, and the kernel reuses the closed descriptor number for `second`.
+            self.assertIsNone(os.environ.get(safe_paths.ROOT_FD_ENV))
+            reused = os.open(second, os.O_RDONLY | os.O_DIRECTORY)
+            self.addCleanup(os.close, reused)
+            self.assertEqual(reused, raw)  # same descriptor number, different directory
+            # CALIBRATION (auditor repro): a second from_runtime() must REFUSE, not adopt the reused
+            # descriptor. Before the pop fix it read the stale env fd and opened `second`.
+            with self.assertRaises(safe_paths.SafePathUnavailable):
+                safe_paths.SafeRoot.from_runtime()
+
+    @unittest.skipUnless(HAS_OPENAT2, "openat2(RESOLVE_BENEATH) not usable here")
+    def test_closed_safe_root_refuses_even_after_fd_reuse(self):  # G19 (CALIBRATED)
+        from portmark import safe_paths
+
+        first = tempfile.mkdtemp()
+        second = tempfile.mkdtemp()
+        with open(os.path.join(second, "SECOND"), "w"):
+            pass
+        root = safe_paths.SafeRoot(os.open(first, os.O_RDONLY | os.O_DIRECTORY))
+        with root.open_beneath("ok", "w") as handle:
+            handle.write("x")
+        closed_fd = root._dirfd
+        root.close()
+        reused = os.open(second, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, reused)
+        self.assertEqual(reused, closed_fd)  # the closed number now names `second`
+        # CALIBRATION (auditor repro): the closed SafeRoot must refuse, not open into `second`.
+        # Before close() nulled _dirfd, open_beneath used the reused descriptor and read `second`.
+        with self.assertRaises(safe_paths.SafePathError):
+            root.open_beneath("SECOND", "r")
+
+    # ---- filesystem_root identity pinning (auditor round 1, finding 3) --------------------------
+
+    @unittest.skipUnless(HAS_OPENAT2 and _CAN_KILL_PROCESS_GROUP, "needs POSIX worker + openat2")
+    def test_filesystem_root_identity_is_pinned_against_a_swap(self):  # G21 (CALIBRATED)
+        from portmark.tools import ToolExecutionError
+
+        original = tempfile.mkdtemp()
+        replacement = tempfile.mkdtemp()
+        root_path = os.path.join(tempfile.mkdtemp(), "root")
+        os.symlink(original, root_path)  # registry records `original`'s identity at construction
+        registry = ToolRegistry(filesystem_root=root_path)
+        registry.register_isolated(
+            "iso.pin", "isolated_tool_fixtures:safe_write_read", env=self._env()
+        )
+        permit = self._permit("iso.pin")
+        # Swap the configured path to point at a DIFFERENT directory after construction.
+        os.unlink(root_path)
+        os.symlink(replacement, root_path)
+        # The launch fstats the descriptor and sees a different (st_dev, st_ino) -> refuses.
+        with self.assertRaisesRegex(ToolExecutionError, "identity changed"):
+            registry.invoke(permit, "iso.pin", {"name": "note.txt", "content": "hi"})
+        # CALIBRATION: neutralize the pin (record the post-swap identity) and the SAME swapped invoke
+        # now runs against the replacement directory -- proving the identity check is what refuses.
+        swapped_stat = os.stat(root_path)
+        registry._filesystem_root_identity = (swapped_stat.st_dev, swapped_stat.st_ino)
+        result = registry.invoke(permit, "iso.pin", {"name": "note.txt", "content": "hi"})
+        self.assertEqual(result["read_back"], "hi")
+        with open(os.path.join(replacement, "note.txt")) as landed:  # it really wrote into `replacement`
+            self.assertEqual(landed.read(), "hi")
+
+
+def _docker_available() -> bool:
+    import shutil
+
+    if shutil.which("docker") is None:
+        return False
+    try:
+        return subprocess.run(  # nosec B603 B607
+            ["docker", "info"], capture_output=True, timeout=30
+        ).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+_PROFILE_IMAGE = os.environ.get("PORTMARK_TEST_IMAGE")
+_RUN_PROFILE_TESTS = bool(_PROFILE_IMAGE) and _docker_available()
+
+
+class DeploymentProfileTests(unittest.TestCase):
+    """Section 7 PR 3: the hardened container profile is executable and TESTED. Each property is
+    probed inside the running container by attempting the operation it governs (deploy/verify_profile.py),
+    and each is CALIBRATED: removing its one flag must flip that property off. Runs only when a built
+    image tag is provided (PORTMARK_TEST_IMAGE) and docker is usable -- CI sets both after the build."""
+
+    # The full hardened flag set (mirrors deploy/README.md and deploy/docker-compose.hardened.yml).
+    BASE_FLAGS = [
+        "--rm",
+        "--read-only",
+        "--tmpfs", "/work:rw,noexec,nosuid,nodev,size=64m",
+        "--env", "PORTMARK_WORKDIR=/work",
+        "--user", "1000:1000",
+        "--cap-drop", "ALL",
+        "--security-opt", "no-new-privileges",
+        "--pids-limit", "128",
+        "--memory", "512m",
+        "--cpus", "1.0",
+        "--network", "none",
+    ]
+
+    def _probe(self, flags):
+        result = subprocess.run(  # nosec B603 B607
+            ["docker", "run", *flags, _PROFILE_IMAGE, "python", "/app/deploy/verify_profile.py"],
+            capture_output=True, text=True, timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, f"docker run failed: {result.stderr.strip()}")
+        return json.loads(result.stdout.strip().splitlines()[-1])
+
+    @unittest.skipUnless(_RUN_PROFILE_TESTS, "needs docker + PORTMARK_TEST_IMAGE (built image tag)")
+    def test_hardened_profile_every_property_holds(self):  # G13 + G15 (present)
+        report = self._probe(self.BASE_FLAGS)
+        for prop, held in report.items():
+            self.assertTrue(held, f"hardened profile property not enforced: {prop} ({report})")
+
+    @unittest.skipUnless(_RUN_PROFILE_TESTS, "needs docker + PORTMARK_TEST_IMAGE (built image tag)")
+    def test_each_property_is_calibrated_by_removing_its_flag(self):  # G15 (CALIBRATED)
+        # For each property, drop/override exactly the flag that enforces it and assert THAT property
+        # flips off -- so a passing full-profile run proves enforcement, not a decorative check.
+        def without(*tokens):
+            flags = list(self.BASE_FLAGS)
+            for token in tokens:
+                flags.remove(token)
+            return flags
+
+        # read-only rootfs: without --read-only the app root becomes writable.
+        self.assertFalse(self._probe(without("--read-only"))["readonly_rootfs"])
+        # private writable dir: without the tmpfs mount (root stays read-only) /work is not writable.
+        self.assertFalse(
+            self._probe(without("--tmpfs", "/work:rw,noexec,nosuid,nodev,size=64m"))["private_writable_dir"]
+        )
+        # non-root: override the user to root (0:0). The image's default user is already non-root, so
+        # merely dropping --user would not flip it -- forcing root is the honest calibration.
+        root_flags = list(self.BASE_FLAGS)
+        root_flags[root_flags.index("1000:1000")] = "0:0"
+        self.assertFalse(self._probe(root_flags)["non_root"])
+        # no-new-privileges: without the security-opt the bit is clear.
+        self.assertFalse(self._probe(without("--security-opt", "no-new-privileges"))["no_new_privileges"])
+        # dropped capabilities: without --cap-drop ALL the bounding set is non-empty.
+        self.assertFalse(self._probe(without("--cap-drop", "ALL"))["dropped_capabilities"])
+        # pids limit: without --pids-limit the cgroup pids.max is "max".
+        self.assertFalse(self._probe(without("--pids-limit", "128"))["pids_limited"])
+        # memory limit: without --memory the cgroup memory.max is "max".
+        self.assertFalse(self._probe(without("--memory", "512m"))["memory_limited"])
+        # cpu limit: without --cpus the cgroup cpu.max quota is "max".
+        self.assertFalse(self._probe(without("--cpus", "1.0"))["cpu_limited"])
+        # egress: without --network none a non-loopback interface (eth0) appears.
+        self.assertFalse(self._probe(without("--network", "none"))["egress_denied"])
+
+    @unittest.skipUnless(_RUN_PROFILE_TESTS, "needs docker + PORTMARK_TEST_IMAGE (built image tag)")
+    def test_resource_ceilings_reject_weak_but_set_limits(self):  # G20 (CALIBRATED, ceilings)
+        # Finiteness is not a bound: a regression from 512m/1.0 to 16g/8.0 leaves memory.max/cpu.max
+        # finite but far above the advertised ceilings. The probe must reject them.
+        def replace(old, new):
+            flags = list(self.BASE_FLAGS)
+            flags[flags.index(old)] = new
+            return flags
+
+        report = self._probe(replace("512m", "16g"))
+        self.assertFalse(report["memory_limited"], f"16g must exceed the 512 MiB ceiling ({report})")
+        # 2.0 (not 8.0) so the flag is accepted on a small CI runner -- docker rejects --cpus above the
+        # host's CPU count (a 4-CPU runner caps at 4.00). 2.0 still exceeds the 1.0 ceiling.
+        report = self._probe(replace("1.0", "2.0"))
+        self.assertFalse(report["cpu_limited"], f"2.0 CPUs must exceed the 1.0 ceiling ({report})")
+
+    @unittest.skipUnless(_RUN_PROFILE_TESTS, "needs docker + PORTMARK_TEST_IMAGE (built image tag)")
+    def test_openat2_is_not_blocked_inside_the_hardened_image(self):  # G14
+        # The safe-path helper needs openat2; a seccomp profile could block it. Prove the hardened
+        # image's default seccomp ALLOWS openat2 by running the usability probe INSIDE the container.
+        result = subprocess.run(  # nosec B603 B607
+            ["docker", "run", *self.BASE_FLAGS, _PROFILE_IMAGE, "python", "-c",
+             "import os;from portmark import safe_paths as s;"
+             # Use the private writable dir: the read-only rootfs has no usable temp directory.
+             "fd=os.open('/work',os.O_RDONLY|os.O_DIRECTORY);"
+             "print('USABLE' if s._openat2_usable(fd) else 'BLOCKED')"],
+            capture_output=True, text=True, timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, f"docker run failed: {result.stderr.strip()}")
+        self.assertEqual(result.stdout.strip().splitlines()[-1], "USABLE")
 
 
 if __name__ == "__main__":
