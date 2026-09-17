@@ -8337,6 +8337,7 @@ class SafePathCapabilityTests(unittest.TestCase):
         finally:
             os.close(descriptor)
 
+    @unittest.skipUnless(os.name == "posix", "opens a directory fd (O_DIRECTORY) -- POSIX only")
     def test_import_touches_no_libc_or_filesystem(self):  # G8 (CALIBRATED)
         import importlib
 
@@ -8356,6 +8357,7 @@ class SafePathCapabilityTests(unittest.TestCase):
                 os.close(descriptor)
         importlib.reload(safe_paths)  # restore the real module for other tests
 
+    @unittest.skipUnless(os.name == "posix", "opens a directory fd (O_DIRECTORY) -- POSIX only")
     def test_from_runtime_refuses_when_openat2_is_unusable(self):  # G7 + G11
         from portmark import safe_paths
 
