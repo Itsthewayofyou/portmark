@@ -19,7 +19,7 @@ import unittest
 import urllib.error
 import urllib.request
 from dataclasses import asdict
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from http.client import HTTPResponse
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -1759,9 +1759,10 @@ class RuntimeTests(unittest.TestCase):
         # P3 round 3 remediation: a reconcile claim has an OWNER (reconcile_claim_id). Two operators
         # cannot clobber each other -- a stale/expired holder can neither overwrite a recorded settlement
         # nor reset a newer holder's claim, because a reclaim mints a DIFFERENT claim_id and the terminal
-        # settle requires the owning id AND a live lease. Runs on SQLite AND (when a DSN is set) Postgres
-        # via two real synchronized connections -- the bar the Section-6 auditor set for a concurrency claim.
-        for context in self._store_case_contexts():
+        # settle requires the owning id AND a live lease. Runs on InMemory (the DEFAULT store, so its
+        # owned-lease methods are covered too) AND SQLite AND (when a DSN is set) Postgres via two real
+        # synchronized connections -- the bar the Section-6 auditor set for a concurrency claim.
+        for context in [nullcontext(("memory", InMemoryRuntimeStore()))] + self._store_case_contexts():
             with context as (backend, store):
                 with self.subTest(backend=backend):
                     def seed_unknown(eid: str) -> None:
