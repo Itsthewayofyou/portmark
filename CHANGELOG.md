@@ -29,6 +29,15 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   and a `provider.failed` audit event, then re-raises — an admitted task is never left represented only as
   `running`. The task is closed; **a retry is a fresh call**, not a resume of the same task id. Previously
   such a failure propagated out of `run()` leaving the checkpoint resumable as `running`.
+- **DNS resolution is now inside the deadline.** `getaddrinfo` runs in a deadline-bounded, pool-capped
+  daemon thread, so a stuck resolver cannot hold the worker past the timeout. The socket timeout is
+  **re-armed to the remaining budget** before headers, `getresponse`, and every read, so time spent in an
+  earlier phase cannot be re-spent in a later one (the total bound is honored, not the per-operation one).
+  An IPv6 endpoint's `Host` header is correctly bracketed (`[::1]:8080`).
+- **Local-gateway escape hatch is reachable again.** A loopback `http://127.0.0.1:...` provider endpoint
+  now requires the explicit opt-in `--allow-local-provider-endpoint` (or
+  `PORTMARK_ALLOW_LOCAL_PROVIDER_ENDPOINT=true`), wired through `make_host`. It permits **loopback only** —
+  private/link-local/etc. addresses are still rejected.
 
 ### Section 7 — tool execution isolation (PR 3): capability-based safe paths + tested container profile
 

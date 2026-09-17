@@ -11,6 +11,7 @@ import socket
 import ssl
 import subprocess  # nosec B404
 import sys
+import threading
 import time
 from urllib.parse import urlparse
 from abc import ABC, abstractmethod
@@ -104,6 +105,11 @@ def _address_is_disallowed(address: ipaddress.IPv4Address | ipaddress.IPv6Addres
     )
 
 
+# A timed-out getaddrinfo thread cannot be killed, so cap how many resolver threads may leak at once.
+# Exhausting the pool fails a new provider call closed rather than spawning unbounded threads.
+_RESOLVER_SLOTS = threading.BoundedSemaphore(32)
+
+
 class GenericHttpProvider(ModelProvider):
     """Provider-neutral JSON adapter for a local or remote model gateway.
 
@@ -133,8 +139,14 @@ class GenericHttpProvider(ModelProvider):
         self._port = parsed.port or (443 if parsed.scheme == "https" else 80)
         path = parsed.path or "/"
         self._path = path + (f"?{parsed.query}" if parsed.query else "")
+        # An IPv6 literal must be bracketed in the Host authority ([::1]:8080, not ::1:8080); urlparse
+        # strips the brackets in .hostname, so restore them for the header.
+        try:
+            header_host = f"[{host}]" if ipaddress.ip_address(host).version == 6 else host
+        except ValueError:
+            header_host = host
         default_port = self._port == (443 if parsed.scheme == "https" else 80)
-        self._host_header = host if default_port else f"{host}:{self._port}"
+        self._host_header = header_host if default_port else f"{header_host}:{self._port}"
         self.bearer_token = bearer_token
         self.timeout = timeout
         self.max_response_bytes = max_response_bytes
@@ -151,26 +163,46 @@ class GenericHttpProvider(ModelProvider):
 
     # ---- Section 8 transport -------------------------------------------------------------------
 
-    def _resolve(self) -> list[tuple[int, str]]:
-        # A literal-IP endpoint is classified directly (no resolution). A hostname is resolved ONCE,
-        # and every A/AAAA answer is returned so the caller can reject a mixed public+private answer.
+    def _resolve(self, deadline: float) -> list[tuple[int, str]]:
+        # A literal-IP endpoint is classified directly (no resolution). A hostname is resolved ONCE.
         try:
             literal = ipaddress.ip_address(self._host)
             return [(socket.AF_INET6 if literal.version == 6 else socket.AF_INET, str(literal))]
         except ValueError:
             pass
-        try:
-            infos = socket.getaddrinfo(self._host, self._port, type=socket.SOCK_STREAM)
-        except socket.gaierror as error:
-            raise ProviderError(f"provider endpoint did not resolve: {error}") from error
-        answers = [(family, sockaddr[0]) for family, _t, _p, _c, sockaddr in infos
+        # socket.getaddrinfo has no timeout and cannot observe the deadline (finding, S8-PR1 round 1):
+        # a stuck resolver would hold the worker indefinitely. Run it in a daemon thread and join with
+        # the remaining deadline, so resolution is bounded by the same clock as the rest of the request.
+        # A timed-out getaddrinfo thread cannot be killed, so cap how many may be in flight at once
+        # (_RESOLVER_SLOTS) and fail closed when the pool is exhausted -- bounding the leak.
+        if not _RESOLVER_SLOTS.acquire(blocking=False):
+            raise ProviderError("too many concurrent provider DNS resolutions in flight")
+        result: dict[str, Any] = {}
+
+        def _worker() -> None:
+            try:
+                result["infos"] = socket.getaddrinfo(self._host, self._port, type=socket.SOCK_STREAM)
+            except OSError as error:  # gaierror is a subclass
+                result["error"] = error
+            finally:
+                _RESOLVER_SLOTS.release()
+
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        if thread.is_alive():
+            # The thread keeps its slot until getaddrinfo eventually returns and releases it.
+            raise ProviderError("provider DNS resolution exceeded the deadline")
+        if "error" in result:
+            raise ProviderError(f"provider endpoint did not resolve: {result['error']}")
+        answers = [(family, sockaddr[0]) for family, _t, _p, _c, sockaddr in result.get("infos", [])
                    if family in (socket.AF_INET, socket.AF_INET6)]
         if not answers:
             raise ProviderError("provider endpoint resolved to no usable address")
         return answers
 
-    def _validated_target(self) -> tuple[int, str]:
-        answers = self._resolve()
+    def _validated_target(self, deadline: float) -> tuple[int, str]:
+        answers = self._resolve(deadline)
         # Fail closed on ANY disallowed answer (a mixed public+loopback response must not proceed on
         # the public one), unless it is loopback AND the operator opted into a local provider.
         for _family, ip in answers:
@@ -201,23 +233,25 @@ class GenericHttpProvider(ModelProvider):
 
     def _post(self, body: bytes) -> bytes:
         deadline = time.monotonic() + self.timeout
-        _family, ip = self._validated_target()
+        _family, ip = self._validated_target(deadline)
         try:
             connection = self._open_connection(ip, deadline)
         except (OSError, ssl.SSLError) as error:
             raise ProviderError(f"provider connection failed: {error}") from error
         try:
             # DNS-rebinding backstop: confirm the socket really connected to the address we validated.
-            # connection.sock is valid here (before getresponse, which may release it for a close).
-            if connection.sock is None:
+            # connection.sock is valid here (before getresponse, which may release it for a close);
+            # capture it so the deadline can be re-armed on it even after getresponse releases it.
+            sock = connection.sock
+            if sock is None:
                 raise ProviderError("provider connection has no socket")
-            if _classify_address(connection.sock.getpeername()[0]) != _classify_address(ip):
+            if _classify_address(sock.getpeername()[0]) != _classify_address(ip):
                 raise ProviderError("connected peer does not match the validated address")
-            return self._exchange(connection, body, deadline)
+            return self._exchange(connection, sock, body, deadline)
         finally:
             connection.close()
 
-    def _exchange(self, connection: http.client.HTTPConnection, body: bytes, deadline: float) -> bytes:
+    def _exchange(self, connection: http.client.HTTPConnection, sock: socket.socket, body: bytes, deadline: float) -> bytes:
         try:
             # skip_host so we set Host ourselves (the hostname, not the pinned IP the socket is on).
             connection.putrequest("POST", self._path, skip_host=True, skip_accept_encoding=True)
@@ -226,9 +260,9 @@ class GenericHttpProvider(ModelProvider):
             connection.putheader("Content-Length", str(len(body)))
             if self.bearer_token:
                 connection.putheader("Authorization", f"Bearer {self.bearer_token}")
-            self._check_deadline(deadline)
+            self._arm_deadline(sock, deadline)
             connection.endheaders(body)
-            self._check_deadline(deadline)
+            self._arm_deadline(sock, deadline)
             response = connection.getresponse()
         except (OSError, http.client.HTTPException) as error:
             raise ProviderError(f"provider request failed: {error}") from error
@@ -238,30 +272,25 @@ class GenericHttpProvider(ModelProvider):
             raise ProviderError(f"provider returned an unfollowed redirect (HTTP {response.status})")
         if response.status != 200:
             raise ProviderError(f"provider returned HTTP {response.status}")
-        return self._read_bounded(response, deadline)
+        return self._read_bounded(response, sock, deadline)
 
-    def _read_bounded(self, response: http.client.HTTPResponse, deadline: float) -> bytes:
+    def _read_bounded(self, response: http.client.HTTPResponse, sock: socket.socket, deadline: float) -> bytes:
         # Bound the body DURING the read (never buffer unbounded) and enforce the total deadline. The
-        # socket carries a connect-time timeout (set from the remaining budget in _open_connection),
-        # which bounds a TOTAL stall (a read that gets no data). read1() returns whatever one recv
-        # yields, so a slow-drip is re-checked against the wall clock between chunks and aborted on the
-        # end-to-end deadline rather than trickling to completion (finding #3).
+        # socket timeout is re-armed to the REMAINING deadline before each read (finding round-1 #2:
+        # a per-operation socket timeout that is not re-armed lets each phase re-spend the full budget).
+        # read1() returns whatever one recv yields, so a slow-drip is also re-checked against the wall
+        # clock between chunks and aborted on the total deadline rather than trickling to completion.
         limit = self.max_response_bytes
         buffer = bytearray()
         while len(buffer) <= limit:
-            self._check_deadline(deadline)
+            self._arm_deadline(sock, deadline)
             try:
-                # read1(), not read(): read(amt) blocks until it has accumulated the full amt (or the
-                # Content-Length is met), so a slow-drip that trickles within the idle socket timeout
-                # keeps a single read() blocked for the whole body and defeats the deadline. read1()
-                # returns whatever one underlying recv yields, so the deadline is re-checked between
-                # chunks and a drip is aborted on the total clock (finding #3).
                 chunk = response.read1(min(65_536, limit + 1 - len(buffer)))
             except (OSError, http.client.HTTPException) as error:
                 raise ProviderError(f"provider response read failed: {error}") from error
             if not chunk:
                 # EOF. If the framing promised more (Content-Length not fully delivered), the body was
-                # truncated -- a controlled provider failure, not a valid short response (finding #3).
+                # truncated -- a controlled provider failure, not a valid short response.
                 if getattr(response, "length", None):
                     raise ProviderError("provider response ended prematurely")
                 return bytes(buffer)
@@ -270,11 +299,20 @@ class GenericHttpProvider(ModelProvider):
                 raise SecurityError("provider response exceeds output limit")
         raise SecurityError("provider response exceeds output limit")
 
-    def _check_deadline(self, deadline: float) -> None:
-        # Wall-clock check of the total end-to-end deadline (independent of the socket idle timeout,
-        # which a slow-drip can beat). Called between read1() chunks so a trickling response is aborted.
-        if deadline - time.monotonic() <= 0:
+    def _arm_deadline(self, sock: socket.socket, deadline: float) -> None:
+        # Re-arm the socket timeout to the time REMAINING on the total deadline, and fail closed if the
+        # deadline has passed. A socket timeout is per-operation (idle), so without re-arming before
+        # each phase/read the time already spent (DNS, connect, prior reads) could be spent again in
+        # the next operation, overshooting the advertised total bound. settimeout is guarded: after a
+        # Connection: close response http.client releases the socket, and a best-effort re-arm on the
+        # released reference must not mask the deadline the wall-clock check above already enforces.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             raise ProviderError("provider deadline exceeded")
+        try:
+            sock.settimeout(remaining)
+        except OSError:
+            pass
 
 
 def _provider_decision(value: Any) -> ProviderDecision:

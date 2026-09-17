@@ -8693,31 +8693,31 @@ class HttpProviderTransportTests(unittest.TestCase):
                 provider = GenericHttpProvider("https://provider.example/run")
                 with patch.object(provider, "_resolve", return_value=[(socket.AF_INET, ip)]):
                     with self.assertRaisesRegex(ProviderError, "not permitted"):
-                        provider._validated_target()
+                        provider._validated_target(time.monotonic() + 1)
         # Mixed answer: one public + one loopback must fail closed on the loopback one.
         provider = GenericHttpProvider("https://provider.example/run")
         with patch.object(provider, "_resolve", return_value=[(socket.AF_INET, "93.184.216.34"), (socket.AF_INET, "127.0.0.1")]):
             with self.assertRaisesRegex(ProviderError, "not permitted"):
-                provider._validated_target()
+                provider._validated_target(time.monotonic() + 1)
         # CALIBRATION: a purely public answer is accepted.
         provider = GenericHttpProvider("https://provider.example/run")
         with patch.object(provider, "_resolve", return_value=[(socket.AF_INET, "93.184.216.34")]):
-            self.assertEqual(provider._validated_target(), (socket.AF_INET, "93.184.216.34"))
+            self.assertEqual(provider._validated_target(time.monotonic() + 1), (socket.AF_INET, "93.184.216.34"))
 
     def test_ipv4_mapped_ipv6_is_normalized_before_classification(self):  # G5 (CALIBRATED)
         provider = GenericHttpProvider("https://provider.example/run")
         with patch.object(provider, "_resolve", return_value=[(socket.AF_INET6, "::ffff:127.0.0.1")]):
             with self.assertRaisesRegex(ProviderError, "not permitted"):
-                provider._validated_target()
+                provider._validated_target(time.monotonic() + 1)
 
     def test_https_required_for_non_loopback(self):  # G7 (CALIBRATED)
         provider = GenericHttpProvider("http://provider.example/run")
         with patch.object(provider, "_resolve", return_value=[(socket.AF_INET, "93.184.216.34")]):
             with self.assertRaisesRegex(ProviderError, "https"):
-                provider._validated_target()
+                provider._validated_target(time.monotonic() + 1)
         # CALIBRATION: loopback + allow_local_endpoint permits plain http.
         local = GenericHttpProvider("http://127.0.0.1/run", allow_local_endpoint=True)
-        self.assertEqual(local._validated_target(), (socket.AF_INET, "127.0.0.1"))
+        self.assertEqual(local._validated_target(time.monotonic() + 1), (socket.AF_INET, "127.0.0.1"))
 
     def test_dns_rebinding_peer_mismatch_is_refused(self):  # G6
         class _FakeSock:
@@ -8812,6 +8812,72 @@ class HttpProviderTransportTests(unittest.TestCase):
             stored = host.store.load_checkpoint(envelope.state.task_id)
             self.assertIsNotNone(stored)
             self.assertEqual(stored["status"], "failed")
+
+    # ---- round 1 findings ------------------------------------------------------------------------
+
+    def test_dns_resolution_is_bounded_by_the_deadline(self):  # G16 (CALIBRATED)
+        provider = GenericHttpProvider("https://slow.example/run", timeout=0.2)
+        real = socket.getaddrinfo
+
+        def slow_getaddrinfo(*args, **kwargs):
+            time.sleep(1.5)  # far past the 0.2s deadline
+            return real(*args, **kwargs)
+
+        with patch("socket.getaddrinfo", side_effect=slow_getaddrinfo):
+            started = time.monotonic()
+            with self.assertRaisesRegex(ProviderError, "DNS resolution exceeded"):
+                provider._validated_target(time.monotonic() + 0.2)
+            # Bounded near the deadline, NOT held for the full blocking resolve (calibration: a resolver
+            # NOT run under the deadline would return only after ~1.5s).
+            self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_arm_deadline_rearms_the_socket_to_the_remaining_budget(self):  # G17 (CALIBRATED)
+        class _RecordingSock:
+            def __init__(self):
+                self.timeouts = []
+            def settimeout(self, value):
+                self.timeouts.append(value)
+
+        provider = GenericHttpProvider("https://provider.example/run", timeout=5.0)
+        sock = _RecordingSock()
+        deadline = time.monotonic() + 0.5
+        provider._arm_deadline(sock, deadline)
+        first = sock.timeouts[-1]
+        time.sleep(0.05)
+        provider._arm_deadline(sock, deadline)
+        second = sock.timeouts[-1]
+        # The socket timeout is re-armed to the REMAINING deadline each time, so it strictly decreases
+        # as time is spent -- an earlier phase's time cannot be re-spent in a later one.
+        self.assertLess(second, first)
+        self.assertLessEqual(first, 0.5)
+        # Past the deadline it fails closed rather than arming a non-positive timeout.
+        with self.assertRaisesRegex(ProviderError, "deadline exceeded"):
+            provider._arm_deadline(sock, time.monotonic() - 0.01)
+
+    def test_ipv6_host_header_is_bracketed(self):  # G19
+        self.assertEqual(GenericHttpProvider("https://[::1]/run", allow_local_endpoint=True)._host_header, "[::1]")
+        self.assertEqual(GenericHttpProvider("http://[::1]:8080/run", allow_local_endpoint=True)._host_header, "[::1]:8080")
+        # IPv4 / hostnames are unchanged.
+        self.assertEqual(GenericHttpProvider("https://provider.example/run")._host_header, "provider.example")
+
+    def test_allow_local_provider_endpoint_is_wired_through_factory(self):  # G18
+        from portmark.config import RuntimeConfig
+
+        # Via the factory argument.
+        host = make_host(provider_endpoint="http://127.0.0.1:9/run", allow_local_provider_endpoint=True)
+        self.assertTrue(host.providers["http"]._allow_local)
+        # Via the environment variable.
+        with patch.dict(os.environ, {"PORTMARK_ALLOW_LOCAL_PROVIDER_ENDPOINT": "true"}):
+            host = make_host(provider_endpoint="http://127.0.0.1:9/run")
+            self.assertTrue(host.providers["http"]._allow_local)
+        # Default is off, and the flag permits LOOPBACK only -- a private address is still rejected.
+        host = make_host(provider_endpoint="http://127.0.0.1:9/run")
+        self.assertFalse(host.providers["http"]._allow_local)
+        self.assertTrue(RuntimeConfig.from_environment().allow_local_provider_endpoint in (True, False))
+        local = GenericHttpProvider("http://10.0.0.5/run", allow_local_endpoint=True)
+        with patch.object(local, "_resolve", return_value=[(socket.AF_INET, "10.0.0.5")]):
+            with self.assertRaisesRegex(ProviderError, "not permitted"):
+                local._validated_target(time.monotonic() + 1)
 
 
 if __name__ == "__main__":

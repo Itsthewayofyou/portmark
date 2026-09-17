@@ -258,6 +258,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Provider-neutral portable agent runtime")
     parser.add_argument("--host-id", help="host identity used for permit audience and signing issuer")
     parser.add_argument("--provider-endpoint", help="generic HTTP model-provider endpoint")
+    parser.add_argument("--allow-local-provider-endpoint", action="store_true", help="allow a LOOPBACK http provider endpoint (dev only; non-loopback still requires https and public addresses only)")
     parser.add_argument("--wasm-component", help="Wasm capsule (.wasm or .wat) implementing the WIT resume ABI")
     parser.add_argument("--wasm-engine", choices=("node", "wasmtime"), help="Wasm provider engine")
     parser.add_argument("--store-backend", choices=("sqlite", "postgres"), help="durable store backend")
@@ -347,6 +348,7 @@ def main() -> None:
         reload_policy=config.reload_policy,
         attestation_verifier_command=config.attestation_verifier_command,
         require_attestation=config.require_attestation,
+        allow_local_provider_endpoint=config.allow_local_provider_endpoint,
         tools=tools,
     )
     if args.command == "demo":

@@ -26,6 +26,7 @@ class RuntimeConfig:
     reload_policy: bool = False
     attestation_verifier_command: tuple[str, ...] | None = None
     require_attestation: bool = False
+    allow_local_provider_endpoint: bool = False
     a2a_token: str | None = None
     a2a_adapter: str = "local"
     a2a_public_base_url: str | None = None
@@ -54,6 +55,7 @@ class RuntimeConfig:
             reload_policy=os.environ.get("PORTMARK_RELOAD_POLICY") == "1",
             attestation_verifier_command=_argv(os.environ.get("PORTMARK_ATTESTATION_VERIFIER_COMMAND")),
             require_attestation=os.environ.get("PORTMARK_REQUIRE_ATTESTATION") == "1",
+            allow_local_provider_endpoint=os.environ.get("PORTMARK_ALLOW_LOCAL_PROVIDER_ENDPOINT", "").strip().lower() in {"1", "true", "yes"},
             a2a_token=os.environ.get("PORTMARK_A2A_TOKEN"),
             a2a_adapter=os.environ.get("PORTMARK_A2A_ADAPTER", "local"),
             a2a_public_base_url=os.environ.get("PORTMARK_A2A_PUBLIC_BASE_URL"),
@@ -88,6 +90,7 @@ class RuntimeConfig:
             reload_policy=bool(args.reload_policy or self.reload_policy),
             attestation_verifier_command=_argv(getattr(args, "attestation_verifier_command", None)) or self.attestation_verifier_command,
             require_attestation=bool(getattr(args, "require_attestation", False) or self.require_attestation),
+            allow_local_provider_endpoint=bool(getattr(args, "allow_local_provider_endpoint", False) or self.allow_local_provider_endpoint),
             a2a_token=getattr(args, "a2a_token", None) or self.a2a_token,
             a2a_adapter=getattr(args, "a2a_adapter", None) or self.a2a_adapter,
             a2a_public_base_url=getattr(args, "a2a_public_base_url", None) or self.a2a_public_base_url,
