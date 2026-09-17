@@ -3841,7 +3841,7 @@ class RuntimeTests(unittest.TestCase):
         # finding #2, the subtle half: even under a `*` projection -- where
         # project_tool_output returns the LIVE result object verbatim -- the view must not
         # alias live host state. A top-level copy alone is not enough; a deep detach is.
-        live_result = {"id": "1", "secret": "x"}
+        live_result = {"id": "1", "detail": "x"}
         state = AgentState("t", "g", memory={"tool_results": {"catalog.search": live_result}})
         view = provider_view(state, (ToolGrant("catalog.search", output_projection=("*",)),))
         # Same VALUE (star reveals everything) ...
@@ -3849,8 +3849,8 @@ class RuntimeTests(unittest.TestCase):
         # ... but a DIFFERENT object: no alias survives the deep detach.
         self.assertIsNot(view.tool_results["catalog.search"], live_result)
         # Proof it is isolated: mutating the view's copy leaves live state untouched.
-        view.tool_results["catalog.search"]["secret"] = "TAMPERED"
-        self.assertEqual(state.memory["tool_results"]["catalog.search"]["secret"], "x")
+        view.tool_results["catalog.search"]["detail"] = "TAMPERED"
+        self.assertEqual(state.memory["tool_results"]["catalog.search"]["detail"], "x")
 
     def test_hostile_provider_cannot_mutate_view_or_live_state(self):
         # finding #2 core: a buggy or hostile IN-PROCESS provider must not corrupt the
@@ -3893,7 +3893,7 @@ class RuntimeTests(unittest.TestCase):
         # A granted tool with a share-nothing (omitted -> ()) projection keeps its KEY with
         # a falsy {} value -- present, not dropped -- so a provider's `"tool" not in results`
         # re-proposal guard fires EXACTLY once, identical to the pre-view provider path.
-        state = AgentState("t", "g", memory={"tool_results": {"catalog.search": {"id": "1", "secret": "x"}}})
+        state = AgentState("t", "g", memory={"tool_results": {"catalog.search": {"id": "1", "detail": "x"}}})
         view = provider_view(state, (ToolGrant("catalog.search"),))  # output_projection omitted
         self.assertIn("catalog.search", view.tool_results)               # PRESENT
         self.assertEqual(dict(view.tool_results["catalog.search"]), {})   # but empty
