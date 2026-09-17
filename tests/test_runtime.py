@@ -308,9 +308,14 @@ class _LocalProviderHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+class _ThreadingProviderServer(http.server.ThreadingHTTPServer):
+    request_queue_size = 128  # accept backlog, for the concurrency test's simultaneous connects
+    daemon_threads = True
+
+
 @contextlib.contextmanager
 def local_provider_server(behavior):
-    server = http.server.HTTPServer(("127.0.0.1", 0), _LocalProviderHandler)
+    server = _ThreadingProviderServer(("127.0.0.1", 0), _LocalProviderHandler)
     server.behavior = behavior
     server.last_body = None
     server.last_authorization = None
@@ -8693,31 +8698,31 @@ class HttpProviderTransportTests(unittest.TestCase):
                 provider = GenericHttpProvider("https://provider.example/run")
                 with patch.object(provider, "_resolve", return_value=[(socket.AF_INET, ip)]):
                     with self.assertRaisesRegex(ProviderError, "not permitted"):
-                        provider._validated_target(time.monotonic() + 1)
+                        provider._validated_target()
         # Mixed answer: one public + one loopback must fail closed on the loopback one.
         provider = GenericHttpProvider("https://provider.example/run")
         with patch.object(provider, "_resolve", return_value=[(socket.AF_INET, "93.184.216.34"), (socket.AF_INET, "127.0.0.1")]):
             with self.assertRaisesRegex(ProviderError, "not permitted"):
-                provider._validated_target(time.monotonic() + 1)
+                provider._validated_target()
         # CALIBRATION: a purely public answer is accepted.
         provider = GenericHttpProvider("https://provider.example/run")
         with patch.object(provider, "_resolve", return_value=[(socket.AF_INET, "93.184.216.34")]):
-            self.assertEqual(provider._validated_target(time.monotonic() + 1), (socket.AF_INET, "93.184.216.34"))
+            self.assertEqual(provider._validated_target(), (socket.AF_INET, "93.184.216.34"))
 
     def test_ipv4_mapped_ipv6_is_normalized_before_classification(self):  # G5 (CALIBRATED)
         provider = GenericHttpProvider("https://provider.example/run")
         with patch.object(provider, "_resolve", return_value=[(socket.AF_INET6, "::ffff:127.0.0.1")]):
             with self.assertRaisesRegex(ProviderError, "not permitted"):
-                provider._validated_target(time.monotonic() + 1)
+                provider._validated_target()
 
     def test_https_required_for_non_loopback(self):  # G7 (CALIBRATED)
         provider = GenericHttpProvider("http://provider.example/run")
         with patch.object(provider, "_resolve", return_value=[(socket.AF_INET, "93.184.216.34")]):
             with self.assertRaisesRegex(ProviderError, "https"):
-                provider._validated_target(time.monotonic() + 1)
+                provider._validated_target()
         # CALIBRATION: loopback + allow_local_endpoint permits plain http.
         local = GenericHttpProvider("http://127.0.0.1/run", allow_local_endpoint=True)
-        self.assertEqual(local._validated_target(time.monotonic() + 1), (socket.AF_INET, "127.0.0.1"))
+        self.assertEqual(local._validated_target(), (socket.AF_INET, "127.0.0.1"))
 
     def test_dns_rebinding_peer_mismatch_is_refused(self):  # G6
         class _FakeSock:
@@ -8816,6 +8821,7 @@ class HttpProviderTransportTests(unittest.TestCase):
     # ---- round 1 findings ------------------------------------------------------------------------
 
     def test_dns_resolution_is_bounded_by_the_deadline(self):  # G16 (CALIBRATED)
+        # DNS runs inside the transaction, which is bounded by the external watchdog deadline in _post.
         provider = GenericHttpProvider("https://slow.example/run", timeout=0.2)
         real = socket.getaddrinfo
 
@@ -8825,10 +8831,10 @@ class HttpProviderTransportTests(unittest.TestCase):
 
         with patch("socket.getaddrinfo", side_effect=slow_getaddrinfo):
             started = time.monotonic()
-            with self.assertRaisesRegex(ProviderError, "DNS resolution exceeded"):
-                provider._validated_target(time.monotonic() + 0.2)
-            # Bounded near the deadline, NOT held for the full blocking resolve (calibration: a resolver
-            # NOT run under the deadline would return only after ~1.5s).
+            with self.assertRaisesRegex(ProviderError, "exceeded the deadline"):
+                provider.decide(AgentState("task", "goal"), ())
+            # Bounded near the deadline, NOT held for the full blocking resolve (calibration: without the
+            # external deadline the caller would return only after ~1.5s).
             self.assertLess(time.monotonic() - started, 1.0)
 
     def test_arm_deadline_rearms_the_socket_to_the_remaining_budget(self):  # G17 (CALIBRATED)
@@ -8854,6 +8860,62 @@ class HttpProviderTransportTests(unittest.TestCase):
         with self.assertRaisesRegex(ProviderError, "deadline exceeded"):
             provider._arm_deadline(sock, time.monotonic() - 0.01)
 
+    # ---- round 2: slow response headers must not bypass the total deadline ----------------------
+
+    def test_slow_dripped_response_headers_cannot_bypass_the_deadline(self):  # G22 (CALIBRATED)
+        # getresponse() reads many times parsing the status line + headers; a socket idle timeout
+        # resets on each dribbled byte, so only the external transaction deadline can bound it.
+        def drip_headers(handler):
+            raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}"
+            for byte in raw:
+                try:
+                    handler.wfile.write(bytes([byte]))
+                    handler.wfile.flush()
+                except OSError:
+                    return
+                time.sleep(0.03)  # ~2s total for the header block, far past the 0.2s deadline
+        with local_provider_server(drip_headers) as (_server, url):
+            provider = self._provider(url, timeout=0.2)
+            started = time.monotonic()
+            with self.assertRaises(ProviderError):
+                provider.decide(AgentState("task", "goal"), ())
+            # The CALLER returns at ~the deadline, not after the full header drip (calibration: without
+            # the external watchdog the per-phase arm alone lets this run to ~1s+).
+            self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_worker_capacity_recovers_after_a_deadline_timeout(self):  # G23
+        # After a timed-out transaction, the caller is freed immediately and a subsequent request to a
+        # responsive endpoint succeeds -- the abandoned thread's slot is released when its socket read
+        # is unblocked by the connection close.
+        def drip_headers(handler):
+            raw = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"
+            for byte in raw:
+                try:
+                    handler.wfile.write(bytes([byte]))
+                    handler.wfile.flush()
+                except OSError:
+                    return
+                time.sleep(0.05)
+        with local_provider_server(drip_headers) as (_slow, slow_url):
+            with self.assertRaises(ProviderError):
+                self._provider(slow_url, timeout=0.2).decide(AgentState("task", "goal"), ())
+        with local_provider_server(_respond_json(b'{"kind":"complete","content":{"ok":true}}')) as (_fast, fast_url):
+            decision = self._provider(fast_url, timeout=2.0).decide(AgentState("task", "goal"), ())
+        self.assertEqual(decision.kind, "complete")
+
+    def test_healthy_concurrent_calls_are_not_refused_by_the_transaction_pool(self):  # G26
+        # The pool bounds LEAKS, not healthy concurrency: many simultaneous healthy calls (far above the
+        # A2A default concurrency of 32) all succeed because they complete fast and recycle their slot.
+        with local_provider_server(_respond_json(b'{"kind":"complete","content":{"ok":true}}')) as (_server, url):
+            provider = self._provider(url, timeout=5.0)
+
+            def call(_i):
+                return provider.decide(AgentState("task", "goal"), ()).kind
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=48) as pool:
+                results = list(pool.map(call, range(48)))
+        self.assertEqual(results, ["complete"] * 48)
+
     def test_ipv6_host_header_is_bracketed(self):  # G19
         self.assertEqual(GenericHttpProvider("https://[::1]/run", allow_local_endpoint=True)._host_header, "[::1]")
         self.assertEqual(GenericHttpProvider("http://[::1]:8080/run", allow_local_endpoint=True)._host_header, "[::1]:8080")
@@ -8877,7 +8939,7 @@ class HttpProviderTransportTests(unittest.TestCase):
         local = GenericHttpProvider("http://10.0.0.5/run", allow_local_endpoint=True)
         with patch.object(local, "_resolve", return_value=[(socket.AF_INET, "10.0.0.5")]):
             with self.assertRaisesRegex(ProviderError, "not permitted"):
-                local._validated_target(time.monotonic() + 1)
+                local._validated_target()
 
 
 if __name__ == "__main__":

@@ -105,9 +105,17 @@ def _address_is_disallowed(address: ipaddress.IPv4Address | ipaddress.IPv6Addres
     )
 
 
-# A timed-out getaddrinfo thread cannot be killed, so cap how many resolver threads may leak at once.
-# Exhausting the pool fails a new provider call closed rather than spawning unbounded threads.
-_RESOLVER_SLOTS = threading.BoundedSemaphore(32)
+# The whole synchronous transaction (DNS + TCP + TLS + request + response) runs in a worker thread so
+# ONE external deadline bounds it -- a socket idle timeout resets on every dribbled byte, so it cannot
+# bound getresponse()/the TLS handshake, which read many times while parsing. A blocking socket thread
+# cannot be killed; most abandoned threads die at once (the watchdog closes their connection), but a
+# thread stalled INSIDE the TLS handshake or DNS (before the connection is published) lingers until it
+# unblocks -- the documented residual. This semaphore bounds how many such threads can accumulate. It is
+# sized well above any plausible healthy concurrency (A2A default is 32) and acquired with a wait rather
+# than a hard refusal, so it bounds LEAKS, not concurrency: healthy transactions finish in well under the
+# deadline and recycle their slot immediately, so a slot is essentially always available unless stalled
+# threads have genuinely piled up.
+_TRANSACTION_SLOTS = threading.BoundedSemaphore(256)
 
 
 class GenericHttpProvider(ModelProvider):
@@ -163,46 +171,27 @@ class GenericHttpProvider(ModelProvider):
 
     # ---- Section 8 transport -------------------------------------------------------------------
 
-    def _resolve(self, deadline: float) -> list[tuple[int, str]]:
+    def _resolve(self) -> list[tuple[int, str]]:
         # A literal-IP endpoint is classified directly (no resolution). A hostname is resolved ONCE.
+        # getaddrinfo has no timeout, but the whole transaction runs under an external deadline
+        # (see _post), so a stuck resolver leaks a bounded worker thread rather than the caller.
         try:
             literal = ipaddress.ip_address(self._host)
             return [(socket.AF_INET6 if literal.version == 6 else socket.AF_INET, str(literal))]
         except ValueError:
             pass
-        # socket.getaddrinfo has no timeout and cannot observe the deadline (finding, S8-PR1 round 1):
-        # a stuck resolver would hold the worker indefinitely. Run it in a daemon thread and join with
-        # the remaining deadline, so resolution is bounded by the same clock as the rest of the request.
-        # A timed-out getaddrinfo thread cannot be killed, so cap how many may be in flight at once
-        # (_RESOLVER_SLOTS) and fail closed when the pool is exhausted -- bounding the leak.
-        if not _RESOLVER_SLOTS.acquire(blocking=False):
-            raise ProviderError("too many concurrent provider DNS resolutions in flight")
-        result: dict[str, Any] = {}
-
-        def _worker() -> None:
-            try:
-                result["infos"] = socket.getaddrinfo(self._host, self._port, type=socket.SOCK_STREAM)
-            except OSError as error:  # gaierror is a subclass
-                result["error"] = error
-            finally:
-                _RESOLVER_SLOTS.release()
-
-        thread = threading.Thread(target=_worker, daemon=True)
-        thread.start()
-        thread.join(timeout=max(0.0, deadline - time.monotonic()))
-        if thread.is_alive():
-            # The thread keeps its slot until getaddrinfo eventually returns and releases it.
-            raise ProviderError("provider DNS resolution exceeded the deadline")
-        if "error" in result:
-            raise ProviderError(f"provider endpoint did not resolve: {result['error']}")
-        answers = [(family, sockaddr[0]) for family, _t, _p, _c, sockaddr in result.get("infos", [])
+        try:
+            infos = socket.getaddrinfo(self._host, self._port, type=socket.SOCK_STREAM)
+        except OSError as error:  # gaierror is a subclass
+            raise ProviderError(f"provider endpoint did not resolve: {error}") from error
+        answers = [(family, sockaddr[0]) for family, _t, _p, _c, sockaddr in infos
                    if family in (socket.AF_INET, socket.AF_INET6)]
         if not answers:
             raise ProviderError("provider endpoint resolved to no usable address")
         return answers
 
-    def _validated_target(self, deadline: float) -> tuple[int, str]:
-        answers = self._resolve(deadline)
+    def _validated_target(self) -> tuple[int, str]:
+        answers = self._resolve()
         # Fail closed on ANY disallowed answer (a mixed public+loopback response must not proceed on
         # the public one), unless it is loopback AND the operator opted into a local provider.
         for _family, ip in answers:
@@ -233,15 +222,55 @@ class GenericHttpProvider(ModelProvider):
 
     def _post(self, body: bytes) -> bytes:
         deadline = time.monotonic() + self.timeout
-        _family, ip = self._validated_target(deadline)
+        # Run the ENTIRE synchronous transaction (DNS, TCP, TLS, request, response headers, body) in a
+        # worker thread joined on the deadline. A socket idle timeout resets on every dribbled byte, so
+        # it cannot bound getresponse() or the TLS handshake -- which read many times while parsing; a
+        # malicious drip would otherwise hold the caller far past the advertised timeout. The join is
+        # the authoritative total bound: the CALLER returns at the deadline regardless of what the
+        # transaction is doing. A blocking socket thread cannot be killed, so it is abandoned as a
+        # bounded (semaphore-capped) daemon; closing its connection unblocks its read so it dies fast.
+        # Acquire with a bounded WAIT, not a hard refusal: a healthy burst above the pool size waits a
+        # moment for a fast completion to free a slot, and only genuinely-stalled accumulation (the pool
+        # full of lingering DNS/TLS-drip leaks) is refused. The slot is released by the worker thread's
+        # finally, so a leaked thread holds its slot until it finally dies.
+        if not _TRANSACTION_SLOTS.acquire(timeout=max(0.0, self.timeout)):
+            raise ProviderError("provider transaction pool exhausted (too many stalled requests in flight)")
+        holder: dict[str, Any] = {}
+        result: dict[str, Any] = {}
+
+        def _run() -> None:
+            try:
+                result["value"] = self._transaction(body, deadline, holder)
+            except Exception as error:  # noqa: BLE001 -- re-raised in the caller thread below
+                result["error"] = error
+            finally:
+                _TRANSACTION_SLOTS.release()
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        thread.join(timeout=max(0.0, self.timeout))
+        if thread.is_alive():
+            connection = holder.get("connection")
+            if connection is not None:
+                try:
+                    connection.close()
+                except OSError:
+                    pass
+            raise ProviderError("provider request exceeded the deadline")
+        if "error" in result:
+            raise result["error"]
+        return result["value"]
+
+    def _transaction(self, body: bytes, deadline: float, holder: dict[str, Any]) -> bytes:
+        _family, ip = self._validated_target()
         try:
             connection = self._open_connection(ip, deadline)
         except (OSError, ssl.SSLError) as error:
             raise ProviderError(f"provider connection failed: {error}") from error
+        # Publish the connection so the watchdog in _post can close it to unblock this thread on timeout.
+        holder["connection"] = connection
         try:
             # DNS-rebinding backstop: confirm the socket really connected to the address we validated.
-            # connection.sock is valid here (before getresponse, which may release it for a close);
-            # capture it so the deadline can be re-armed on it even after getresponse releases it.
             sock = connection.sock
             if sock is None:
                 raise ProviderError("provider connection has no socket")

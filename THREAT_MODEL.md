@@ -137,9 +137,13 @@ what makes the SafeRoot the only reachable path.
   is rejected if loopback/private/link-local/multicast/reserved/unspecified — mixed answers fail closed —
   IPv4-mapped IPv6 normalized first; loopback allowed only under `allow_local_endpoint`); the connection
   is pinned to the pre-validated IP with a `getpeername` cross-check (DNS-rebinding defense) while TLS
-  cert validation stays on the hostname; and a single monotonic deadline bounds connect+headers+body,
-  re-armed before every `read1` so a slow-drip cannot hold the worker. A premature EOF/reset/timeout is a
-  controlled `ProviderError`. Evidence: `src/portmark/providers.py`.
+  cert validation stays on the hostname; and the ENTIRE synchronous transaction (DNS, TCP, TLS, request,
+  response status line + headers, body) runs in a pool-capped worker thread joined on one external
+  deadline, so the caller returns at the timeout no matter what the transaction blocks on -- a socket
+  idle timeout resets per dribbled byte and cannot bound `getresponse()`/the TLS handshake, so a
+  slow-dripped header block cannot hold the worker (the socket timeout is still re-armed per phase as a
+  secondary bound). A premature EOF/reset/timeout is a controlled `ProviderError`. Evidence:
+  `src/portmark/providers.py`.
 - **Durable provider-failure semantics (Section 8).** A provider failure AFTER admission (transport error,
   deadline, malformed response, or any provider exception) closes the task to a durable terminal `failed`
   checkpoint with a `provider.failed` audit event, then re-raises — extending the terminalization
