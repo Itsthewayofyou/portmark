@@ -6,6 +6,70 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Section 7 — tool execution isolation (PR 2a): idempotency/reconciliation effect ledger
+
+- **Side-effecting isolated tools now run under a durable effect ledger** (new `tool_effects` table;
+  SQLite schema v10, Postgres schema v8) so a crash-and-resume never re-applies an external effect it
+  cannot be sure landed. The host derives an **effect id** — `hash(task_id, tool, canonical arguments,
+  per-call sequence)` — records a `prepared` row before launch, advances it to `started` immediately
+  before the tool runs, and settles it afterward: `confirmed` on success (the result is stored and a
+  later identical call **replays** it instead of re-running), `unknown` on a deadline kill, a clean
+  tool error, or a non-serializable result (the effect may have landed before the failure). On resume
+  the host replays a `confirmed` effect, proceeds for a `prepared` one (never launched), and **refuses**
+  a `started`/`unknown`/`reconciled` one — it **never auto-retries** an unknown effect.
+- **The effect id identifies the logical call POSITION — `hash(task_id, per-call sequence)` — and
+  nothing else.** The sequence is `state.tool_calls`, monotonic per task, never reset, and rebound from
+  the durable checkpoint on resume, so the same position re-derives the same id and a distinct call
+  cannot collide with it. It is bound to neither the checkpoint generation (which identifies the *run*,
+  not the call) **nor the tool/arguments**: binding those would let a provider that re-proposes the
+  same position with different arguments (or a different tool) mint a NEW id and run a **second** effect
+  while the first at that position is unresolved. The invariant is **at most one effect per position**.
+  Because the id excludes the tool and arguments, the host does **not** silently replay a drifted
+  position: `_effect_pre_launch` compares the current decision's (tool, arguments) against the ledger
+  row's recorded values and **refuses on any drift** — it never replays another call's result and never
+  re-runs at a bound position. A deterministic resume re-proposes the same tool+args and replays
+  cleanly; a drifted re-proposal hard-fails the task, and reconcile (or a fresh call) resolves it. The
+  ledger row records the tool and arguments for exactly this drift check plus reconcile and audit.
+- **Launch authority is a one-use capability, not knowledge of the effect_id.** An effect_id is
+  deterministic (`hash(task_id, sequence)`) and not a secret, so knowing one must not authorize a
+  launch. Right before the call the host **arms** a random, one-use capability bound to
+  `(effect_id, tool, canonical arguments)` — arming first validates that a durable `started` ledger row
+  matches, so a fabricated id cannot be armed — and `ToolRegistry.invoke` **consumes** it atomically,
+  only on an exact `(tool, arguments)` match. A fabricated capability, a reused one, one armed for a
+  different tool, or one armed with different arguments all fail closed. **Arming is not a public
+  method:** `attach_effect_ledger` (called once, not re-attachable) returns a private armer handle only
+  `AgentHost` holds, so no caller with a registry reference can mint a capability — and the handle
+  refuses a *second* outstanding capability for one `started` effect, so one started effect authorizes
+  at most one launch. This closes the public-API bypass and defends against a fabricated/guessed/replayed
+  *value*; a caller that runs arbitrary in-process code against the registry object is outside this gate
+  (the deployment sandbox's job) — it is not claimed as protection against arbitrary in-process Python.
+  Supersedes the earlier public `arm_effect_launch` (repeatable minting) and the round-2 "is it started?"
+  predicate (a holder of a `started` id could reuse it, transfer it to another tool, or replay it).
+- **Side-effecting tools receive the effect id as an idempotency key.** The isolated worker calls a
+  side-effecting tool as `tool(arguments, effect_id)` (the id travels in the request envelope, outside
+  `arguments`, so the argument-name allowlist does not reject it); the tool must use it as its external
+  idempotency key. A tool that does not accept the parameter is failed with a controlled
+  `tool does not accept effect_id` and is never called (never called twice).
+- **Reconciliation API.** `AgentHost.reconcile_effect(effect_id, task_id)` (task-scoped) resolves an
+  `unknown` effect by running the tool's registered `reconcile` function
+  (`reconcile(arguments, effect_id) -> {"landed": bool, "result"?: ...}`): a landed effect settles to
+  `confirmed`, a not-landed effect to `reconciled`. The host never auto-retries; the operator drives it.
+  Reconciliation is concurrency-safe, using the migration outbox's owned-lease shape: the effect is
+  **claimed** atomically (`unknown → reconciling`) under a random **owner id**, and a terminal settle
+  requires that owner id **and** a live lease — so two operators cannot clobber each other, and a
+  stale/expired reconciler can neither overwrite a recorded `confirmed` nor reset a newer holder's claim
+  (a reclaim mints a *different* owner id). The claim is **leased**: a `reconciling` row left by a crashed
+  reconciler is reclaimable after the window, so a mid-reconcile crash never strands the effect; a
+  failing reconcile releases the claim (owner-id match only, so an expired holder can always relinquish).
+  Lease creation and expiry use **database time** on Postgres (and the store's injected clock on the
+  embedded backends), so a fast host clock cannot steal a live claim. The store validates its own claim
+  inputs (non-empty owner id, positive integer lease) rather than trusting the caller. New store columns
+  `reconcile_claim_id` + `reconcile_lease_expires_at` (SQLite v11, Postgres v9). The tool registry is
+  **immutable after host construction** — the private armer binds to the registry given at construction,
+  so swapping `host.tools` afterward fails closed for side-effecting tools (configure it before, not after).
+- Making the `reconcile` contract and an acknowledged isolation profile **mandatory** at registration
+  for `side_effecting=True` is the immediately following change (Section 7 PR 2b).
+
 ### Section 7 — tool execution isolation (PR 1b)
 
 - **The normal-exit background-child leak is closed at the source.** A tool that spawned a background

@@ -318,6 +318,110 @@ empty dict; the CPU-time backstop still applies.
 > these limits apply, so this refusal only fires on a genuinely unsupported platform
 > or an impossible value.
 
+## Side-Effecting Tools And The Effect Ledger
+
+A tool registered `side_effecting=True` (which must be isolated) runs under a durable **effect
+ledger** so a crash-and-resume never re-applies an external effect it cannot be sure landed.
+
+**How it works.** Before the tool launches, the host derives an **effect id** — a hash of
+`(task_id, per-call sequence)`, i.e. the logical call **position** (deliberately *not* the tool or
+arguments, so the invariant is **at most one effect per position** and provider drift cannot mint a
+second effect at a position whose first effect is unresolved) — and records a `prepared` row, then
+advances it to `started` immediately before launch. After the call it settles the row:
+
+- **success → `confirmed`** (the result is stored; a later call at the same position with the **same
+  tool and arguments** *replays* it instead of running the tool again). A call that re-proposes the
+  position with a **different tool or different arguments** is **drift**: the host **refuses** it — it
+  never replays another call's recorded result and never re-runs at a bound position. A deterministic
+  resume re-proposes the same tool+args and replays cleanly; a drifted re-proposal hard-fails the task,
+  and reconcile (or a fresh call) resolves it;
+- **killed at the deadline → `unknown`**, and a **clean tool error → `unknown` too** — because the
+  effect may have landed before the tool reported failure;
+- a non-serializable result → `unknown`.
+
+On a resume, the same logical call re-derives the **same** effect id (the sequence is the
+per-task `tool_calls`, rebound from the durable checkpoint, monotonic and never reset — it is
+deliberately **not** bound to the checkpoint generation, which identifies the run, not the call).
+The host then: replays a `confirmed` effect; proceeds for a `prepared` row (a prior attempt never
+launched); and **refuses** a `started`/`unknown`/`reconciled`/`reconciling` row — it **never
+auto-retries** an effect whose status is unknown or under reconciliation, because a second run could
+double a real effect. On a `confirmed` or `prepared` row the host also checks the current decision's
+tool + arguments against the row's recorded tool + arguments and **refuses on any drift** — it never
+replays another call's result or re-runs at a bound position.
+
+**Launch authority is a one-use capability, not knowledge of the effect_id.** An effect_id is
+deterministic (`hash(task_id, sequence)`) and therefore *not* a secret, so knowing one must not let
+anything launch a side-effecting tool. Instead, right before the call the host **arms** a random,
+one-use launch capability bound to `(effect_id, tool, canonical arguments)` — arming first validates
+that a durable `started` ledger row matches, so a fabricated id cannot be armed — and
+`ToolRegistry.invoke` **consumes** it atomically, only on an exact `(tool, arguments)` match. A
+fabricated capability, a capability reused after its single launch, one armed for a different tool, or
+one armed with different arguments all fail closed. **Arming is not a public method:**
+`attach_effect_ledger` (called once by the host, and not re-attachable) returns a private armer handle
+that only `AgentHost` holds, so a caller with a registry reference cannot mint a capability — and even
+the handle refuses a *second* outstanding capability for one `started` effect, so one started effect
+authorizes at most one launch. **What this does *not* cover:** a caller that can execute arbitrary code
+in-process against the registry object (mutating its private state) is outside this gate — that is the
+deployment sandbox's job, per the resource-bounded-worker contract above. The runtime gate closes the
+public-API bypass and defends against a fabricated/guessed/replayed *value*; it is not protection
+against arbitrary malicious in-process Python. (The host's own reconcile pass calls the reconcile function directly, not
+through this gate; that is intentional — a reconcile function is registered separately and is not
+itself `side_effecting`.)
+
+> **The tool registry is immutable after host construction.** `AgentHost` binds the private armer to
+> the registry it is given at construction. Replacing `host.tools` afterward is **not supported**: the
+> new registry has no armer, so every side-effecting launch through it **fails closed** (safe, but
+> broken). Configure the registry before constructing the host; do not swap it later. (There is no
+> runtime registry-replacement API today; if one is ever needed it must re-bind the armer explicitly.)
+
+**The tool contract.** A side-effecting tool is called as `tool(arguments, effect_id)` and **must
+use the `effect_id` as its idempotency key** with the external system (e.g. a payment idempotency
+key), so that even a retry it does see cannot double the effect. A tool that does not accept a
+second parameter is failed with a controlled `tool does not accept effect_id` and never called.
+
+```python
+def charge(arguments: dict, effect_id: str) -> dict:
+    return payment_api.charge(arguments["amount"], idempotency_key=effect_id)
+
+tools.register_isolated(
+    "billing.charge", "mytools:charge",
+    side_effecting=True,
+    reconcile="mytools:reconcile_charge",  # queries whether the effect landed
+)
+```
+
+**Reconciliation.** An `unknown` effect is resolved by `AgentHost.reconcile_effect(effect_id,
+task_id)` (task-scoped: the effect must belong to that task). It runs the tool's registered
+`reconcile` function — `reconcile(arguments, effect_id) -> {"landed": bool, "result"?: ...}` —
+which asks the external system whether the effect landed: a landed effect settles to `confirmed`
+(with the reconciled result), a not-landed effect to `reconciled` (terminal; a retry is a fresh
+call). The host never auto-retries; the operator drives reconciliation.
+
+Reconciliation is **concurrency-safe**, using the same owned-lease shape as the migration outbox: the
+host **claims** the effect atomically (`unknown → reconciling`) under a random **owner id** before
+running the reconcile function, and a terminal settle requires *that owner id* **and** a still-live
+lease — so two operators reconciling at once cannot clobber each other, and a stale/expired reconciler
+can neither overwrite a recorded `confirmed` nor reset a newer holder's claim (a reclaim mints a
+*different* owner id). The claim carries a **lease**: a `reconciling` row left behind by a reconciler
+whose process died is reclaimable after the lease window, so a crash mid-reconcile never strands the
+effect. If the reconcile function itself raises, the owner releases its claim back to `unknown` for
+retry (release needs only the owner id, so an expired holder can always safely relinquish). Lease
+creation and expiry use **database time** on Postgres (a shared central clock), so a host whose clock
+runs fast cannot prematurely steal another host's live claim. *Known bound:* a reconcile that runs
+longer than the lease window makes the effect reclaimable — a slow reconciler may lose its claim (its
+terminal settle then no-ops); this is a liveness bound, not a double-settle.
+
+> **Known cost.** The `started` state is settled `unknown` on resume even if the tool never
+> actually launched (a crash in the microsecond window between the durable `started` write and the
+> launch). That is the conservative choice — an operator pays one reconcile round-trip for an
+> effect that did not happen, rather than the host silently assuming it did not and re-running.
+
+> **Not yet enforced here.** PR 2a ships the ledger and the reconcile mechanism; making the
+> `reconcile` contract and an acknowledged isolation profile **mandatory** at registration for
+> `side_effecting=True` is the immediately following change (Section 7 PR 2b). Until then a
+> side-effecting tool may be registered without a `reconcile` function, and its `unknown` effects
+> cannot be reconciled.
+
 ## Credential Handling
 
 Tools may use local credentials internally, but returned data is audit material

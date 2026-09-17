@@ -13,7 +13,9 @@ import time
 from typing import Any
 
 
-def echo(arguments: dict[str, Any]) -> dict[str, Any]:
+def echo(arguments: dict[str, Any], effect_id: str | None = None) -> dict[str, Any]:
+    # Accepts the optional Section 7 PR 2 effect_id so it satisfies the side-effecting-tool contract
+    # when registered side_effecting=True, and still works as a 1-arg non-side-effecting tool.
     return {"echo": arguments}
 
 
@@ -40,7 +42,8 @@ def oversized(arguments: dict[str, Any]) -> dict[str, Any]:
     return {"blob": "x" * int(arguments.get("size", 100_000))}
 
 
-def slow_then_return(arguments: dict[str, Any]) -> dict[str, Any]:
+def slow_then_return(arguments: dict[str, Any], effect_id: str | None = None) -> dict[str, Any]:
+    # Optional effect_id so it satisfies the side-effecting contract when registered side_effecting.
     time.sleep(float(arguments.get("seconds", 30.0)))
     return {"done": True}
 
@@ -124,3 +127,44 @@ def write_file(arguments: dict[str, Any]) -> dict[str, Any]:
     with open(path, "wb") as handle:
         handle.write(b"x" * size)
     return {"written": size}
+
+
+# ---- Section 7 PR 2: effect-ledger fixtures -----------------------------------------------------
+
+def idempotent_charge(arguments: dict[str, Any], effect_id: str | None = None) -> dict[str, Any]:
+    # A side-effecting tool that USES the effect_id as its idempotency key. It records each actual
+    # run (one line per invocation in attempts.log) and writes a per-effect "landed" marker, so a
+    # test can prove the host REPLAYED a confirmed effect instead of running the tool twice.
+    directory = str(arguments["dir"])
+    with open(os.path.join(directory, "attempts.log"), "a", encoding="utf-8") as handle:
+        handle.write(f"{effect_id}\n")
+    open(os.path.join(directory, f"{effect_id}.landed"), "w", encoding="utf-8").close()
+    return {"charged": arguments["amount"], "effect_id": effect_id}
+
+
+def reconcile_charge(arguments: dict[str, Any], effect_id: str | None = None) -> dict[str, Any]:
+    # Reconcile contract: report whether the effect landed by checking the marker idempotent_charge
+    # (or charge_then_fail) writes, and return a result for a landed effect to settle as confirmed.
+    directory = str(arguments["dir"])
+    landed = os.path.exists(os.path.join(directory, f"{effect_id}.landed"))
+    return {"landed": landed, "result": {"charged": arguments["amount"], "effect_id": effect_id, "reconciled": True}}
+
+
+def charge_then_fail(arguments: dict[str, Any], effect_id: str | None = None) -> dict[str, Any]:
+    # The effect LANDS (marker written) but the tool then raises -- the "errored after the effect
+    # landed" case. Decision 2: this settles `unknown`, and reconcile then finds it landed.
+    directory = str(arguments["dir"])
+    open(os.path.join(directory, f"{effect_id}.landed"), "w", encoding="utf-8").close()
+    raise RuntimeError("charge posted but the tool then failed")
+
+
+def no_effect_id_param(arguments: dict[str, Any]) -> dict[str, Any]:
+    # A 1-arg tool registered side_effecting: it does NOT accept the effect_id, so the worker must
+    # fail it with a controlled "tool does not accept effect_id" reply (never call it).
+    return {"ok": True}
+
+
+def fail_without_landing(arguments: dict[str, Any], effect_id: str | None = None) -> dict[str, Any]:
+    # Raises WITHOUT writing the landed marker -- the effect did not land. Settles `unknown`, and
+    # reconcile then finds no marker -> not landed -> `reconciled`.
+    raise RuntimeError("charge failed before any external effect")

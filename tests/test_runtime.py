@@ -19,7 +19,7 @@ import unittest
 import urllib.error
 import urllib.request
 from dataclasses import asdict
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from http.client import HTTPResponse
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -51,6 +51,7 @@ from portmark.security import (
     TrustRegistry,
     TrustedIdentity,
     canonical_json,
+    effect_id,
     generate_signing_material,
     load_trust_registry,
 )
@@ -178,6 +179,21 @@ class PaymentProvider(ModelProvider):
         if "payments.reserve" not in results:
             return ProviderDecision("tool", "payments.reserve", {"amount": self.amount, "currency": "USD"})
         return ProviderDecision("complete", content={"payment": results["payments.reserve"]})
+
+
+class ChargeProvider(ModelProvider):
+    # Proposes one side-effecting "iso.charge" call, then completes -- so a run makes exactly one
+    # tool call (Section 7 PR 2 effect-ledger tests).
+    def __init__(self, directory, amount=5, tool="iso.charge"):
+        self.directory = directory
+        self.amount = amount
+        self.tool = tool
+
+    def decide(self, state, available_tools, grants=()):
+        results = state.memory.get("tool_results", {})
+        if self.tool not in results:
+            return ProviderDecision("tool", self.tool, {"dir": self.directory, "amount": self.amount})
+        return ProviderDecision("complete", content={"done": results[self.tool]})
 
 
 class BlockingProvider(ModelProvider):
@@ -1444,8 +1460,58 @@ class RuntimeTests(unittest.TestCase):
         registry.register_isolated(
             "iso.pay", "isolated_tool_fixtures:echo", side_effecting=True, env=self._isolated_env()
         )
-        permit = self._isolated_permit("iso.pay")
-        self.assertEqual(registry.invoke(permit, "iso.pay", {"amount": 10}), {"echo": {"amount": 10}})
+        registry.register_isolated(
+            "iso.other", "isolated_tool_fixtures:echo", side_effecting=True, env=self._isolated_env()
+        )
+        permit = self._isolated_permit("iso.pay", "iso.other")
+        # Section 7 PR 2 (round 3): launching a side-effecting tool requires a ONE-USE launch capability
+        # the host armed and bound to (effect_id, tool, canonical args). Knowledge of a (deterministic,
+        # non-secret) effect_id is NOT launch authority -- the auditor's round-3 P1s. There is no public
+        # rebindable predicate any more.
+        from portmark.tools import ToolExecutionError
+        # Arming is NOT a public registry method any more (round-3-r1 hole: a public mint let a caller
+        # forge capabilities). It is only reachable via the handle attach_effect_ledger returns.
+        self.assertFalse(hasattr(registry, "bind_effect_ledger"))   # the rebindable-predicate hole is gone
+        self.assertFalse(hasattr(registry, "arm_effect_launch"))    # no public mint
+        # Attach a read-only ledger view, exactly as AgentHost does; keep the private armer handle.
+        ledger: dict[str, dict] = {}
+        armer = registry.attach_effect_ledger(lambda eid: ledger.get(eid))
+        self.assertRaises(RuntimeError, registry.attach_effect_ledger, lambda eid: None)  # set-once
+        pay_args = {"amount": 10}
+        canonical_pay = canonical_json(pay_args).decode("utf-8")
+        # (a) No launch capability at all -> refuse.
+        with self.assertRaisesRegex(ToolExecutionError, "must run through the effect ledger"):
+            registry.invoke(permit, "iso.pay", pay_args)
+        # (b) A fabricated effect_id has no `started` row -> cannot even be armed.
+        with self.assertRaisesRegex(SecurityError, "no `started` ledger row matches|not launch authority"):
+            armer.arm("forged", "iso.pay", pay_args)
+        # Record a real started row and arm a capability for it (as the host does pre-launch).
+        ledger["e-real"] = {"effect_id": "e-real", "state": "started", "tool": "iso.pay", "arguments_json": canonical_pay}
+        cap = armer.arm("e-real", "iso.pay", pay_args)
+        # (b2) CALIBRATED: even the armer cannot mint a SECOND outstanding capability for one started
+        #      effect (the auditor's repeated-minting bypass). Calibration (gate ledger): drop the
+        #      `any(existing[0] == effect_id ...)` refusal in arm -> a second cap is minted and this fails.
+        with self.assertRaisesRegex(SecurityError, "already outstanding"):
+            armer.arm("e-real", "iso.pay", pay_args)
+        # (c) A fabricated capability string never armed -> refuse.
+        with self.assertRaisesRegex(SecurityError, "does not authorize"):
+            registry.invoke(permit, "iso.pay", pay_args, launch_capability="fabricated-cap")
+        # (d) The capability is bound to iso.pay -- using it to launch a DIFFERENT tool -> refuse.
+        with self.assertRaisesRegex(SecurityError, "does not authorize"):
+            registry.invoke(permit, "iso.other", pay_args, launch_capability=cap)
+        # (e) The capability is bound to these arguments -- drifted arguments -> refuse.
+        with self.assertRaisesRegex(SecurityError, "does not authorize"):
+            registry.invoke(permit, "iso.pay", {"amount": 999}, launch_capability=cap)
+        # (f) Exact match -> runs once, and the effect_id reaches the tool.
+        self.assertEqual(
+            registry.invoke(permit, "iso.pay", pay_args, launch_capability=cap),
+            {"echo": {"amount": 10}},
+        )
+        # (g) CALIBRATED one-use: the SAME capability is consumed, so a replay -> refuse. Calibration
+        #     (gate ledger): drop the `del self._armed[launch_capability]` line in invoke -> the reused
+        #     capability runs the tool a SECOND time and this assertion fails.
+        with self.assertRaisesRegex(SecurityError, "does not authorize"):
+            registry.invoke(permit, "iso.pay", pay_args, launch_capability=cap)
 
     def test_side_effecting_isolated_tool_refused_without_process_group_kill(self):
         # Fail-closed on a platform with no process-tree hard-kill primitive: a
@@ -1482,6 +1548,7 @@ class RuntimeTests(unittest.TestCase):
             )
             host = make_host(store=store, allow_ephemeral_signing_key=True)
             host.tools = tools
+            host._effect_armer = host.tools.attach_effect_ledger(host._effect_ledger_row)  # plain-attribute swap: re-attach + re-arm (round 3)
             # Under B-lite the host policy must name the argument it allows; a bare
             # policy grant now denies unnamed arguments. This test is about the kill
             # audit, not argument policy, so the grant declares `seconds` explicitly.
@@ -1499,6 +1566,383 @@ class RuntimeTests(unittest.TestCase):
             killed = next(event for event in result.audit if event["event"] == "tool.killed")
             self.assertEqual(killed["details"]["effect_status"], "unknown")
             self.assertEqual(killed["details"]["tool"], "slow.side")
+
+    # ---- Section 7 PR 2: effect ledger ---------------------------------------------------------
+
+    def _charge_host(self, store, directory, target="idempotent_charge", reconcile="isolated_tool_fixtures:reconcile_charge"):
+        tools = ToolRegistry()
+        tools.register_isolated(
+            "iso.charge", f"isolated_tool_fixtures:{target}", timeout=5.0, side_effecting=True,
+            reconcile=reconcile, env=self._isolated_env(),
+        )
+        host = make_host(store=store, allow_ephemeral_signing_key=True)
+        host.tools = tools
+        host._effect_armer = host.tools.attach_effect_ledger(host._effect_ledger_row)  # plain-attribute swap: re-attach + re-arm (round 3)
+        host.policy = HostPolicy(
+            host.host_id,
+            (ToolGrant("iso.charge", {"arguments": {"dir": {"type": "string"}, "amount": {"type": "integer"}}}),),
+            ResourceBudget(),
+        )
+        host.providers["charge"] = ChargeProvider(directory)
+        envelope = make_demo_envelope(host, "charge", "charge")
+        object.__setattr__(envelope.manifest, "requested_tools", ("iso.charge",))
+        object.__setattr__(envelope.permit, "grants", (ToolGrant("iso.charge"),))
+        host.signer.seal(envelope)
+        return host, envelope
+
+    def _charge_eid(self, envelope, directory):
+        return effect_id(envelope.state.task_id, 0)  # first tool call -> sequence 0
+
+    @unittest.skipUnless(_has_tree_termination_primitive(), "isolated side-effecting tools need a process-tree termination primitive")
+    def test_side_effecting_effect_is_confirmed_and_recorded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            host, envelope = self._charge_host(store, directory)
+            result = host.run(envelope)
+            self.assertEqual(result.status, "completed")
+            row = store.get_effect(self._charge_eid(envelope, directory))
+            self.assertEqual(row["state"], "confirmed")
+            self.assertEqual(json.loads(row["result_json"])["charged"], 5)
+            with open(Path(directory) / "attempts.log", encoding="utf-8") as handle:
+                self.assertEqual(len(handle.read().splitlines()), 1)  # ran exactly once
+
+    @unittest.skipUnless(_has_tree_termination_primitive(), "isolated side-effecting tools need a process-tree termination primitive")
+    def test_confirmed_effect_replays_without_rerunning(self):
+        # CALIBRATED: a prior identical call already CONFIRMED -> the host returns the stored result
+        # and does NOT run the tool. Proves the effect_id derivation matches across a resume (same
+        # task/tool/args/sequence=0). Calibration (gate ledger): neutralize _effect_pre_launch to
+        # always return ("run", None) -> the tool runs and attempts.log appears.
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            host, envelope = self._charge_host(store, directory)
+            eid = self._charge_eid(envelope, directory)
+            store.record_effect_prepared(eid, envelope.state.task_id, "iso.charge",
+                                         canonical_json({"dir": directory, "amount": 5}).decode("utf-8"))
+            store.mark_effect_started(eid)
+            store.settle_effect(eid, "confirmed", canonical_json({"charged": 5, "prior": True}).decode("utf-8"), None)
+            result = host.run(envelope)
+            self.assertEqual(result.status, "completed")
+            self.assertFalse((Path(directory) / "attempts.log").exists())  # tool NEVER ran
+            self.assertTrue(any(event["event"] == "tool.replayed" for event in result.audit))
+
+    @unittest.skipUnless(_has_tree_termination_primitive(), "isolated side-effecting tools need a process-tree termination primitive")
+    def test_unknown_effect_refuses_rerun(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            host, envelope = self._charge_host(store, directory)
+            eid = self._charge_eid(envelope, directory)
+            store.record_effect_prepared(eid, envelope.state.task_id, "iso.charge",
+                                         canonical_json({"dir": directory, "amount": 5}).decode("utf-8"))
+            store.settle_effect(eid, "unknown", None, "prior kill")
+            result = host.run(envelope)
+            self.assertEqual(result.status, "failed")
+            self.assertFalse((Path(directory) / "attempts.log").exists())  # never auto-retried
+            self.assertTrue(any(event["event"] == "tool.refused" for event in result.audit))
+
+    @unittest.skipUnless(_has_tree_termination_primitive(), "isolated side-effecting tools need a process-tree termination primitive")
+    def test_error_settles_unknown_then_reconcile_confirms_a_landed_effect(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            host, envelope = self._charge_host(store, directory, target="charge_then_fail")
+            result = host.run(envelope)
+            self.assertEqual(result.status, "failed")  # tool raised after the effect landed
+            eid = self._charge_eid(envelope, directory)
+            self.assertEqual(store.get_effect(eid)["state"], "unknown")
+            # Reconcile finds the landed marker -> confirmed.
+            self.assertEqual(host.reconcile_effect(eid, envelope.state.task_id), "confirmed")
+            self.assertEqual(store.get_effect(eid)["state"], "confirmed")
+
+    @unittest.skipUnless(_has_tree_termination_primitive(), "isolated side-effecting tools need a process-tree termination primitive")
+    def test_reconcile_settles_reconciled_when_effect_did_not_land(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            host, envelope = self._charge_host(store, directory, target="fail_without_landing")
+            self.assertEqual(host.run(envelope).status, "failed")
+            eid = self._charge_eid(envelope, directory)
+            self.assertEqual(store.get_effect(eid)["state"], "unknown")
+            self.assertEqual(host.reconcile_effect(eid, envelope.state.task_id), "reconciled")
+
+    @unittest.skipUnless(_has_tree_termination_primitive(), "isolated side-effecting tools need a process-tree termination primitive")
+    def test_side_effecting_tool_missing_effect_id_param_fails_controlled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            host, envelope = self._charge_host(store, directory, target="no_effect_id_param", reconcile=None)
+            result = host.run(envelope)
+            self.assertEqual(result.status, "failed")
+            failed = next(event for event in result.audit if event["event"] == "tool.failed")
+            self.assertIn("does not accept effect_id", failed["details"]["error"])
+            self.assertEqual(store.get_effect(self._charge_eid(envelope, directory))["state"], "unknown")
+
+    @unittest.skipUnless(_has_tree_termination_primitive(), "isolated side-effecting tools need a process-tree termination primitive")
+    def test_reconcile_rejects_a_foreign_task(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            host, envelope = self._charge_host(store, directory, target="fail_without_landing")
+            host.run(envelope)
+            eid = self._charge_eid(envelope, directory)
+            with self.assertRaisesRegex(SecurityError, "does not belong to task"):
+                host.reconcile_effect(eid, "some-other-task")
+
+    def test_effect_id_is_bound_only_to_task_and_position(self):
+        # The id identifies the logical call POSITION: task_id + sequence, and NOTHING else. Tool and
+        # arguments are deliberately excluded so provider drift at one position cannot mint a second id
+        # (the auditor's argument-drift hole). The host passes only (task_id, sequence).
+        base = effect_id("task", 0)
+        self.assertEqual(base, effect_id("task", 0))        # deterministic
+        self.assertNotEqual(base, effect_id("task", 1))     # position (sequence) distinguishes
+        self.assertNotEqual(base, effect_id("other", 0))    # task distinguishes
+
+    @unittest.skipUnless(_has_tree_termination_primitive(), "isolated side-effecting tools need a process-tree termination primitive")
+    def test_replay_refuses_on_argument_drift(self):
+        # CALIBRATED (P1 round 2). Position 0 already holds a CONFIRMED effect recorded with amount=999.
+        # The provider re-proposes the SAME position with amount=5. Because the effect_id is
+        # position-only, the host must REFUSE -- never replay the amount=999 result, never re-run at a
+        # bound position. Calibration (gate ledger): drop the drift check in _effect_pre_launch -> the
+        # confirmed row REPLAYS and the run completes (tool.replayed), so status is not "failed".
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            host, envelope = self._charge_host(store, directory)
+            eid = self._charge_eid(envelope, directory)
+            store.record_effect_prepared(eid, envelope.state.task_id, "iso.charge",
+                                         canonical_json({"dir": directory, "amount": 999}).decode("utf-8"))
+            store.mark_effect_started(eid)
+            store.settle_effect(eid, "confirmed", canonical_json({"charged": 999}).decode("utf-8"), None)
+            result = host.run(envelope)
+            self.assertEqual(result.status, "failed")
+            refused = next(event for event in result.audit if event["event"] == "tool.refused")
+            self.assertIn("arguments", refused["details"]["reason"])
+            self.assertFalse((Path(directory) / "attempts.log").exists())  # the tool never ran
+            self.assertFalse(any(event["event"] == "tool.replayed" for event in result.audit))  # not replayed
+            self.assertFalse(any(event["event"] == "tool.executed" for event in result.audit))
+
+    @unittest.skipUnless(_has_tree_termination_primitive(), "isolated side-effecting tools need a process-tree termination primitive")
+    def test_replay_refuses_on_tool_drift(self):
+        # The auditor's exact case: "a different TOOL's result". Position 0 holds a confirmed effect
+        # recorded for tool "iso.other" (same arguments). The provider now proposes "iso.charge" at that
+        # position -> refuse; the host must not hand back another tool's recorded result.
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            host, envelope = self._charge_host(store, directory)
+            eid = self._charge_eid(envelope, directory)
+            store.record_effect_prepared(eid, envelope.state.task_id, "iso.other",
+                                         canonical_json({"dir": directory, "amount": 5}).decode("utf-8"))
+            store.mark_effect_started(eid)
+            store.settle_effect(eid, "confirmed", canonical_json({"charged": 777}).decode("utf-8"), None)
+            result = host.run(envelope)
+            self.assertEqual(result.status, "failed")
+            refused = next(event for event in result.audit if event["event"] == "tool.refused")
+            self.assertIn("tool", refused["details"]["reason"])
+            self.assertFalse((Path(directory) / "attempts.log").exists())  # the tool never ran
+            self.assertFalse(any(event["event"] == "tool.replayed" for event in result.audit))  # not replayed
+
+    @unittest.skipUnless(_has_tree_termination_primitive(), "isolated side-effecting tools need a process-tree termination primitive")
+    def test_reconciling_effect_refuses_relaunch(self):
+        # CALIBRATED (P3 round 3, the re-run bug the fix pass must not introduce). A row left `reconciling`
+        # (a reconcile pass in flight) must REFUSE a fresh launch -- launching now would run the tool WHILE
+        # reconciliation resolves whether the prior effect landed, the double-effect the ledger prevents.
+        # Calibration (gate ledger): drop "reconciling" from the refuse set in _effect_pre_launch -> the
+        # row falls through to the drift/run path and the tool RUNS, so status is not "failed".
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            host, envelope = self._charge_host(store, directory)
+            eid = self._charge_eid(envelope, directory)
+            store.record_effect_prepared(eid, envelope.state.task_id, "iso.charge",
+                                         canonical_json({"dir": directory, "amount": 5}).decode("utf-8"))
+            store.mark_effect_started(eid)
+            store.settle_effect(eid, "reconciling", None, "a reconcile is in flight")
+            result = host.run(envelope)
+            self.assertEqual(result.status, "failed")
+            self.assertFalse((Path(directory) / "attempts.log").exists())  # never launched under reconciliation
+            self.assertTrue(any(event["event"] == "tool.refused" for event in result.audit))
+
+    def test_effect_reconcile_claim_is_owned_lease_bounded_and_race_safe(self):
+        # P3 round 3 remediation: a reconcile claim has an OWNER (reconcile_claim_id). Two operators
+        # cannot clobber each other -- a settle requires the owning id AND a live lease, so a non-owner
+        # (or a superseded holder) can neither overwrite a recorded settlement nor reset the claim. This
+        # test covers the owner semantics with LIVE leases; lease EXPIRY + reclaim is covered
+        # deterministically by test_effect_reconcile_expiry_reclaims_with_a_new_owner (injected clock).
+        # Runs on InMemory (the DEFAULT store, so its owned-lease methods are covered too) AND SQLite AND
+        # (when a DSN is set) Postgres via two real synchronized connections -- the Section-6 bar.
+        for context in [nullcontext(("memory", InMemoryRuntimeStore()))] + self._store_case_contexts():
+            with context as (backend, store):
+                with self.subTest(backend=backend):
+                    def seed_unknown(eid: str) -> None:
+                        store.record_effect_prepared(eid, "t", "iso.charge", "{}")
+                        store.mark_effect_started(eid)
+                        store.settle_effect(eid, "unknown", None, "kill")
+
+                    # A FRESH claim's live lease blocks another owner (lease_seconds is the NEW claim's).
+                    seed_unknown("live-1")
+                    self.assertTrue(store.claim_effect_for_reconcile("live-1", "A", 10_000))    # unknown -> reconciling (A)
+                    self.assertFalse(store.claim_effect_for_reconcile("live-1", "B", 10_000))   # A's lease live -> B refused
+
+                    # Owned CAS settle: the owner settles; a late loser with its OWN id cannot clobber it.
+                    seed_unknown("cas-1")
+                    self.assertTrue(store.claim_effect_for_reconcile("cas-1", "W", 10_000))
+                    self.assertTrue(store.settle_effect_from_claim("cas-1", "W", "confirmed",
+                                                                   canonical_json({"charged": 5}).decode("utf-8"), "landed"))
+                    self.assertFalse(store.settle_effect_from_claim("cas-1", "L", "reconciled", None, "did not land"))  # loser's own id
+                    self.assertFalse(store.settle_effect_from_claim("cas-1", "W", "reconciled", None, "did not land"))  # even W: no longer reconciling
+                    final = store.get_effect("cas-1")
+                    self.assertEqual(final["state"], "confirmed")
+                    self.assertEqual(json.loads(final["result_json"])["charged"], 5)  # confirmed result intact
+
+                    # The claim OWNER may RELEASE its claim back to unknown (liveness); a non-owner cannot.
+                    seed_unknown("rel-1")
+                    self.assertTrue(store.claim_effect_for_reconcile("rel-1", "R", 10_000))
+                    self.assertFalse(store.release_effect_claim("rel-1", "not-R"))             # non-owner cannot reset
+                    self.assertTrue(store.release_effect_claim("rel-1", "R"))                  # owner relinquishes
+                    self.assertEqual(store.get_effect("rel-1")["state"], "unknown")           # retryable, not stranded
+
+                    # Two real connections race to claim the SAME unknown effect; exactly one wins.
+                    seed_unknown("race-1")
+                    barrier = threading.Barrier(2)
+                    wins: list[bool] = []
+                    lock = threading.Lock()
+
+                    def claim(claim_id: str) -> None:
+                        barrier.wait()
+                        won = store.claim_effect_for_reconcile("race-1", claim_id, 10_000)
+                        with lock:
+                            wins.append(won)
+
+                    threads = [threading.Thread(target=claim, args=(cid,)) for cid in ("race-A", "race-B")]
+                    for thread in threads:
+                        thread.start()
+                    for thread in threads:
+                        thread.join(timeout=30)
+                    self.assertEqual(sorted(wins), [False, True])  # exactly one claimant wins the race
+
+    def test_effect_reconcile_expiry_reclaims_with_a_new_owner(self):
+        # Round-4 hardening: lease EXPIRY tested deterministically with an INJECTED clock (no negative
+        # lease, no sleep) on the embedded stores -- the store's reconcile methods read self._clock().
+        # An expired claim is reclaimable, the reclaim mints a DIFFERENT owner id, and the superseded
+        # holder can then neither settle nor reset the new claim. (Postgres uses DB time, not the injected
+        # clock; its owner-scoped settle is covered by the race test above.)
+        now = {"t": 1000}
+        clock = lambda: now["t"]  # noqa: E731
+        with tempfile.TemporaryDirectory() as directory:
+            stores = [("memory", InMemoryRuntimeStore(clock=clock)),
+                      ("sqlite", SQLiteRuntimeStore(Path(directory) / "eff.sqlite", clock=clock))]
+            for backend, store in stores:
+                with self.subTest(backend=backend):
+                    now["t"] = 1000
+                    store.record_effect_prepared("e", "t", "iso.charge", "{}")
+                    store.mark_effect_started("e")
+                    store.settle_effect("e", "unknown", None, "kill")
+                    self.assertTrue(store.claim_effect_for_reconcile("e", "A", 100))   # lease -> 1100
+                    now["t"] = 1050                                                    # still live
+                    self.assertFalse(store.claim_effect_for_reconcile("e", "B", 100))  # B refused, A's lease live
+                    now["t"] = 1200                                                    # A's lease expired
+                    self.assertTrue(store.claim_effect_for_reconcile("e", "C", 100))   # C reclaims
+                    self.assertEqual(store.get_effect("e")["reconcile_claim_id"], "C")  # a NEW owner id
+                    # A, superseded, can neither settle nor reset C's live claim.
+                    self.assertFalse(store.settle_effect_from_claim("e", "A", "confirmed", None, "stale"))
+                    self.assertFalse(store.release_effect_claim("e", "A"))
+                    self.assertEqual(store.get_effect("e")["state"], "reconciling")     # C's claim untouched
+                    # C, the live owner, settles it.
+                    self.assertTrue(store.settle_effect_from_claim("e", "C", "reconciled", None, "did not land"))
+                    self.assertEqual(store.get_effect("e")["state"], "reconciled")
+
+    def test_reconcile_claim_rejects_invalid_lease_or_owner(self):
+        # Round-4 hardening (auditor note): the store validates its OWN inputs so a zero/negative lease
+        # (which would make the claim instantly reclaimable, defeating exclusivity) or an empty owner id
+        # is rejected at the boundary, not trusted from the caller. CALIBRATED: neutralize the validator
+        # call and a negative lease is accepted (the claim's lease lands in the past -> instantly
+        # reclaimable), so this test fails; restored -> passes.
+        with tempfile.TemporaryDirectory() as directory:
+            stores = [("memory", InMemoryRuntimeStore()),
+                      ("sqlite", SQLiteRuntimeStore(Path(directory) / "eff.sqlite"))]
+            for backend, store in stores:
+                with self.subTest(backend=backend):
+                    store.record_effect_prepared("e", "t", "iso.charge", "{}")
+                    store.mark_effect_started("e")
+                    store.settle_effect("e", "unknown", None, "kill")
+                    for bad in (0, -1, True, 1.5):
+                        with self.assertRaisesRegex(SecurityError, "lease_seconds"):
+                            store.claim_effect_for_reconcile("e", "owner", bad)
+                    for bad_id in ("", "   ", None):
+                        with self.assertRaisesRegex(SecurityError, "claim_id"):
+                            store.claim_effect_for_reconcile("e", bad_id, 100)
+                    self.assertTrue(store.claim_effect_for_reconcile("e", "owner", 100))  # a well-formed claim still works
+
+    @unittest.skipUnless(_has_tree_termination_primitive(), "isolated side-effecting tools need a process-tree termination primitive")
+    def test_reconcile_effect_refuses_a_live_reconciling_claim(self):
+        # A host-level reconcile cannot start while another reconcile holds a live claim: the CAS claim
+        # fails and reconcile_effect raises rather than running a second reconciler concurrently.
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            host, envelope = self._charge_host(store, directory, target="fail_without_landing")
+            host.run(envelope)
+            eid = self._charge_eid(envelope, directory)
+            self.assertEqual(store.get_effect(eid)["state"], "unknown")
+            # Simulate a reconcile already in flight (another worker holds a live claim).
+            self.assertTrue(store.claim_effect_for_reconcile(eid, "other-worker", 10_000))
+            with self.assertRaisesRegex(SecurityError, "only an unknown"):
+                host.reconcile_effect(eid, envelope.state.task_id)
+
+    @unittest.skipUnless(_has_tree_termination_primitive(), "isolated side-effecting tools need a process-tree termination primitive")
+    def test_launch_capability_is_disarmed_when_not_consumed(self):
+        # A capability armed but not consumed (invoke failed before the gate) must not outlive its one
+        # intended launch. disarm() drops it, so a later invoke with it is refused.
+        registry = ToolRegistry()
+        registry.register_isolated("iso.pay", "isolated_tool_fixtures:echo", side_effecting=True, env=self._isolated_env())
+        permit = self._isolated_permit("iso.pay")
+        args = {"amount": 3}
+        canonical_args = canonical_json(args).decode("utf-8")
+        armer = registry.attach_effect_ledger(lambda eid: {"effect_id": eid, "state": "started", "tool": "iso.pay", "arguments_json": canonical_args} if eid == "e-1" else None)
+        cap = armer.arm("e-1", "iso.pay", args)
+        armer.disarm(cap)  # the host's `finally` path
+        with self.assertRaisesRegex(SecurityError, "does not authorize"):
+            registry.invoke(permit, "iso.pay", args, launch_capability=cap)
+
+    def test_sqlite_v9_to_v10_adds_tool_effects(self):
+        # Section 7 PR 2a (G2, upgrade path). An existing v9 SQLite store opened by v10 code migrates
+        # to v10 and gains the tool_effects table -- the path a real deployment takes.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime.sqlite"
+            SQLiteRuntimeStore(path)  # build a full v10 store, then roll it back to look like v9
+            with self._raw_sqlite(str(path)) as connection:
+                connection.execute("DROP TABLE tool_effects")
+                connection.execute("PRAGMA user_version = 9")
+            with self._raw_sqlite(str(path)) as connection:
+                self.assertEqual(int(connection.execute("PRAGMA user_version").fetchone()[0]), 9)
+
+            store = SQLiteRuntimeStore(path)  # v10 code opens a v9 db -> migrates
+            with self._raw_sqlite(str(path)) as connection:
+                self.assertEqual(int(connection.execute("PRAGMA user_version").fetchone()[0]), SQLITE_SCHEMA_VERSION)
+                self.assertIsNotNone(connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='tool_effects'").fetchone())
+            store.record_effect_prepared("e1", "t1", "pay", "{}")
+            self.assertEqual(store.get_effect("e1")["state"], "prepared")
+
+    def test_sqlite_v10_to_v11_adds_reconcile_lease_columns(self):
+        # Section 7 PR 2 (round 3, G-migration). An existing v10 SQLite store opened by v11 code migrates
+        # to v11 and gains the OWNED-reconcile-lease columns -- the path a real deployment takes. A v10 row
+        # (no lease columns) upgrades untouched and is then claimable under an owner.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(path)  # full v11
+            store.record_effect_prepared("e1", "t1", "pay", "{}")  # a pre-existing row
+            with self._raw_sqlite(str(path)) as connection:  # roll it back to look like v10
+                connection.execute("ALTER TABLE tool_effects DROP COLUMN reconcile_claim_id")
+                connection.execute("ALTER TABLE tool_effects DROP COLUMN reconcile_lease_expires_at")
+                connection.execute("PRAGMA user_version = 10")
+            with self._raw_sqlite(str(path)) as connection:
+                self.assertEqual(int(connection.execute("PRAGMA user_version").fetchone()[0]), 10)
+
+            store = SQLiteRuntimeStore(path)  # v11 code opens a v10 db -> migrates
+            with self._raw_sqlite(str(path)) as connection:
+                self.assertEqual(int(connection.execute("PRAGMA user_version").fetchone()[0]), SQLITE_SCHEMA_VERSION)
+                columns = {row[1] for row in connection.execute("PRAGMA table_info(tool_effects)").fetchall()}
+                self.assertIn("reconcile_claim_id", columns)
+                self.assertIn("reconcile_lease_expires_at", columns)
+            # The pre-existing row survived and now carries NULL lease fields; make it unknown + claim it.
+            self.assertEqual(store.get_effect("e1")["reconcile_claim_id"], None)
+            store.mark_effect_started("e1")
+            store.settle_effect("e1", "unknown", None, "kill")
+            self.assertTrue(store.claim_effect_for_reconcile("e1", "owner-1", 300))
+            self.assertEqual(store.get_effect("e1")["reconcile_claim_id"], "owner-1")
 
     def test_constrained_grant_denies_unknown_arguments_without_an_explicit_flag(self):
         # Regression: a grant that constrains ANY argument thereby whitelists the
@@ -1917,6 +2361,7 @@ class RuntimeTests(unittest.TestCase):
             )
             host = make_host(store=store, allow_ephemeral_signing_key=True)
             host.tools = tools
+            host._effect_armer = host.tools.attach_effect_ledger(host._effect_ledger_row)  # plain-attribute swap: re-attach + re-arm (round 3)
             budget = ResourceBudget(max_steps=6, max_tool_calls=2, max_output_bytes=32768)
             host.policy = HostPolicy(
                 host.host_id,
@@ -1964,6 +2409,7 @@ class RuntimeTests(unittest.TestCase):
             tools.register("noop", lambda arguments: {"ok": True})
             host = make_host(store=store, allow_ephemeral_signing_key=True)
             host.tools = tools
+            host._effect_armer = host.tools.attach_effect_ledger(host._effect_ledger_row)  # plain-attribute swap: re-attach + re-arm (round 3)
             budget = ResourceBudget(max_steps=6, max_tool_calls=2, max_output_bytes=32768)
             host.policy = HostPolicy(host.host_id, (ToolGrant("noop", {"arguments": {"n": {"type": "number"}}}),), budget)
             host.providers["big"] = OversizedResultProvider()  # never reached; admission fails first
@@ -2719,6 +3165,91 @@ class RuntimeTests(unittest.TestCase):
                 self.assertIsNotNone(exists)
             store.cancel_task("t1")
             self.assertTrue(store.is_task_cancelled("t1"))
+        finally:
+            self._drop_postgres_schema(dsn, schema)
+
+    def test_effect_ledger_store_round_trip_on_both_backends(self):
+        # Section 7 PR 2a (G2): the effect-ledger store methods on SQLite AND Postgres. Exercises the
+        # ON CONFLICT DO NOTHING idempotency, the state=prepared-guarded start, and the settle path,
+        # so the Postgres arm is not left unrun until CI.
+        for context in self._store_case_contexts():
+            with context as (backend, store), self.subTest(backend=backend):
+                self.assertIsNone(store.get_effect("e1"))
+                store.record_effect_prepared("e1", "task1", "pay", '{"amount": 5}')
+                self.assertEqual(store.get_effect("e1")["state"], "prepared")
+                store.record_effect_prepared("e1", "task1", "pay", '{"amount": 9}')  # idempotent
+                self.assertEqual(store.get_effect("e1")["arguments_json"], '{"amount": 5}')  # kept first
+                store.mark_effect_started("e1")
+                self.assertEqual(store.get_effect("e1")["state"], "started")
+                store.settle_effect("e1", "confirmed", '{"ok": true}', None)
+                row = store.get_effect("e1")
+                self.assertEqual(row["state"], "confirmed")
+                self.assertEqual(row["result_json"], '{"ok": true}')
+
+    @unittest.skipUnless(
+        os.environ.get("PORTMARK_TEST_POSTGRES_DSN") and PostgresRuntimeStore.available(),
+        "needs a live Postgres (PORTMARK_TEST_POSTGRES_DSN)",
+    )
+    def test_postgres_v7_to_v8_upgrade_adds_tool_effects(self):
+        # Section 7 PR 2a (G2, upgrade path, Postgres). A v7 schema re-initialized by v8 code creates
+        # tool_effects idempotently and bumps the recorded version to 8.
+        import psycopg
+        dsn = os.environ["PORTMARK_TEST_POSTGRES_DSN"]
+        schema = "portmark_upgrade_" + secrets.token_hex(8)
+        try:
+            PostgresRuntimeStore(dsn, schema=schema)  # full v8 schema
+            with psycopg.connect(dsn) as connection:
+                connection.execute(f'SET search_path TO "{schema}"')
+                connection.execute("DROP TABLE tool_effects")
+                connection.execute("UPDATE portmark_schema SET version = 7")
+                connection.commit()
+            store = PostgresRuntimeStore(dsn, schema=schema)  # re-initialize as v8
+            with psycopg.connect(dsn) as connection:
+                connection.execute(f'SET search_path TO "{schema}"')
+                version = connection.execute("SELECT version FROM portmark_schema").fetchone()[0]
+                self.assertEqual(version, POSTGRES_SCHEMA_VERSION)
+                exists = connection.execute(
+                    "SELECT to_regclass(%s)", (f"{schema}.tool_effects",)).fetchone()[0]
+                self.assertIsNotNone(exists)
+            store.record_effect_prepared("e1", "t1", "pay", "{}")
+            self.assertEqual(store.get_effect("e1")["state"], "prepared")
+        finally:
+            self._drop_postgres_schema(dsn, schema)
+
+    @unittest.skipUnless(
+        os.environ.get("PORTMARK_TEST_POSTGRES_DSN") and PostgresRuntimeStore.available(),
+        "needs a live Postgres (PORTMARK_TEST_POSTGRES_DSN)",
+    )
+    def test_postgres_v8_to_v9_adds_reconcile_lease_columns(self):
+        # Section 7 PR 2 (round 3, Postgres upgrade path). A v8 schema (tool_effects WITHOUT the owned-
+        # lease columns) re-initialized by v9 code ADDs reconcile_claim_id + reconcile_lease_expires_at
+        # idempotently and bumps the recorded version to 9. A pre-existing row upgrades and is claimable.
+        import psycopg
+        dsn = os.environ["PORTMARK_TEST_POSTGRES_DSN"]
+        schema = "portmark_upgrade_" + secrets.token_hex(8)
+        try:
+            store = PostgresRuntimeStore(dsn, schema=schema)  # full v9 schema
+            store.record_effect_prepared("e1", "t1", "pay", "{}")
+            with psycopg.connect(dsn) as connection:  # roll back to look like v8
+                connection.execute(f'SET search_path TO "{schema}"')
+                connection.execute("ALTER TABLE tool_effects DROP COLUMN reconcile_claim_id")
+                connection.execute("ALTER TABLE tool_effects DROP COLUMN reconcile_lease_expires_at")
+                connection.execute("UPDATE portmark_schema SET version = 8")
+                connection.commit()
+            store = PostgresRuntimeStore(dsn, schema=schema)  # re-initialize as v9
+            with psycopg.connect(dsn) as connection:
+                connection.execute(f'SET search_path TO "{schema}"')
+                version = connection.execute("SELECT version FROM portmark_schema").fetchone()[0]
+                self.assertEqual(version, POSTGRES_SCHEMA_VERSION)
+                columns = {row[0] for row in connection.execute(
+                    "SELECT column_name FROM information_schema.columns WHERE table_schema = %s AND table_name = 'tool_effects'",
+                    (schema,)).fetchall()}
+                self.assertIn("reconcile_claim_id", columns)
+                self.assertIn("reconcile_lease_expires_at", columns)
+            store.mark_effect_started("e1")
+            store.settle_effect("e1", "unknown", None, "kill")
+            self.assertTrue(store.claim_effect_for_reconcile("e1", "owner-1", 300))
+            self.assertEqual(store.get_effect("e1")["reconcile_claim_id"], "owner-1")
         finally:
             self._drop_postgres_schema(dsn, schema)
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import secrets
 import signal
 import subprocess  # nosec B404
 import sys
@@ -17,6 +18,16 @@ from .security import SecurityError, canonical_json, check_constraints
 
 
 Tool = Callable[[dict[str, Any]], Any]
+
+
+@dataclass(frozen=True)
+class LaunchArmer:
+    """Private handle returned by ToolRegistry.attach_effect_ledger and held only by AgentHost. `arm`
+    mints a one-use launch capability for a `started` side-effecting effect; `disarm` drops one that was
+    not consumed. Bundling them here (instead of public registry methods) is what stops any caller with
+    a registry reference from minting capabilities (Section 7 PR 2, round 3 remediation)."""
+    arm: Callable[[str, str, dict[str, Any]], str]
+    disarm: Callable[[str | None], None]
 
 # Extra bytes the parent will read past the tool's output budget before it
 # declares an overflow: the response is `{"ok": true, "result": <output>}`, so
@@ -128,6 +139,9 @@ class ToolKilledError(ToolExecutionError):
 class _IsolatedSpec:
     target: str
     env: dict[str, str] = field(default_factory=dict)
+    # Section 7 PR 2: a module:function the host runs (isolated, with the effect_id) to determine
+    # whether a side-effecting tool's external effect actually landed, for the reconcile pass.
+    reconcile: str | None = None
 
 
 class ToolRegistry:
@@ -144,6 +158,24 @@ class ToolRegistry:
         self._timeouts: dict[str, float] = {}
         self._max_output: dict[str, int] = {}
         self._side_effecting: set[str] = set()
+        # Section 7 PR 2 (round 3, remediation): launching a side-effecting tool requires a one-use,
+        # in-memory LAUNCH CAPABILITY that AgentHost arms right before the call and invoke() consumes
+        # atomically. Knowledge of a (deterministic, non-secret) effect_id is NOT launch authority.
+        #   * ARMING IS NOT A PUBLIC METHOD. attach_effect_ledger() returns a private armer handle (arm /
+        #     disarm closures) that only AgentHost holds -- so no caller with a registry reference can
+        #     mint a capability, and none can mint a SECOND one for a started effect (round-3-r1 hole:
+        #     public arm_effect_launch let a caller mint N capabilities for one started row). Arming
+        #     validates against the read-only ledger row (a fabricated effect_id cannot be armed) and
+        #     refuses a second outstanding capability for the same effect.
+        #   * `_armed` maps a random capability -> (effect_id, tool, canonical_args). invoke() pops it on
+        #     an exact (tool, args) match: one-use, non-transferable, non-replayable. After a crash it is
+        #     empty, so a durable `started` row alone authorizes nothing.
+        # This removes the PUBLIC-API bypass; it is not protection against arbitrary in-process code
+        # mutating these private attributes -- that is the deployment sandbox's job per the Section 7
+        # contract, and the docs say so rather than overclaiming.
+        self._ledger_attached = False
+        self._armed: dict[str, tuple[str, str, str]] = {}
+        self._arm_lock = threading.Lock()
         self.default_timeout = default_timeout
         self.max_output_bytes = max_output_bytes
         # Section 7 #6/#3: defense-in-depth resource caps applied inside each isolated worker.
@@ -183,6 +215,7 @@ class ToolRegistry:
         max_output_bytes: int | None = None,
         side_effecting: bool = False,
         env: dict[str, str] | None = None,
+        reconcile: str | None = None,
     ) -> None:
         """Register a tool that runs in a separate, deadline-terminated subprocess (EV-002).
 
@@ -204,6 +237,10 @@ class ToolRegistry:
         module_name, separator, object_path = target.partition(":")
         if not separator or not module_name or not object_path:
             raise ValueError("register_isolated target must use module:function syntax")
+        if reconcile is not None:
+            r_module, r_sep, r_object = reconcile.partition(":")
+            if not r_sep or not r_module or not r_object:
+                raise ValueError("register_isolated reconcile must use module:function syntax")
         if side_effecting and not _has_tree_termination_primitive():
             # Fail closed at startup, not at the first payment: on a platform with no
             # tree-kill primitive the host cannot guarantee the tool and its descendants
@@ -213,7 +250,7 @@ class ToolRegistry:
                 "process tree, so the host cannot guarantee it stops at its deadline; refusing "
                 "to register it. Non-side-effecting isolated tools are allowed."
             )
-        self._isolated[name] = _IsolatedSpec(target=target, env=dict(env or {}))
+        self._isolated[name] = _IsolatedSpec(target=target, env=dict(env or {}), reconcile=reconcile)
         self._tools.pop(name, None)
         if timeout is not None:
             self._timeouts[name] = timeout
@@ -222,10 +259,78 @@ class ToolRegistry:
         if side_effecting:
             self._side_effecting.add(name)
 
+    def attach_effect_ledger(self, effect_ledger_row: Callable[[str], dict[str, Any] | None]) -> LaunchArmer:
+        """Attach the host's read-only durable-ledger view ONCE and RETURN a private armer handle
+        (Section 7 PR 2, round 3 remediation). AgentHost calls this at construction and keeps the handle;
+        it is the ONLY way to mint a launch capability. Arming is deliberately NOT a public registry
+        method -- otherwise any caller holding the registry could mint capabilities (including several
+        for one `started` effect). Set-once: a second attach raises, so the arming validator cannot be
+        swapped for a permissive one. The row lookup and the armer are captured in the closure, not
+        stored as reassignable attributes."""
+        if self._ledger_attached:
+            raise RuntimeError("effect ledger already attached; it is set once and cannot be re-attached")
+        self._ledger_attached = True
+
+        def arm(effect_id: str, tool: str, arguments: dict[str, Any]) -> str:
+            # Validate against the durable ledger: a fabricated or drifted effect_id has no matching
+            # `started` row and cannot be armed. Then refuse a SECOND outstanding capability for the same
+            # effect, so even the holder of the armer cannot mint two launches for one started row. The
+            # host disarms in a `finally`, so a launch that never consumes frees the slot (no poisoning).
+            row = effect_ledger_row(effect_id)
+            canonical_args = canonical_json(arguments).decode("utf-8")
+            if row is None or row["state"] != "started" or row["tool"] != tool or row["arguments_json"] != canonical_args:
+                raise SecurityError(
+                    f"cannot arm a launch for effect {effect_id!r}: no `started` ledger row matches this "
+                    "(tool, arguments). Knowledge of an effect_id is not launch authority."
+                )
+            with self._arm_lock:
+                if any(existing[0] == effect_id for existing in self._armed.values()):
+                    raise SecurityError(
+                        f"a launch capability is already outstanding for effect {effect_id!r}; one "
+                        "started effect authorizes at most one launch."
+                    )
+                capability = secrets.token_urlsafe(32)
+                self._armed[capability] = (effect_id, tool, canonical_args)
+            return capability
+
+        def disarm(capability: str | None) -> None:
+            if capability is None:
+                return
+            with self._arm_lock:
+                self._armed.pop(capability, None)
+
+        return LaunchArmer(arm=arm, disarm=disarm)
+
+    def is_side_effecting(self, name: str) -> bool:
+        """Whether the tool is registered side-effecting (the host wraps it in the effect ledger)."""
+        return name in self._side_effecting
+
+    def is_isolated(self, name: str) -> bool:
+        """Whether the tool runs in an isolated worker (the only path that can carry an effect_id)."""
+        return name in self._isolated
+
+    def has_reconcile(self, name: str) -> bool:
+        """Whether an isolated tool has a reconcile function registered (Section 7 PR 2)."""
+        spec = self._isolated.get(name)
+        return spec is not None and spec.reconcile is not None
+
+    def reconcile(self, name: str, arguments: dict[str, Any], effect_id: str) -> Any:
+        """Run a tool's registered reconcile function (isolated, with the effect_id) to determine
+        whether its external effect landed. Host-invoked during the reconcile pass -- NOT an
+        agent-facing tool call, so it does not go through the permit/constraint check. Returns the
+        reconcile function's result (by contract, a dict like {"landed": bool, "result"?: ...})."""
+        spec = self._isolated.get(name)
+        if spec is None or spec.reconcile is None:
+            raise ToolExecutionError(f"tool {name!r} has no reconcile function registered")
+        reconcile_spec = _IsolatedSpec(target=spec.reconcile, env=dict(spec.env))
+        timeout = self._timeouts.get(name, self.default_timeout)
+        cap = self._max_output.get(name, self.max_output_bytes)
+        return self._invoke_isolated(reconcile_spec, arguments, timeout, cap, effect_id=effect_id)
+
     def names(self) -> tuple[str, ...]:
         return tuple(sorted(set(self._tools) | set(self._isolated)))
 
-    def invoke(self, permit: Permit, name: str, arguments: dict[str, Any], max_output_bytes: int | None = None) -> Any:
+    def invoke(self, permit: Permit, name: str, arguments: dict[str, Any], max_output_bytes: int | None = None, launch_capability: str | None = None) -> Any:
         grant = next((grant for grant in permit.grants if grant.name == name), None)
         if grant is None:
             # Only the effective permit is visible here, so this cannot say which
@@ -243,8 +348,34 @@ class ToolRegistry:
         timeout = self._timeouts.get(name, self.default_timeout)
         cap = max_output_bytes if max_output_bytes is not None else self._max_output.get(name, self.max_output_bytes)
 
+        effect_id: str | None = None
+        if name in self._side_effecting:
+            # Fail closed at the invoke boundary. Launching a side-effecting tool requires a one-use
+            # LAUNCH CAPABILITY the host armed (arm_effect_launch) right before this call and bound to
+            # THIS (effect_id, tool, canonical arguments). Knowledge of the (deterministic, non-secret)
+            # effect_id is NOT launch authority -- so a fabricated id, a capability reused after its one
+            # launch, one armed for a different tool, or one armed with different arguments all fail
+            # here. The capability is consumed ONLY on an exact match, so a mismatch never burns a valid
+            # one. This is the authority the round-2 "is it started?" predicate failed to be.
+            if launch_capability is None:
+                raise ToolExecutionError(
+                    f"tool {name!r} is side-effecting and must run through the effect ledger via AgentHost "
+                    "(which arms a one-use launch capability); it cannot be invoked directly without one."
+                )
+            with self._arm_lock:
+                armed = self._armed.get(launch_capability)
+                canonical_args = canonical_json(arguments).decode("utf-8")
+                if armed is None or armed[1] != name or armed[2] != canonical_args:
+                    raise SecurityError(
+                        f"launch capability does not authorize this call to {name!r}; a fabricated, "
+                        "already-consumed, cross-tool, or argument-mismatched capability cannot launch a "
+                        "side-effecting tool. Knowledge of an effect_id is not launch authority."
+                    )
+                effect_id = armed[0]
+                del self._armed[launch_capability]  # one-use: consume on the exact match
+
         if is_isolated:
-            return self._invoke_isolated(self._isolated[name], arguments, timeout, cap)
+            return self._invoke_isolated(self._isolated[name], arguments, timeout, cap, effect_id=effect_id)
 
         if name in self._side_effecting:
             # Finding #3 / EV-002: the thread + queue-timeout path below cannot
@@ -298,15 +429,24 @@ class ToolRegistry:
             raise ToolExecutionError("tool execution failed") from value
         return self._checked_output(value, cap)
 
-    def _invoke_isolated(self, spec: _IsolatedSpec, arguments: dict[str, Any], timeout: float, cap: int) -> Any:
+    def _invoke_isolated(
+        self, spec: _IsolatedSpec, arguments: dict[str, Any], timeout: float, cap: int, effect_id: str | None = None
+    ) -> Any:
         # Section 7 #6: hand the worker its resource caps. cpu_seconds is a kernel backstop for the
         # wall-clock deadline (a CPU-bound tool that ignores the clock still dies), set a little
         # above the timeout so it never fires before the host's own deadline does.
         rlimits = dict(self.resource_limits)
         if "cpu_seconds" not in rlimits:
             rlimits["cpu_seconds"] = int(timeout) + 2
-        request = json.dumps(
-            {"target": spec.target, "arguments": arguments, "max_output_bytes": cap, "rlimits": rlimits}
+        payload: dict[str, Any] = {
+            "target": spec.target, "arguments": arguments, "max_output_bytes": cap, "rlimits": rlimits
+        }
+        # Section 7 PR 2: side-effecting tools (and their reconcile fns) receive a host-derived
+        # idempotency key OUTSIDE `arguments` -- the deny-by-default argument-name whitelist in
+        # check_constraints would reject an injected key. The worker passes it as tool(arguments, effect_id).
+        if effect_id is not None:
+            payload["effect_id"] = effect_id
+        request = json.dumps(payload
         ).encode("utf-8")
         try:
             tree = _launch_process_tree(

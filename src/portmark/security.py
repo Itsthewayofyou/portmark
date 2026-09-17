@@ -1086,6 +1086,37 @@ def arguments_hash(arguments: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_json(arguments)).hexdigest()
 
 
+def effect_id(task_id: str, sequence: int) -> str:
+    """Host-derived idempotency key for the side-effecting call at one logical POSITION (Section 7 PR 2).
+
+    The invariant is **at most one effect per logical call position**: the id is bound ONLY to the
+    task and the per-call `sequence`, NOT to the tool or the arguments. So a given position has exactly
+    one effect id, and a retry of that position re-derives it and is deduplicated by the effect ledger.
+
+    STABILITY (the correctness proof): `sequence` is the pre-increment `state.tool_calls` at the call
+    site. `tool_calls` is monotonic per task and never reset, and on a RESUME it is rebound from the
+    DURABLE checkpoint (`state.tool_calls = int(stored["tool_calls"])`), not the caller-asserted
+    envelope -- so the same position re-derives this id across a crash-and-resume, and a distinct call
+    (a later, higher `tool_calls`) cannot collide with it. It is deliberately NOT bound to the
+    checkpoint generation (captured once per RUN, so it identifies the run not the call and is unstable
+    across a resume).
+
+    Why NOT the tool/arguments: binding them would let a provider that re-proposes the same position
+    with DIFFERENT arguments (or a different tool) on a resume derive a NEW id and run a SECOND effect
+    while the first effect at that position is still unresolved -- the argument-drift hole. The
+    invariant is **at most one effect per position**. Because the id excludes the tool and arguments,
+    the host does NOT silently replay a drifted position: `_effect_pre_launch` compares the current
+    decision's (tool, arguments) against the ledger ROW's recorded (tool, arguments_json) and REFUSES
+    on any drift -- it never replays another call's recorded result and never re-runs at a bound
+    position. A legitimate deterministic resume re-proposes the same tool+args and passes cleanly; a
+    drifted re-proposal hard-fails the task (settling `unknown` where a prior attempt was in flight),
+    so reconcile or a fresh call resolves it -- never a silent replay. The ledger ROW keeps the tool
+    and arguments for exactly this drift check plus reconcile and audit; only the id excludes them.
+    """
+    material = {"task_id": task_id, "sequence": sequence}
+    return hashlib.sha256(canonical_json(material)).hexdigest()
+
+
 class ApprovalAuthority:
     def __init__(self, key_id: str, approver: str, private_key: Ed25519PrivateKey) -> None:
         self.key_id = key_id
