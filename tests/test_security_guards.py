@@ -484,7 +484,7 @@ class SecurityGuardTests(unittest.TestCase):
         # nothing" (POLICY.md / TOOLS.md). A permit granting ["*"] must not widen
         # that to full tool output. Pre-fix, the omitted host projection parsed to
         # None, and the permit's ("*",) survived the intersection unchanged.
-        from portmark.projection import provider_state
+        from portmark.projection import provider_state, provider_view
 
         manifest = AgentManifest("agent:demo", "1.0.0", "deterministic", ("catalog.search",))
         permit = self._permit()
@@ -504,7 +504,7 @@ class SecurityGuardTests(unittest.TestCase):
         # And end to end, no tool content reaches a provider.
         state = AgentState(task_id="t1", goal="g")
         state.messages = [{"role": "tool", "name": "catalog.search", "content": {"id": "1", "confidential": "x"}}]
-        projected = provider_state(state, effective.grants)
+        projected = provider_state(provider_view(state, effective.grants))
         self.assertEqual(projected["messages"], [{"role": "tool", "name": "catalog.search"}])
 
     def test_policy_and_trust_registry_loader_validation_guards_are_table_driven(self):

@@ -10,7 +10,7 @@ from typing import Any
 
 from .metrics import RuntimeMetrics
 from .models import AgentEnvelope, ApprovalToken, AttestationEvidence, ProviderDecision, RunResult
-from .projection import project_state_for_migration, project_state_for_provider
+from .projection import project_state_for_migration, provider_view
 from .providers import ModelProvider
 from .security import _MIGRATION_RECEIPT_FIELDS, _OPTIONAL_MIGRATION_RECEIPT_FIELDS, AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, MigrationAttesterProtocol, SecurityError, arguments_hash, audit_head_payload, canonical_json, effect_id, migration_envelope_digest, migration_receipt_payload, verified_approval_token
 from .storage import InMemoryRuntimeStore, RuntimeStore
@@ -480,10 +480,10 @@ class AgentHost:
             # -- in-process or a remote adapter -- can read them. Projection is enforced
             # here, not trusted to the adapter. The provider only reads the state to
             # decide; the host mutates the real state via _apply_decision below.
-            projected_state = project_state_for_provider(state, effective.grants)
+            view = provider_view(state, effective.grants)
             try:
                 try:
-                    decision = provider.decide(projected_state, tool_names, effective.grants)
+                    decision = provider.decide(view, tool_names)
                 finally:
                     self.metrics.observe_duration("provider_decision_duration_seconds", time.monotonic() - decision_started)
             except Exception:

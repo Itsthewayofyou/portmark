@@ -18,7 +18,7 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 from .component_bindings import component_checkpoint, component_context, decode_component_decision, encode_component_input
-from .models import AgentState, ProviderDecision, ToolGrant
+from .models import ProviderDecision, ProviderView
 from .projection import provider_state
 from .security import SecurityError
 
@@ -50,20 +50,22 @@ def _wasmtime_subprocess_env() -> dict[str, str]:
 
 class ModelProvider(ABC):
     @abstractmethod
-    def decide(self, state: AgentState, available_tools: tuple[str, ...], grants: tuple[ToolGrant, ...] = ()) -> ProviderDecision:
-        """Return a proposal. The host remains responsible for authorization and execution."""
+    def decide(self, view: ProviderView, available_tools: tuple[str, ...]) -> ProviderDecision:
+        """Return a proposal from the canonical detached ProviderView (finding #2). The host
+        builds the view (applying every grant's projection) and remains responsible for
+        authorization and execution -- the provider never receives grants or live state."""
 
 
 class DeterministicProvider(ModelProvider):
     """Offline provider used for tests and the demo."""
 
-    def decide(self, state: AgentState, available_tools: tuple[str, ...], grants: tuple[ToolGrant, ...] = ()) -> ProviderDecision:
-        results = state.memory.get("tool_results", {})
+    def decide(self, view: ProviderView, available_tools: tuple[str, ...]) -> ProviderDecision:
+        results = view.tool_results
         if not results.get("catalog.search") and "catalog.search" in available_tools:
-            return ProviderDecision("tool", "catalog.search", {"query": state.goal, "limit": 3})
+            return ProviderDecision("tool", "catalog.search", {"query": view.goal, "limit": 3})
         return ProviderDecision(
             "complete",
-            content={"summary": f"Completed: {state.goal}", "evidence": results.get("catalog.search", [])},
+            content={"summary": f"Completed: {view.goal}", "evidence": results.get("catalog.search", [])},
         )
 
 
@@ -160,8 +162,8 @@ class GenericHttpProvider(ModelProvider):
         self.max_response_bytes = max_response_bytes
         self._allow_local = allow_local_endpoint
 
-    def decide(self, state: AgentState, available_tools: tuple[str, ...], grants: tuple[ToolGrant, ...] = ()) -> ProviderDecision:
-        body = json.dumps({"state": provider_state(state, grants), "available_tools": available_tools}).encode()
+    def decide(self, view: ProviderView, available_tools: tuple[str, ...]) -> ProviderDecision:
+        body = json.dumps({"state": provider_state(view), "available_tools": available_tools}).encode()
         raw = self._post(body)
         try:
             value = json.loads(raw)
@@ -430,10 +432,10 @@ class WasmDecisionProvider(ModelProvider):
         component = _read_component_file(path, max_component_bytes)
         return cls(component, timeout, max_output_bytes, max_component_bytes)
 
-    def decide(self, state: AgentState, available_tools: tuple[str, ...], grants: tuple[ToolGrant, ...] = ()) -> ProviderDecision:
+    def decide(self, view: ProviderView, available_tools: tuple[str, ...]) -> ProviderDecision:
         encoded_component = base64.b64encode(self._component).decode("ascii")
-        context_json = encode_component_input(component_context(state, available_tools, grants))
-        checkpoint_json = encode_component_input(component_checkpoint(state, grants))
+        context_json = encode_component_input(component_context(view, available_tools))
+        checkpoint_json = encode_component_input(component_checkpoint(view))
         try:
             # Shell is disabled and the executable/runner paths are host-controlled.
             process = subprocess.run(  # nosec B603
@@ -493,12 +495,11 @@ class NativeWasmtimeComponentProvider(ModelProvider):
 
     def decide(
         self,
-        state: AgentState,
+        view: ProviderView,
         available_tools: tuple[str, ...],
-        grants: tuple[ToolGrant, ...] = (),
     ) -> ProviderDecision:
-        context_json = encode_component_input(component_context(state, available_tools, grants))
-        checkpoint_json = encode_component_input(component_checkpoint(state, grants))
+        context_json = encode_component_input(component_context(view, available_tools))
+        checkpoint_json = encode_component_input(component_checkpoint(view))
         environment = _wasmtime_subprocess_env()
         try:
             process = subprocess.run(  # nosec B603

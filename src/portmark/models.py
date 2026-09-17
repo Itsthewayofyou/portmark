@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
@@ -120,6 +121,47 @@ class AgentState:
     messages: list[Json] = field(default_factory=list)
     status: Literal["ready", "running", "awaiting_input", "migrating", "completed", "failed"] = "ready"
     result: Any = None
+
+
+@dataclass(frozen=True)
+class ProviderView:
+    """The canonical, detached, immutable surface a provider sees (Section 8 finding #2).
+
+    Every provider -- in-process or remote adapter -- receives exactly this and nothing
+    more. Two things it deliberately is NOT:
+
+    - NOT `AgentState`. The old path handed the in-process provider a whole (mutable)
+      `AgentState` via `project_state_for_provider`, so a buggy or hostile in-process
+      provider could see host bookkeeping in `memory` (approvals, used_approval_ids,
+      migration) that the remote adapters never got, AND mutate the host's live state
+      through aliased nested containers. This view drops `memory` entirely -- closing
+      BOTH the over-exposure and the mutation -- and also drops `checkpoint_generation`
+      (store-owned authority) and `result` (host-owned), neither of which a decision needs.
+    - NOT shallow. `messages` is a tuple and `tool_results` a read-only Mapping, but the
+      immutability is only skin-deep unless every nested container is detached too. The
+      builder (`projection.provider_view`) recursively copies dict->MappingProxyType and
+      list->tuple over NEW containers, so no object reachable from here is shared with the
+      live state -- a `*` output_projection cannot leak an aliased result object.
+
+    `tool_results` keeps the in-process shape (a mapping keyed by tool name) so a provider's
+    truthiness-based "have I run this tool?" check is unchanged; `messages` keeps the remote
+    shape. They are two views of ONE per-grant projection, not two different reductions.
+    """
+
+    task_id: str
+    goal: str
+    step: int
+    tool_calls: int
+    status: Literal["ready", "running", "awaiting_input", "migrating", "completed", "failed"]
+    # A single derived boolean, not the raw `memory` dict: True iff this state resumed after
+    # a migration (host sets memory["migration"] on the destination). A provider legitimately
+    # needs to know it resumed elsewhere so it does not immediately re-migrate; the old path
+    # served this by exposing the WHOLE memory dict (approvals bookkeeping included), which is
+    # exactly finding #2's over-exposure. Narrowing it to this flag reveals no secret and
+    # aliases nothing.
+    migrated: bool = False
+    messages: tuple[Any, ...] = ()
+    tool_results: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass

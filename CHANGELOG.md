@@ -6,6 +6,37 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Section 8 — provider boundary (PR 2): canonical detached ProviderView
+
+- **BREAKING API — providers now receive a `ProviderView`, not `AgentState`.** `ModelProvider.decide`
+  changed from `decide(self, state: AgentState, available_tools, grants=())` to
+  `decide(self, view: ProviderView, available_tools)`. `ProviderView` is a frozen dataclass carrying only
+  `task_id, goal, step, tool_calls, status, migrated, messages, tool_results` — third-party in-process
+  providers must update their signature and read `view.tool_results` / `view.goal` instead of
+  `state.memory[...]`.
+- **BREAKING API — `grants` is no longer passed to `decide`.** The host applies every grant's projection
+  when it builds the view; a provider never receives grants, so it cannot widen its own projection.
+  `provider_state(view)` and `component_context(view, available_tools)` / `component_checkpoint(view)`
+  changed signatures accordingly, and `projection.project_state_for_provider` was **removed**.
+- **Fixes finding #2 (High): the in-process provider was over-exposed AND could mutate live host state.**
+  The old path handed the in-process provider a whole mutable `AgentState` (via a shallow-copying
+  `project_state_for_provider`), so it saw host bookkeeping in `memory` — `approvals`,
+  `used_approval_ids`, `migration` — that the remote adapters never got, and could corrupt the host's
+  live state through aliased nested containers (e.g. `state.memory["used_approval_ids"].clear()`,
+  defeating replay prevention). The canonical view **drops `memory` entirely** (closing the
+  over-exposure) and is **deeply detached** into plain, json-safe copies (closing the mutation — no
+  object reachable from the view aliases live state, even under a `*` output projection). Top-level
+  containers are read-only (a `tuple` of messages, a `MappingProxyType` of tool_results) and the
+  dataclass is frozen. `checkpoint_generation` (store-owned) and `result` (host-owned) are dropped too.
+- **`migrated` replaces raw `memory["migration"]` inspection.** An in-process provider that needs to know
+  it resumed after a migration reads the single derived boolean `view.migrated` (present iff the host set
+  `memory["migration"]`), instead of the old leak of the whole `memory` dict. The remote wire payload
+  (`provider_state`) is unchanged — it never carried migration state — so remote/Wasm provider input is
+  byte-for-byte identical to before.
+- No behavior change to what a well-behaved provider decides: tool-output projection, the
+  share-nothing "present-but-empty" re-proposal semantic, and the wire shape sent to remote providers
+  are all preserved.
+
 ### Section 8 — provider boundary (PR 1): HTTP transport safety (SSRF / redirects / DNS-rebinding / total deadline)
 
 - **`GenericHttpProvider` no longer follows redirects and validates the endpoint address.** The provider

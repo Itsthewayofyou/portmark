@@ -21,7 +21,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
-from dataclasses import asdict
+from dataclasses import FrozenInstanceError, asdict
 from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from http.client import HTTPResponse
 from http.server import ThreadingHTTPServer
@@ -36,7 +36,7 @@ from portmark.factory import build_envelope, make_demo_envelope, make_host, sign
 from portmark.metrics import RuntimeMetrics
 from portmark.logging_config import JsonLogFormatter
 from portmark.models import AgentState, AttestationEvidence, Permit, ProviderDecision, ResourceBudget, ToolGrant
-from portmark.projection import project_state_for_migration, project_state_for_provider
+from portmark.projection import project_state_for_migration, provider_view
 from portmark.providers import GenericHttpProvider, ModelProvider, NativeWasmtimeComponentProvider, ProviderError
 from portmark.policy import load_host_policy
 from portmark.security import (
@@ -107,7 +107,7 @@ class AlwaysSuspendProvider(ModelProvider):
 class MigrateThenCompleteProvider(ModelProvider):
     def __init__(self, destination): self.destination = destination
     def decide(self, state, available_tools, grants=()):
-        if "migration" not in state.memory:
+        if not state.migrated:
             return ProviderDecision("migrate", destination=self.destination)
         return ProviderDecision("complete", content={"resumed_on": self.destination})
 
@@ -117,7 +117,7 @@ class AttestedMigrateThenCompleteProvider(ModelProvider):
         self.destination = destination
         self.attestation = attestation
     def decide(self, state, available_tools, grants=()):
-        if "migration" not in state.memory:
+        if not state.migrated:
             return ProviderDecision("migrate", destination=self.destination, content={"attestation": asdict(self.attestation)})
         return ProviderDecision("complete", content={"resumed_on": self.destination})
 
@@ -166,9 +166,12 @@ class SearchThenMigrateProvider(ModelProvider):
     def __init__(self, destination):
         self.destination = destination
     def decide(self, state, available_tools, grants=()):
-        if "migration" in state.memory:
+        # The canonical view drops raw memory (finding #2) but exposes `migrated`: True once
+        # this task resumed at the destination. Same three phases as before -- search, migrate,
+        # then complete on resume -- keyed on `migrated` instead of memory["migration"].
+        if state.migrated:
             return ProviderDecision("complete", content={"resumed_on": self.destination})
-        if not state.memory.get("tool_results", {}).get("catalog.search"):
+        if not state.tool_results.get("catalog.search"):
             return ProviderDecision("tool", "catalog.search", {"query": "widgets", "limit": 2})
         return ProviderDecision("migrate", destination=self.destination)
 
@@ -191,7 +194,7 @@ class PaymentProvider(ModelProvider):
     def __init__(self, amount=50):
         self.amount = amount
     def decide(self, state, available_tools, grants=()):
-        results = state.memory.get("tool_results", {})
+        results = state.tool_results
         if "payments.reserve" not in results:
             return ProviderDecision("tool", "payments.reserve", {"amount": self.amount, "currency": "USD"})
         return ProviderDecision("complete", content={"payment": results["payments.reserve"]})
@@ -206,7 +209,7 @@ class ChargeProvider(ModelProvider):
         self.tool = tool
 
     def decide(self, state, available_tools, grants=()):
-        results = state.memory.get("tool_results", {})
+        results = state.tool_results
         if self.tool not in results:
             return ProviderDecision("tool", self.tool, {"dir": self.directory, "amount": self.amount})
         return ProviderDecision("complete", content={"done": results[self.tool]})
@@ -225,9 +228,9 @@ class BlockingProvider(ModelProvider):
 
 class LargeToolProvider(ModelProvider):
     def decide(self, state, available_tools, grants=()):
-        if "large" not in state.memory:
+        if "large.output" not in state.tool_results:
             return ProviderDecision("tool", "large.output", {})
-        return ProviderDecision("complete", content={"large": state.memory["large"]})
+        return ProviderDecision("complete", content={"large": state.tool_results["large.output"]})
 
 
 class OversizedResultProvider(ModelProvider):
@@ -235,7 +238,7 @@ class OversizedResultProvider(ModelProvider):
     # once recorded in both memory["tool_results"] and messages, doubles over the
     # checkpoint output budget.
     def decide(self, state, available_tools, grants=()):
-        results = state.memory.get("tool_results", {})
+        results = state.tool_results
         if "big.echo" not in results:
             return ProviderDecision("tool", "big.echo", {})
         return ProviderDecision("complete", content={"done": True})
@@ -243,7 +246,7 @@ class OversizedResultProvider(ModelProvider):
 
 class EchoThenCompleteProvider(ModelProvider):
     def decide(self, state, available_tools, grants=()):
-        results = state.memory.get("tool_results", {})
+        results = state.tool_results
         if "custom.echo" not in results:
             return ProviderDecision("tool", "custom.echo", {"text": "hello"})
         return ProviderDecision("complete", content={"echo": results["custom.echo"]})
@@ -254,7 +257,7 @@ class HttpFetchThenCompleteProvider(ModelProvider):
         self.arguments = arguments
 
     def decide(self, state, available_tools, grants=()):
-        results = state.memory.get("tool_results", {})
+        results = state.tool_results
         if "http.fetch" not in results:
             return ProviderDecision("tool", "http.fetch", self.arguments)
         return ProviderDecision("complete", content={"fetch": results["http.fetch"]})
@@ -834,7 +837,7 @@ class RuntimeTests(unittest.TestCase):
         # Transport is mocked at _post; this exercises payload build + decision decode.
         provider = GenericHttpProvider("https://provider.example/run", max_response_bytes=64)
         with patch.object(provider, "_post", return_value=b'{"kind":"complete","content":{"ok":true}}'):
-            decision = provider.decide(AgentState("task", "goal"), ())
+            decision = provider.decide(provider_view(AgentState("task", "goal")), ())
         self.assertEqual(decision.kind, "complete")
         self.assertEqual(decision.content, {"ok": True})
 
@@ -857,7 +860,7 @@ class RuntimeTests(unittest.TestCase):
             return b'{"kind":"complete","content":{"ok":true}}'
 
         with patch.object(provider, "_post", side_effect=fake_post):
-            decision = provider.decide(state, ("catalog.search",), (ToolGrant("catalog.search"),))
+            decision = provider.decide(provider_view(state, (ToolGrant("catalog.search"),)), ("catalog.search",))
 
         self.assertEqual(decision.kind, "complete")
         self.assertEqual(captured["body"], {
@@ -892,7 +895,7 @@ class RuntimeTests(unittest.TestCase):
             return b'{"kind":"complete","content":{"ok":true}}'
 
         with patch.object(provider, "_post", side_effect=fake_post):
-            provider.decide(state, ("catalog.search",), (ToolGrant("catalog.search", output_projection=("id", "title")),))
+            provider.decide(provider_view(state, (ToolGrant("catalog.search", output_projection=("id", "title")),)), ("catalog.search",))
 
         self.assertEqual(
             captured["body"]["state"]["messages"],
@@ -949,7 +952,7 @@ class RuntimeTests(unittest.TestCase):
                 provider = GenericHttpProvider("https://provider.example/run")
                 with patch.object(provider, "_post", return_value=body):
                     with self.assertRaisesRegex(SecurityError, message):
-                        provider.decide(AgentState("task", "goal"), ("catalog.search",))
+                        provider.decide(provider_view(AgentState("task", "goal")), ("catalog.search",))
 
     def test_host_restricts_permit_more_than_agent_requests(self):
         host = make_host()
@@ -2674,7 +2677,7 @@ class RuntimeTests(unittest.TestCase):
 
         class RecordingProvider(ModelProvider):
             def decide(self, state, available_tools, grants=()):
-                results = state.memory.get("tool_results", {})
+                results = state.tool_results
                 if "catalog.search" not in results:
                     return ProviderDecision("tool", "catalog.search", {"query": state.goal, "limit": 2})
                 seen["view"] = results["catalog.search"]
@@ -3817,11 +3820,11 @@ class RuntimeTests(unittest.TestCase):
                 self.assertEqual(projected.memory["tool_results"], {})
                 self.assertEqual(projected.memory["other"], "kept")
 
-    def test_project_state_for_provider_fails_closed_on_malformed_tool_results(self):
-        # Consistency parity with project_state_for_migration: the provider projection
-        # (finding #4 confidentiality ceiling) must also fail closed on a non-dict
+    def test_provider_view_fails_closed_on_malformed_tool_results(self):
+        # finding #2/#4: the canonical ProviderView must fail closed on a non-dict
         # tool_results (a captured/crafted wire state), dropping it to {} rather than
-        # letting the raw value reach the provider unprojected.
+        # letting the raw value reach the provider unprojected -- AND it carries no
+        # `memory` at all, so the sibling `other` bookkeeping key cannot leak either.
         for malformed in ([{"leaked": "not-for-provider"}], "opaque-blob", 42, None):
             with self.subTest(shape=type(malformed).__name__):
                 state = AgentState(
@@ -3830,9 +3833,70 @@ class RuntimeTests(unittest.TestCase):
                     memory={"tool_results": malformed, "other": "kept"},
                     messages=[],
                 )
-                projected = project_state_for_provider(state, (ToolGrant("any.tool", output_projection=("x",)),))
-                self.assertEqual(projected.memory["tool_results"], {})
-                self.assertEqual(projected.memory["other"], "kept")
+                view = provider_view(state, (ToolGrant("any.tool", output_projection=("x",)),))
+                self.assertEqual(dict(view.tool_results), {})
+                self.assertFalse(hasattr(view, "memory"))
+
+    def test_provider_view_detach_identity_under_star_projection(self):
+        # finding #2, the subtle half: even under a `*` projection -- where
+        # project_tool_output returns the LIVE result object verbatim -- the view must not
+        # alias live host state. A top-level copy alone is not enough; a deep detach is.
+        live_result = {"id": "1", "secret": "x"}
+        state = AgentState("t", "g", memory={"tool_results": {"catalog.search": live_result}})
+        view = provider_view(state, (ToolGrant("catalog.search", output_projection=("*",)),))
+        # Same VALUE (star reveals everything) ...
+        self.assertEqual(dict(view.tool_results["catalog.search"]), live_result)
+        # ... but a DIFFERENT object: no alias survives the deep detach.
+        self.assertIsNot(view.tool_results["catalog.search"], live_result)
+        # Proof it is isolated: mutating the view's copy leaves live state untouched.
+        view.tool_results["catalog.search"]["secret"] = "TAMPERED"
+        self.assertEqual(state.memory["tool_results"]["catalog.search"]["secret"], "x")
+
+    def test_hostile_provider_cannot_mutate_view_or_live_state(self):
+        # finding #2 core: a buggy or hostile IN-PROCESS provider must not corrupt the
+        # host's live state. The view is a frozen dataclass (field reassignment raises)
+        # with read-only top-level containers (no tool_results key-add, no messages
+        # append). Nested mutation of a value DOES succeed -- deliberately: a provider may
+        # echo tool output into its own decision content, and the values are plain
+        # deep-copies, so that write lands on a THROWAWAY copy, never on live host state.
+        # The load-bearing assertion is the last one: live state is byte-identical after.
+        state = AgentState(
+            "t", "g",
+            memory={
+                "tool_results": {"catalog.search": {"id": "1"}},
+                "used_approval_ids": ["a1"],           # host bookkeeping the old path leaked
+                "approvals": {"payments.reserve": {}},  # ... and let a provider mutate
+            },
+            messages=[{"role": "tool", "name": "catalog.search", "content": {"id": "1"}}],
+        )
+        before = canonical_json(asdict(state))
+        view = provider_view(state, (ToolGrant("catalog.search", output_projection=("*",)),))
+
+        with self.assertRaises(FrozenInstanceError):     # frozen: cannot reassign a field
+            view.status = "completed"
+        with self.assertRaises(TypeError):               # MappingProxyType: cannot add a key
+            view.tool_results["evil"] = {}
+        with self.assertRaises(AttributeError):          # tuple: cannot append a message
+            view.messages.append({"role": "tool", "name": "x"})
+
+        # The over-exposed bookkeeping the finding is about is simply ABSENT from the view.
+        self.assertFalse(hasattr(view, "memory"))
+        self.assertFalse(hasattr(view, "used_approval_ids"))
+        self.assertFalse(hasattr(view, "approvals"))
+
+        # Nested mutation succeeds on the throwaway copy (correct) ...
+        view.tool_results["catalog.search"]["id"] = "TAMPERED"
+        # ... and live host state is untouched by everything above.
+        self.assertEqual(canonical_json(asdict(state)), before)
+
+    def test_share_nothing_present_but_empty(self):
+        # A granted tool with a share-nothing (omitted -> ()) projection keeps its KEY with
+        # a falsy {} value -- present, not dropped -- so a provider's `"tool" not in results`
+        # re-proposal guard fires EXACTLY once, identical to the pre-view provider path.
+        state = AgentState("t", "g", memory={"tool_results": {"catalog.search": {"id": "1", "secret": "x"}}})
+        view = provider_view(state, (ToolGrant("catalog.search"),))  # output_projection omitted
+        self.assertIn("catalog.search", view.tool_results)               # PRESENT
+        self.assertEqual(dict(view.tool_results["catalog.search"]), {})   # but empty
 
     @contextmanager
     def _three_store_context(self, backend):
@@ -7624,7 +7688,7 @@ class RuntimeTests(unittest.TestCase):
         component = b"native-component"
         with self._fake_wasmtime_runtime():
             provider = NativeWasmtimeComponentProvider(component)
-            decision = provider.decide(AgentState("task", "goal"), ("catalog.search",))
+            decision = provider.decide(provider_view(AgentState("task", "goal")), ("catalog.search",))
         self.assertEqual(decision.kind, "tool")
         self.assertEqual(decision.tool, "catalog.search")
         self.assertEqual(decision.arguments, {"query": "from native wasmtime", "limit": 2})
@@ -7649,10 +7713,10 @@ class RuntimeTests(unittest.TestCase):
         state = AgentState("task", "goal")
         starved_fuel = NativeWasmtimeComponentProvider.from_file(capsule, max_fuel=10)
         with self.assertRaisesRegex(RuntimeError, "rejected|fuel"):
-            starved_fuel.decide(state, ("catalog.search",))
+            starved_fuel.decide(provider_view(state), ("catalog.search",))
         starved_memory = NativeWasmtimeComponentProvider.from_file(capsule, max_memory_bytes=1)
         with self.assertRaisesRegex(RuntimeError, "rejected|memory"):
-            starved_memory.decide(state, ("catalog.search",))
+            starved_memory.decide(provider_view(state), ("catalog.search",))
 
     @unittest.skipUnless(HAS_REAL_WASMTIME, "requires portmark[wasmtime]")
     def test_real_native_wasmtime_component_artifact_matches_source(self):
@@ -7677,33 +7741,33 @@ class RuntimeTests(unittest.TestCase):
         """))
         provider = NativeWasmtimeComponentProvider(importing_component)
         with self.assertRaisesRegex(RuntimeError, "unknown import|import"):
-            provider.decide(AgentState("task", "goal"), ("catalog.search",))
+            provider.decide(provider_view(AgentState("task", "goal")), ("catalog.search",))
 
         core_provider = NativeWasmtimeComponentProvider(base64.b64decode(WASM_TOOL_REQUEST))
         with self.assertRaisesRegex(RuntimeError, "component parser|parse a wasm module"):
-            core_provider.decide(AgentState("task", "goal"), ("catalog.search",))
+            core_provider.decide(provider_view(AgentState("task", "goal")), ("catalog.search",))
 
     def test_native_wasmtime_provider_rejects_unlinkable_or_missing_resume_components(self):
         with self._fake_wasmtime_runtime():
             provider = NativeWasmtimeComponentProvider(b"import")
             with self.assertRaisesRegex(RuntimeError, "native Wasmtime component rejected"):
-                provider.decide(AgentState("task", "goal"), ("catalog.search",))
+                provider.decide(provider_view(AgentState("task", "goal")), ("catalog.search",))
 
         with self._fake_wasmtime_runtime():
             provider = NativeWasmtimeComponentProvider(b"missing-resume")
             with self.assertRaisesRegex(RuntimeError, "native Wasmtime component rejected"):
-                provider.decide(AgentState("task", "goal"), ("catalog.search",))
+                provider.decide(provider_view(AgentState("task", "goal")), ("catalog.search",))
 
     def test_native_wasmtime_provider_enforces_timeout_and_output_limit(self):
         with self._fake_wasmtime_runtime(sleep_seconds=2):
             provider = NativeWasmtimeComponentProvider(b"slow", timeout=0.1)
             with self.assertRaisesRegex(RuntimeError, "execution deadline"):
-                provider.decide(AgentState("task", "goal"), ("catalog.search",))
+                provider.decide(provider_view(AgentState("task", "goal")), ("catalog.search",))
 
         with self._fake_wasmtime_runtime(content="x" * 1024):
             provider = NativeWasmtimeComponentProvider(b"large", max_output_bytes=128)
             with self.assertRaisesRegex(RuntimeError, "output limit|rejected"):
-                provider.decide(AgentState("task", "goal"), ("catalog.search",))
+                provider.decide(provider_view(AgentState("task", "goal")), ("catalog.search",))
 
     def test_native_wasmtime_provider_rejects_oversized_component_files(self):
         capsule = tempfile.NamedTemporaryFile(delete=False)
@@ -7740,8 +7804,9 @@ class RuntimeTests(unittest.TestCase):
             result={"internal_note": "blocked-content"},
         )
         grants = (ToolGrant("catalog.search", output_projection=("title",)),)
-        context = component_context(state, ("catalog.search",), grants)
-        checkpoint = component_checkpoint(state, grants)
+        view = provider_view(state, grants)
+        context = component_context(view, ("catalog.search",))
+        checkpoint = component_checkpoint(view)
 
         self.assertEqual(context["state"]["messages"], [{"role": "tool", "name": "catalog.search", "content": {"title": "Visible"}}])
         self.assertEqual(checkpoint["messages"], [{"role": "tool", "name": "catalog.search", "content": {"title": "Visible"}}])
@@ -7756,7 +7821,7 @@ class RuntimeTests(unittest.TestCase):
         hostile = base64.b64decode(WASM_FORBIDDEN_IMPORT)
         provider = WasmDecisionProvider(hostile)
         with self.assertRaisesRegex(RuntimeError, "ambient imports"):
-            provider.decide(AgentState("task", "goal"), ())
+            provider.decide(provider_view(AgentState("task", "goal")), ())
 
     def test_wit_world_declares_no_host_imports(self):
         # Invariant tripwire: a Portmark component is a pure decision function.
@@ -7785,7 +7850,7 @@ class RuntimeTests(unittest.TestCase):
     def test_wasm_component_tool_decision_uses_structured_wit_outcome(self):
         from portmark.providers import WasmDecisionProvider
         provider = WasmDecisionProvider(base64.b64decode(WASM_TOOL_REQUEST))
-        decision = provider.decide(AgentState("task", "goal"), ("catalog.search",))
+        decision = provider.decide(provider_view(AgentState("task", "goal")), ("catalog.search",))
         self.assertEqual(decision.kind, "tool")
         self.assertEqual(decision.tool, "catalog.search")
         self.assertEqual(decision.arguments, {"query": "from wasm", "limit": 3})
@@ -7793,7 +7858,7 @@ class RuntimeTests(unittest.TestCase):
     def test_wasm_component_unavailable_capability_fails_closed(self):
         from portmark.providers import WasmDecisionProvider
         provider = WasmDecisionProvider(base64.b64decode(WASM_TOOL_REQUEST))
-        decision = provider.decide(AgentState("task", "goal"), ())
+        decision = provider.decide(provider_view(AgentState("task", "goal")), ())
         self.assertEqual(decision.kind, "fail")
         self.assertEqual(decision.content, {"error": "required capability unavailable"})
 
@@ -7809,7 +7874,7 @@ class RuntimeTests(unittest.TestCase):
             provider = WasmDecisionProvider(base64.b64decode(encoded), **kwargs)
             with self.subTest(message=message):
                 with self.assertRaisesRegex(RuntimeError, message):
-                    provider.decide(AgentState("task", "goal"), ("catalog.search",))
+                    provider.decide(provider_view(AgentState("task", "goal")), ("catalog.search",))
 
 
 
@@ -8747,7 +8812,7 @@ class HttpProviderTransportTests(unittest.TestCase):
 
     def test_valid_loopback_response_is_decoded(self):  # G13
         with local_provider_server(_respond_json(b'{"kind":"complete","content":{"ok":true}}')) as (server, url):
-            decision = self._provider(url).decide(AgentState("task", "goal"), ())
+            decision = self._provider(url).decide(provider_view(AgentState("task", "goal")), ())
         self.assertEqual(decision.kind, "complete")
         self.assertEqual(server.last_body and json.loads(server.last_body)["available_tools"], [])
 
@@ -8759,7 +8824,7 @@ class HttpProviderTransportTests(unittest.TestCase):
         with local_provider_server(redirect) as (server, url):
             provider = self._provider(url, bearer_token="SECRET")  # nosec B106 -- test bearer literal
             with self.assertRaisesRegex(ProviderError, "redirect"):
-                provider.decide(AgentState("task", "goal"), ())
+                provider.decide(provider_view(AgentState("task", "goal")), ())
             # The bearer reached only the configured origin; there is no second request to a new origin.
             self.assertEqual(server.last_authorization, "Bearer SECRET")
 
@@ -8780,7 +8845,7 @@ class HttpProviderTransportTests(unittest.TestCase):
             provider = self._provider(url, timeout=0.3)
             started = time.monotonic()
             with self.assertRaises(ProviderError):
-                provider.decide(AgentState("task", "goal"), ())
+                provider.decide(provider_view(AgentState("task", "goal")), ())
             self.assertLess(time.monotonic() - started, 2.0)  # aborted on the deadline, not after the full drip
 
     def test_premature_eof_is_a_controlled_failure(self):  # G10
@@ -8793,12 +8858,12 @@ class HttpProviderTransportTests(unittest.TestCase):
             handler.close_connection = True
         with local_provider_server(truncated) as (_server, url):
             with self.assertRaises(ProviderError):
-                self._provider(url).decide(AgentState("task", "goal"), ())
+                self._provider(url).decide(provider_view(AgentState("task", "goal")), ())
 
     def test_response_body_is_bounded(self):  # G11 (CALIBRATED)
         with local_provider_server(_respond_json(b"x" * 200)) as (_server, url):
             with self.assertRaisesRegex(SecurityError, "exceeds output limit"):
-                self._provider(url, max_response_bytes=64).decide(AgentState("task", "goal"), ())
+                self._provider(url, max_response_bytes=64).decide(provider_view(AgentState("task", "goal")), ())
 
     def test_provider_failure_persists_a_durable_failed_checkpoint(self):  # G12 (CALIBRATED)
         def truncated(handler):
@@ -8832,7 +8897,7 @@ class HttpProviderTransportTests(unittest.TestCase):
         with patch("socket.getaddrinfo", side_effect=slow_getaddrinfo):
             started = time.monotonic()
             with self.assertRaisesRegex(ProviderError, "exceeded the deadline"):
-                provider.decide(AgentState("task", "goal"), ())
+                provider.decide(provider_view(AgentState("task", "goal")), ())
             # Bounded near the deadline, NOT held for the full blocking resolve (calibration: without the
             # external deadline the caller would return only after ~1.5s).
             self.assertLess(time.monotonic() - started, 1.0)
@@ -8878,7 +8943,7 @@ class HttpProviderTransportTests(unittest.TestCase):
             provider = self._provider(url, timeout=0.2)
             started = time.monotonic()
             with self.assertRaises(ProviderError):
-                provider.decide(AgentState("task", "goal"), ())
+                provider.decide(provider_view(AgentState("task", "goal")), ())
             # The CALLER returns at ~the deadline, not after the full header drip (calibration: without
             # the external watchdog the per-phase arm alone lets this run to ~1s+).
             self.assertLess(time.monotonic() - started, 1.0)
@@ -8898,9 +8963,9 @@ class HttpProviderTransportTests(unittest.TestCase):
                 time.sleep(0.05)
         with local_provider_server(drip_headers) as (_slow, slow_url):
             with self.assertRaises(ProviderError):
-                self._provider(slow_url, timeout=0.2).decide(AgentState("task", "goal"), ())
+                self._provider(slow_url, timeout=0.2).decide(provider_view(AgentState("task", "goal")), ())
         with local_provider_server(_respond_json(b'{"kind":"complete","content":{"ok":true}}')) as (_fast, fast_url):
-            decision = self._provider(fast_url, timeout=2.0).decide(AgentState("task", "goal"), ())
+            decision = self._provider(fast_url, timeout=2.0).decide(provider_view(AgentState("task", "goal")), ())
         self.assertEqual(decision.kind, "complete")
 
     def test_healthy_concurrent_calls_are_not_refused_by_the_transaction_pool(self):  # G26
@@ -8910,7 +8975,7 @@ class HttpProviderTransportTests(unittest.TestCase):
             provider = self._provider(url, timeout=5.0)
 
             def call(_i):
-                return provider.decide(AgentState("task", "goal"), ()).kind
+                return provider.decide(provider_view(AgentState("task", "goal")), ()).kind
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=48) as pool:
                 results = list(pool.map(call, range(48)))
@@ -8944,7 +9009,7 @@ class HttpProviderTransportTests(unittest.TestCase):
             with patch.object(providers_module._TRANSACTION_SLOTS, "acquire", side_effect=slow_acquire):
                 started = time.monotonic()
                 with self.assertRaises(ProviderError):
-                    provider.decide(AgentState("task", "goal"), ())
+                    provider.decide(provider_view(AgentState("task", "goal")), ())
                 elapsed = time.monotonic() - started
         # ~one deadline (0.4), NOT acquire(0.3) + a fresh join(0.4) = 0.7 (calibration: the pre-fix code
         # passes self.timeout to the join and lands near 0.7).
