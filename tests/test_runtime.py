@@ -8600,6 +8600,20 @@ class DeploymentProfileTests(unittest.TestCase):
         self.assertFalse(self._probe(without("--network", "none"))["egress_denied"])
 
     @unittest.skipUnless(_RUN_PROFILE_TESTS, "needs docker + PORTMARK_TEST_IMAGE (built image tag)")
+    def test_resource_ceilings_reject_weak_but_set_limits(self):  # G20 (CALIBRATED, ceilings)
+        # Finiteness is not a bound: a regression from 512m/1.0 to 16g/8.0 leaves memory.max/cpu.max
+        # finite but far above the advertised ceilings. The probe must reject them.
+        def replace(old, new):
+            flags = list(self.BASE_FLAGS)
+            flags[flags.index(old)] = new
+            return flags
+
+        report = self._probe(replace("512m", "16g"))
+        self.assertFalse(report["memory_limited"], f"16g must exceed the 512 MiB ceiling ({report})")
+        report = self._probe(replace("1.0", "8.0"))
+        self.assertFalse(report["cpu_limited"], f"8.0 CPUs must exceed the 1.0 ceiling ({report})")
+
+    @unittest.skipUnless(_RUN_PROFILE_TESTS, "needs docker + PORTMARK_TEST_IMAGE (built image tag)")
     def test_openat2_is_not_blocked_inside_the_hardened_image(self):  # G14
         # The safe-path helper needs openat2; a seccomp profile could block it. Prove the hardened
         # image's default seccomp ALLOWS openat2 by running the usability probe INSIDE the container.

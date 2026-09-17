@@ -83,32 +83,46 @@ def _pids_limited() -> bool:
     return False
 
 
+# The profile commits to <=512 MiB and <=1.0 CPU. Finiteness alone is NOT a bound: a regression to
+# --memory 16g / --cpus 8.0 leaves memory.max/cpu.max finite, so the probe must enforce the actual
+# ceilings the profile advertises, not merely "is it set". (cgroup v1 also reports an "unlimited"
+# memory limit as a huge finite sentinel, which the ceiling comparison correctly rejects as too weak.)
+MEMORY_CEILING_BYTES = 512 * 1024 * 1024
+CPU_CEILING_RATIO = 1.0
+
+
 def _memory_limited() -> bool:
-    # --memory sets a finite cgroup v2 memory.max; without it the value is "max" (unlimited). Unlike
-    # pids, a container does NOT inherit a finite memory.max by default, so finiteness is a real signal.
     for candidate in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
         try:
             with open(candidate, encoding="utf-8") as handle:
                 value = handle.read().strip()
         except OSError:
             continue
-        return value.isdigit()
+        if not value.isdigit():  # "max" (cgroup v2 unlimited)
+            return False
+        limit = int(value)
+        return 0 < limit <= MEMORY_CEILING_BYTES
     return False
 
 
 def _cpu_limited() -> bool:
-    # --cpus sets cgroup v2 cpu.max to "<quota> <period>"; without it the quota field is "max".
-    for candidate in ("/sys/fs/cgroup/cpu.max",):
-        try:
-            with open(candidate, encoding="utf-8") as handle:
-                quota = handle.read().split()[0]
-        except (OSError, IndexError):
-            continue
-        return quota != "max"
-    # cgroup v1: a finite cfs_quota_us is > 0 (unlimited is -1).
+    # cgroup v2: cpu.max is "<quota> <period>"; the CPU count is quota/period ("max" = unlimited).
+    try:
+        with open("/sys/fs/cgroup/cpu.max", encoding="utf-8") as handle:
+            fields = handle.read().split()
+        quota, period = fields[0], int(fields[1])
+        if quota == "max":
+            return False
+        return period > 0 and int(quota) / period <= CPU_CEILING_RATIO
+    except (OSError, IndexError, ValueError):
+        pass
+    # cgroup v1: cfs_quota_us / cfs_period_us; unlimited quota is -1.
     try:
         with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", encoding="utf-8") as handle:
-            return int(handle.read().strip()) > 0
+            quota = int(handle.read().strip())
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us", encoding="utf-8") as handle:
+            period = int(handle.read().strip())
+        return quota > 0 and period > 0 and quota / period <= CPU_CEILING_RATIO
     except (OSError, ValueError):
         return False
 
