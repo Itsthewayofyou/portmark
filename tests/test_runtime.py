@@ -8610,8 +8610,10 @@ class DeploymentProfileTests(unittest.TestCase):
 
         report = self._probe(replace("512m", "16g"))
         self.assertFalse(report["memory_limited"], f"16g must exceed the 512 MiB ceiling ({report})")
-        report = self._probe(replace("1.0", "8.0"))
-        self.assertFalse(report["cpu_limited"], f"8.0 CPUs must exceed the 1.0 ceiling ({report})")
+        # 2.0 (not 8.0) so the flag is accepted on a small CI runner -- docker rejects --cpus above the
+        # host's CPU count (a 4-CPU runner caps at 4.00). 2.0 still exceeds the 1.0 ceiling.
+        report = self._probe(replace("1.0", "2.0"))
+        self.assertFalse(report["cpu_limited"], f"2.0 CPUs must exceed the 1.0 ceiling ({report})")
 
     @unittest.skipUnless(_RUN_PROFILE_TESTS, "needs docker + PORTMARK_TEST_IMAGE (built image tag)")
     def test_openat2_is_not_blocked_inside_the_hardened_image(self):  # G14
