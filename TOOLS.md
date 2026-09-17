@@ -207,10 +207,14 @@ tools.register_isolated(
     "http.fetch",
     "examples.tools.http_fetch:fetch",   # module:function, resolved in the worker
     timeout=3.0,
-    side_effecting=True,
     env={"HTTPS_PROXY": "http://proxy.internal:8080"},  # optional, off by default
 )
 ```
+
+A fetch is a read, so this tool is not `side_effecting`; a tool that changes external
+state (a charge, a booking) sets `side_effecting=True`, which triggers the mandatory
+gate below — a reconcile target and an acknowledged `IsolationProfile`. See the
+"billing.charge" example under **Side-effecting tools and the effect ledger**.
 
 An isolated tool is named by an import path, not a callable, because it runs in a
 fresh Python process (`portmark.tool_subprocess_runner`) that imports the target
@@ -239,8 +243,35 @@ else. What this buys you:
   caps"), so a heavy tool module may need `address_space` raised.
 
 Only an isolated tool may be `side_effecting=True`. A side-effecting tool
-registered on the plain thread path is refused, because that path cannot be
-cancelled.
+registered on the plain thread path (`register(..., side_effecting=True)`) is
+**refused at registration** — that path cannot cancel a running tool or carry the
+effect ledger.
+
+**The mandatory side-effecting gate (Section 7 PR 2b).** `register_isolated(side_effecting=True)`
+fails closed at startup unless BOTH hold:
+
+- **A `reconcile=<module:function>` target is declared.** Mandatory (it was optional
+  in 2a): without it, an effect that fails to `unknown` can never be resolved. The
+  gate proves a reconcile target is *declared*, not that reconciliation *works* — the
+  target resolves in the worker, and the host cannot verify its signature at
+  registration.
+- **The registry has an acknowledged `IsolationProfile`** —
+  `ToolRegistry(isolation_profile=IsolationProfile(mechanism=..., acknowledged_by=...))`.
+  There is no default that satisfies the gate; the operator must construct it,
+  mirroring the `allow_anonymous=True` acknowledgement idiom. The profile's
+  **mechanism is cross-checked against the platform**: `EXTERNAL_CONTAINER` (you run
+  workers in a container/VM/sandbox) is accepted anywhere; `OS_JOB_OBJECT` (the
+  platform's kill-on-close job) is accepted only where the Windows Job Object exists
+  and is **refused on POSIX**, where you must affirm external containment. The profile
+  records a *claim*; it cannot verify the container is actually running.
+
+The gate is also **re-asserted at the launch boundary** in `invoke()` (a startup-only
+check over a mutable set is advisory, not a gate), and re-registration cannot strip
+the reconcile target while keeping a tool side-effecting. When a side-effecting effect
+settles `unknown`, its `tool.killed`/`tool.failed` audit event records the profile's
+`mechanism` + `acknowledged_by`, so an incident responder sees what containment was
+claimed. This closes the public-API path into a side-effecting launch without the
+contract; it is **not** protection against arbitrary in-process Python.
 
 **Platform support — and the honest difference between the two backends.** Deadline
 termination needs *some* primitive to reach the worker's descendants. The two
@@ -260,12 +291,15 @@ platforms are NOT equivalent:
   child and a worker that dies before it can sweep. So on POSIX the host still does
   **not** guarantee the tool and everything it spawned actually stop.
 
-`register_isolated(..., side_effecting=True)` is allowed on both platforms because
-*a* termination primitive exists on both; it is **refused at registration** only on
-a platform with neither. That gate is about primitive existence, **not** a promise
-of hostile-tool containment — which POSIX does not provide. Real containment of an
-untrusted side-effecting tool comes from the deployment isolation profile plus the
-tool's own idempotency/reconciliation, covered in DEPLOYMENT.md and THREAT_MODEL.md.
+The **tree-primitive check** specifically — one of several the side-effecting gate
+applies — passes on both platforms because *a* termination primitive exists on both,
+and refuses only on a platform with neither. That particular check is about primitive
+existence, **not** a promise of hostile-tool containment — which POSIX does not
+provide. It is layered *under* the 2b gate above (mandatory reconcile + acknowledged,
+platform-appropriate `IsolationProfile`), which adds the rest of the registration
+requirements. Real containment of an untrusted side-effecting tool comes from the
+deployment isolation profile plus the tool's own idempotency/reconciliation, covered
+in DEPLOYMENT.md and THREAT_MODEL.md.
 CI runs the isolated-tool descendant-kill, side-effecting, and kill-audit tests on
 both Linux and Windows.
 
@@ -380,13 +414,23 @@ key), so that even a retry it does see cannot double the effect. A tool that doe
 second parameter is failed with a controlled `tool does not accept effect_id` and never called.
 
 ```python
+from portmark.tools import IsolationMechanism, IsolationProfile, ToolRegistry
+
 def charge(arguments: dict, effect_id: str) -> dict:
     return payment_api.charge(arguments["amount"], idempotency_key=effect_id)
 
+# A side-effecting tool requires an acknowledged IsolationProfile on the registry (declared once)
+# AND a reconcile target; register_isolated(side_effecting=True) is refused without both (PR 2b).
+tools = ToolRegistry(
+    isolation_profile=IsolationProfile(
+        mechanism=IsolationMechanism.EXTERNAL_CONTAINER,  # you run workers in a container/VM/sandbox
+        acknowledged_by="platform-team",                  # recorded on the effect-unknown audit event
+    )
+)
 tools.register_isolated(
     "billing.charge", "mytools:charge",
     side_effecting=True,
-    reconcile="mytools:reconcile_charge",  # queries whether the effect landed
+    reconcile="mytools:reconcile_charge",  # REQUIRED for side_effecting: queries whether the effect landed
 )
 ```
 

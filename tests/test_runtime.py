@@ -57,9 +57,22 @@ from portmark.security import (
 )
 from portmark.storage import POSTGRES_SCHEMA_VERSION, SQLITE_BUSY_TIMEOUT_MS, SQLITE_SCHEMA_VERSION, InMemoryRuntimeStore, PostgresRuntimeStore, SQLiteRuntimeStore
 from portmark.cli import main as cli_main
-from portmark.tools import ToolRegistry, _CAN_KILL_PROCESS_GROUP, _has_tree_termination_primitive
+from portmark.tools import (
+    IsolationMechanism,
+    IsolationProfile,
+    ToolRegistry,
+    _CAN_KILL_PROCESS_GROUP,
+    _has_tree_termination_primitive,
+)
 from examples.tools import http_fetch
 from fuzz_a2a_parser import run_fuzz_cases
+
+# Section 7 PR 2b: a side-effecting tool now requires an acknowledged IsolationProfile on the
+# registry. EXTERNAL_CONTAINER is valid on every platform (it is the operator's own affirmation),
+# so the test suite uses it as the standard acknowledgement.
+_TEST_ISOLATION_PROFILE = IsolationProfile(
+    mechanism=IsolationMechanism.EXTERNAL_CONTAINER, acknowledged_by="test-suite"
+)
 
 
 WASM_TOOL_REQUEST = "AGFzbQEAAAABCQFgBH9/f38BfgMCAQAFAwEAAQcTAgZtZW1vcnkCAAZyZXN1bWUAAAoLAQkAQu+AgICAAgsLdQEAQRALb3sib3V0Y29tZSI6InRvb2wiLCJyZXF1ZXN0Ijp7Im5hbWUiOiJjYXRhbG9nLnNlYXJjaCIsImFyZ3VtZW50c19qc29uIjoie1wicXVlcnlcIjpcImZyb20gd2FzbVwiLFwibGltaXRcIjozfSJ9fQ=="
@@ -915,11 +928,20 @@ class RuntimeTests(unittest.TestCase):
         # path, which cannot cancel it -- a deadline there records failure while
         # the side effect may still land. It fails closed until an isolated
         # hard-kill executor exists.
-        from portmark.tools import ToolExecutionError
+        from portmark.security import SecurityError
 
         ran = []
         registry = ToolRegistry()
-        registry.register("payments.charge", lambda arguments: ran.append(True) or {"ok": True}, side_effecting=True)
+        # Section 7 PR 2b: a side-effecting tool on the thread path now fails closed AT REGISTRATION,
+        # not (as before) only at the first invoke. register() cannot carry an effect ledger and cannot
+        # cancel a running tool, so it refuses side_effecting outright -- a stronger guarantee than the
+        # old invoke-time refusal, and it never lets the name into _side_effecting without a contract.
+        with self.assertRaisesRegex(SecurityError, "side-effecting"):
+            registry.register(
+                "payments.charge", lambda arguments: ran.append(True) or {"ok": True}, side_effecting=True
+            )
+        self.assertNotIn("payments.charge", registry.names())  # refused registration left no trace
+        # A tool not marked side-effecting still registers and runs on the normal path.
         registry.register("catalog.search", lambda arguments: {"ok": True})
         permit = Permit(
             issuer="issuer",
@@ -927,13 +949,10 @@ class RuntimeTests(unittest.TestCase):
             audience="host",
             expires_at=int(time.time()) + 60,
             nonce="nonce-se",
-            grants=(ToolGrant("payments.charge"), ToolGrant("catalog.search")),
+            grants=(ToolGrant("catalog.search"),),
         )
-        with self.assertRaisesRegex(ToolExecutionError, "side-effecting"):
-            registry.invoke(permit, "payments.charge", {})
-        self.assertEqual(ran, [])  # the tool never executed
-        # A tool not marked side-effecting still runs on the normal path.
         self.assertEqual(registry.invoke(permit, "catalog.search", {}), {"ok": True})
+        self.assertEqual(ran, [])  # the refused side-effecting tool never executed
 
     def test_thread_path_caps_inflight_executions_and_fails_closed(self):
         # Finding #5: a thread-path tool that exceeds its deadline leaks a daemon thread
@@ -1456,12 +1475,14 @@ class RuntimeTests(unittest.TestCase):
         # sanctioned way to run one, because the host can hard-kill it. Skipped
         # where the platform cannot hard-kill (Windows): register_isolated refuses
         # a side-effecting tool there, which the sibling fail-closed test asserts.
-        registry = ToolRegistry()
+        registry = ToolRegistry(isolation_profile=_TEST_ISOLATION_PROFILE)
         registry.register_isolated(
-            "iso.pay", "isolated_tool_fixtures:echo", side_effecting=True, env=self._isolated_env()
+            "iso.pay", "isolated_tool_fixtures:echo", side_effecting=True,
+            reconcile="isolated_tool_fixtures:reconcile_charge", env=self._isolated_env(),
         )
         registry.register_isolated(
-            "iso.other", "isolated_tool_fixtures:echo", side_effecting=True, env=self._isolated_env()
+            "iso.other", "isolated_tool_fixtures:echo", side_effecting=True,
+            reconcile="isolated_tool_fixtures:reconcile_charge", env=self._isolated_env(),
         )
         permit = self._isolated_permit("iso.pay", "iso.other")
         # Section 7 PR 2 (round 3): launching a side-effecting tool requires a ONE-USE launch capability
@@ -1538,12 +1559,13 @@ class RuntimeTests(unittest.TestCase):
         # unknown -- a distinct signal from a clean tool.failed.
         with tempfile.TemporaryDirectory() as directory:
             store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
-            tools = ToolRegistry()
+            tools = ToolRegistry(isolation_profile=_TEST_ISOLATION_PROFILE)
             tools.register_isolated(
                 "slow.side",
                 "isolated_tool_fixtures:slow_then_return",
                 timeout=1.0,
                 side_effecting=True,
+                reconcile="isolated_tool_fixtures:reconcile_charge",
                 env=self._isolated_env(),
             )
             host = make_host(store=store, allow_ephemeral_signing_key=True)
@@ -1566,11 +1588,18 @@ class RuntimeTests(unittest.TestCase):
             killed = next(event for event in result.audit if event["event"] == "tool.killed")
             self.assertEqual(killed["details"]["effect_status"], "unknown")
             self.assertEqual(killed["details"]["tool"], "slow.side")
+            # Section 7 PR 2b (G11): the effect-unknown audit event records WHAT containment the
+            # operator claimed, so an incident responder resolving this unknown effect sees it.
+            # Neutralize check: drop the two `if ... claim` lines in host._apply_decision -> this fails.
+            self.assertEqual(
+                killed["details"]["isolation_profile"],
+                {"mechanism": "external_container", "acknowledged_by": "test-suite"},
+            )
 
     # ---- Section 7 PR 2: effect ledger ---------------------------------------------------------
 
     def _charge_host(self, store, directory, target="idempotent_charge", reconcile="isolated_tool_fixtures:reconcile_charge"):
-        tools = ToolRegistry()
+        tools = ToolRegistry(isolation_profile=_TEST_ISOLATION_PROFILE)
         tools.register_isolated(
             "iso.charge", f"isolated_tool_fixtures:{target}", timeout=5.0, side_effecting=True,
             reconcile=reconcile, env=self._isolated_env(),
@@ -1666,7 +1695,10 @@ class RuntimeTests(unittest.TestCase):
     def test_side_effecting_tool_missing_effect_id_param_fails_controlled(self):
         with tempfile.TemporaryDirectory() as directory:
             store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
-            host, envelope = self._charge_host(store, directory, target="no_effect_id_param", reconcile=None)
+            # reconcile is mandatory now (Section 7 PR 2b), and it is unrelated to what this test
+            # exercises (the WORKER-side controlled failure when the tool signature omits effect_id),
+            # so keep the default reconcile target -- it is never called here.
+            host, envelope = self._charge_host(store, directory, target="no_effect_id_param")
             result = host.run(envelope)
             self.assertEqual(result.status, "failed")
             failed = next(event for event in result.audit if event["event"] == "tool.failed")
@@ -1885,8 +1917,11 @@ class RuntimeTests(unittest.TestCase):
     def test_launch_capability_is_disarmed_when_not_consumed(self):
         # A capability armed but not consumed (invoke failed before the gate) must not outlive its one
         # intended launch. disarm() drops it, so a later invoke with it is refused.
-        registry = ToolRegistry()
-        registry.register_isolated("iso.pay", "isolated_tool_fixtures:echo", side_effecting=True, env=self._isolated_env())
+        registry = ToolRegistry(isolation_profile=_TEST_ISOLATION_PROFILE)
+        registry.register_isolated(
+            "iso.pay", "isolated_tool_fixtures:echo", side_effecting=True,
+            reconcile="isolated_tool_fixtures:reconcile_charge", env=self._isolated_env(),
+        )
         permit = self._isolated_permit("iso.pay")
         args = {"amount": 3}
         canonical_args = canonical_json(args).decode("utf-8")
@@ -2351,12 +2386,13 @@ class RuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runtime.sqlite"
             store = SQLiteRuntimeStore(path)
-            tools = ToolRegistry()
+            tools = ToolRegistry(isolation_profile=_TEST_ISOLATION_PROFILE)
             tools.register_isolated(
                 "slow.side",
                 "isolated_tool_fixtures:slow_then_return",
                 timeout=1.0,
                 side_effecting=True,
+                reconcile="isolated_tool_fixtures:reconcile_charge",
                 env=self._isolated_env(),
             )
             host = make_host(store=store, allow_ephemeral_signing_key=True)
@@ -7902,6 +7938,106 @@ def registry():
                     with self.assertRaises(SystemExit):
                         cli_main()
             self.assertEqual(path.read_text(), before, "existing trust registry must survive")
+
+
+class IsolationProfileGateTests(unittest.TestCase):
+    """Section 7 PR 2b: the MANDATORY side-effecting startup gate (reconcile + acknowledged,
+    platform-appropriate IsolationProfile) and its launch-time re-check. The registration-gate tests
+    patch _has_tree_termination_primitive to True so they isolate the 2b logic and run on every
+    platform; they never spawn a worker (registration and the pre-capability re-check raise first)."""
+
+    def _profile(self, mechanism=IsolationMechanism.EXTERNAL_CONTAINER, by="ops"):
+        return IsolationProfile(mechanism=mechanism, acknowledged_by=by)
+
+    def _permit(self, name):
+        return Permit(
+            issuer="i", subject="s", audience="host", expires_at=int(time.time()) + 60,
+            nonce=f"n-{name}", grants=(ToolGrant(name),),
+        )
+
+    def test_isolation_profile_rejects_empty_or_non_enum(self):  # G1
+        with self.assertRaises(ValueError):
+            IsolationProfile(mechanism=IsolationMechanism.EXTERNAL_CONTAINER, acknowledged_by="   ")
+        with self.assertRaises(ValueError):
+            IsolationProfile(mechanism="external_container", acknowledged_by="ops")  # type: ignore[arg-type]
+        p = IsolationProfile(mechanism=IsolationMechanism.EXTERNAL_CONTAINER, acknowledged_by="ops")
+        self.assertEqual(p.audit_summary(), {"mechanism": "external_container", "acknowledged_by": "ops"})
+
+    def test_side_effecting_registration_requires_reconcile(self):  # G3 (CALIBRATED)
+        with patch("portmark.tools._has_tree_termination_primitive", return_value=True):
+            registry = ToolRegistry(isolation_profile=self._profile())
+            with self.assertRaisesRegex(SecurityError, "reconcile"):
+                registry.register_isolated("pay", "m:f", side_effecting=True)
+            self.assertNotIn("pay", registry.names())  # refused registration left no trace
+            registry.register_isolated("pay", "m:f", side_effecting=True, reconcile="m:r")
+            self.assertTrue(registry.is_side_effecting("pay"))
+
+    def test_side_effecting_registration_requires_acknowledged_profile(self):  # G4 (CALIBRATED)
+        with patch("portmark.tools._has_tree_termination_primitive", return_value=True):
+            no_profile = ToolRegistry()
+            with self.assertRaisesRegex(SecurityError, "IsolationProfile"):
+                no_profile.register_isolated("pay", "m:f", side_effecting=True, reconcile="m:r")
+            self.assertNotIn("pay", no_profile.names())
+            with_profile = ToolRegistry(isolation_profile=self._profile())
+            with_profile.register_isolated("pay", "m:f", side_effecting=True, reconcile="m:r")
+            self.assertIn("pay", with_profile.names())
+
+    def test_side_effecting_registration_couples_mechanism_to_platform(self):  # G5 (CALIBRATED)
+        with patch("portmark.tools._has_tree_termination_primitive", return_value=True):
+            # A platform with NO Windows Job Object (POSIX): os_job_object is refused, external ok.
+            with patch("portmark.tools._windows_job.available", return_value=False):
+                job_reg = ToolRegistry(isolation_profile=self._profile(IsolationMechanism.OS_JOB_OBJECT))
+                with self.assertRaisesRegex(SecurityError, "does not contain workers on this platform"):
+                    job_reg.register_isolated("pay", "m:f", side_effecting=True, reconcile="m:r")
+                ext_reg = ToolRegistry(isolation_profile=self._profile(IsolationMechanism.EXTERNAL_CONTAINER))
+                ext_reg.register_isolated("pay", "m:f", side_effecting=True, reconcile="m:r")
+                self.assertIn("pay", ext_reg.names())
+            # A platform WITH the Job Object (Windows): os_job_object is now genuine and accepted.
+            with patch("portmark.tools._windows_job.available", return_value=True):
+                job_ok = ToolRegistry(isolation_profile=self._profile(IsolationMechanism.OS_JOB_OBJECT))
+                job_ok.register_isolated("pay", "m:f", side_effecting=True, reconcile="m:r")
+                self.assertIn("pay", job_ok.names())
+
+    def test_reregistration_cannot_strip_reconcile_while_side_effecting(self):  # G8 (CALIBRATED)
+        with patch("portmark.tools._has_tree_termination_primitive", return_value=True):
+            registry = ToolRegistry(isolation_profile=self._profile())
+            registry.register_isolated("pay", "m:f", side_effecting=True, reconcile="m:r")
+            self.assertTrue(registry.is_side_effecting("pay"))
+            # Re-register side-effecting WITHOUT reconcile -> refused; prior state untouched.
+            with self.assertRaisesRegex(SecurityError, "reconcile"):
+                registry.register_isolated("pay", "m:f2", side_effecting=True)
+            self.assertTrue(registry.is_side_effecting("pay"))
+            self.assertTrue(registry.has_reconcile("pay"))
+            # Re-register as NON-side-effecting -> membership cleared (no stale side-effecting flag).
+            registry.register_isolated("pay", "m:f2", side_effecting=False)
+            self.assertFalse(registry.is_side_effecting("pay"))
+            # A plain thread register() of the same name also clears any stale membership.
+            registry._side_effecting.add("pay")
+            registry.register("pay", lambda arguments: {"ok": True})
+            self.assertFalse(registry.is_side_effecting("pay"))
+
+    def test_invoke_reasserts_side_effecting_contract_at_launch(self):  # G9 (CALIBRATED)
+        with patch("portmark.tools._has_tree_termination_primitive", return_value=True):
+            # (a) a side-effecting name with NO reconcile target (a stale flag the gate would never
+            #     create) fails closed at the launch boundary, before any capability is consumed.
+            reg = ToolRegistry(isolation_profile=self._profile())
+            reg.register_isolated("iso.x", "m:f", env={})  # non-side-effecting -> no reconcile
+            reg._side_effecting.add("iso.x")
+            with self.assertRaisesRegex(SecurityError, "reconcile"):
+                reg.invoke(self._permit("iso.x"), "iso.x", {}, launch_capability="whatever")
+            # (b) reconcile present but the IsolationProfile was dropped after registration.
+            reg2 = ToolRegistry(isolation_profile=self._profile())
+            reg2.register_isolated("pay", "m:f", side_effecting=True, reconcile="m:r")
+            reg2._isolation_profile = None
+            with self.assertRaisesRegex(SecurityError, "IsolationProfile"):
+                reg2.invoke(self._permit("pay"), "pay", {}, launch_capability="whatever")
+
+    def test_non_side_effecting_isolated_tool_needs_no_profile_or_reconcile(self):  # G10
+        registry = ToolRegistry()  # no profile acknowledged
+        registry.register_isolated("iso.read", "m:f", env={})  # no reconcile, not side-effecting
+        self.assertIn("iso.read", registry.names())
+        self.assertFalse(registry.is_side_effecting("iso.read"))
+        self.assertIsNone(registry.isolation_profile)
 
 
 if __name__ == "__main__":

@@ -605,15 +605,17 @@ class AgentHost:
                     self.metrics.increment("tools.failed")
                     state.status = "failed"
                     state.result = {"error": "tool killed at deadline"}
-                    audit.append(
-                        "tool.killed",
-                        {
-                            "tool": decision.tool,
-                            "arguments": decision.arguments,
-                            "error": str(error),
-                            "effect_status": "unknown",
-                        },
-                    )
+                    killed_details: dict[str, Any] = {
+                        "tool": decision.tool,
+                        "arguments": decision.arguments,
+                        "error": str(error),
+                        "effect_status": "unknown",
+                    }
+                    # Section 7 PR 2b: record the operator's claimed containment on the effect-unknown
+                    # event for the incident responder who will decide how to reconcile this effect.
+                    if eid is not None and (claim := self._containment_claim()) is not None:
+                        killed_details["isolation_profile"] = claim
+                    audit.append("tool.killed", killed_details)
                     audit.append("agent.failed", state.result)
                     return True, None
                 except ToolExecutionError as error:
@@ -624,16 +626,17 @@ class AgentHost:
                     self.metrics.increment("tools.failed")
                     state.status = "failed"
                     state.result = {"error": "tool execution failed"}
-                    audit.append(
-                        "tool.failed",
-                        {
-                            "tool": decision.tool,
-                            "arguments": decision.arguments,
-                            "error": str(error),
-                            "cause": type(error.__cause__).__name__ if error.__cause__ is not None else None,
-                            "cause_message": str(error.__cause__) if error.__cause__ is not None else "",
-                        },
-                    )
+                    failed_details: dict[str, Any] = {
+                        "tool": decision.tool,
+                        "arguments": decision.arguments,
+                        "error": str(error),
+                        "cause": type(error.__cause__).__name__ if error.__cause__ is not None else None,
+                        "cause_message": str(error.__cause__) if error.__cause__ is not None else "",
+                    }
+                    # Section 7 PR 2b: stamp the claimed containment on the effect-unknown event.
+                    if eid is not None and (claim := self._containment_claim()) is not None:
+                        failed_details["isolation_profile"] = claim
+                    audit.append("tool.failed", failed_details)
                     audit.append("agent.failed", state.result)
                     return True, None
                 if not self._is_encodable(result):
@@ -641,10 +644,14 @@ class AgentHost:
                     # reference cycle -- that no JSON transport would have caught. Storing it would
                     # strand the run at the closing _persist; fail closed here instead. Finding #7.
                     # For a side-effecting tool the effect may already have happened -> settle unknown.
+                    unserializable_claim = None
                     if eid is not None:
                         self.store.settle_effect(eid, "unknown", None, "tool output not serializable")
+                        unserializable_claim = self._containment_claim()
                     self.metrics.increment("tools.failed")
-                    return self._fail_unserializable(state, audit, "tool", decision.tool)
+                    return self._fail_unserializable(
+                        state, audit, "tool", decision.tool, isolation_profile=unserializable_claim
+                    )
                 if eid is not None:
                     self.store.settle_effect(eid, "confirmed", canonical_json(result).decode("utf-8"), None)
 
@@ -855,6 +862,15 @@ class AgentHost:
         -- it must find a `started` row whose tool + canonical arguments match -- so a fabricated
         effect_id cannot be armed. Read-only; the effect_id PRIMARY KEY makes the lookup exact."""
         return self.store.get_effect(effect_id)
+
+    def _containment_claim(self) -> dict[str, str] | None:
+        """The operator's acknowledged containment claim (Section 7 PR 2b), stamped on an effect's
+        audit event when it settles `unknown`. This is the profile's real on-path consumer: an
+        incident responder reading a `tool.killed`/`tool.failed` event for a side-effecting effect
+        that went unknown sees WHAT containment the operator claimed at registration -- otherwise the
+        acknowledged IsolationProfile would be a gate input that nothing downstream ever reads."""
+        profile = self.tools.isolation_profile
+        return profile.audit_summary() if profile is not None else None
 
     def _effect_pre_launch(self, eid: str, task_id: str, tool: str, arguments: dict[str, Any]) -> tuple[str, Any]:
         """Effect-ledger state machine for a side-effecting tool BEFORE it launches (Section 7 PR 2).
@@ -1111,7 +1127,9 @@ class AgentHost:
             return False
         return True
 
-    def _fail_unserializable(self, state, audit, source: str, tool: str | None = None) -> tuple[bool, None]:
+    def _fail_unserializable(
+        self, state, audit, source: str, tool: str | None = None, isolation_profile: dict[str, str] | None = None
+    ) -> tuple[bool, None]:
         # Convert un-encodable provider/tool content into a clean, bounded terminal
         # failure at the boundary where it would enter state. state.result is a small
         # fixed dict that always encodes, so the closing _persist succeeds and the
@@ -1122,6 +1140,10 @@ class AgentHost:
         details: dict[str, Any] = {"source": source, "reason": "content is not JSON-encodable"}
         if tool is not None:
             details["tool"] = tool
+        # Section 7 PR 2b: when a SIDE-EFFECTING tool's output is non-serializable its effect also
+        # settled `unknown`, so carry the same containment claim the other effect-unknown events do.
+        if isolation_profile is not None:
+            details["isolation_profile"] = isolation_profile
         audit.append("content.rejected", details)
         audit.append("agent.failed", state.result)
         return True, None
