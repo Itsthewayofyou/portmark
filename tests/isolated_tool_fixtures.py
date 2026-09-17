@@ -221,8 +221,9 @@ def safe_grandchild_cannot_inherit(arguments: dict[str, Any]) -> dict[str, Any]:
 
     from portmark.safe_paths import SafeRoot
 
-    root = SafeRoot.from_runtime()  # noqa: F841 -- held so the owned fd stays open in THIS process
+    # Capture the descriptor number BEFORE from_runtime() -- it consumes (pops) PORTMARK_ROOT_FD.
     fd_number = os.environ["PORTMARK_ROOT_FD"]
+    root = SafeRoot.from_runtime()  # noqa: F841 -- held so the owned fd stays open in THIS process
     program = (
         "import os,sys\n"
         f"try:\n os.fstat({fd_number}); sys.stdout.write('INHERITED')\n"

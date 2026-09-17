@@ -83,6 +83,36 @@ def _pids_limited() -> bool:
     return False
 
 
+def _memory_limited() -> bool:
+    # --memory sets a finite cgroup v2 memory.max; without it the value is "max" (unlimited). Unlike
+    # pids, a container does NOT inherit a finite memory.max by default, so finiteness is a real signal.
+    for candidate in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            with open(candidate, encoding="utf-8") as handle:
+                value = handle.read().strip()
+        except OSError:
+            continue
+        return value.isdigit()
+    return False
+
+
+def _cpu_limited() -> bool:
+    # --cpus sets cgroup v2 cpu.max to "<quota> <period>"; without it the quota field is "max".
+    for candidate in ("/sys/fs/cgroup/cpu.max",):
+        try:
+            with open(candidate, encoding="utf-8") as handle:
+                quota = handle.read().split()[0]
+        except (OSError, IndexError):
+            continue
+        return quota != "max"
+    # cgroup v1: a finite cfs_quota_us is > 0 (unlimited is -1).
+    try:
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", encoding="utf-8") as handle:
+            return int(handle.read().strip()) > 0
+    except (OSError, ValueError):
+        return False
+
+
 def _egress_denied() -> bool:
     # Checked by network-interface PRESENCE, not reachability: with `--network none` the container has
     # only loopback, so no outbound path exists. Reachability would false-green on a CI runner that
@@ -117,6 +147,8 @@ PROPERTIES = {
     "no_new_privileges": _no_new_privileges,
     "dropped_capabilities": _dropped_capabilities,
     "pids_limited": _pids_limited,
+    "memory_limited": _memory_limited,
+    "cpu_limited": _cpu_limited,
     "egress_denied": _egress_denied,
 }
 

@@ -42,6 +42,8 @@ docker run --rm \
 | `--security-opt no-new-privileges` | no privilege escalation | `/proc/self/status` `NoNewPrivs: 1` |
 | `--cap-drop ALL` | no Linux capabilities | `/proc/self/status` `CapEff: 0000000000000000` |
 | `--pids-limit 128` | bounded process count | cgroup `pids.max` is finite **and ≤ 1024** (a container inherits a large finite `pids.max`, so the ceiling — not mere finiteness — is what proves a bound) |
+| `--memory 512m` | bounded memory | cgroup `memory.max` is finite, not `max` |
+| `--cpus 1.0` | bounded CPU | cgroup `cpu.max` quota is not `max` |
 | `--network none` | default-deny egress | only the `lo` interface exists |
 
 `--network none` is the strictest egress stance. If the tool legitimately needs outbound access,

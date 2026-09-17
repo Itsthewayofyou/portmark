@@ -249,6 +249,14 @@ class ToolRegistry:
         if filesystem_root is not None and not os.path.isdir(filesystem_root):
             raise ValueError(f"filesystem_root must be an existing directory: {filesystem_root!r}")
         self._filesystem_root = filesystem_root
+        # Pin the root's identity at construction (when the path is the operator-approved one). Each
+        # launch fstats the descriptor it is about to hand the worker and refuses if (st_dev, st_ino)
+        # changed -- so a path swapped or redirected between construction and invocation cannot
+        # redirect the worker to a different directory.
+        self._filesystem_root_identity: tuple[int, int] | None = None
+        if filesystem_root is not None and os.name == "posix":
+            root_stat = os.stat(filesystem_root)
+            self._filesystem_root_identity = (root_stat.st_dev, root_stat.st_ino)
         self._tools: dict[str, Tool] = {}
         self._isolated: dict[str, _IsolatedSpec] = {}
         self._timeouts: dict[str, float] = {}
@@ -702,6 +710,13 @@ class ToolRegistry:
                 root_fd = os.open(self._filesystem_root, os.O_RDONLY | os.O_DIRECTORY)
             except OSError as error:
                 raise ToolExecutionError("could not open the configured filesystem_root") from error
+            # Verify the descriptor we are about to pass is still the directory recorded at
+            # construction. The fd fstat'd here IS the fd handed to the worker, so there is no
+            # check-then-reopen gap for an attacker to exploit.
+            root_stat = os.fstat(root_fd)
+            if self._filesystem_root_identity != (root_stat.st_dev, root_stat.st_ino):
+                os.close(root_fd)
+                raise ToolExecutionError("configured filesystem_root identity changed since startup")
             child_env = {**child_env, safe_paths.ROOT_FD_ENV: str(root_fd)}
             pass_fds = (root_fd,)
         try:

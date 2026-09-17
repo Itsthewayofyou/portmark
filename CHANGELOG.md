@@ -32,6 +32,15 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   flags (every property must hold) and again with each flag removed (that property must flip), and proves
   `openat2` is **not** blocked by the image's seccomp profile. This `deploy/` profile is the concrete
   meaning of the `IsolationMechanism.EXTERNAL_CONTAINER` an operator acknowledges (PR 2b).
+- **Descriptor lifecycle is safe against reuse.** `SafeRoot.from_runtime()` **consumes**
+  `PORTMARK_ROOT_FD` (pops it), so it is one-shot: a second call cannot read a descriptor number the
+  first already closed and the kernel has reused for another directory. `SafeRoot.close()` invalidates
+  the descriptor, so a closed capability refuses `open_beneath()` rather than operate on a reused
+  descriptor number. The configured `filesystem_root`'s identity `(st_dev, st_ino)` is pinned at
+  construction and re-verified on the exact descriptor each launch hands the worker, so a path swapped
+  or redirected after startup is refused instead of silently redirecting the tool.
+- The tested container profile also verifies the advertised `--memory` and `--cpus` limits (cgroup
+  `memory.max` / `cpu.max`), each calibrated by flag removal — so "every property is tested" holds.
 - Claim boundary (unchanged stance): `SafeRoot` removes the *accidental* filesystem escape; it does not
   stop a tool from calling `open("/etc/passwd")` directly. The deployment's mount namespace / read-only
   rootfs is what makes the SafeRoot the only reachable path.

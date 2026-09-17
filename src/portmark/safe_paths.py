@@ -186,11 +186,15 @@ class SafeRoot:
         is usable. Raises :class:`SafePathUnavailable` if no descriptor was handed
         in or openat2 is not usable here.
         """
-        raw = os.environ.get(ROOT_FD_ENV)
+        # Consume the descriptor number atomically: pop, do not get. Leaving PORTMARK_ROOT_FD in the
+        # environment lets a SECOND from_runtime() read a descriptor number the first call already
+        # closed -- which the kernel promptly reuses for an unrelated directory -- silently retargeting
+        # the capability. Popping makes from_runtime() one-shot: a second call finds nothing and refuses.
+        raw = os.environ.pop(ROOT_FD_ENV, None)
         if not raw:
             raise SafePathUnavailable(
-                "no runtime filesystem root was provided "
-                "(set ToolRegistry(filesystem_root=...) to grant one)"
+                "no runtime filesystem root was provided, or it was already consumed "
+                "(set ToolRegistry(filesystem_root=...) to grant one; from_runtime() is one-shot)"
             )
         try:
             inherited = int(raw)
@@ -234,6 +238,8 @@ class SafeRoot:
             flags = _MODE_FLAGS[mode]
         except KeyError as error:
             raise ValueError(f"unsupported mode: {mode!r}") from error
+        if self._dirfd < 0:
+            raise SafePathError("SafeRoot is closed")
         if relpath.startswith("/") or relpath == "":
             raise SafePathEscape(f"path must be relative and non-empty: {relpath!r}")
         # openat2 requires how.mode == 0 unless O_CREAT/O_TMPFILE is set (EINVAL otherwise), so a
@@ -253,10 +259,16 @@ class SafeRoot:
         return os.fdopen(fd, mode, encoding=encoding or "utf-8", closefd=True)
 
     def close(self) -> None:
-        try:
-            os.close(self._dirfd)
-        except OSError:
-            pass
+        # Invalidate the descriptor BEFORE closing it: move it to a local and mark this SafeRoot
+        # closed (_dirfd = -1). Otherwise a closed SafeRoot still holds the old descriptor number,
+        # and after the kernel reuses that number for another directory the closed capability would
+        # open files in the replacement. Idempotent: a second close() is a no-op.
+        fd, self._dirfd = self._dirfd, -1
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
     def __enter__(self) -> "SafeRoot":
         return self

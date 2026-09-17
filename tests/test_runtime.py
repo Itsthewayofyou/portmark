@@ -8436,6 +8436,82 @@ class SafePathCapabilityTests(unittest.TestCase):
             result = registry.invoke(self._permit("iso.leak"), "iso.leak", {})
             self.assertEqual(result["grandchild"], "EBADF")
 
+    # ---- descriptor lifecycle (auditor round 1, finding 1) --------------------------------------
+
+    @unittest.skipUnless(HAS_OPENAT2, "openat2(RESOLVE_BENEATH) not usable here")
+    def test_from_runtime_is_one_shot_and_a_reused_fd_cannot_retarget_it(self):  # G19 (CALIBRATED)
+        from portmark import safe_paths
+
+        first = tempfile.mkdtemp()
+        second = tempfile.mkdtemp()
+        with open(os.path.join(second, "SECOND"), "w"):
+            pass
+        raw = os.open(first, os.O_RDONLY | os.O_DIRECTORY)
+        os.set_inheritable(raw, True)
+        with patch.dict(os.environ, {safe_paths.ROOT_FD_ENV: str(raw)}):
+            root = safe_paths.SafeRoot.from_runtime()  # consumes env (pop) and closes `raw`
+            self.addCleanup(root.close)
+            # The env var was consumed, and the kernel reuses the closed descriptor number for `second`.
+            self.assertIsNone(os.environ.get(safe_paths.ROOT_FD_ENV))
+            reused = os.open(second, os.O_RDONLY | os.O_DIRECTORY)
+            self.addCleanup(os.close, reused)
+            self.assertEqual(reused, raw)  # same descriptor number, different directory
+            # CALIBRATION (auditor repro): a second from_runtime() must REFUSE, not adopt the reused
+            # descriptor. Before the pop fix it read the stale env fd and opened `second`.
+            with self.assertRaises(safe_paths.SafePathUnavailable):
+                safe_paths.SafeRoot.from_runtime()
+
+    @unittest.skipUnless(HAS_OPENAT2, "openat2(RESOLVE_BENEATH) not usable here")
+    def test_closed_safe_root_refuses_even_after_fd_reuse(self):  # G19 (CALIBRATED)
+        from portmark import safe_paths
+
+        first = tempfile.mkdtemp()
+        second = tempfile.mkdtemp()
+        with open(os.path.join(second, "SECOND"), "w"):
+            pass
+        root = safe_paths.SafeRoot(os.open(first, os.O_RDONLY | os.O_DIRECTORY))
+        with root.open_beneath("ok", "w") as handle:
+            handle.write("x")
+        closed_fd = root._dirfd
+        root.close()
+        reused = os.open(second, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, reused)
+        self.assertEqual(reused, closed_fd)  # the closed number now names `second`
+        # CALIBRATION (auditor repro): the closed SafeRoot must refuse, not open into `second`.
+        # Before close() nulled _dirfd, open_beneath used the reused descriptor and read `second`.
+        with self.assertRaises(safe_paths.SafePathError):
+            root.open_beneath("SECOND", "r")
+
+    # ---- filesystem_root identity pinning (auditor round 1, finding 3) --------------------------
+
+    @unittest.skipUnless(HAS_OPENAT2 and _CAN_KILL_PROCESS_GROUP, "needs POSIX worker + openat2")
+    def test_filesystem_root_identity_is_pinned_against_a_swap(self):  # G21 (CALIBRATED)
+        from portmark.tools import ToolExecutionError
+
+        original = tempfile.mkdtemp()
+        replacement = tempfile.mkdtemp()
+        root_path = os.path.join(tempfile.mkdtemp(), "root")
+        os.symlink(original, root_path)  # registry records `original`'s identity at construction
+        registry = ToolRegistry(filesystem_root=root_path)
+        registry.register_isolated(
+            "iso.pin", "isolated_tool_fixtures:safe_write_read", env=self._env()
+        )
+        permit = self._permit("iso.pin")
+        # Swap the configured path to point at a DIFFERENT directory after construction.
+        os.unlink(root_path)
+        os.symlink(replacement, root_path)
+        # The launch fstats the descriptor and sees a different (st_dev, st_ino) -> refuses.
+        with self.assertRaisesRegex(ToolExecutionError, "identity changed"):
+            registry.invoke(permit, "iso.pin", {"name": "note.txt", "content": "hi"})
+        # CALIBRATION: neutralize the pin (record the post-swap identity) and the SAME swapped invoke
+        # now runs against the replacement directory -- proving the identity check is what refuses.
+        swapped_stat = os.stat(root_path)
+        registry._filesystem_root_identity = (swapped_stat.st_dev, swapped_stat.st_ino)
+        result = registry.invoke(permit, "iso.pin", {"name": "note.txt", "content": "hi"})
+        self.assertEqual(result["read_back"], "hi")
+        with open(os.path.join(replacement, "note.txt")) as landed:  # it really wrote into `replacement`
+            self.assertEqual(landed.read(), "hi")
+
 
 def _docker_available() -> bool:
     import shutil
@@ -8470,6 +8546,8 @@ class DeploymentProfileTests(unittest.TestCase):
         "--cap-drop", "ALL",
         "--security-opt", "no-new-privileges",
         "--pids-limit", "128",
+        "--memory", "512m",
+        "--cpus", "1.0",
         "--network", "none",
     ]
 
@@ -8514,6 +8592,10 @@ class DeploymentProfileTests(unittest.TestCase):
         self.assertFalse(self._probe(without("--cap-drop", "ALL"))["dropped_capabilities"])
         # pids limit: without --pids-limit the cgroup pids.max is "max".
         self.assertFalse(self._probe(without("--pids-limit", "128"))["pids_limited"])
+        # memory limit: without --memory the cgroup memory.max is "max".
+        self.assertFalse(self._probe(without("--memory", "512m"))["memory_limited"])
+        # cpu limit: without --cpus the cgroup cpu.max quota is "max".
+        self.assertFalse(self._probe(without("--cpus", "1.0"))["cpu_limited"])
         # egress: without --network none a non-loopback interface (eth0) appears.
         self.assertFalse(self._probe(without("--network", "none"))["egress_denied"])
 
