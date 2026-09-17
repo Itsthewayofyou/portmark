@@ -81,6 +81,7 @@ def make_host(
     tools: ToolRegistry | None = None,
     providers: dict[str, ModelProvider] | None = None,
     allow_ephemeral_signing_key: bool = False,
+    allow_local_provider_endpoint: bool | None = None,
 ) -> AgentHost:
     # Note the asymmetry with `tools`, which REPLACES the demo registry.
     # Providers merge over the constructed defaults instead, so passing an
@@ -89,7 +90,17 @@ def make_host(
     # reusing its key.
     configured_providers: dict[str, ModelProvider] = {"deterministic": DeterministicProvider()}
     if provider_endpoint:
-        configured_providers["http"] = GenericHttpProvider(provider_endpoint, os.environ.get("MODEL_PROVIDER_TOKEN"))
+        # The local-gateway escape hatch (loopback-only http): opt in via the CLI flag / this argument
+        # or PORTMARK_ALLOW_LOCAL_PROVIDER_ENDPOINT=true. It permits ONLY a loopback address, not
+        # arbitrary private networks -- GenericHttpProvider still rejects private/link-local/etc.
+        if allow_local_provider_endpoint is None:
+            allow_local_provider_endpoint = os.environ.get(
+                "PORTMARK_ALLOW_LOCAL_PROVIDER_ENDPOINT", ""
+            ).strip().lower() in {"1", "true", "yes"}
+        configured_providers["http"] = GenericHttpProvider(
+            provider_endpoint, os.environ.get("MODEL_PROVIDER_TOKEN"),
+            allow_local_endpoint=allow_local_provider_endpoint,
+        )
     if wasm_component:
         if wasm_engine == "wasmtime":
             configured_providers["wasm"] = NativeWasmtimeComponentProvider.from_file(wasm_component)
