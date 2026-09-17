@@ -379,6 +379,10 @@ class AgentHost:
             raise SecurityError("signed manifest pins a component digest but the provider exposes none to verify")
 
         state = envelope.state
+        # Section 8 (terminalization): reject a malformed messages list BEFORE any persist,
+        # for fresh / resume / migration alike, so a non-dict message entry cannot be
+        # admitted and then crash view construction outside the failure boundary.
+        self._require_wellformed_messages(state)
         # Finding EV-008: fresh-vs-resume and replay protection come from the durable
         # store's checkpoint generation, not from caller-supplied state.status. A task
         # with no stored checkpoint is a fresh run: it must carry generation 0 and it
@@ -480,8 +484,11 @@ class AgentHost:
             # -- in-process or a remote adapter -- can read them. Projection is enforced
             # here, not trusted to the adapter. The provider only reads the state to
             # decide; the host mutates the real state via _apply_decision below.
-            view = provider_view(state, effective.grants)
             try:
+                # Build the view INSIDE the failure boundary too (defense in depth): even
+                # though admission now rejects a malformed messages list, any exception while
+                # constructing the view must terminalize the task, never strand it as running.
+                view = provider_view(state, effective.grants)
                 try:
                     decision = provider.decide(view, tool_names)
                 finally:
@@ -1185,6 +1192,20 @@ class AgentHost:
         audit.append("content.rejected", details)
         audit.append("agent.failed", state.result)
         return True, None
+
+    @staticmethod
+    def _require_wellformed_messages(state) -> None:
+        # Section 8 (terminalization). provider_view()/project_tool_messages iterate
+        # state.messages and call .get() on each entry, so a caller-supplied message that
+        # is NOT a dict -- e.g. a validly signed envelope carrying messages=[42] -- would
+        # raise AttributeError during view construction, AFTER admission, stranding the
+        # checkpoint as `running` (view construction is outside the provider-failure
+        # boundary). Reject a malformed messages list at the door, before the first
+        # persist, so nothing is stored. Only the SHAPE is checked (a list of dicts);
+        # message CONTENT is untrusted and projected/validated on the provider path.
+        messages = state.messages
+        if not isinstance(messages, list) or not all(isinstance(message, dict) for message in messages):
+            raise SecurityError("state.messages must be a list of message objects")
 
     @staticmethod
     def _require_nonnegative_counters(state) -> None:

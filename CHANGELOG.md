@@ -28,14 +28,25 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   object reachable from the view aliases live state, even under a `*` output projection). Top-level
   containers are read-only (a `tuple` of messages, a `MappingProxyType` of tool_results) and the
   dataclass is frozen. `checkpoint_generation` (store-owned) and `result` (host-owned) are dropped too.
-- **`migrated` replaces raw `memory["migration"]` inspection.** An in-process provider that needs to know
-  it resumed after a migration reads the single derived boolean `view.migrated` (present iff the host set
-  `memory["migration"]`), instead of the old leak of the whole `memory` dict. The remote wire payload
-  (`provider_state`) is unchanged — it never carried migration state — so remote/Wasm provider input is
-  byte-for-byte identical to before.
-- No behavior change to what a well-behaved provider decides: tool-output projection, the
-  share-nothing "present-but-empty" re-proposal semantic, and the wire shape sent to remote providers
-  are all preserved.
+- **`migrated` replaces raw `memory["migration"]` inspection.** A provider that needs to know it resumed
+  after a migration reads the single derived boolean `view.migrated` (present iff the host set
+  `memory["migration"]`), instead of the old leak of the whole `memory` dict.
+- No behavior change to what a well-behaved provider decides: tool-output projection and the
+  share-nothing "present-but-empty" re-proposal semantic are preserved.
+- **Cross-adapter consistency (audit follow-up, Medium).** `provider_state` — the json wire payload for
+  the HTTP/Wasm adapters — now serializes EVERY `ProviderView` field, including `migrated` and
+  `tool_results` (which earlier drafts dropped). Previously the in-process provider read `migrated` /
+  `tool_results` while the wire omitted them and re-derived tool output from `messages`, so a crafted
+  state whose `memory` and `messages` disagreed could make adapters decide differently (re-migration /
+  tool re-proposal). Every adapter now receives a faithful serialization of the same view. `WIT_ABI` is
+  unchanged (`portmark-json-lowered-v1`); the two fields are additive to the component input.
+- **Malformed message list can no longer strand a checkpoint (audit follow-up, Medium).** A validly
+  signed envelope whose `state.messages` contains a non-dict entry (e.g. `[42]`) used to be admitted and
+  then crash view construction with `AttributeError`, leaving the checkpoint `running` (view construction
+  was outside the provider-failure boundary). The host now rejects a non-dict-shaped messages list at
+  admission with `SecurityError` — before the first persist, so nothing is stored — and, defense in depth,
+  builds the view inside the terminalization boundary so any view-construction error closes the task to a
+  durable `failed` checkpoint instead of stranding it.
 
 ### Section 8 — provider boundary (PR 1): HTTP transport safety (SSRF / redirects / DNS-rebinding / total deadline)
 

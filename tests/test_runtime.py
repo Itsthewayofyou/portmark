@@ -36,7 +36,7 @@ from portmark.factory import build_envelope, make_demo_envelope, make_host, sign
 from portmark.metrics import RuntimeMetrics
 from portmark.logging_config import JsonLogFormatter
 from portmark.models import AgentState, AttestationEvidence, Permit, ProviderDecision, ResourceBudget, ToolGrant
-from portmark.projection import project_state_for_migration, provider_view
+from portmark.projection import project_state_for_migration, provider_state, provider_view
 from portmark.providers import GenericHttpProvider, ModelProvider, NativeWasmtimeComponentProvider, ProviderError
 from portmark.policy import load_host_policy
 from portmark.security import (
@@ -870,10 +870,15 @@ class RuntimeTests(unittest.TestCase):
                 "step": 2,
                 "tool_calls": 1,
                 "status": "running",
+                "migrated": False,
                 "messages": [{"role": "tool", "name": "catalog.search"}],
+                "tool_results": {},
             },
             "available_tools": ["catalog.search"],
         })
+        # The wire is a faithful serialization of the ProviderView (cross-adapter consistency)
+        # and must be json-serializable end to end (no MappingProxyType leaks).
+        json.dumps(captured["body"])
         self.assertNotIn("memory", captured["body"]["state"])
         self.assertNotIn("result", captured["body"]["state"])
         self.assertNotIn("internal_note", json.dumps(captured["body"]))
@@ -3897,6 +3902,65 @@ class RuntimeTests(unittest.TestCase):
         view = provider_view(state, (ToolGrant("catalog.search"),))  # output_projection omitted
         self.assertIn("catalog.search", view.tool_results)               # PRESENT
         self.assertEqual(dict(view.tool_results["catalog.search"]), {})   # but empty
+
+    def test_wire_serializes_the_same_view_every_adapter_sees(self):
+        # Section 8 finding (cross-adapter consistency): the remote wire (provider_state)
+        # must be a FAITHFUL serialization of the ProviderView the in-process provider gets,
+        # so no adapter can make a different decision from the same admitted state. It carries
+        # every view field -- including `migrated` and `tool_results`, which earlier versions
+        # dropped -- and must be json-serializable (no MappingProxyType leak).
+        state = AgentState(
+            "t", "g", step=3, tool_calls=1, status="running",
+            memory={"migration": {"from": "a", "to": "b"}, "tool_results": {"catalog.search": {"id": "1", "detail": "x"}}},
+            messages=[{"role": "tool", "name": "catalog.search", "content": {"id": "1", "detail": "x"}}],
+        )
+        grants = (ToolGrant("catalog.search", output_projection=("id",)),)
+        view = provider_view(state, grants)
+        wire = provider_state(view)
+        json.dumps(wire)  # must not raise (dict() unwraps the MappingProxyType)
+        # Every field the in-process provider reads is present on the wire, with equal values.
+        self.assertEqual(wire["migrated"], view.migrated)
+        self.assertTrue(wire["migrated"])  # memory["migration"] present -> True on BOTH paths
+        self.assertEqual(wire["tool_results"], {k: dict(v) for k, v in view.tool_results.items()})
+        self.assertEqual(wire["tool_results"], {"catalog.search": {"id": "1"}})  # projected to id
+        self.assertEqual(wire["messages"], list(view.messages))
+        for field in ("task_id", "goal", "step", "tool_calls", "status"):
+            self.assertEqual(wire[field], getattr(view, field))
+
+    def test_non_dict_message_rejected_at_admission_nothing_stored(self):
+        # Section 8 (terminalization, finding 1): a validly signed envelope whose state
+        # carries a non-dict message entry must be rejected at admission -- BEFORE the first
+        # persist -- so it can never be admitted and then crash view construction (which is
+        # outside the provider-failure boundary), stranding the checkpoint as `running`.
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            host = make_host(store=store, allow_ephemeral_signing_key=True)
+            envelope = make_demo_envelope(host, "malformed messages", "deterministic")
+            object.__setattr__(envelope.state, "messages", [42])  # not a dict
+            host.signer.seal(envelope)
+            with self.assertRaisesRegex(SecurityError, "list of message objects"):
+                host.run(envelope)
+            # Nothing stored: no checkpoint and no audit head for the rejected task.
+            self.assertIsNone(store.load_checkpoint(envelope.state.task_id))
+            self.assertIsNone(store.audit_head(envelope.state.task_id))
+
+    def test_view_construction_failure_terminalizes_not_strands(self):
+        # Defense in depth (finding 1): even if view construction raises AFTER admission
+        # (admission validation makes the messages=[42] path unreachable, so this forces the
+        # failure with a patched provider_view), the task must reach a durable terminal
+        # `failed` checkpoint with a `provider.failed` event -- never be left as `running`.
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            host = make_host(store=store, allow_ephemeral_signing_key=True)
+            envelope = make_demo_envelope(host, "view boom", "deterministic")
+            host.signer.seal(envelope)
+            with patch("portmark.host.provider_view", side_effect=RuntimeError("view boom")):
+                with self.assertRaises(RuntimeError):
+                    host.run(envelope)
+            checkpoint = store.load_checkpoint(envelope.state.task_id)
+            self.assertIsNotNone(checkpoint)
+            self.assertEqual(checkpoint["status"], "failed")  # durable terminal, not running
+            self.assertTrue(store.verify_audit_chain(envelope.state.task_id))  # closed chain intact
 
     @contextmanager
     def _three_store_context(self, backend):
@@ -7850,7 +7914,18 @@ class RuntimeTests(unittest.TestCase):
     def test_wasm_component_tool_decision_uses_structured_wit_outcome(self):
         from portmark.providers import WasmDecisionProvider
         provider = WasmDecisionProvider(base64.b64decode(WASM_TOOL_REQUEST))
-        decision = provider.decide(provider_view(AgentState("task", "goal")), ("catalog.search",))
+        # Carry real tool_results (and a prior tool message) so the wire input includes the
+        # now-serialized `tool_results` field -- confirms the larger component input (tool
+        # output appears in BOTH messages and tool_results after the cross-adapter-consistency
+        # fix) round-trips a real Node-Wasm decision without tripping a fuel/memory/output cap.
+        state = AgentState(
+            "task", "goal",
+            memory={"tool_results": {"catalog.search": {"id": "1", "title": "Prior", "score": 0.9}}},
+            messages=[{"role": "tool", "name": "catalog.search", "content": {"id": "1", "title": "Prior", "score": 0.9}}],
+        )
+        view = provider_view(state, (ToolGrant("catalog.search", output_projection=("id", "title")),))
+        self.assertTrue(view.tool_results)  # the bigger input is actually present
+        decision = provider.decide(view, ("catalog.search",))
         self.assertEqual(decision.kind, "tool")
         self.assertEqual(decision.tool, "catalog.search")
         self.assertEqual(decision.arguments, {"query": "from wasm", "limit": 3})

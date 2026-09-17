@@ -124,18 +124,21 @@ def project_state_for_migration(state: AgentState, grants: tuple[ToolGrant, ...]
 
 
 def provider_state(view: ProviderView) -> dict[str, Any]:
-    """Json-serializable wire dict for the remote adapters (HTTP / Wasm), built from the
-    canonical ProviderView. `view.messages` is a tuple of already-plain dicts (`_detach`
-    keeps values plain), so `list(...)` is all json needs. Same narrow shape the remote path
-    has always sent -- no `memory`, no `tool_results` (remote reads tool output via
-    `messages`)."""
+    """Json-serializable wire dict for the remote adapters (HTTP / Wasm) -- a FAITHFUL
+    serialization of every ProviderView field, so an in-process provider and a remote
+    adapter receive the SAME canonical view and cannot make adapter-dependent decisions
+    (Section 8 finding: cross-adapter consistency). `_detach` keeps container values plain,
+    but the view's top-level `tool_results` is a MappingProxyType (json.dumps raises on
+    that), so it is unwrapped with `dict(...)`; `messages` is a tuple of plain dicts."""
     return {
         "task_id": view.task_id,
         "goal": view.goal,
         "step": view.step,
         "tool_calls": view.tool_calls,
         "status": view.status,
+        "migrated": view.migrated,
         "messages": list(view.messages),
+        "tool_results": dict(view.tool_results),
     }
 
 
