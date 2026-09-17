@@ -16,8 +16,8 @@ from .models import AgentState
 from .security import AUDIT_HASH_VERSION, AuditHeadVerifier, SecurityError, _audit_head_payload_for, audit_event_record, canonical_json
 
 
-SQLITE_SCHEMA_VERSION = 10
-POSTGRES_SCHEMA_VERSION = 8
+SQLITE_SCHEMA_VERSION = 11
+POSTGRES_SCHEMA_VERSION = 9
 
 # Section 4 #3: a migration lease is bounded. Zero/negative would defeat exclusivity (two workers
 # could claim the same row at the same instant); an unbounded lease would let a dead worker hold a
@@ -173,18 +173,27 @@ class RuntimeStore(Protocol):
         effect did not land). Idempotent overwrite of state/result/reason with a fresh updated_at."""
         ...
 
-    def settle_effect_from(self, effect_id: str, expected_state: str, new_state: str, result_json: str | None, reason: str | None) -> bool:
-        """Compare-and-set settle: move the row from `expected_state` to `new_state` (with result/reason)
-        ONLY if it is currently in `expected_state`. Returns True iff exactly one row moved. Used so a
-        concurrent reconciler cannot overwrite another's already-recorded settlement (Section 7 PR 2,
-        round 3)."""
+    def claim_effect_for_reconcile(self, effect_id: str, claim_id: str, lease_seconds: int) -> bool:
+        """Atomically claim an effect for reconciliation under an OWNED lease (Section 7 PR 2, round 3
+        remediation, mirroring the migration-outbox lease). Moves the row to `reconciling` and stamps it
+        with `claim_id` (the owner) + a lease expiry iff it is currently `unknown`, OR a `reconciling`
+        row whose lease has EXPIRED (a claim from a reconciler that died). A reclaim mints a DIFFERENT
+        claim_id, so the prior holder can no longer settle it. Returns True iff this caller won the
+        claim. Lease expiry uses DATABASE time on Postgres (a shared central clock), the local clock on
+        the embedded stores."""
         ...
 
-    def claim_effect_for_reconcile(self, effect_id: str, stale_before: int) -> bool:
-        """Atomically claim an effect for reconciliation: move it to `reconciling` iff it is currently
-        `unknown`, OR it is a `reconciling` row whose updated_at is older than `stale_before` (a
-        lease-expired claim from a reconciler that died). Returns True iff this caller won the claim.
-        The lease bound keeps a dead reconciler from stranding the row forever (Section 7 PR 2, r3)."""
+    def settle_effect_from_claim(self, effect_id: str, claim_id: str, new_state: str, result_json: str | None, reason: str | None) -> bool:
+        """Terminal CAS settle scoped to the claim OWNER: move a `reconciling` row to `new_state` ONLY if
+        `claim_id` still holds it AND the lease is still LIVE. Returns True iff it moved. A stale/expired
+        holder (or one whose claim was reclaimed under a new id) cannot overwrite the current claim."""
+        ...
+
+    def release_effect_claim(self, effect_id: str, claim_id: str) -> bool:
+        """Release a reconcile claim back to `unknown` (the reconcile function failed). Requires the
+        `claim_id` match but NOT a live lease -- an expired holder relinquishing is always safe (it
+        cannot touch a DIFFERENT holder, whose claim_id differs), and it keeps the effect retryable
+        rather than stranded `reconciling`. Returns True iff it moved."""
         ...
 
     def consumed_nonce_exists(self, nonce: str) -> bool:
@@ -375,6 +384,7 @@ class InMemoryRuntimeStore:
                 "effect_id": effect_id, "task_id": task_id, "tool": tool, "state": "prepared",
                 "arguments_json": arguments_json, "result_json": None, "reason": None,
                 "created_at": now, "updated_at": now,
+                "reconcile_claim_id": None, "reconcile_lease_expires_at": None,
             }
 
     def mark_effect_started(self, effect_id: str) -> None:
@@ -393,28 +403,50 @@ class InMemoryRuntimeStore:
                 row["reason"] = reason
                 row["updated_at"] = int(time.time())
 
-    def settle_effect_from(self, effect_id: str, expected_state: str, new_state: str, result_json: str | None, reason: str | None) -> bool:
-        with self._lock:
-            row = self._effects.get(effect_id)
-            if row is None or row["state"] != expected_state:
-                return False
-            row["state"] = new_state
-            row["result_json"] = result_json
-            row["reason"] = reason
-            row["updated_at"] = int(time.time())
-            return True
-
-    def claim_effect_for_reconcile(self, effect_id: str, stale_before: int) -> bool:
+    def claim_effect_for_reconcile(self, effect_id: str, claim_id: str, lease_seconds: int) -> bool:
         with self._lock:
             row = self._effects.get(effect_id)
             if row is None:
                 return False
+            now = int(time.time())
             state = row["state"]
-            if state == "unknown" or (state == "reconciling" and int(row["updated_at"]) < stale_before):
-                row["state"] = "reconciling"
-                row["updated_at"] = int(time.time())
-                return True
-            return False
+            lease = row.get("reconcile_lease_expires_at")
+            eligible = state == "unknown" or (state == "reconciling" and (lease is None or int(lease) <= now))
+            if not eligible:
+                return False
+            row["state"] = "reconciling"
+            row["reconcile_claim_id"] = claim_id
+            row["reconcile_lease_expires_at"] = now + int(lease_seconds)
+            row["updated_at"] = now
+            return True
+
+    def settle_effect_from_claim(self, effect_id: str, claim_id: str, new_state: str, result_json: str | None, reason: str | None) -> bool:
+        with self._lock:
+            row = self._effects.get(effect_id)
+            now = int(time.time())
+            if (row is None or row["state"] != "reconciling" or row.get("reconcile_claim_id") != claim_id
+                    or int(row.get("reconcile_lease_expires_at") or 0) <= now):
+                return False  # terminal settle needs the owning claim AND a LIVE lease
+            row["state"] = new_state
+            row["result_json"] = result_json
+            row["reason"] = reason
+            row["reconcile_claim_id"] = None
+            row["reconcile_lease_expires_at"] = None
+            row["updated_at"] = now
+            return True
+
+    def release_effect_claim(self, effect_id: str, claim_id: str) -> bool:
+        with self._lock:
+            row = self._effects.get(effect_id)
+            if row is None or row["state"] != "reconciling" or row.get("reconcile_claim_id") != claim_id:
+                return False  # release needs the owning claim, but NOT a live lease (safe relinquish)
+            row["state"] = "unknown"
+            row["result_json"] = None
+            row["reason"] = "reconcile failed; claim released"
+            row["reconcile_claim_id"] = None
+            row["reconcile_lease_expires_at"] = None
+            row["updated_at"] = int(time.time())
+            return True
 
     def mark_migration_delivered(self, task_id: str, receipt_json: str) -> None:
         with self._lock:
@@ -738,6 +770,7 @@ class SQLiteRuntimeStore:
             7: self._migrate_to_v8,
             8: self._migrate_to_v9,
             9: self._migrate_to_v10,
+            10: self._migrate_to_v11,
         }
         migration = migrations.get(version)
         if migration is None:
@@ -933,6 +966,21 @@ class SQLiteRuntimeStore:
             """
         )
 
+    def _migrate_to_v11(self, connection: sqlite3.Connection) -> None:
+        # Section 7 PR 2 (round 3, remediation): give a reconcile claim an OWNER + a lease, mirroring the
+        # migration-outbox lease (v8). reconcile_claim_id identifies WHO holds the current claim so a
+        # stale/expired reconciler cannot settle or reset a newer holder's claim; reconcile_lease_expires_at
+        # bounds it so a dead reconciler's claim is reclaimable. Both nullable -- an effect not under
+        # reconciliation has them NULL, so existing rows upgrade untouched.
+        # SQLite has no ADD COLUMN IF NOT EXISTS, so check first -- idempotent, and parity with the
+        # Postgres side (which uses ADD COLUMN IF NOT EXISTS).
+        existing = {row[1] for row in connection.execute("PRAGMA table_info(tool_effects)").fetchall()}
+        if "reconcile_claim_id" not in existing:
+            connection.execute("ALTER TABLE tool_effects ADD COLUMN reconcile_claim_id TEXT")
+        if "reconcile_lease_expires_at" not in existing:
+            connection.execute("ALTER TABLE tool_effects ADD COLUMN reconcile_lease_expires_at INTEGER")
+        connection.execute("PRAGMA user_version = 11")
+
     def transaction(self) -> AbstractContextManager[RuntimeTransaction]:
         return _SQLiteTransaction(self)
 
@@ -988,7 +1036,8 @@ class SQLiteRuntimeStore:
         with self._connection() as connection:
             row = connection.execute(
                 "SELECT effect_id, task_id, tool, state, arguments_json, result_json, reason, "
-                "created_at, updated_at FROM tool_effects WHERE effect_id = ?",
+                "created_at, updated_at, reconcile_claim_id, reconcile_lease_expires_at "
+                "FROM tool_effects WHERE effect_id = ?",
                 (effect_id,),
             ).fetchone()
         return None if row is None else dict(row)
@@ -1023,21 +1072,41 @@ class SQLiteRuntimeStore:
                 (state, result_json, reason, int(time.time()), effect_id),
             )
 
-    def settle_effect_from(self, effect_id: str, expected_state: str, new_state: str, result_json: str | None, reason: str | None) -> bool:
+    def claim_effect_for_reconcile(self, effect_id: str, claim_id: str, lease_seconds: int) -> bool:
+        # Embedded single-host store: the local clock is authoritative (no cross-host lease comparison).
+        now = int(time.time())
         with self._connection() as connection:
             cursor = connection.execute(
-                "UPDATE tool_effects SET state = ?, result_json = ?, reason = ?, updated_at = ? "
-                "WHERE effect_id = ? AND state = ?",
-                (new_state, result_json, reason, int(time.time()), effect_id, expected_state),
+                "UPDATE tool_effects SET state = 'reconciling', reconcile_claim_id = ?, "
+                "reconcile_lease_expires_at = ?, updated_at = ? "
+                "WHERE effect_id = ? AND (state = 'unknown' OR (state = 'reconciling' "
+                "AND (reconcile_lease_expires_at IS NULL OR reconcile_lease_expires_at <= ?)))",
+                (claim_id, now + int(lease_seconds), now, effect_id, now),
             )
             return cursor.rowcount == 1
 
-    def claim_effect_for_reconcile(self, effect_id: str, stale_before: int) -> bool:
+    def settle_effect_from_claim(self, effect_id: str, claim_id: str, new_state: str, result_json: str | None, reason: str | None) -> bool:
+        now = int(time.time())
         with self._connection() as connection:
             cursor = connection.execute(
-                "UPDATE tool_effects SET state = 'reconciling', updated_at = ? "
-                "WHERE effect_id = ? AND (state = 'unknown' OR (state = 'reconciling' AND updated_at < ?))",
-                (int(time.time()), effect_id, stale_before),
+                "UPDATE tool_effects SET state = ?, result_json = ?, reason = ?, "
+                "reconcile_claim_id = NULL, reconcile_lease_expires_at = NULL, updated_at = ? "
+                "WHERE effect_id = ? AND state = 'reconciling' AND reconcile_claim_id = ? "
+                "AND reconcile_lease_expires_at > ?",
+                (new_state, result_json, reason, now, effect_id, claim_id, now),
+            )
+            return cursor.rowcount == 1
+
+    def release_effect_claim(self, effect_id: str, claim_id: str) -> bool:
+        # Claim match only, NOT lease-live: an expired holder relinquishing to `unknown` is safe (its
+        # claim_id cannot match a DIFFERENT holder's) and keeps the effect retryable.
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE tool_effects SET state = 'unknown', result_json = NULL, "
+                "reason = 'reconcile failed; claim released', reconcile_claim_id = NULL, "
+                "reconcile_lease_expires_at = NULL, updated_at = ? "
+                "WHERE effect_id = ? AND state = 'reconciling' AND reconcile_claim_id = ?",
+                (int(time.time()), effect_id, claim_id),
             )
             return cursor.rowcount == 1
 
@@ -1433,6 +1502,11 @@ class PostgresRuntimeStore:
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_tool_effects_task ON tool_effects (task_id)"
         )
+        # Section 7 PR 2 (round 3, schema v9): OWNED reconcile lease -- who holds the current claim and
+        # when it expires -- so a stale/expired reconciler cannot settle or reset a newer claim. Both
+        # nullable; ADD COLUMN IF NOT EXISTS upgrades an existing (v8) store idempotently.
+        connection.execute("ALTER TABLE tool_effects ADD COLUMN IF NOT EXISTS reconcile_claim_id TEXT")
+        connection.execute("ALTER TABLE tool_effects ADD COLUMN IF NOT EXISTS reconcile_lease_expires_at BIGINT")
         connection.execute(
             """
             INSERT INTO portmark_schema (singleton, version)
@@ -1505,7 +1579,8 @@ class PostgresRuntimeStore:
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT effect_id, task_id, tool, state, arguments_json, result_json, reason, "
-                "created_at, updated_at FROM tool_effects WHERE effect_id = %s",
+                "created_at, updated_at, reconcile_claim_id, reconcile_lease_expires_at "
+                "FROM tool_effects WHERE effect_id = %s",
                 (effect_id,),
             ).fetchone()
         return None if row is None else dict(row)
@@ -1540,21 +1615,42 @@ class PostgresRuntimeStore:
                 (state, result_json, reason, int(time.time()), effect_id),
             )
 
-    def settle_effect_from(self, effect_id: str, expected_state: str, new_state: str, result_json: str | None, reason: str | None) -> bool:
+    def claim_effect_for_reconcile(self, effect_id: str, claim_id: str, lease_seconds: int) -> bool:
+        # Lease creation + eligibility use DATABASE time (clock_timestamp), not the app host clock, so a
+        # host whose clock runs ahead cannot prematurely reclaim another host's live reconcile claim.
         with self._connect() as connection:
             cursor = connection.execute(
-                "UPDATE tool_effects SET state = %s, result_json = %s, reason = %s, updated_at = %s "
-                "WHERE effect_id = %s AND state = %s",
-                (new_state, result_json, reason, int(time.time()), effect_id, expected_state),
+                "UPDATE tool_effects SET state = 'reconciling', reconcile_claim_id = %s, "
+                "reconcile_lease_expires_at = EXTRACT(EPOCH FROM clock_timestamp())::bigint + %s, "
+                "updated_at = EXTRACT(EPOCH FROM clock_timestamp())::bigint "
+                "WHERE effect_id = %s AND (state = 'unknown' OR (state = 'reconciling' "
+                "AND (reconcile_lease_expires_at IS NULL "
+                "OR reconcile_lease_expires_at <= EXTRACT(EPOCH FROM clock_timestamp())::bigint)))",
+                (claim_id, lease_seconds, effect_id),
             )
             return cursor.rowcount == 1
 
-    def claim_effect_for_reconcile(self, effect_id: str, stale_before: int) -> bool:
+    def settle_effect_from_claim(self, effect_id: str, claim_id: str, new_state: str, result_json: str | None, reason: str | None) -> bool:
         with self._connect() as connection:
             cursor = connection.execute(
-                "UPDATE tool_effects SET state = 'reconciling', updated_at = %s "
-                "WHERE effect_id = %s AND (state = 'unknown' OR (state = 'reconciling' AND updated_at < %s))",
-                (int(time.time()), effect_id, stale_before),
+                "UPDATE tool_effects SET state = %s, result_json = %s, reason = %s, "
+                "reconcile_claim_id = NULL, reconcile_lease_expires_at = NULL, "
+                "updated_at = EXTRACT(EPOCH FROM clock_timestamp())::bigint "
+                "WHERE effect_id = %s AND state = 'reconciling' AND reconcile_claim_id = %s "
+                "AND reconcile_lease_expires_at > EXTRACT(EPOCH FROM clock_timestamp())::bigint",
+                (new_state, result_json, reason, effect_id, claim_id),
+            )
+            return cursor.rowcount == 1
+
+    def release_effect_claim(self, effect_id: str, claim_id: str) -> bool:
+        # Claim match only, NOT lease-live (an expired holder relinquishing to `unknown` is safe).
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE tool_effects SET state = 'unknown', result_json = NULL, "
+                "reason = 'reconcile failed; claim released', reconcile_claim_id = NULL, "
+                "reconcile_lease_expires_at = NULL, updated_at = EXTRACT(EPOCH FROM clock_timestamp())::bigint "
+                "WHERE effect_id = %s AND state = 'reconciling' AND reconcile_claim_id = %s",
+                (effect_id, claim_id),
             )
             return cursor.rowcount == 1
 

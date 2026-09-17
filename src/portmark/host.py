@@ -90,7 +90,7 @@ class AgentHost:
         # plain attribute again (the round-2 auto-binding property setter is gone -- the gate no longer
         # rests on a rebindable predicate; authority is the one-use launch capability). A registry
         # swapped in after construction (as some tests do) must be re-attached explicitly.
-        self.tools.attach_effect_ledger(self._effect_ledger_row)
+        self._effect_armer = self.tools.attach_effect_ledger(self._effect_ledger_row)
         if hasattr(self.store, "set_audit_head_verifier"):
             self.store.set_audit_head_verifier(self.signer)  # type: ignore[attr-defined]  # guarded by hasattr; not on the base RuntimeStore protocol
         self.attestation_policy = attestation_policy or AttestationPolicy()
@@ -225,14 +225,16 @@ class AgentHost:
         tool = row["tool"]
         if not self.tools.has_reconcile(tool):
             raise SecurityError(f"tool {tool!r} has no reconcile function registered; cannot reconcile its effects")
-        # Round 3: CLAIM the effect atomically (unknown -> reconciling) before running the reconciler,
-        # and settle only FROM the claimed state, so two concurrent operators cannot both reconcile and
-        # clobber each other (a late "not landed" overwriting an already-recorded `confirmed`). The claim
-        # carries a lease: a `reconciling` row whose updated_at is older than the lease window is
-        # reclaimable, so a reconciler whose process died does not strand the effect forever (it stayed
-        # retryable as `unknown` before -- we must not regress that).
-        stale_before = int(time.time()) - _RECONCILE_LEASE_SECONDS
-        if not self.store.claim_effect_for_reconcile(effect_id, stale_before):
+        # Round 3 (remediation): CLAIM the effect under an OWNED lease before running the reconciler, and
+        # settle only under that claim id, so two concurrent operators cannot clobber each other -- a
+        # stale/expired reconciler can neither overwrite a recorded `confirmed` nor reset a newer holder's
+        # live claim (a reclaim mints a DIFFERENT claim_id). The lease is bounded so a dead reconciler's
+        # claim is reclaimable (mirrors the migration-outbox lease). Lease expiry uses DB time on Postgres.
+        # Known bound: a reconcile that runs longer than the lease window makes the effect reclaimable --
+        # a slow reconciler may lose its claim (its terminal settle then no-ops and reports the current
+        # state); not a correctness hole (nothing is double-settled), a liveness bound.
+        claim_id = secrets.token_urlsafe(24)
+        if not self.store.claim_effect_for_reconcile(effect_id, claim_id, _RECONCILE_LEASE_SECONDS):
             current = self.store.get_effect(effect_id)
             state = current["state"] if current is not None else "missing"
             raise SecurityError(
@@ -247,23 +249,24 @@ class AgentHost:
             if outcome["landed"]:
                 result = outcome.get("result")
                 result_json = canonical_json(result).decode("utf-8") if "result" in outcome else None
-                if not self.store.settle_effect_from(effect_id, "reconciling", "confirmed", result_json, "reconciled: effect landed"):
+                if not self.store.settle_effect_from_claim(effect_id, claim_id, "confirmed", result_json, "reconciled: effect landed"):
                     return self._effect_state_after_lost_claim(effect_id)
                 return "confirmed"
-            if not self.store.settle_effect_from(effect_id, "reconciling", "reconciled", None, "reconciled: effect did not land"):
+            if not self.store.settle_effect_from_claim(effect_id, claim_id, "reconciled", None, "reconciled: effect did not land"):
                 return self._effect_state_after_lost_claim(effect_id)
             return "reconciled"
         except Exception:
-            # Release the claim so the effect is retryable (back to unknown), not stranded `reconciling`.
-            # Only release if WE still hold it (settle_effect_from is a no-op if another reconciler's
-            # lease-expiry reclaim already moved it on), so we never overwrite a newer holder.
-            self.store.settle_effect_from(effect_id, "reconciling", "unknown", None, "reconcile failed; claim released")
+            # Release OUR claim back to `unknown` so the effect stays retryable (round-3 liveness). Release
+            # requires only the claim-id match, NOT a live lease -- an expired holder relinquishing is safe
+            # (its claim_id cannot match a DIFFERENT holder, so it never resets a newer live claim).
+            self.store.release_effect_claim(effect_id, claim_id)
             raise
 
     def _effect_state_after_lost_claim(self, effect_id: str) -> str:
-        """Our CAS settle did not move the row: our lease expired and another reconciler took over and
-        settled it. Report the current state WITHOUT overwriting their result -- the whole point of the
-        CAS (round 3). The row exists (we just claimed it); `unknown` is a defensive fallback only."""
+        """Our claim-scoped settle did not move the row: our lease expired and another reconciler took
+        over (a reclaim minted a different claim_id) and may have settled it. Report the current state
+        WITHOUT overwriting their result. The row exists (we just claimed it); `unknown` is a defensive
+        fallback only."""
         current = self.store.get_effect(effect_id)
         return current["state"] if current is not None else "unknown"
 
@@ -580,7 +583,7 @@ class AgentHost:
                 # before the side-effecting gate, a kill, an exec error) so a capability never outlives
                 # its single intended launch. eid is None for a non-side-effecting or non-isolated tool,
                 # in which case no capability is armed and invoke takes launch_capability=None.
-                launch_cap = self.tools.arm_effect_launch(eid, decision.tool, decision.arguments) if eid is not None else None
+                launch_cap = self._effect_armer.arm(eid, decision.tool, decision.arguments) if eid is not None else None
                 try:
                     tool_started = time.monotonic()
                     try:
@@ -589,7 +592,7 @@ class AgentHost:
                         )
                     finally:
                         self.metrics.observe_duration("tool_invocation_duration_seconds", time.monotonic() - tool_started)
-                        self.tools.disarm(launch_cap)
+                        self._effect_armer.disarm(launch_cap)
                 except ToolKilledError as error:
                     # EV-002: the isolated tool was hard-killed at its deadline. The kill stops any
                     # *new* side effect, but a call already in flight (a payment POST mid-request) may

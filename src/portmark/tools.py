@@ -19,6 +19,16 @@ from .security import SecurityError, canonical_json, check_constraints
 
 Tool = Callable[[dict[str, Any]], Any]
 
+
+@dataclass(frozen=True)
+class LaunchArmer:
+    """Private handle returned by ToolRegistry.attach_effect_ledger and held only by AgentHost. `arm`
+    mints a one-use launch capability for a `started` side-effecting effect; `disarm` drops one that was
+    not consumed. Bundling them here (instead of public registry methods) is what stops any caller with
+    a registry reference from minting capabilities (Section 7 PR 2, round 3 remediation)."""
+    arm: Callable[[str, str, dict[str, Any]], str]
+    disarm: Callable[[str | None], None]
+
 # Extra bytes the parent will read past the tool's output budget before it
 # declares an overflow: the response is `{"ok": true, "result": <output>}`, so
 # the JSON envelope adds a little over the raw output. Kept small on purpose --
@@ -148,21 +158,22 @@ class ToolRegistry:
         self._timeouts: dict[str, float] = {}
         self._max_output: dict[str, int] = {}
         self._side_effecting: set[str] = set()
-        # Section 7 PR 2 (round 3): launching a side-effecting tool requires a one-use, in-memory
-        # LAUNCH CAPABILITY that AgentHost arms right before the call and invoke() consumes atomically.
-        # Knowledge of a (deterministic, non-secret) effect_id is NOT launch authority -- round 2's
-        # "is it started?" predicate let any holder of a started id reuse it, transfer it to another
-        # tool, or replay it after a crash. Now:
-        #   * `_effect_ledger_row` is the registry's ONLY (read-only) view of the durable ledger,
-        #     attached ONCE by the host (attach_effect_ledger, no public re-attach). Arming validates
-        #     against it, so a fabricated effect_id cannot be armed.
-        #   * `_armed` maps a random capability -> (effect_id, tool, canonical_args). invoke() pops the
-        #     capability on an exact (tool, args) match: one-use, non-transferable, non-replayable.
-        # After a crash the in-memory `_armed` is empty, so a durable `started` row alone authorizes
-        # nothing. The residual (a caller that mutates these private attributes / calls internal methods
-        # on the registry object) is the standard Python boundary -- outside the runtime gate and the
-        # deployment sandbox's job per the locked Section 7 contract.
-        self._effect_ledger_row: Callable[[str], dict[str, Any] | None] | None = None
+        # Section 7 PR 2 (round 3, remediation): launching a side-effecting tool requires a one-use,
+        # in-memory LAUNCH CAPABILITY that AgentHost arms right before the call and invoke() consumes
+        # atomically. Knowledge of a (deterministic, non-secret) effect_id is NOT launch authority.
+        #   * ARMING IS NOT A PUBLIC METHOD. attach_effect_ledger() returns a private armer handle (arm /
+        #     disarm closures) that only AgentHost holds -- so no caller with a registry reference can
+        #     mint a capability, and none can mint a SECOND one for a started effect (round-3-r1 hole:
+        #     public arm_effect_launch let a caller mint N capabilities for one started row). Arming
+        #     validates against the read-only ledger row (a fabricated effect_id cannot be armed) and
+        #     refuses a second outstanding capability for the same effect.
+        #   * `_armed` maps a random capability -> (effect_id, tool, canonical_args). invoke() pops it on
+        #     an exact (tool, args) match: one-use, non-transferable, non-replayable. After a crash it is
+        #     empty, so a durable `started` row alone authorizes nothing.
+        # This removes the PUBLIC-API bypass; it is not protection against arbitrary in-process code
+        # mutating these private attributes -- that is the deployment sandbox's job per the Section 7
+        # contract, and the docs say so rather than overclaiming.
+        self._ledger_attached = False
         self._armed: dict[str, tuple[str, str, str]] = {}
         self._arm_lock = threading.Lock()
         self.default_timeout = default_timeout
@@ -248,45 +259,47 @@ class ToolRegistry:
         if side_effecting:
             self._side_effecting.add(name)
 
-    def attach_effect_ledger(self, effect_ledger_row: Callable[[str], dict[str, Any] | None]) -> None:
-        """Attach the host's read-only durable-ledger view ONCE (Section 7 PR 2, round 3). AgentHost
-        calls this at construction with a lookup that returns the ledger row for an effect_id (or None).
-        Arming a launch validates the current decision against this row, so a fabricated effect_id
-        cannot be armed. Set-once: a second attach raises, so the arming validator cannot be swapped for
-        a permissive one through this method (the round-2 rebindable-predicate hole). It is a read-only
-        row lookup, not launch authority -- authority is the one-use capability from arm_effect_launch."""
-        if self._effect_ledger_row is not None:
-            raise RuntimeError("effect ledger already attached; the ledger view is set once and cannot be re-attached")
-        self._effect_ledger_row = effect_ledger_row
+    def attach_effect_ledger(self, effect_ledger_row: Callable[[str], dict[str, Any] | None]) -> LaunchArmer:
+        """Attach the host's read-only durable-ledger view ONCE and RETURN a private armer handle
+        (Section 7 PR 2, round 3 remediation). AgentHost calls this at construction and keeps the handle;
+        it is the ONLY way to mint a launch capability. Arming is deliberately NOT a public registry
+        method -- otherwise any caller holding the registry could mint capabilities (including several
+        for one `started` effect). Set-once: a second attach raises, so the arming validator cannot be
+        swapped for a permissive one. The row lookup and the armer are captured in the closure, not
+        stored as reassignable attributes."""
+        if self._ledger_attached:
+            raise RuntimeError("effect ledger already attached; it is set once and cannot be re-attached")
+        self._ledger_attached = True
 
-    def arm_effect_launch(self, effect_id: str, tool: str, arguments: dict[str, Any]) -> str:
-        """Mint a one-use launch capability for a side-effecting tool (Section 7 PR 2, round 3). The
-        host calls this immediately before invoke, after it has recorded a `started` ledger row. Arming
-        REQUIRES a durable row that is `started` AND whose recorded tool + canonical arguments match the
-        request -- so a fabricated or drifted effect_id cannot be armed. Returns a random capability
-        bound to (effect_id, tool, canonical arguments); invoke() consumes it exactly once."""
-        if self._effect_ledger_row is None:
-            raise ToolExecutionError("registry has no effect ledger attached; construct it via AgentHost before arming a side-effecting launch")
-        row = self._effect_ledger_row(effect_id)
-        canonical_args = canonical_json(arguments).decode("utf-8")
-        if row is None or row["state"] != "started" or row["tool"] != tool or row["arguments_json"] != canonical_args:
-            raise SecurityError(
-                f"cannot arm a launch for effect {effect_id!r}: no `started` ledger row matches this "
-                "(tool, arguments). Knowledge of an effect_id is not launch authority."
-            )
-        capability = secrets.token_urlsafe(32)
-        with self._arm_lock:
-            self._armed[capability] = (effect_id, tool, canonical_args)
-        return capability
+        def arm(effect_id: str, tool: str, arguments: dict[str, Any]) -> str:
+            # Validate against the durable ledger: a fabricated or drifted effect_id has no matching
+            # `started` row and cannot be armed. Then refuse a SECOND outstanding capability for the same
+            # effect, so even the holder of the armer cannot mint two launches for one started row. The
+            # host disarms in a `finally`, so a launch that never consumes frees the slot (no poisoning).
+            row = effect_ledger_row(effect_id)
+            canonical_args = canonical_json(arguments).decode("utf-8")
+            if row is None or row["state"] != "started" or row["tool"] != tool or row["arguments_json"] != canonical_args:
+                raise SecurityError(
+                    f"cannot arm a launch for effect {effect_id!r}: no `started` ledger row matches this "
+                    "(tool, arguments). Knowledge of an effect_id is not launch authority."
+                )
+            with self._arm_lock:
+                if any(existing[0] == effect_id for existing in self._armed.values()):
+                    raise SecurityError(
+                        f"a launch capability is already outstanding for effect {effect_id!r}; one "
+                        "started effect authorizes at most one launch."
+                    )
+                capability = secrets.token_urlsafe(32)
+                self._armed[capability] = (effect_id, tool, canonical_args)
+            return capability
 
-    def disarm(self, capability: str | None) -> None:
-        """Drop an armed capability that was not consumed (e.g. invoke failed before the gate). A no-op
-        if it was already consumed or never armed. The host calls this in a `finally` so a capability
-        never outlives its single intended launch."""
-        if capability is None:
-            return
-        with self._arm_lock:
-            self._armed.pop(capability, None)
+        def disarm(capability: str | None) -> None:
+            if capability is None:
+                return
+            with self._arm_lock:
+                self._armed.pop(capability, None)
+
+        return LaunchArmer(arm=arm, disarm=disarm)
 
     def is_side_effecting(self, name: str) -> bool:
         """Whether the tool is registered side-effecting (the host wraps it in the effect ledger)."""

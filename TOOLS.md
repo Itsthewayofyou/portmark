@@ -356,12 +356,15 @@ one-use launch capability bound to `(effect_id, tool, canonical arguments)` — 
 that a durable `started` ledger row matches, so a fabricated id cannot be armed — and
 `ToolRegistry.invoke` **consumes** it atomically, only on an exact `(tool, arguments)` match. A
 fabricated capability, a capability reused after its single launch, one armed for a different tool, or
-one armed with different arguments all fail closed. The read-only ledger view the registry uses to
-validate arming is attached once by the host and cannot be re-attached. **What this does *not* cover:**
-a caller that can execute arbitrary code in-process against the registry object (mutating its private
-state) is outside this gate — that is the deployment sandbox's job, per the resource-bounded-worker
-contract above; the runtime gate defends against a fabricated/guessed/replayed *value*, not against
-arbitrary in-process code. (The host's own reconcile pass calls the reconcile function directly, not
+one armed with different arguments all fail closed. **Arming is not a public method:**
+`attach_effect_ledger` (called once by the host, and not re-attachable) returns a private armer handle
+that only `AgentHost` holds, so a caller with a registry reference cannot mint a capability — and even
+the handle refuses a *second* outstanding capability for one `started` effect, so one started effect
+authorizes at most one launch. **What this does *not* cover:** a caller that can execute arbitrary code
+in-process against the registry object (mutating its private state) is outside this gate — that is the
+deployment sandbox's job, per the resource-bounded-worker contract above. The runtime gate closes the
+public-API bypass and defends against a fabricated/guessed/replayed *value*; it is not protection
+against arbitrary malicious in-process Python. (The host's own reconcile pass calls the reconcile function directly, not
 through this gate; that is intentional — a reconcile function is registered separately and is not
 itself `side_effecting`.)
 
@@ -388,13 +391,19 @@ which asks the external system whether the effect landed: a landed effect settle
 (with the reconciled result), a not-landed effect to `reconciled` (terminal; a retry is a fresh
 call). The host never auto-retries; the operator drives reconciliation.
 
-Reconciliation is **concurrency-safe**: the host **claims** the effect atomically (`unknown →
-reconciling`) before running the reconcile function and settles only *from* that claimed state, so two
-operators reconciling at once cannot clobber each other — a late "not landed" can never overwrite an
-already-recorded `confirmed`. The claim carries a **lease**: a `reconciling` row left behind by a
-reconciler whose process died is reclaimable after the lease window, so a crash mid-reconcile never
-strands the effect (it returns to being reconcilable rather than stuck). If the reconcile function
-itself raises, the claim is released back to `unknown` for the operator to retry.
+Reconciliation is **concurrency-safe**, using the same owned-lease shape as the migration outbox: the
+host **claims** the effect atomically (`unknown → reconciling`) under a random **owner id** before
+running the reconcile function, and a terminal settle requires *that owner id* **and** a still-live
+lease — so two operators reconciling at once cannot clobber each other, and a stale/expired reconciler
+can neither overwrite a recorded `confirmed` nor reset a newer holder's claim (a reclaim mints a
+*different* owner id). The claim carries a **lease**: a `reconciling` row left behind by a reconciler
+whose process died is reclaimable after the lease window, so a crash mid-reconcile never strands the
+effect. If the reconcile function itself raises, the owner releases its claim back to `unknown` for
+retry (release needs only the owner id, so an expired holder can always safely relinquish). Lease
+creation and expiry use **database time** on Postgres (a shared central clock), so a host whose clock
+runs fast cannot prematurely steal another host's live claim. *Known bound:* a reconcile that runs
+longer than the lease window makes the effect reclaimable — a slow reconciler may lose its claim (its
+terminal settle then no-ops); this is a liveness bound, not a double-settle.
 
 > **Known cost.** The `started` state is settled `unknown` on resume even if the tool never
 > actually launched (a crash in the microsecond window between the durable `started` write and the

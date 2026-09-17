@@ -36,12 +36,15 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   `(effect_id, tool, canonical arguments)` — arming first validates that a durable `started` ledger row
   matches, so a fabricated id cannot be armed — and `ToolRegistry.invoke` **consumes** it atomically,
   only on an exact `(tool, arguments)` match. A fabricated capability, a reused one, one armed for a
-  different tool, or one armed with different arguments all fail closed. The registry's read-only ledger
-  view is attached once and cannot be re-attached. This defends against a fabricated/guessed/replayed
+  different tool, or one armed with different arguments all fail closed. **Arming is not a public
+  method:** `attach_effect_ledger` (called once, not re-attachable) returns a private armer handle only
+  `AgentHost` holds, so no caller with a registry reference can mint a capability — and the handle
+  refuses a *second* outstanding capability for one `started` effect, so one started effect authorizes
+  at most one launch. This closes the public-API bypass and defends against a fabricated/guessed/replayed
   *value*; a caller that runs arbitrary in-process code against the registry object is outside this gate
-  (the deployment sandbox's job, per the resource-bounded-worker contract). Replaces the round-2
-  "is it started?" predicate, which a holder of a `started` id could reuse, transfer to another tool, or
-  replay after a crash.
+  (the deployment sandbox's job) — it is not claimed as protection against arbitrary in-process Python.
+  Supersedes the earlier public `arm_effect_launch` (repeatable minting) and the round-2 "is it started?"
+  predicate (a holder of a `started` id could reuse it, transfer it to another tool, or replay it).
 - **Side-effecting tools receive the effect id as an idempotency key.** The isolated worker calls a
   side-effecting tool as `tool(arguments, effect_id)` (the id travels in the request envelope, outside
   `arguments`, so the argument-name allowlist does not reject it); the tool must use it as its external
@@ -51,12 +54,15 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   `unknown` effect by running the tool's registered `reconcile` function
   (`reconcile(arguments, effect_id) -> {"landed": bool, "result"?: ...}`): a landed effect settles to
   `confirmed`, a not-landed effect to `reconciled`. The host never auto-retries; the operator drives it.
-  Reconciliation is concurrency-safe: the effect is **claimed** atomically (`unknown → reconciling`,
-  compare-and-set) before the reconcile function runs and settled only *from* that claimed state, so
-  two concurrent operators cannot clobber each other (a late "not landed" cannot overwrite a recorded
-  `confirmed`). The claim is **leased**: a `reconciling` row left by a crashed reconciler is reclaimable
-  after the lease window, so a mid-reconcile crash never strands the effect; a failing reconcile
-  function releases the claim back to `unknown`.
+  Reconciliation is concurrency-safe, using the migration outbox's owned-lease shape: the effect is
+  **claimed** atomically (`unknown → reconciling`) under a random **owner id**, and a terminal settle
+  requires that owner id **and** a live lease — so two operators cannot clobber each other, and a
+  stale/expired reconciler can neither overwrite a recorded `confirmed` nor reset a newer holder's claim
+  (a reclaim mints a *different* owner id). The claim is **leased**: a `reconciling` row left by a crashed
+  reconciler is reclaimable after the window, so a mid-reconcile crash never strands the effect; a
+  failing reconcile releases the claim (owner-id match only, so an expired holder can always relinquish).
+  Lease creation and expiry use **database time** on Postgres, so a fast host clock cannot steal a live
+  claim. New store columns `reconcile_claim_id` + `reconcile_lease_expires_at` (SQLite v11, Postgres v9).
 - Making the `reconcile` contract and an acknowledged isolation profile **mandatory** at registration
   for `side_effecting=True` is the immediately following change (Section 7 PR 2b).
 

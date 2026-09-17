@@ -1469,10 +1469,13 @@ class RuntimeTests(unittest.TestCase):
         # non-secret) effect_id is NOT launch authority -- the auditor's round-3 P1s. There is no public
         # rebindable predicate any more.
         from portmark.tools import ToolExecutionError
-        self.assertFalse(hasattr(registry, "bind_effect_ledger"))  # the rebindable-predicate hole is gone
-        # Attach a read-only ledger view, exactly as AgentHost does. arm validates against it.
+        # Arming is NOT a public registry method any more (round-3-r1 hole: a public mint let a caller
+        # forge capabilities). It is only reachable via the handle attach_effect_ledger returns.
+        self.assertFalse(hasattr(registry, "bind_effect_ledger"))   # the rebindable-predicate hole is gone
+        self.assertFalse(hasattr(registry, "arm_effect_launch"))    # no public mint
+        # Attach a read-only ledger view, exactly as AgentHost does; keep the private armer handle.
         ledger: dict[str, dict] = {}
-        registry.attach_effect_ledger(lambda eid: ledger.get(eid))
+        armer = registry.attach_effect_ledger(lambda eid: ledger.get(eid))
         self.assertRaises(RuntimeError, registry.attach_effect_ledger, lambda eid: None)  # set-once
         pay_args = {"amount": 10}
         canonical_pay = canonical_json(pay_args).decode("utf-8")
@@ -1481,10 +1484,15 @@ class RuntimeTests(unittest.TestCase):
             registry.invoke(permit, "iso.pay", pay_args)
         # (b) A fabricated effect_id has no `started` row -> cannot even be armed.
         with self.assertRaisesRegex(SecurityError, "no `started` ledger row matches|not launch authority"):
-            registry.arm_effect_launch("forged", "iso.pay", pay_args)
+            armer.arm("forged", "iso.pay", pay_args)
         # Record a real started row and arm a capability for it (as the host does pre-launch).
         ledger["e-real"] = {"effect_id": "e-real", "state": "started", "tool": "iso.pay", "arguments_json": canonical_pay}
-        cap = registry.arm_effect_launch("e-real", "iso.pay", pay_args)
+        cap = armer.arm("e-real", "iso.pay", pay_args)
+        # (b2) CALIBRATED: even the armer cannot mint a SECOND outstanding capability for one started
+        #      effect (the auditor's repeated-minting bypass). Calibration (gate ledger): drop the
+        #      `any(existing[0] == effect_id ...)` refusal in arm -> a second cap is minted and this fails.
+        with self.assertRaisesRegex(SecurityError, "already outstanding"):
+            armer.arm("e-real", "iso.pay", pay_args)
         # (c) A fabricated capability string never armed -> refuse.
         with self.assertRaisesRegex(SecurityError, "does not authorize"):
             registry.invoke(permit, "iso.pay", pay_args, launch_capability="fabricated-cap")
@@ -1540,7 +1548,7 @@ class RuntimeTests(unittest.TestCase):
             )
             host = make_host(store=store, allow_ephemeral_signing_key=True)
             host.tools = tools
-            host.tools.attach_effect_ledger(host._effect_ledger_row)  # plain-attribute swap: re-attach the ledger view (round 3)
+            host._effect_armer = host.tools.attach_effect_ledger(host._effect_ledger_row)  # plain-attribute swap: re-attach + re-arm (round 3)
             # Under B-lite the host policy must name the argument it allows; a bare
             # policy grant now denies unnamed arguments. This test is about the kill
             # audit, not argument policy, so the grant declares `seconds` explicitly.
@@ -1569,7 +1577,7 @@ class RuntimeTests(unittest.TestCase):
         )
         host = make_host(store=store, allow_ephemeral_signing_key=True)
         host.tools = tools
-        host.tools.attach_effect_ledger(host._effect_ledger_row)  # plain-attribute swap: re-attach the ledger view (round 3)
+        host._effect_armer = host.tools.attach_effect_ledger(host._effect_ledger_row)  # plain-attribute swap: re-attach + re-arm (round 3)
         host.policy = HostPolicy(
             host.host_id,
             (ToolGrant("iso.charge", {"arguments": {"dir": {"type": "string"}, "amount": {"type": "integer"}}}),),
@@ -1747,40 +1755,52 @@ class RuntimeTests(unittest.TestCase):
             self.assertFalse((Path(directory) / "attempts.log").exists())  # never launched under reconciliation
             self.assertTrue(any(event["event"] == "tool.refused" for event in result.audit))
 
-    def test_effect_reconcile_claim_is_cas_lease_bounded_and_race_safe(self):
-        # P3 round 3: reconciliation must not let two operators clobber each other. The claim is a CAS
-        # (unknown -> reconciling) with a lease, and settlement is CAS from the claimed state, so a late
-        # "not landed" cannot overwrite an already-recorded `confirmed`. Runs on SQLite AND (when a DSN is
-        # set) Postgres via two real synchronized connections -- the bar the Section-6 auditor set for a
-        # concurrency claim ("sequential conflicts only" was rejected there).
+    def test_effect_reconcile_claim_is_owned_lease_bounded_and_race_safe(self):
+        # P3 round 3 remediation: a reconcile claim has an OWNER (reconcile_claim_id). Two operators
+        # cannot clobber each other -- a stale/expired holder can neither overwrite a recorded settlement
+        # nor reset a newer holder's claim, because a reclaim mints a DIFFERENT claim_id and the terminal
+        # settle requires the owning id AND a live lease. Runs on SQLite AND (when a DSN is set) Postgres
+        # via two real synchronized connections -- the bar the Section-6 auditor set for a concurrency claim.
         for context in self._store_case_contexts():
             with context as (backend, store):
                 with self.subTest(backend=backend):
-                    now = int(time.time())
-                    far_past, far_future = now - 10_000, now + 10_000
-
                     def seed_unknown(eid: str) -> None:
                         store.record_effect_prepared(eid, "t", "iso.charge", "{}")
                         store.mark_effect_started(eid)
                         store.settle_effect(eid, "unknown", None, "kill")
 
-                    # Lease semantics: unknown is claimable; a FRESH reconciling is not (lease live); a
-                    # reconciling older than the bound IS reclaimable (dead reconciler never strands it).
-                    seed_unknown("lease-1")
-                    self.assertTrue(store.claim_effect_for_reconcile("lease-1", far_past))   # unknown -> reconciling
-                    self.assertFalse(store.claim_effect_for_reconcile("lease-1", far_past))  # fresh reconciling: lease live
-                    self.assertTrue(store.claim_effect_for_reconcile("lease-1", far_future))  # lease-expired -> reclaim
+                    # A FRESH claim's live lease blocks another owner (lease_seconds is the NEW claim's).
+                    seed_unknown("live-1")
+                    self.assertTrue(store.claim_effect_for_reconcile("live-1", "A", 10_000))    # unknown -> reconciling (A)
+                    self.assertFalse(store.claim_effect_for_reconcile("live-1", "B", 10_000))   # A's lease live -> B refused
 
-                    # CAS settle: a claimant settles from `reconciling`; a late loser cannot clobber it.
+                    # An EXPIRED claim is reclaimable, and the reclaim mints a NEW owner id (A is seeded
+                    # with an already-expired lease, since we cannot wait out a real lease window here).
+                    seed_unknown("exp-1")
+                    self.assertTrue(store.claim_effect_for_reconcile("exp-1", "A", -1))         # claim, immediately expired
+                    self.assertTrue(store.claim_effect_for_reconcile("exp-1", "C", 10_000))     # A expired -> C reclaims
+                    self.assertEqual(store.get_effect("exp-1")["reconcile_claim_id"], "C")      # reclaim minted a NEW owner
+                    # A (the original, now-superseded holder) can no longer settle OR reset C's live claim.
+                    self.assertFalse(store.settle_effect_from_claim("exp-1", "A", "confirmed", None, "stale settle"))
+                    self.assertFalse(store.release_effect_claim("exp-1", "A"))                  # nor reset it to unknown
+                    self.assertEqual(store.get_effect("exp-1")["state"], "reconciling")         # C's claim untouched
+
+                    # Owned CAS settle: the owner settles; a late loser with its OWN id cannot clobber it.
                     seed_unknown("cas-1")
-                    self.assertTrue(store.claim_effect_for_reconcile("cas-1", far_past))
-                    self.assertTrue(store.settle_effect_from("cas-1", "reconciling", "confirmed",
-                                                             canonical_json({"charged": 5}).decode("utf-8"), "landed"))
-                    # A late "not landed" from a stale reconciler: state is `confirmed`, not `reconciling` -> no-op.
-                    self.assertFalse(store.settle_effect_from("cas-1", "reconciling", "reconciled", None, "did not land"))
+                    self.assertTrue(store.claim_effect_for_reconcile("cas-1", "W", 10_000))
+                    self.assertTrue(store.settle_effect_from_claim("cas-1", "W", "confirmed",
+                                                                   canonical_json({"charged": 5}).decode("utf-8"), "landed"))
+                    self.assertFalse(store.settle_effect_from_claim("cas-1", "L", "reconciled", None, "did not land"))  # loser's own id
+                    self.assertFalse(store.settle_effect_from_claim("cas-1", "W", "reconciled", None, "did not land"))  # even W: no longer reconciling
                     final = store.get_effect("cas-1")
                     self.assertEqual(final["state"], "confirmed")
                     self.assertEqual(json.loads(final["result_json"])["charged"], 5)  # confirmed result intact
+
+                    # Expired holder may RELEASE its own claim back to unknown (liveness) when NOT reclaimed.
+                    seed_unknown("rel-1")
+                    self.assertTrue(store.claim_effect_for_reconcile("rel-1", "R", -10_000))  # immediately-expired claim
+                    self.assertTrue(store.release_effect_claim("rel-1", "R"))                 # its own holder relinquishes
+                    self.assertEqual(store.get_effect("rel-1")["state"], "unknown")           # retryable, not stranded
 
                     # Two real connections race to claim the SAME unknown effect; exactly one wins.
                     seed_unknown("race-1")
@@ -1788,13 +1808,13 @@ class RuntimeTests(unittest.TestCase):
                     wins: list[bool] = []
                     lock = threading.Lock()
 
-                    def claim() -> None:
+                    def claim(claim_id: str) -> None:
                         barrier.wait()
-                        won = store.claim_effect_for_reconcile("race-1", far_past)
+                        won = store.claim_effect_for_reconcile("race-1", claim_id, 10_000)
                         with lock:
                             wins.append(won)
 
-                    threads = [threading.Thread(target=claim) for _ in range(2)]
+                    threads = [threading.Thread(target=claim, args=(cid,)) for cid in ("race-A", "race-B")]
                     for thread in threads:
                         thread.start()
                     for thread in threads:
@@ -1811,8 +1831,8 @@ class RuntimeTests(unittest.TestCase):
             host.run(envelope)
             eid = self._charge_eid(envelope, directory)
             self.assertEqual(store.get_effect(eid)["state"], "unknown")
-            # Simulate a reconcile already in flight (claim held, lease live).
-            self.assertTrue(store.claim_effect_for_reconcile(eid, int(time.time()) - 10_000))
+            # Simulate a reconcile already in flight (another worker holds a live claim).
+            self.assertTrue(store.claim_effect_for_reconcile(eid, "other-worker", 10_000))
             with self.assertRaisesRegex(SecurityError, "only an unknown"):
                 host.reconcile_effect(eid, envelope.state.task_id)
 
@@ -1825,9 +1845,9 @@ class RuntimeTests(unittest.TestCase):
         permit = self._isolated_permit("iso.pay")
         args = {"amount": 3}
         canonical_args = canonical_json(args).decode("utf-8")
-        registry.attach_effect_ledger(lambda eid: {"effect_id": eid, "state": "started", "tool": "iso.pay", "arguments_json": canonical_args} if eid == "e-1" else None)
-        cap = registry.arm_effect_launch("e-1", "iso.pay", args)
-        registry.disarm(cap)  # the host's `finally` path
+        armer = registry.attach_effect_ledger(lambda eid: {"effect_id": eid, "state": "started", "tool": "iso.pay", "arguments_json": canonical_args} if eid == "e-1" else None)
+        cap = armer.arm("e-1", "iso.pay", args)
+        armer.disarm(cap)  # the host's `finally` path
         with self.assertRaisesRegex(SecurityError, "does not authorize"):
             registry.invoke(permit, "iso.pay", args, launch_capability=cap)
 
@@ -1850,6 +1870,34 @@ class RuntimeTests(unittest.TestCase):
                     "SELECT name FROM sqlite_master WHERE type='table' AND name='tool_effects'").fetchone())
             store.record_effect_prepared("e1", "t1", "pay", "{}")
             self.assertEqual(store.get_effect("e1")["state"], "prepared")
+
+    def test_sqlite_v10_to_v11_adds_reconcile_lease_columns(self):
+        # Section 7 PR 2 (round 3, G-migration). An existing v10 SQLite store opened by v11 code migrates
+        # to v11 and gains the OWNED-reconcile-lease columns -- the path a real deployment takes. A v10 row
+        # (no lease columns) upgrades untouched and is then claimable under an owner.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime.sqlite"
+            store = SQLiteRuntimeStore(path)  # full v11
+            store.record_effect_prepared("e1", "t1", "pay", "{}")  # a pre-existing row
+            with self._raw_sqlite(str(path)) as connection:  # roll it back to look like v10
+                connection.execute("ALTER TABLE tool_effects DROP COLUMN reconcile_claim_id")
+                connection.execute("ALTER TABLE tool_effects DROP COLUMN reconcile_lease_expires_at")
+                connection.execute("PRAGMA user_version = 10")
+            with self._raw_sqlite(str(path)) as connection:
+                self.assertEqual(int(connection.execute("PRAGMA user_version").fetchone()[0]), 10)
+
+            store = SQLiteRuntimeStore(path)  # v11 code opens a v10 db -> migrates
+            with self._raw_sqlite(str(path)) as connection:
+                self.assertEqual(int(connection.execute("PRAGMA user_version").fetchone()[0]), SQLITE_SCHEMA_VERSION)
+                columns = {row[1] for row in connection.execute("PRAGMA table_info(tool_effects)").fetchall()}
+                self.assertIn("reconcile_claim_id", columns)
+                self.assertIn("reconcile_lease_expires_at", columns)
+            # The pre-existing row survived and now carries NULL lease fields; make it unknown + claim it.
+            self.assertEqual(store.get_effect("e1")["reconcile_claim_id"], None)
+            store.mark_effect_started("e1")
+            store.settle_effect("e1", "unknown", None, "kill")
+            self.assertTrue(store.claim_effect_for_reconcile("e1", "owner-1", 300))
+            self.assertEqual(store.get_effect("e1")["reconcile_claim_id"], "owner-1")
 
     def test_constrained_grant_denies_unknown_arguments_without_an_explicit_flag(self):
         # Regression: a grant that constrains ANY argument thereby whitelists the
@@ -2268,7 +2316,7 @@ class RuntimeTests(unittest.TestCase):
             )
             host = make_host(store=store, allow_ephemeral_signing_key=True)
             host.tools = tools
-            host.tools.attach_effect_ledger(host._effect_ledger_row)  # plain-attribute swap: re-attach the ledger view (round 3)
+            host._effect_armer = host.tools.attach_effect_ledger(host._effect_ledger_row)  # plain-attribute swap: re-attach + re-arm (round 3)
             budget = ResourceBudget(max_steps=6, max_tool_calls=2, max_output_bytes=32768)
             host.policy = HostPolicy(
                 host.host_id,
@@ -2316,7 +2364,7 @@ class RuntimeTests(unittest.TestCase):
             tools.register("noop", lambda arguments: {"ok": True})
             host = make_host(store=store, allow_ephemeral_signing_key=True)
             host.tools = tools
-            host.tools.attach_effect_ledger(host._effect_ledger_row)  # plain-attribute swap: re-attach the ledger view (round 3)
+            host._effect_armer = host.tools.attach_effect_ledger(host._effect_ledger_row)  # plain-attribute swap: re-attach + re-arm (round 3)
             budget = ResourceBudget(max_steps=6, max_tool_calls=2, max_output_bytes=32768)
             host.policy = HostPolicy(host.host_id, (ToolGrant("noop", {"arguments": {"n": {"type": "number"}}}),), budget)
             host.providers["big"] = OversizedResultProvider()  # never reached; admission fails first
@@ -3120,6 +3168,43 @@ class RuntimeTests(unittest.TestCase):
                 self.assertIsNotNone(exists)
             store.record_effect_prepared("e1", "t1", "pay", "{}")
             self.assertEqual(store.get_effect("e1")["state"], "prepared")
+        finally:
+            self._drop_postgres_schema(dsn, schema)
+
+    @unittest.skipUnless(
+        os.environ.get("PORTMARK_TEST_POSTGRES_DSN") and PostgresRuntimeStore.available(),
+        "needs a live Postgres (PORTMARK_TEST_POSTGRES_DSN)",
+    )
+    def test_postgres_v8_to_v9_adds_reconcile_lease_columns(self):
+        # Section 7 PR 2 (round 3, Postgres upgrade path). A v8 schema (tool_effects WITHOUT the owned-
+        # lease columns) re-initialized by v9 code ADDs reconcile_claim_id + reconcile_lease_expires_at
+        # idempotently and bumps the recorded version to 9. A pre-existing row upgrades and is claimable.
+        import psycopg
+        dsn = os.environ["PORTMARK_TEST_POSTGRES_DSN"]
+        schema = "portmark_upgrade_" + secrets.token_hex(8)
+        try:
+            store = PostgresRuntimeStore(dsn, schema=schema)  # full v9 schema
+            store.record_effect_prepared("e1", "t1", "pay", "{}")
+            with psycopg.connect(dsn) as connection:  # roll back to look like v8
+                connection.execute(f'SET search_path TO "{schema}"')
+                connection.execute("ALTER TABLE tool_effects DROP COLUMN reconcile_claim_id")
+                connection.execute("ALTER TABLE tool_effects DROP COLUMN reconcile_lease_expires_at")
+                connection.execute("UPDATE portmark_schema SET version = 8")
+                connection.commit()
+            store = PostgresRuntimeStore(dsn, schema=schema)  # re-initialize as v9
+            with psycopg.connect(dsn) as connection:
+                connection.execute(f'SET search_path TO "{schema}"')
+                version = connection.execute("SELECT version FROM portmark_schema").fetchone()[0]
+                self.assertEqual(version, POSTGRES_SCHEMA_VERSION)
+                columns = {row[0] for row in connection.execute(
+                    "SELECT column_name FROM information_schema.columns WHERE table_schema = %s AND table_name = 'tool_effects'",
+                    (schema,)).fetchall()}
+                self.assertIn("reconcile_claim_id", columns)
+                self.assertIn("reconcile_lease_expires_at", columns)
+            store.mark_effect_started("e1")
+            store.settle_effect("e1", "unknown", None, "kill")
+            self.assertTrue(store.claim_effect_for_reconcile("e1", "owner-1", 300))
+            self.assertEqual(store.get_effect("e1")["reconcile_claim_id"], "owner-1")
         finally:
             self._drop_postgres_schema(dsn, schema)
 
