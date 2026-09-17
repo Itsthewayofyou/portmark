@@ -22,13 +22,19 @@ Tool = Callable[[dict[str, Any]], Any]
 
 
 @dataclass(frozen=True)
-class LaunchArmer:
-    """Private handle returned by ToolRegistry.attach_effect_ledger and held only by AgentHost. `arm`
-    mints a one-use launch capability for a `started` side-effecting effect; `disarm` drops one that was
-    not consumed. Bundling them here (instead of public registry methods) is what stops any caller with
-    a registry reference from minting capabilities (Section 7 PR 2, round 3 remediation)."""
+class EffectLedgerAuthority:
+    """Private handle returned by ToolRegistry.attach_effect_ledger and held only by AgentHost. It is
+    the ONLY way to reach the two effect-ledger operations that must not be public:
+      * `arm` mints a one-use launch capability for a `started` effect (`disarm` drops an unconsumed
+        one), so knowledge of a deterministic effect_id is not launch authority; and
+      * `run_reconcile` executes a side-effecting tool's reconcile target, but only for an effect the
+        host has already CLAIMED under an owned lease (Section 7 PR 2b round 2) -- there is no public
+        registry method that runs a reconcile target with caller-chosen inputs.
+    Bundling these here (instead of public registry methods) is what stops any caller with a registry
+    reference from minting a launch or triggering a reconcile-target execution."""
     arm: Callable[[str, str, dict[str, Any]], str]
     disarm: Callable[[str | None], None]
+    run_reconcile: Callable[[str, str, dict[str, Any], str], Any]
 
 
 class IsolationMechanism(Enum):
@@ -336,6 +342,18 @@ class ToolRegistry:
             r_module, r_sep, r_object = reconcile.partition(":")
             if not r_sep or not r_module or not r_object:
                 raise ValueError("register_isolated reconcile must use module:function syntax")
+            if reconcile == target:
+                # PR 2b round 2: the reconcile target must be a DISTINCT function from the tool. A
+                # reconcile is observational -- it CHECKS whether the effect landed; it must never BE
+                # the effect. Registering the effectful tool as its own reconcile target is the exact
+                # exploit the auditor ran (a reconcile execution then fires the charge). The runtime
+                # cannot verify a reconcile target is genuinely read-only, so it enforces the one thing
+                # it can (distinctness) and documents the read-only requirement as an operator contract.
+                raise SecurityError(
+                    f"reconcile target for {name!r} must be a DISTINCT function from the tool target "
+                    f"{target!r}; a reconcile must observe whether the effect landed, never re-run it. "
+                    "The runtime cannot verify read-only-ness; keeping them distinct is the contract."
+                )
         if side_effecting:
             # Section 7 PR 2b: the MANDATORY side-effecting startup gate. Validate the full contract
             # BEFORE mutating any state, so a refused registration leaves the registry untouched
@@ -359,6 +377,9 @@ class ToolRegistry:
                     "be resolved. (Section 7 PR 2b -- reconcile is mandatory for side-effecting tools.)"
                 )
             self._assert_isolation_profile(name)
+            # PR 2b round 2: preflight the reconcile target in a worker (import + callable + signature)
+            # so a broken reconcile is caught HERE, not when a real effect first becomes `unknown`.
+            self._preflight_reconcile_target(name, reconcile, env or {})
         self._isolated[name] = _IsolatedSpec(target=target, env=dict(env or {}), reconcile=reconcile)
         self._tools.pop(name, None)
         if timeout is not None:
@@ -373,14 +394,16 @@ class ToolRegistry:
         else:
             self._side_effecting.discard(name)
 
-    def attach_effect_ledger(self, effect_ledger_row: Callable[[str], dict[str, Any] | None]) -> LaunchArmer:
-        """Attach the host's read-only durable-ledger view ONCE and RETURN a private armer handle
-        (Section 7 PR 2, round 3 remediation). AgentHost calls this at construction and keeps the handle;
-        it is the ONLY way to mint a launch capability. Arming is deliberately NOT a public registry
-        method -- otherwise any caller holding the registry could mint capabilities (including several
-        for one `started` effect). Set-once: a second attach raises, so the arming validator cannot be
-        swapped for a permissive one. The row lookup and the armer are captured in the closure, not
-        stored as reassignable attributes."""
+    def attach_effect_ledger(self, effect_ledger_row: Callable[[str], dict[str, Any] | None]) -> EffectLedgerAuthority:
+        """Attach the host's read-only durable-ledger view ONCE and RETURN a private authority handle
+        (Section 7 PR 2, round 3 remediation; reconcile authority added in PR 2b round 2). AgentHost
+        calls this at construction and keeps the handle; it is the ONLY way to mint a launch capability
+        OR execute a reconcile target. Neither is a public registry method -- otherwise any caller
+        holding the registry could mint capabilities (including several for one `started` effect) or run
+        a reconcile TARGET with caller-chosen (tool, arguments, effect_id), which the auditor showed
+        executes an effectful target with no ledger row, no claim, and no launch gate. Set-once: a second
+        attach raises, so the validators cannot be swapped for permissive ones. The row lookup and the
+        closures are captured here, not stored as reassignable attributes."""
         if self._ledger_attached:
             raise RuntimeError("effect ledger already attached; it is set once and cannot be re-attached")
         self._ledger_attached = True
@@ -413,7 +436,38 @@ class ToolRegistry:
             with self._arm_lock:
                 self._armed.pop(capability, None)
 
-        return LaunchArmer(arm=arm, disarm=disarm)
+        def run_reconcile(effect_id: str, tool: str, arguments: dict[str, Any], claim_id: str) -> Any:
+            # Execute a side-effecting tool's reconcile target -- ONLY for an effect the host has already
+            # CLAIMED under its owned lease. Validate against the durable ledger row before running:
+            #   * a row exists and is in `reconciling` (the state claim_effect_for_reconcile creates);
+            #   * its reconcile_claim_id equals THIS claim_id -- the host's unguessable token_urlsafe(24),
+            #     minted only after claim_effect_for_reconcile atomically proved live-lease ownership; and
+            #   * the recorded tool and canonical arguments match what the host passed (the STORED args,
+            #     not caller-chosen), so a run cannot be retargeted to a different call's inputs.
+            # Liveness note: the runner binds to the claim_id, NOT a re-read lease. The lease was proven
+            # live atomically by claim_effect_for_reconcile; the registry has no handle on the store's
+            # time base (Postgres uses DB time, embedded stores an injected clock), so re-checking expiry
+            # here could not be done consistently. The claim_id carries the weight -- it is unguessable
+            # and unique per claim, so a stale/foreign holder cannot match a live row. This is why the
+            # reconcile authority lives here (private, host-only) and not as a public registry method:
+            # that method (removed in PR 2b round 2) ran the target with no row, no claim, no gate.
+            row = effect_ledger_row(effect_id)
+            canonical_args = canonical_json(arguments).decode("utf-8")
+            if (
+                row is None
+                or row["state"] != "reconciling"
+                or row.get("reconcile_claim_id") != claim_id
+                or row["tool"] != tool
+                or row["arguments_json"] != canonical_args
+            ):
+                raise SecurityError(
+                    f"cannot run a reconcile for effect {effect_id!r}: it must be a `reconciling` row "
+                    "owned by this claim whose recorded tool and arguments match. A reconcile target is "
+                    "run only through the host's claimed-lease path, never directly via the registry."
+                )
+            return self._run_reconcile_target(tool, arguments, effect_id)
+
+        return EffectLedgerAuthority(arm=arm, disarm=disarm, run_reconcile=run_reconcile)
 
     def is_side_effecting(self, name: str) -> bool:
         """Whether the tool is registered side-effecting (the host wraps it in the effect ledger)."""
@@ -469,11 +523,43 @@ class ToolRegistry:
         spec = self._isolated.get(name)
         return spec is not None and spec.reconcile is not None
 
-    def reconcile(self, name: str, arguments: dict[str, Any], effect_id: str) -> Any:
-        """Run a tool's registered reconcile function (isolated, with the effect_id) to determine
-        whether its external effect landed. Host-invoked during the reconcile pass -- NOT an
-        agent-facing tool call, so it does not go through the permit/constraint check. Returns the
-        reconcile function's result (by contract, a dict like {"landed": bool, "result"?: ...})."""
+    def _preflight_reconcile_target(self, name: str, reconcile_target: str, env: dict[str, str]) -> None:
+        """Spawn a worker to verify a side-effecting tool's reconcile target is importable, callable and
+        accepts (arguments, effect_id) -- WITHOUT running it -- at registration (Section 7 PR 2b round 2).
+        Registration otherwise validated only module:function SYNTAX, so a nonexistent module, missing
+        function, non-callable object or wrong signature was discovered only when a real effect became
+        `unknown` and the reconcile then failed, stranding it. Fail closed. The two failure classes are
+        DISTINGUISHED in the message: a worker that could not START (a sandbox blocking subprocess spawn)
+        is not a bad target -- but the tool itself could not run there either, so registration is still
+        refused. This proves the target is DECLARED, importable and shaped correctly; it cannot prove the
+        reconcile is semantically correct or read-only (only a deployment test against the real system can)."""
+        spec = _IsolatedSpec(target=reconcile_target, env=dict(env))
+        try:
+            self._invoke_isolated(spec, {}, self.default_timeout, 4096, preflight=True)
+        except ToolKilledError as error:
+            raise SecurityError(
+                f"reconcile preflight for tool {name!r} (target {reconcile_target!r}) did not complete "
+                "within the deadline; refusing to register."
+            ) from error
+        except ToolExecutionError as error:
+            # Carries the worker's own reason, which distinguishes a broken TARGET ("reconcile target
+            # could not be imported / is not callable / does not accept (arguments, effect_id)") from a
+            # preflight worker that COULD NOT START ("could not start isolated tool worker").
+            raise SecurityError(
+                f"reconcile target {reconcile_target!r} for tool {name!r} failed preflight: {error}. A "
+                "side-effecting tool's reconcile target must be importable, callable, and accept "
+                "(arguments, effect_id); refusing to register."
+            ) from error
+
+    def _run_reconcile_target(self, name: str, arguments: dict[str, Any], effect_id: str) -> Any:
+        """Run a tool's registered reconcile function (isolated, with the effect_id) to determine whether
+        its external effect landed. PRIVATE (PR 2b round 2): reachable ONLY through the run_reconcile
+        closure of the EffectLedgerAuthority, which the host holds and calls only for an effect it has
+        already claimed under an owned lease -- there is no public method that runs a reconcile target,
+        because one (the old `reconcile()`) let any registry holder execute an effectful target with a
+        fabricated effect_id, no ledger row, and no launch gate. NOT an agent-facing tool call, so it
+        does not go through the permit/constraint check. Returns the reconcile function's result (by
+        contract, a dict like {"landed": bool, "result"?: ...})."""
         spec = self._isolated.get(name)
         if spec is None or spec.reconcile is None:
             raise ToolExecutionError(f"tool {name!r} has no reconcile function registered")
@@ -591,7 +677,8 @@ class ToolRegistry:
         return self._checked_output(value, cap)
 
     def _invoke_isolated(
-        self, spec: _IsolatedSpec, arguments: dict[str, Any], timeout: float, cap: int, effect_id: str | None = None
+        self, spec: _IsolatedSpec, arguments: dict[str, Any], timeout: float, cap: int, effect_id: str | None = None,
+        preflight: bool = False,
     ) -> Any:
         # Section 7 #6: hand the worker its resource caps. cpu_seconds is a kernel backstop for the
         # wall-clock deadline (a CPU-bound tool that ignores the clock still dies), set a little
@@ -602,6 +689,10 @@ class ToolRegistry:
         payload: dict[str, Any] = {
             "target": spec.target, "arguments": arguments, "max_output_bytes": cap, "rlimits": rlimits
         }
+        # Section 7 PR 2b round 2: preflight mode imports + type-checks the target WITHOUT running it,
+        # so register_isolated can catch a broken reconcile target at startup, not at first `unknown`.
+        if preflight:
+            payload["preflight"] = True
         # Section 7 PR 2: side-effecting tools (and their reconcile fns) receive a host-derived
         # idempotency key OUTSIDE `arguments` -- the deny-by-default argument-name whitelist in
         # check_constraints would reject an injected key. The worker passes it as tool(arguments, effect_id).

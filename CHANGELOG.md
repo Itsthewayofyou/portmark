@@ -38,10 +38,27 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   non-serializable result (`content.rejected`) — the audit event carries the profile's `mechanism` +
   `acknowledged_by`, so an incident responder resolving the unknown effect sees what containment was
   claimed at registration — the profile is a real downstream consumer, not a gate input nothing reads.
-- **Scope (unchanged from 2a).** This closes the public-API path into a side-effecting launch without the
-  contract; it is **not** protection against arbitrary malicious in-process Python. The `IsolationProfile`
-  records a CLAIM about the deployment; it cannot verify the container is actually running. Containment
-  of a hostile tool remains the deployment substrate's job (see THREAT_MODEL.md).
+- **Reconcile execution is now private host authority (round 2 — closes a High-severity public-API bypass).**
+  The public `ToolRegistry.reconcile()` method is **removed**. It ran a reconcile *target* with
+  caller-chosen tool, arguments and effect_id and no gate — so registering the effectful tool as its own
+  reconcile target let any registry holder execute the effect with a fabricated effect_id, no ledger row,
+  no claim and no launch capability. Reconcile execution now lives behind the same private handle as the
+  launch armer (`run_reconcile`), runs a target only for an effect the host has already **claimed** under
+  its owned lease, and only when the row's recorded tool and arguments match. The reconcile target must be
+  **distinct** from the tool (the self-target exploit is refused at registration), and it must be
+  observational/read-only — a contract the runtime documents but cannot verify.
+- **The reconcile target is preflighted at registration (round 2).** A worker imports it and checks it is
+  callable and accepts `(arguments, effect_id)` **without running it**, so a non-importable / missing /
+  non-callable / wrong-signature reconcile is caught at startup instead of when a real effect first
+  becomes `unknown`. Docs describe the reconcile as a **declared** target, not a verified implementation;
+  semantic correctness still requires a deployment test against the real system.
+- **`effect_status:"unknown"` is recorded on all three effect-unknown audit events (round 2).** Previously
+  only `tool.killed` carried it; `tool.failed` and `content.rejected` now do too when a side-effecting
+  effect settled unknown, so incident analysis is self-contained.
+- **Scope (unchanged from 2a).** This closes the public-API path into a side-effecting launch OR reconcile
+  without the contract; it is **not** protection against arbitrary malicious in-process Python. The
+  `IsolationProfile` records a CLAIM about the deployment; it cannot verify the container is actually
+  running. Containment of a hostile tool remains the deployment substrate's job (see THREAT_MODEL.md).
 
 ### Section 7 — tool execution isolation (PR 2a): idempotency/reconciliation effect ledger
 

@@ -1677,6 +1677,11 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(result.status, "failed")  # tool raised after the effect landed
             eid = self._charge_eid(envelope, directory)
             self.assertEqual(store.get_effect(eid)["state"], "unknown")
+            # Section 7 PR 2b round 2 (G18): the tool.failed event self-records effect_status:"unknown"
+            # (as tool.killed already did), so an incident responder need not cross-reference the ledger.
+            # Neutralize: drop `failed_details["effect_status"] = "unknown"` in host._apply_decision -> fails.
+            failed = next(event for event in result.audit if event["event"] == "tool.failed")
+            self.assertEqual(failed["details"]["effect_status"], "unknown")
             # Reconcile finds the landed marker -> confirmed.
             self.assertEqual(host.reconcile_effect(eid, envelope.state.task_id), "confirmed")
             self.assertEqual(store.get_effect(eid)["state"], "confirmed")
@@ -7946,6 +7951,15 @@ class IsolationProfileGateTests(unittest.TestCase):
     patch _has_tree_termination_primitive to True so they isolate the 2b logic and run on every
     platform; they never spawn a worker (registration and the pre-capability re-check raise first)."""
 
+    def setUp(self):
+        # These tests exercise the GATE LOGIC (reconcile presence, profile, platform, membership, launch
+        # re-check) with lightweight fake targets ("m:f"/"m:r"). The reconcile-target PREFLIGHT (its own
+        # subprocess, which would reject "m:r" as non-importable) is exercised separately in
+        # ReconcilePreflightTests, so patch it to a no-op here to keep these fast and target-agnostic.
+        preflight_patch = patch.object(ToolRegistry, "_preflight_reconcile_target", lambda self, *a, **k: None)
+        preflight_patch.start()
+        self.addCleanup(preflight_patch.stop)
+
     def _profile(self, mechanism=IsolationMechanism.EXTERNAL_CONTAINER, by="ops"):
         return IsolationProfile(mechanism=mechanism, acknowledged_by=by)
 
@@ -8038,6 +8052,91 @@ class IsolationProfileGateTests(unittest.TestCase):
         self.assertIn("iso.read", registry.names())
         self.assertFalse(registry.is_side_effecting("iso.read"))
         self.assertIsNone(registry.isolation_profile)
+
+    def test_reconcile_target_must_be_distinct_from_the_tool(self):  # G16 (CALIBRATED)
+        # A reconcile is observational; registering the effectful tool as its OWN reconcile target is
+        # the auditor's exploit (a reconcile execution then fires the charge). Refused at registration.
+        # Neutralize the `reconcile == target` check -> this registration is accepted.
+        registry = ToolRegistry(isolation_profile=self._profile())
+        with self.assertRaisesRegex(SecurityError, "DISTINCT function"):
+            registry.register_isolated(
+                "pay", "mytools:charge", side_effecting=True, reconcile="mytools:charge"
+            )
+        self.assertNotIn("pay", registry.names())
+        # A distinct reconcile target is accepted (preflight patched out by setUp).
+        registry.register_isolated("pay", "mytools:charge", side_effecting=True, reconcile="mytools:check")
+        self.assertIn("pay", registry.names())
+
+
+class ReconcilePreflightTests(unittest.TestCase):
+    """Section 7 PR 2b round 2: the private reconcile authority (G15) and the worker-based reconcile
+    preflight (G17). These spawn real workers, so they need a process-tree termination primitive."""
+
+    def _env(self):
+        import portmark
+
+        src_dir = os.path.dirname(os.path.dirname(os.path.abspath(portmark.__file__)))
+        tests_dir = os.path.dirname(os.path.abspath(__file__))
+        return {"PYTHONPATH": os.pathsep.join([src_dir, tests_dir])}
+
+    @unittest.skipUnless(_has_tree_termination_primitive(), "reconcile preflight/authority spawn a worker")
+    def test_public_reconcile_runner_is_gone_and_authority_validates_the_row(self):  # G15 (CALIBRATED)
+        registry = ToolRegistry(isolation_profile=_TEST_ISOLATION_PROFILE)
+        registry.register_isolated(
+            "iso.charge", "isolated_tool_fixtures:idempotent_charge", side_effecting=True,
+            reconcile="isolated_tool_fixtures:reconcile_charge", env=self._env(),
+        )
+        # The public reconcile RUNNER that let any registry holder execute a target is gone.
+        self.assertFalse(hasattr(registry, "reconcile"))
+        rows: dict[str, dict] = {}
+        authority = registry.attach_effect_ledger(lambda eid: rows.get(eid))
+        with tempfile.TemporaryDirectory() as directory:
+            args = {"dir": directory, "amount": 5}  # reconcile_charge reads dir + amount
+            canonical_args = canonical_json(args).decode("utf-8")
+            # (a) fabricated effect_id -> no row -> refused (CALIBRATED: the row validation is what
+            #     refuses; neutralize it and a caller-fabricated effect runs the target -- the exploit).
+            with self.assertRaisesRegex(SecurityError, "reconciling"):
+                authority.run_reconcile("fabricated", "iso.charge", args, "claim-1")
+            # (b) row exists but not `reconciling` (never claimed) -> refused
+            rows["e-1"] = {"state": "unknown", "reconcile_claim_id": "claim-1", "tool": "iso.charge", "arguments_json": canonical_args}
+            with self.assertRaisesRegex(SecurityError, "reconciling"):
+                authority.run_reconcile("e-1", "iso.charge", args, "claim-1")
+            # (c) `reconciling` but a DIFFERENT owner claim -> refused (unguessable claim_id carries weight)
+            rows["e-1"] = {"state": "reconciling", "reconcile_claim_id": "OTHER", "tool": "iso.charge", "arguments_json": canonical_args}
+            with self.assertRaisesRegex(SecurityError, "reconciling"):
+                authority.run_reconcile("e-1", "iso.charge", args, "claim-1")
+            # (d) owned + `reconciling` but the arguments do not match the stored ones -> refused
+            rows["e-1"] = {"state": "reconciling", "reconcile_claim_id": "claim-1", "tool": "iso.charge", "arguments_json": canonical_args}
+            with self.assertRaisesRegex(SecurityError, "reconciling"):
+                authority.run_reconcile("e-1", "iso.charge", {"dir": directory, "amount": 99}, "claim-1")
+            # (e) a properly owned, matching `reconciling` row -> the target actually runs and returns its dict.
+            outcome = authority.run_reconcile("e-1", "iso.charge", args, "claim-1")
+            self.assertIn("landed", outcome)
+
+    @unittest.skipUnless(_has_tree_termination_primitive(), "reconcile preflight spawns a worker")
+    def test_preflight_refuses_a_broken_reconcile_target(self):  # G17 (CALIBRATED)
+        registry = ToolRegistry(isolation_profile=_TEST_ISOLATION_PROFILE)
+        broken = [
+            "definitely_not_a_real_module_xyz:fn",               # not importable
+            "isolated_tool_fixtures:does_not_exist",             # missing function
+            "isolated_tool_fixtures:not_a_callable",             # imports but not callable
+            "isolated_tool_fixtures:no_effect_id_param",         # wrong signature (no effect_id)
+        ]
+        for i, bad in enumerate(broken):
+            # CALIBRATED: neutralize the preflight (make _preflight_reconcile_target a no-op) and each
+            # of these broken targets registers successfully, discovered only at first `unknown` effect.
+            with self.assertRaisesRegex(SecurityError, "failed preflight"):
+                registry.register_isolated(
+                    f"iso.bad{i}", "isolated_tool_fixtures:idempotent_charge", side_effecting=True,
+                    reconcile=bad, env=self._env(),
+                )
+            self.assertNotIn(f"iso.bad{i}", registry.names())
+        # A good reconcile target passes preflight and registers.
+        registry.register_isolated(
+            "iso.ok", "isolated_tool_fixtures:idempotent_charge", side_effecting=True,
+            reconcile="isolated_tool_fixtures:reconcile_charge", env=self._env(),
+        )
+        self.assertIn("iso.ok", registry.names())
 
 
 if __name__ == "__main__":

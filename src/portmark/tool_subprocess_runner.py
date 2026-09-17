@@ -134,6 +134,25 @@ def main() -> None:
         return
     real_stdout = sys.stdout
 
+    if request.get("preflight"):
+        # Section 7 PR 2b round 2: import + type-check the target WITHOUT running it, so a broken
+        # reconcile target is caught at registration. Apply caps first (a hostile module import can be
+        # heavy). Nothing is RUN, so nothing could have spawned -- no process-group sweep is needed.
+        try:
+            unapplied = _apply_resource_limits(request.get("rlimits"))
+            if unapplied:
+                ok, value = False, "worker could not apply resource limits: " + ", ".join(unapplied)
+            else:
+                ok, value = _import_and_preflight(module_name, object_path, sink)
+        finally:
+            sink.close()
+        # Route through _finish so the worker runs its process-group self-sweep and exits by SIGKILL,
+        # the containment confirmation the parent (_self_sweep_confirmed) requires before accepting ANY
+        # reply. Importing a target can execute module-scope code that spawns a child, so preflight is
+        # not exempt from the sweep -- it just never CALLS the target.
+        _finish(_respond_ok if ok else _respond_error, value, real_stdout)
+        return
+
     try:
         # Caps THEN untrusted import, both after the trusted bootstrap above. FAIL CLOSED: if any
         # requested cap could not be put in force, do NOT run the tool believing it is capped when
@@ -269,6 +288,30 @@ def _import_and_run(
             return True, result
         except BaseException as error:  # noqa: BLE001 - any tool failure fails closed
             return False, f"tool raised {type(error).__name__}"
+
+
+def _import_and_preflight(module_name: str, object_path: str, sink: Any) -> tuple[bool, Any]:
+    """Import the target and verify it is callable and accepts ``(arguments, effect_id)`` -- WITHOUT
+    running it (Section 7 PR 2b round 2). register_isolated uses this to preflight a side-effecting
+    tool's reconcile target at registration, so a non-importable / missing / non-callable / wrong-
+    signature reconcile is caught at startup instead of only when a real effect first becomes
+    ``unknown`` and cannot be resolved. Fail closed with a controlled reason; never call the target."""
+    with redirect_stdout(sink):
+        try:
+            loaded: Any = importlib.import_module(module_name)
+            for part in object_path.split("."):
+                if not part:
+                    raise AttributeError
+                loaded = getattr(loaded, part)
+        except (ImportError, AttributeError):
+            return False, "reconcile target could not be imported"
+        except BaseException as error:  # noqa: BLE001 - module-scope code failed; fail closed
+            return False, f"reconcile target import raised {type(error).__name__}"
+        if not callable(loaded):
+            return False, "reconcile target is not callable"
+        if not _accepts_effect_id(loaded):
+            return False, "reconcile target does not accept (arguments, effect_id)"
+        return True, "ok"
 
 
 def _respond_ok(result: Any, stream: Any = None) -> None:

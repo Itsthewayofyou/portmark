@@ -398,9 +398,12 @@ authorizes at most one launch. **What this does *not* cover:** a caller that can
 in-process against the registry object (mutating its private state) is outside this gate — that is the
 deployment sandbox's job, per the resource-bounded-worker contract above. The runtime gate closes the
 public-API bypass and defends against a fabricated/guessed/replayed *value*; it is not protection
-against arbitrary malicious in-process Python. (The host's own reconcile pass calls the reconcile function directly, not
-through this gate; that is intentional — a reconcile function is registered separately and is not
-itself `side_effecting`.)
+against arbitrary malicious in-process Python. **Reconcile execution is gated the same way** (PR 2b
+round 2): there is **no public** registry method that runs a reconcile target. The runner lives behind
+the same private handle as the launch armer and executes a target only for an effect the host has
+already **claimed** under its owned lease, and only when the row's recorded tool and arguments match —
+so a caller cannot run a reconcile target with a fabricated effect_id (the exploit that let an
+effectful reconcile target fire with no ledger row and no claim).
 
 > **The tool registry is immutable after host construction.** `AgentHost` binds the private armer to
 > the registry it is given at construction. Replacing `host.tools` afterward is **not supported**: the
@@ -434,6 +437,16 @@ tools.register_isolated(
 )
 ```
 
+**The reconcile target must be a DISTINCT, observational function.** It must never *be* the effect it
+checks — registering the effectful tool as its own reconcile target is refused at registration
+(a reconcile execution would then fire the effect). The runtime cannot verify a target is genuinely
+read-only, so it enforces the one thing it can (distinctness) and this read-only requirement is an
+operator **contract**. At registration a **worker-based preflight** confirms the reconcile target is
+importable, callable and accepts `(arguments, effect_id)` — a broken reconcile is caught at startup,
+not when a real effect first becomes `unknown`. The preflight proves the target is *declared* and
+correctly *shaped*; only a deployment test against the real external system can prove it is
+semantically correct.
+
 **Reconciliation.** An `unknown` effect is resolved by `AgentHost.reconcile_effect(effect_id,
 task_id)` (task-scoped: the effect must belong to that task). It runs the tool's registered
 `reconcile` function — `reconcile(arguments, effect_id) -> {"landed": bool, "result"?: ...}` —
@@ -460,11 +473,10 @@ terminal settle then no-ops); this is a liveness bound, not a double-settle.
 > launch). That is the conservative choice — an operator pays one reconcile round-trip for an
 > effect that did not happen, rather than the host silently assuming it did not and re-running.
 
-> **Not yet enforced here.** PR 2a ships the ledger and the reconcile mechanism; making the
-> `reconcile` contract and an acknowledged isolation profile **mandatory** at registration for
-> `side_effecting=True` is the immediately following change (Section 7 PR 2b). Until then a
-> side-effecting tool may be registered without a `reconcile` function, and its `unknown` effects
-> cannot be reconciled.
+> **Enforced at registration (PR 2b).** A `reconcile` target and an acknowledged, platform-appropriate
+> `IsolationProfile` are now **mandatory** for `side_effecting=True`; the reconcile target is
+> preflighted in a worker and must be distinct from the tool. A side-effecting tool can no longer be
+> registered without a reconcile function, so its `unknown` effects are always reconcilable.
 
 ## Credential Handling
 

@@ -245,7 +245,11 @@ class AgentHost:
             )
         arguments = json.loads(row["arguments_json"])
         try:
-            outcome = self.tools.reconcile(tool, arguments, effect_id)
+            # Run the reconcile target through the PRIVATE authority, bound to this effect_id, tool, the
+            # STORED arguments, and the owned claim_id (PR 2b round 2). The public ToolRegistry.reconcile()
+            # was removed: it let any registry holder execute an effectful reconcile target with a
+            # fabricated effect_id, no ledger row and no claim -- bypassing the launch gate entirely.
+            outcome = self._effect_armer.run_reconcile(effect_id, tool, arguments, claim_id)
             if not isinstance(outcome, dict) or not isinstance(outcome.get("landed"), bool):
                 raise SecurityError("reconcile function must return {'landed': bool, 'result'?: ...}")
             if outcome["landed"]:
@@ -633,9 +637,13 @@ class AgentHost:
                         "cause": type(error.__cause__).__name__ if error.__cause__ is not None else None,
                         "cause_message": str(error.__cause__) if error.__cause__ is not None else "",
                     }
-                    # Section 7 PR 2b: stamp the claimed containment on the effect-unknown event.
-                    if eid is not None and (claim := self._containment_claim()) is not None:
-                        failed_details["isolation_profile"] = claim
+                    # Section 7 PR 2b: for a side-effecting tool this settled the ledger `unknown`, so
+                    # record effect_status:"unknown" (round 2 -- self-contained with tool.killed) AND the
+                    # claimed containment, on the same eid-present condition.
+                    if eid is not None:
+                        failed_details["effect_status"] = "unknown"
+                        if (claim := self._containment_claim()) is not None:
+                            failed_details["isolation_profile"] = claim
                     audit.append("tool.failed", failed_details)
                     audit.append("agent.failed", state.result)
                     return True, None
@@ -1141,8 +1149,11 @@ class AgentHost:
         if tool is not None:
             details["tool"] = tool
         # Section 7 PR 2b: when a SIDE-EFFECTING tool's output is non-serializable its effect also
-        # settled `unknown`, so carry the same containment claim the other effect-unknown events do.
+        # settled `unknown`, so carry effect_status:"unknown" (round 2 -- consistent with tool.killed /
+        # tool.failed) plus the same containment claim. isolation_profile is passed only for that
+        # eid-present case, so it is the correct guard for both.
         if isolation_profile is not None:
+            details["effect_status"] = "unknown"
             details["isolation_profile"] = isolation_profile
         audit.append("content.rejected", details)
         audit.append("agent.failed", state.result)
