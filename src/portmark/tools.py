@@ -10,6 +10,7 @@ import sys
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 from . import _windows_job
@@ -21,13 +22,89 @@ Tool = Callable[[dict[str, Any]], Any]
 
 
 @dataclass(frozen=True)
-class LaunchArmer:
-    """Private handle returned by ToolRegistry.attach_effect_ledger and held only by AgentHost. `arm`
-    mints a one-use launch capability for a `started` side-effecting effect; `disarm` drops one that was
-    not consumed. Bundling them here (instead of public registry methods) is what stops any caller with
-    a registry reference from minting capabilities (Section 7 PR 2, round 3 remediation)."""
+class EffectLedgerAuthority:
+    """Private handle returned by ToolRegistry.attach_effect_ledger and held only by AgentHost. It is
+    the ONLY way to reach the two effect-ledger operations that must not be public:
+      * `arm` mints a one-use launch capability for a `started` effect (`disarm` drops an unconsumed
+        one), so knowledge of a deterministic effect_id is not launch authority; and
+      * `run_reconcile` executes a side-effecting tool's reconcile target, but only for an effect the
+        host has already CLAIMED under an owned lease (Section 7 PR 2b round 2) -- there is no public
+        registry method that runs a reconcile target with caller-chosen inputs.
+    Bundling these here (instead of public registry methods) is what stops any caller with a registry
+    reference from minting a launch or triggering a reconcile-target execution."""
     arm: Callable[[str, str, dict[str, Any]], str]
     disarm: Callable[[str | None], None]
+    run_reconcile: Callable[[str, str, dict[str, Any], str], Any]
+
+
+class IsolationMechanism(Enum):
+    """HOW a deployment contains a side-effecting worker's escaped descendants (Section 7 PR 2b).
+
+    The runtime CANNOT contain a hostile tool on its own -- on POSIX the deadline sweep is a
+    cooperative process-group signal that a setsid() descendant escapes; a genuine payment or
+    booking that already fired cannot be rolled back. Containment is the deployment's job. This
+    enum names the mechanism the operator asserts is in place, and the registration gate cross-checks
+    it against the platform (an over-claim for a platform that lacks the primitive is refused).
+    """
+
+    # The operator runs workers inside a container / VM / seccomp jail / dedicated sandbox that
+    # confines any escaped descendant. This is the operator's own affirmation about the deployment,
+    # not something the runtime can verify -- valid on ANY platform because it does not rely on a
+    # runtime primitive.
+    EXTERNAL_CONTAINER = "external_container"
+    # The operator relies on the platform's own kill-on-close job for the worker tree. Genuine only
+    # where such a primitive exists with NO breakaway -- the Windows Job Object. On POSIX there is no
+    # equivalent (only the cooperative process-group signal above), so this mechanism is refused there.
+    OS_JOB_OBJECT = "os_job_object"
+
+
+@dataclass(frozen=True)
+class IsolationProfile:
+    """An operator's EXPLICIT, non-defaultable acknowledgement of how side-effecting worker processes
+    are contained in this deployment (Section 7 PR 2b). Passed once to ToolRegistry(isolation_profile=...)
+    -- containment is a property of the shared worker-spawn environment, identical for every isolated
+    tool, so it is declared once, not per tool.
+
+    Mirrors the a2a `allow_anonymous=True` idiom: there is NO default that satisfies the registration
+    gate; the operator must construct this object with a real mechanism and name who acknowledged it.
+    `acknowledged_by` is recorded in the audit trail so an incident responder can see what containment
+    was claimed when an effect went `unknown`. This object records a CLAIM; it does not and cannot
+    verify that the container is actually in place.
+    """
+
+    mechanism: IsolationMechanism
+    acknowledged_by: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.mechanism, IsolationMechanism):
+            raise ValueError(
+                "IsolationProfile.mechanism must be an IsolationMechanism, not "
+                f"{type(self.mechanism).__name__}"
+            )
+        if not isinstance(self.acknowledged_by, str) or not self.acknowledged_by.strip():
+            raise ValueError(
+                "IsolationProfile.acknowledged_by must name the operator/team acknowledging the "
+                "deployment's containment (a non-empty string); it is recorded in the audit trail."
+            )
+
+    def audit_summary(self) -> dict[str, str]:
+        """The claim, as recorded on an effect-unknown audit event (Section 7 PR 2b)."""
+        return {"mechanism": self.mechanism.value, "acknowledged_by": self.acknowledged_by}
+
+
+def _profile_contains_on_this_platform(profile: IsolationProfile) -> bool:
+    """Whether the operator's declared containment mechanism genuinely contains a worker's escaped
+    descendants ON THIS PLATFORM (Section 7 PR 2b, coupled-teeth variant). external_container is the
+    operator's own affirmation and is valid anywhere; os_job_object is genuine ONLY where the Windows
+    kill-on-close Job Object exists, so on POSIX (cooperative process-group signal only) it is refused
+    -- there the operator MUST affirm external containment. Named for what it checks; it proves the
+    mechanism is APPROPRIATE for the platform, never that the container is actually running."""
+    if profile.mechanism is IsolationMechanism.EXTERNAL_CONTAINER:
+        return True
+    if profile.mechanism is IsolationMechanism.OS_JOB_OBJECT:
+        return _windows_job.available()
+    return False
+
 
 # Extra bytes the parent will read past the tool's output budget before it
 # declares an overflow: the response is `{"ok": true, "result": <output>}`, so
@@ -152,7 +229,16 @@ class ToolRegistry:
         max_inflight_threaded: int = DEFAULT_MAX_INFLIGHT_THREADED_TOOLS,
         resource_limits: dict[str, int] | None = None,
         disable_resource_limits: bool = False,
+        isolation_profile: IsolationProfile | None = None,
     ) -> None:
+        # Section 7 PR 2b: the operator's containment acknowledgement for side-effecting tools.
+        # None means "not acknowledged" -- registering a side-effecting isolated tool then fails
+        # closed. Containment is one shared property of the worker-spawn environment, so it lives
+        # on the registry, not per tool (a per-tool profile could make inconsistent claims about
+        # one shared fact).
+        if isolation_profile is not None and not isinstance(isolation_profile, IsolationProfile):
+            raise ValueError("isolation_profile must be an IsolationProfile or None")
+        self._isolation_profile = isolation_profile
         self._tools: dict[str, Tool] = {}
         self._isolated: dict[str, _IsolatedSpec] = {}
         self._timeouts: dict[str, float] = {}
@@ -199,12 +285,27 @@ class ToolRegistry:
         self._inflight_threaded = threading.BoundedSemaphore(max_inflight_threaded)
 
     def register(self, name: str, tool: Tool, timeout: float | None = None, side_effecting: bool = False) -> None:
+        if side_effecting:
+            # Section 7 PR 2b: refuse a side-effecting tool on the thread path AT REGISTRATION, not
+            # (as before) only at the first invoke. The thread + queue-timeout path cannot cancel a
+            # tool once started, and this path never arms an effect-ledger launch capability -- so a
+            # side-effecting tool must use register_isolated (which enforces reconcile + IsolationProfile
+            # and runs in a process the host can hard-kill). Registration here let a name into
+            # _side_effecting with no reconcile and no profile: the 2b gate bypassed. Fail closed.
+            raise SecurityError(
+                f"tool {name!r} is side-effecting but register() runs it on the thread-timeout path, "
+                "which cannot cancel a running tool and cannot carry an effect ledger; register it with "
+                "register_isolated(side_effecting=True, reconcile=..., ...) and an acknowledged "
+                "IsolationProfile instead."
+            )
         self._tools[name] = tool
         self._isolated.pop(name, None)
         if timeout is not None:
             self._timeouts[name] = timeout
-        if side_effecting:
-            self._side_effecting.add(name)
+        # A plain (non-side-effecting) register REPLACES any prior registration of this name, so it
+        # must also clear a stale side-effecting membership (e.g. re-registering an isolated
+        # side-effecting name as a plain thread tool). Fail closed on the invariant, not just add.
+        self._side_effecting.discard(name)
 
     def register_isolated(
         self,
@@ -241,32 +342,72 @@ class ToolRegistry:
             r_module, r_sep, r_object = reconcile.partition(":")
             if not r_sep or not r_module or not r_object:
                 raise ValueError("register_isolated reconcile must use module:function syntax")
-        if side_effecting and not _has_tree_termination_primitive():
-            # Fail closed at startup, not at the first payment: on a platform with no
-            # tree-kill primitive the host cannot guarantee the tool and its descendants
-            # stop at the deadline, so it must not promise to run a side-effecting one.
-            raise SecurityError(
-                f"tool {name!r} is side-effecting but this platform cannot hard-kill a worker's "
-                "process tree, so the host cannot guarantee it stops at its deadline; refusing "
-                "to register it. Non-side-effecting isolated tools are allowed."
-            )
+            if reconcile == target:
+                # PR 2b round 2: the reconcile target must be a DISTINCT function from the tool. A
+                # reconcile is observational -- it CHECKS whether the effect landed; it must never BE
+                # the effect. Registering the effectful tool as its own reconcile target is the exact
+                # exploit the auditor ran (a reconcile execution then fires the charge). The runtime
+                # cannot verify a reconcile target is genuinely read-only, so it enforces the one thing
+                # it can (distinctness) and documents the read-only requirement as an operator contract.
+                raise SecurityError(
+                    f"reconcile target for {name!r} must be a DISTINCT function from the tool target "
+                    f"{target!r}; a reconcile must observe whether the effect landed, never re-run it. "
+                    "The runtime cannot verify read-only-ness; keeping them distinct is the contract."
+                )
+        if side_effecting:
+            # Section 7 PR 2b: the MANDATORY side-effecting startup gate. Validate the full contract
+            # BEFORE mutating any state, so a refused registration leaves the registry untouched
+            # (no half-registered name in _isolated with a stripped _side_effecting membership).
+            if not _has_tree_termination_primitive():
+                # Fail closed at startup, not at the first payment: on a platform with no
+                # tree-kill primitive the host cannot guarantee the tool and its descendants
+                # stop at the deadline, so it must not promise to run a side-effecting one.
+                raise SecurityError(
+                    f"tool {name!r} is side-effecting but this platform cannot hard-kill a worker's "
+                    "process tree, so the host cannot guarantee it stops at its deadline; refusing "
+                    "to register it. Non-side-effecting isolated tools are allowed."
+                )
+            if reconcile is None:
+                # reconcile is now MANDATORY for a side-effecting tool (optional in 2a): 2a's whole
+                # failure -> unknown -> reconcile machinery is dead unless every side-effecting tool
+                # declares a reconcile target. Fail closed at startup, not when an effect first hangs.
+                raise SecurityError(
+                    f"tool {name!r} is side-effecting but has no reconcile target; pass "
+                    "reconcile=<module:function> so an effect that fails to a known-unknown state can "
+                    "be resolved. (Section 7 PR 2b -- reconcile is mandatory for side-effecting tools.)"
+                )
+            self._assert_isolation_profile(name)
+            # NOTE (PR 2b round 3): registration does NOT import or otherwise EXECUTE the reconcile target.
+            # An earlier round preflighted it in a worker, but importing arbitrary module code at
+            # registration runs untrusted top-level code before any ledger/permit/claim exists (a
+            # filesystem/network effect that resource caps + tree-kill do not prevent). Registration keeps
+            # only the module:function SYNTAX check and the tool!=reconcile distinctness check (both pure,
+            # no import). Semantic/read-only correctness of the reconcile is the operator's own integration
+            # test, run in a credential-free, egress-denied environment -- not a runtime import.
         self._isolated[name] = _IsolatedSpec(target=target, env=dict(env or {}), reconcile=reconcile)
         self._tools.pop(name, None)
         if timeout is not None:
             self._timeouts[name] = timeout
         if max_output_bytes is not None:
             self._max_output[name] = max_output_bytes
+        # Reconcile membership on EVERY registration, both branches: only adding on True let a
+        # re-registration strip reconcile (register_isolated(name, side_effecting=False)) while the
+        # name stayed in _side_effecting -- gate passed once, invariant then violated (Section 7 PR 2b).
         if side_effecting:
             self._side_effecting.add(name)
+        else:
+            self._side_effecting.discard(name)
 
-    def attach_effect_ledger(self, effect_ledger_row: Callable[[str], dict[str, Any] | None]) -> LaunchArmer:
-        """Attach the host's read-only durable-ledger view ONCE and RETURN a private armer handle
-        (Section 7 PR 2, round 3 remediation). AgentHost calls this at construction and keeps the handle;
-        it is the ONLY way to mint a launch capability. Arming is deliberately NOT a public registry
-        method -- otherwise any caller holding the registry could mint capabilities (including several
-        for one `started` effect). Set-once: a second attach raises, so the arming validator cannot be
-        swapped for a permissive one. The row lookup and the armer are captured in the closure, not
-        stored as reassignable attributes."""
+    def attach_effect_ledger(self, effect_ledger_row: Callable[[str], dict[str, Any] | None]) -> EffectLedgerAuthority:
+        """Attach the host's read-only durable-ledger view ONCE and RETURN a private authority handle
+        (Section 7 PR 2, round 3 remediation; reconcile authority added in PR 2b round 2). AgentHost
+        calls this at construction and keeps the handle; it is the ONLY way to mint a launch capability
+        OR execute a reconcile target. Neither is a public registry method -- otherwise any caller
+        holding the registry could mint capabilities (including several for one `started` effect) or run
+        a reconcile TARGET with caller-chosen (tool, arguments, effect_id), which the auditor showed
+        executes an effectful target with no ledger row, no claim, and no launch gate. Set-once: a second
+        attach raises, so the validators cannot be swapped for permissive ones. The row lookup and the
+        closures are captured here, not stored as reassignable attributes."""
         if self._ledger_attached:
             raise RuntimeError("effect ledger already attached; it is set once and cannot be re-attached")
         self._ledger_attached = True
@@ -299,11 +440,83 @@ class ToolRegistry:
             with self._arm_lock:
                 self._armed.pop(capability, None)
 
-        return LaunchArmer(arm=arm, disarm=disarm)
+        def run_reconcile(effect_id: str, tool: str, arguments: dict[str, Any], claim_id: str) -> Any:
+            # Execute a side-effecting tool's reconcile target -- ONLY for an effect the host has already
+            # CLAIMED under its owned lease. Validate against the durable ledger row before running:
+            #   * a row exists and is in `reconciling` (the state claim_effect_for_reconcile creates);
+            #   * its reconcile_claim_id equals THIS claim_id -- the host's unguessable token_urlsafe(24),
+            #     minted only after claim_effect_for_reconcile atomically proved live-lease ownership; and
+            #   * the recorded tool and canonical arguments match what the host passed (the STORED args,
+            #     not caller-chosen), so a run cannot be retargeted to a different call's inputs.
+            # Liveness note: the runner binds to the claim_id, NOT a re-read lease. The lease was proven
+            # live atomically by claim_effect_for_reconcile; the registry has no handle on the store's
+            # time base (Postgres uses DB time, embedded stores an injected clock), so re-checking expiry
+            # here could not be done consistently. The claim_id carries the weight -- it is unguessable
+            # and unique per claim, so a stale/foreign holder cannot match a live row. This is why the
+            # reconcile authority lives here (private, host-only) and not as a public registry method:
+            # that method (removed in PR 2b round 2) ran the target with no row, no claim, no gate.
+            row = effect_ledger_row(effect_id)
+            canonical_args = canonical_json(arguments).decode("utf-8")
+            if (
+                row is None
+                or row["state"] != "reconciling"
+                or row.get("reconcile_claim_id") != claim_id
+                or row["tool"] != tool
+                or row["arguments_json"] != canonical_args
+            ):
+                raise SecurityError(
+                    f"cannot run a reconcile for effect {effect_id!r}: it must be a `reconciling` row "
+                    "owned by this claim whose recorded tool and arguments match. A reconcile target is "
+                    "run only through the host's claimed-lease path, never directly via the registry."
+                )
+            return self._run_reconcile_target(tool, arguments, effect_id)
+
+        return EffectLedgerAuthority(arm=arm, disarm=disarm, run_reconcile=run_reconcile)
 
     def is_side_effecting(self, name: str) -> bool:
         """Whether the tool is registered side-effecting (the host wraps it in the effect ledger)."""
         return name in self._side_effecting
+
+    @property
+    def isolation_profile(self) -> IsolationProfile | None:
+        """The operator's containment acknowledgement for side-effecting tools, or None if none was
+        given (Section 7 PR 2b). Read-only; set once at construction. AgentHost reads it to record
+        the claimed containment on an effect-unknown audit event."""
+        return self._isolation_profile
+
+    def _assert_isolation_profile(self, name: str) -> None:
+        """Fail closed unless the deployment's IsolationProfile is acknowledged AND its mechanism is
+        appropriate for this platform (Section 7 PR 2b). Name-agnostic to the tool's reconcile state,
+        so it is reusable before the tool's spec is stored. Proves the containment is CLAIMED and
+        platform-appropriate; it cannot prove the container is actually running (only the operator can)."""
+        profile = self._isolation_profile
+        if profile is None:
+            raise SecurityError(
+                f"tool {name!r} is side-effecting but no IsolationProfile was acknowledged; the runtime "
+                "cannot contain a hostile tool by itself, so the operator must pass "
+                "ToolRegistry(isolation_profile=IsolationProfile(...)) to affirm how workers are contained."
+            )
+        if not _profile_contains_on_this_platform(profile):
+            raise SecurityError(
+                f"tool {name!r} is side-effecting but the acknowledged IsolationProfile mechanism "
+                f"{profile.mechanism.value!r} does not contain workers on this platform; on POSIX the "
+                "deadline sweep is only cooperative, so external containment must be affirmed "
+                "(IsolationMechanism.EXTERNAL_CONTAINER)."
+            )
+
+    def _assert_side_effecting_contract(self, name: str) -> None:
+        """Fail closed unless the mandatory side-effecting contract holds for `name` (Section 7 PR 2b):
+        a reconcile target is declared AND the IsolationProfile is acknowledged + platform-appropriate.
+        Enforced at BOTH registration (startup) and the launch boundary in invoke() -- a startup-only
+        check over a mutable set is advisory, not a gate (security.md: compute the enforcement AT the
+        gate). Reads stored state, so it runs only after the tool's spec exists (i.e. at invoke time)."""
+        if not self.has_reconcile(name):
+            raise SecurityError(
+                f"tool {name!r} is side-effecting but has no reconcile target; a side-effecting tool "
+                "must declare reconcile=<module:function> so an effect that fails to a known-unknown "
+                "state can be resolved instead of silently retried or dropped."
+            )
+        self._assert_isolation_profile(name)
 
     def is_isolated(self, name: str) -> bool:
         """Whether the tool runs in an isolated worker (the only path that can carry an effect_id)."""
@@ -314,11 +527,15 @@ class ToolRegistry:
         spec = self._isolated.get(name)
         return spec is not None and spec.reconcile is not None
 
-    def reconcile(self, name: str, arguments: dict[str, Any], effect_id: str) -> Any:
-        """Run a tool's registered reconcile function (isolated, with the effect_id) to determine
-        whether its external effect landed. Host-invoked during the reconcile pass -- NOT an
-        agent-facing tool call, so it does not go through the permit/constraint check. Returns the
-        reconcile function's result (by contract, a dict like {"landed": bool, "result"?: ...})."""
+    def _run_reconcile_target(self, name: str, arguments: dict[str, Any], effect_id: str) -> Any:
+        """Run a tool's registered reconcile function (isolated, with the effect_id) to determine whether
+        its external effect landed. PRIVATE (PR 2b round 2): reachable ONLY through the run_reconcile
+        closure of the EffectLedgerAuthority, which the host holds and calls only for an effect it has
+        already claimed under an owned lease -- there is no public method that runs a reconcile target,
+        because one (the old `reconcile()`) let any registry holder execute an effectful target with a
+        fabricated effect_id, no ledger row, and no launch gate. NOT an agent-facing tool call, so it
+        does not go through the permit/constraint check. Returns the reconcile function's result (by
+        contract, a dict like {"landed": bool, "result"?: ...})."""
         spec = self._isolated.get(name)
         if spec is None or spec.reconcile is None:
             raise ToolExecutionError(f"tool {name!r} has no reconcile function registered")
@@ -350,6 +567,12 @@ class ToolRegistry:
 
         effect_id: str | None = None
         if name in self._side_effecting:
+            # Section 7 PR 2b: RE-ASSERT the side-effecting contract at the launch boundary, not only
+            # at registration. A startup-only gate over the mutable _side_effecting set is advisory,
+            # not a gate (security.md: compute the enforcement AT the gate) -- so if any path ever left
+            # a name side-effecting without a reconcile target or a platform-valid IsolationProfile,
+            # the effect fails closed HERE, at the moment of launch, before any external effect fires.
+            self._assert_side_effecting_contract(name)
             # Fail closed at the invoke boundary. Launching a side-effecting tool requires a one-use
             # LAUNCH CAPABILITY the host armed (arm_effect_launch) right before this call and bound to
             # THIS (effect_id, tool, canonical arguments). Knowledge of the (deterministic, non-secret)

@@ -207,10 +207,14 @@ tools.register_isolated(
     "http.fetch",
     "examples.tools.http_fetch:fetch",   # module:function, resolved in the worker
     timeout=3.0,
-    side_effecting=True,
     env={"HTTPS_PROXY": "http://proxy.internal:8080"},  # optional, off by default
 )
 ```
+
+A fetch is a read, so this tool is not `side_effecting`; a tool that changes external
+state (a charge, a booking) sets `side_effecting=True`, which triggers the mandatory
+gate below — a reconcile target and an acknowledged `IsolationProfile`. See the
+"billing.charge" example under **Side-effecting tools and the effect ledger**.
 
 An isolated tool is named by an import path, not a callable, because it runs in a
 fresh Python process (`portmark.tool_subprocess_runner`) that imports the target
@@ -239,8 +243,35 @@ else. What this buys you:
   caps"), so a heavy tool module may need `address_space` raised.
 
 Only an isolated tool may be `side_effecting=True`. A side-effecting tool
-registered on the plain thread path is refused, because that path cannot be
-cancelled.
+registered on the plain thread path (`register(..., side_effecting=True)`) is
+**refused at registration** — that path cannot cancel a running tool or carry the
+effect ledger.
+
+**The mandatory side-effecting gate (Section 7 PR 2b).** `register_isolated(side_effecting=True)`
+fails closed at startup unless BOTH hold:
+
+- **A `reconcile=<module:function>` target is declared.** Mandatory (it was optional
+  in 2a): without it, an effect that fails to `unknown` can never be resolved. The
+  gate proves a reconcile target is *declared*, not that reconciliation *works* — the
+  target resolves in the worker, and the host cannot verify its signature at
+  registration.
+- **The registry has an acknowledged `IsolationProfile`** —
+  `ToolRegistry(isolation_profile=IsolationProfile(mechanism=..., acknowledged_by=...))`.
+  There is no default that satisfies the gate; the operator must construct it,
+  mirroring the `allow_anonymous=True` acknowledgement idiom. The profile's
+  **mechanism is cross-checked against the platform**: `EXTERNAL_CONTAINER` (you run
+  workers in a container/VM/sandbox) is accepted anywhere; `OS_JOB_OBJECT` (the
+  platform's kill-on-close job) is accepted only where the Windows Job Object exists
+  and is **refused on POSIX**, where you must affirm external containment. The profile
+  records a *claim*; it cannot verify the container is actually running.
+
+The gate is also **re-asserted at the launch boundary** in `invoke()` (a startup-only
+check over a mutable set is advisory, not a gate), and re-registration cannot strip
+the reconcile target while keeping a tool side-effecting. When a side-effecting effect
+settles `unknown`, its `tool.killed`/`tool.failed` audit event records the profile's
+`mechanism` + `acknowledged_by`, so an incident responder sees what containment was
+claimed. This closes the public-API path into a side-effecting launch without the
+contract; it is **not** protection against arbitrary in-process Python.
 
 **Platform support — and the honest difference between the two backends.** Deadline
 termination needs *some* primitive to reach the worker's descendants. The two
@@ -260,12 +291,15 @@ platforms are NOT equivalent:
   child and a worker that dies before it can sweep. So on POSIX the host still does
   **not** guarantee the tool and everything it spawned actually stop.
 
-`register_isolated(..., side_effecting=True)` is allowed on both platforms because
-*a* termination primitive exists on both; it is **refused at registration** only on
-a platform with neither. That gate is about primitive existence, **not** a promise
-of hostile-tool containment — which POSIX does not provide. Real containment of an
-untrusted side-effecting tool comes from the deployment isolation profile plus the
-tool's own idempotency/reconciliation, covered in DEPLOYMENT.md and THREAT_MODEL.md.
+The **tree-primitive check** specifically — one of several the side-effecting gate
+applies — passes on both platforms because *a* termination primitive exists on both,
+and refuses only on a platform with neither. That particular check is about primitive
+existence, **not** a promise of hostile-tool containment — which POSIX does not
+provide. It is layered *under* the 2b gate above (mandatory reconcile + acknowledged,
+platform-appropriate `IsolationProfile`), which adds the rest of the registration
+requirements. Real containment of an untrusted side-effecting tool comes from the
+deployment isolation profile plus the tool's own idempotency/reconciliation, covered
+in DEPLOYMENT.md and THREAT_MODEL.md.
 CI runs the isolated-tool descendant-kill, side-effecting, and kill-audit tests on
 both Linux and Windows.
 
@@ -364,9 +398,12 @@ authorizes at most one launch. **What this does *not* cover:** a caller that can
 in-process against the registry object (mutating its private state) is outside this gate — that is the
 deployment sandbox's job, per the resource-bounded-worker contract above. The runtime gate closes the
 public-API bypass and defends against a fabricated/guessed/replayed *value*; it is not protection
-against arbitrary malicious in-process Python. (The host's own reconcile pass calls the reconcile function directly, not
-through this gate; that is intentional — a reconcile function is registered separately and is not
-itself `side_effecting`.)
+against arbitrary malicious in-process Python. **Reconcile execution is gated the same way** (PR 2b
+round 2): there is **no public** registry method that runs a reconcile target. The runner lives behind
+the same private handle as the launch armer and executes a target only for an effect the host has
+already **claimed** under its owned lease, and only when the row's recorded tool and arguments match —
+so a caller cannot run a reconcile target with a fabricated effect_id (the exploit that let an
+effectful reconcile target fire with no ledger row and no claim).
 
 > **The tool registry is immutable after host construction.** `AgentHost` binds the private armer to
 > the registry it is given at construction. Replacing `host.tools` afterward is **not supported**: the
@@ -380,15 +417,37 @@ key), so that even a retry it does see cannot double the effect. A tool that doe
 second parameter is failed with a controlled `tool does not accept effect_id` and never called.
 
 ```python
+from portmark.tools import IsolationMechanism, IsolationProfile, ToolRegistry
+
 def charge(arguments: dict, effect_id: str) -> dict:
     return payment_api.charge(arguments["amount"], idempotency_key=effect_id)
 
+# A side-effecting tool requires an acknowledged IsolationProfile on the registry (declared once)
+# AND a reconcile target; register_isolated(side_effecting=True) is refused without both (PR 2b).
+tools = ToolRegistry(
+    isolation_profile=IsolationProfile(
+        mechanism=IsolationMechanism.EXTERNAL_CONTAINER,  # you run workers in a container/VM/sandbox
+        acknowledged_by="platform-team",                  # recorded on the effect-unknown audit event
+    )
+)
 tools.register_isolated(
     "billing.charge", "mytools:charge",
     side_effecting=True,
-    reconcile="mytools:reconcile_charge",  # queries whether the effect landed
+    reconcile="mytools:reconcile_charge",  # REQUIRED for side_effecting: queries whether the effect landed
 )
 ```
+
+**The reconcile target must be a DISTINCT, observational function.** It must never *be* the effect it
+checks — registering the effectful tool as its own reconcile target is refused at registration
+(a reconcile execution would then fire the effect). The runtime cannot verify a target is genuinely
+read-only, so it enforces the one thing it can (distinctness) and this read-only requirement is an
+operator **contract**. Registration validates only the `module:function` **syntax** and this
+distinctness — it does **not** import or otherwise run the reconcile target. (An earlier revision
+preflighted it by importing it in a worker; importing arbitrary module code executes untrusted
+top-level code before any ledger/permit/claim exists, so that automatic import was removed.) The
+reconcile is therefore a **declared** target; verifying that it is importable, correctly shaped, and
+genuinely read-only is the operator's own integration test, which should run in a credential-free,
+egress-denied environment.
 
 **Reconciliation.** An `unknown` effect is resolved by `AgentHost.reconcile_effect(effect_id,
 task_id)` (task-scoped: the effect must belong to that task). It runs the tool's registered
@@ -407,20 +466,25 @@ whose process died is reclaimable after the lease window, so a crash mid-reconci
 effect. If the reconcile function itself raises, the owner releases its claim back to `unknown` for
 retry (release needs only the owner id, so an expired holder can always safely relinquish). Lease
 creation and expiry use **database time** on Postgres (a shared central clock), so a host whose clock
-runs fast cannot prematurely steal another host's live claim. *Known bound:* a reconcile that runs
-longer than the lease window makes the effect reclaimable — a slow reconciler may lose its claim (its
-terminal settle then no-ops); this is a liveness bound, not a double-settle.
+runs fast cannot prematurely steal another host's live claim. To stop a holder that was **paused past
+its lease** from executing concurrently with a reclaimer, the host **renews** its claim atomically
+(`renew_effect_claim`, database time on Postgres) immediately before running the reconcile and proceeds
+only if renewal succeeds: if it still owns the row the lease is extended (and, since the reconcile
+timeout ≪ lease, it finishes within that window); if a reclaimer already took the row its owner id no
+longer matches and renewal fails, so it aborts without running. *Known bound:* a reconcile that runs
+longer than the (renewed) lease window makes the effect reclaimable — a slow reconciler may lose its
+claim (its terminal settle then no-ops); this is a liveness bound, not a double-settle or double-run.
 
 > **Known cost.** The `started` state is settled `unknown` on resume even if the tool never
 > actually launched (a crash in the microsecond window between the durable `started` write and the
 > launch). That is the conservative choice — an operator pays one reconcile round-trip for an
 > effect that did not happen, rather than the host silently assuming it did not and re-running.
 
-> **Not yet enforced here.** PR 2a ships the ledger and the reconcile mechanism; making the
-> `reconcile` contract and an acknowledged isolation profile **mandatory** at registration for
-> `side_effecting=True` is the immediately following change (Section 7 PR 2b). Until then a
-> side-effecting tool may be registered without a `reconcile` function, and its `unknown` effects
-> cannot be reconciled.
+> **Enforced at registration (PR 2b).** A `reconcile` target and an acknowledged, platform-appropriate
+> `IsolationProfile` are now **mandatory** for `side_effecting=True`; the reconcile target's
+> `module:function` syntax is checked and it must be distinct from the tool (registration does not
+> import it). A side-effecting tool can no longer be registered without a reconcile function, so its
+> `unknown` effects are always reconcilable.
 
 ## Credential Handling
 

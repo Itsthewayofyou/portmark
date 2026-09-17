@@ -6,6 +6,70 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Section 7 — tool execution isolation (PR 2b): mandatory side-effecting startup gate
+
+- **BREAKING API change.** Registering a side-effecting tool now REQUIRES two things it did not before,
+  both enforced when `register_isolated(side_effecting=True)` is called (fail closed at startup, not at
+  the first effect):
+  1. a **`reconcile=<module:function>` target** (optional in 2a, now mandatory) — 2a's whole
+     failure→`unknown`→reconcile machinery is dead unless every side-effecting tool declares one, so an
+     effect that fails to a known-unknown state can be resolved instead of silently retried or dropped;
+  2. an **operator-acknowledged `IsolationProfile`** passed once as
+     `ToolRegistry(isolation_profile=IsolationProfile(mechanism=..., acknowledged_by=...))`. The runtime
+     cannot contain a hostile tool by itself (on POSIX the deadline sweep is only a cooperative
+     process-group signal a `setsid()` descendant escapes), so the operator must affirm HOW workers are
+     contained. There is **no default** that satisfies the gate. Existing callers that register a
+     side-effecting tool must add both; non-side-effecting isolated tools are unaffected.
+- **The profile's mechanism is cross-checked against the platform.** `IsolationMechanism.EXTERNAL_CONTAINER`
+  (the operator runs workers inside a container/VM/sandbox) is valid everywhere; `IsolationMechanism.OS_JOB_OBJECT`
+  (the platform's kill-on-close job) is genuine ONLY where the Windows Job Object exists and is **refused
+  on POSIX**, where the operator must affirm external containment instead.
+- **The thread path refuses side-effecting tools at registration.** `register(side_effecting=True)` now
+  raises immediately (previously it was refused only at the first invoke) — that path cannot cancel a
+  running tool or carry an effect ledger, and letting a name into the side-effecting set with no
+  contract was a gate bypass. A re-registration can no longer strip the reconcile target while keeping a
+  tool side-effecting: side-effecting membership is reconciled on **every** registration path.
+- **The gate is re-asserted at the launch boundary, not only at startup.** `invoke()` re-checks the
+  reconcile target and a platform-valid profile at the moment it would consume a launch capability, so a
+  mutated-set edge case fails closed before any external effect fires (a startup-only check over a
+  mutable set is advisory, not a gate).
+- **The acknowledged containment is recorded in the audit trail.** When a side-effecting effect settles
+  `unknown` — on a deadline kill (`tool.killed`), a clean tool error (`tool.failed`), or a
+  non-serializable result (`content.rejected`) — the audit event carries the profile's `mechanism` +
+  `acknowledged_by`, so an incident responder resolving the unknown effect sees what containment was
+  claimed at registration — the profile is a real downstream consumer, not a gate input nothing reads.
+- **Reconcile execution is now private host authority (round 2 — closes a High-severity public-API bypass).**
+  The public `ToolRegistry.reconcile()` method is **removed**. It ran a reconcile *target* with
+  caller-chosen tool, arguments and effect_id and no gate — so registering the effectful tool as its own
+  reconcile target let any registry holder execute the effect with a fabricated effect_id, no ledger row,
+  no claim and no launch capability. Reconcile execution now lives behind the same private handle as the
+  launch armer (`run_reconcile`), runs a target only for an effect the host has already **claimed** under
+  its owned lease, and only when the row's recorded tool and arguments match. The reconcile target must be
+  **distinct** from the tool (the self-target exploit is refused at registration), and it must be
+  observational/read-only — a contract the runtime documents but cannot verify.
+- **Registration executes NO reconcile-target code (round 3 — fixes an unintended consequence of round 2).**
+  Round 2 preflighted the reconcile target by importing it in a worker at registration, but importing
+  arbitrary module code runs untrusted top-level code before any ledger/permit/claim exists (a
+  filesystem/network effect that resource caps and process-tree kill do not prevent). That automatic
+  import is **removed**. Registration keeps only the `module:function` **syntax** check and the
+  tool-≠-reconcile **distinctness** check (both pure, no import). The reconcile is a **declared** target;
+  its semantic/read-only correctness is the operator's own integration test, run in a credential-free,
+  egress-denied environment — not a runtime import.
+- **Reconcile renews its owned claim immediately before running (round 3).** `run_reconcile` validated
+  ownership but not lease liveness, so a holder paused past its 5-minute lease could execute concurrently
+  with a reclaimer. The host now calls a new `renew_effect_claim(effect_id, claim_id, lease_seconds)`
+  (all three backends; database time on Postgres) right before running the reconcile and proceeds only if
+  it succeeds — whichever of renew and a reclaim reaches the row first wins atomically, so no two
+  reconcile functions run concurrently. A reconcile that itself outruns the renewed lease remains a
+  documented liveness bound, not a double-execution hole.
+- **`effect_status:"unknown"` is recorded on all three effect-unknown audit events (round 2).** Previously
+  only `tool.killed` carried it; `tool.failed` and `content.rejected` now do too when a side-effecting
+  effect settled unknown, so incident analysis is self-contained.
+- **Scope (unchanged from 2a).** This closes the public-API path into a side-effecting launch OR reconcile
+  without the contract; it is **not** protection against arbitrary malicious in-process Python. The
+  `IsolationProfile` records a CLAIM about the deployment; it cannot verify the container is actually
+  running. Containment of a hostile tool remains the deployment substrate's job (see THREAT_MODEL.md).
+
 ### Section 7 — tool execution isolation (PR 2a): idempotency/reconciliation effect ledger
 
 - **Side-effecting isolated tools now run under a durable effect ledger** (new `tool_effects` table;

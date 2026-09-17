@@ -57,9 +57,22 @@ from portmark.security import (
 )
 from portmark.storage import POSTGRES_SCHEMA_VERSION, SQLITE_BUSY_TIMEOUT_MS, SQLITE_SCHEMA_VERSION, InMemoryRuntimeStore, PostgresRuntimeStore, SQLiteRuntimeStore
 from portmark.cli import main as cli_main
-from portmark.tools import ToolRegistry, _CAN_KILL_PROCESS_GROUP, _has_tree_termination_primitive
+from portmark.tools import (
+    IsolationMechanism,
+    IsolationProfile,
+    ToolRegistry,
+    _CAN_KILL_PROCESS_GROUP,
+    _has_tree_termination_primitive,
+)
 from examples.tools import http_fetch
 from fuzz_a2a_parser import run_fuzz_cases
+
+# Section 7 PR 2b: a side-effecting tool now requires an acknowledged IsolationProfile on the
+# registry. EXTERNAL_CONTAINER is valid on every platform (it is the operator's own affirmation),
+# so the test suite uses it as the standard acknowledgement.
+_TEST_ISOLATION_PROFILE = IsolationProfile(
+    mechanism=IsolationMechanism.EXTERNAL_CONTAINER, acknowledged_by="test-suite"
+)
 
 
 WASM_TOOL_REQUEST = "AGFzbQEAAAABCQFgBH9/f38BfgMCAQAFAwEAAQcTAgZtZW1vcnkCAAZyZXN1bWUAAAoLAQkAQu+AgICAAgsLdQEAQRALb3sib3V0Y29tZSI6InRvb2wiLCJyZXF1ZXN0Ijp7Im5hbWUiOiJjYXRhbG9nLnNlYXJjaCIsImFyZ3VtZW50c19qc29uIjoie1wicXVlcnlcIjpcImZyb20gd2FzbVwiLFwibGltaXRcIjozfSJ9fQ=="
@@ -915,11 +928,20 @@ class RuntimeTests(unittest.TestCase):
         # path, which cannot cancel it -- a deadline there records failure while
         # the side effect may still land. It fails closed until an isolated
         # hard-kill executor exists.
-        from portmark.tools import ToolExecutionError
+        from portmark.security import SecurityError
 
         ran = []
         registry = ToolRegistry()
-        registry.register("payments.charge", lambda arguments: ran.append(True) or {"ok": True}, side_effecting=True)
+        # Section 7 PR 2b: a side-effecting tool on the thread path now fails closed AT REGISTRATION,
+        # not (as before) only at the first invoke. register() cannot carry an effect ledger and cannot
+        # cancel a running tool, so it refuses side_effecting outright -- a stronger guarantee than the
+        # old invoke-time refusal, and it never lets the name into _side_effecting without a contract.
+        with self.assertRaisesRegex(SecurityError, "side-effecting"):
+            registry.register(
+                "payments.charge", lambda arguments: ran.append(True) or {"ok": True}, side_effecting=True
+            )
+        self.assertNotIn("payments.charge", registry.names())  # refused registration left no trace
+        # A tool not marked side-effecting still registers and runs on the normal path.
         registry.register("catalog.search", lambda arguments: {"ok": True})
         permit = Permit(
             issuer="issuer",
@@ -927,13 +949,10 @@ class RuntimeTests(unittest.TestCase):
             audience="host",
             expires_at=int(time.time()) + 60,
             nonce="nonce-se",
-            grants=(ToolGrant("payments.charge"), ToolGrant("catalog.search")),
+            grants=(ToolGrant("catalog.search"),),
         )
-        with self.assertRaisesRegex(ToolExecutionError, "side-effecting"):
-            registry.invoke(permit, "payments.charge", {})
-        self.assertEqual(ran, [])  # the tool never executed
-        # A tool not marked side-effecting still runs on the normal path.
         self.assertEqual(registry.invoke(permit, "catalog.search", {}), {"ok": True})
+        self.assertEqual(ran, [])  # the refused side-effecting tool never executed
 
     def test_thread_path_caps_inflight_executions_and_fails_closed(self):
         # Finding #5: a thread-path tool that exceeds its deadline leaks a daemon thread
@@ -1456,12 +1475,14 @@ class RuntimeTests(unittest.TestCase):
         # sanctioned way to run one, because the host can hard-kill it. Skipped
         # where the platform cannot hard-kill (Windows): register_isolated refuses
         # a side-effecting tool there, which the sibling fail-closed test asserts.
-        registry = ToolRegistry()
+        registry = ToolRegistry(isolation_profile=_TEST_ISOLATION_PROFILE)
         registry.register_isolated(
-            "iso.pay", "isolated_tool_fixtures:echo", side_effecting=True, env=self._isolated_env()
+            "iso.pay", "isolated_tool_fixtures:echo", side_effecting=True,
+            reconcile="isolated_tool_fixtures:reconcile_charge", env=self._isolated_env(),
         )
         registry.register_isolated(
-            "iso.other", "isolated_tool_fixtures:echo", side_effecting=True, env=self._isolated_env()
+            "iso.other", "isolated_tool_fixtures:echo", side_effecting=True,
+            reconcile="isolated_tool_fixtures:reconcile_charge", env=self._isolated_env(),
         )
         permit = self._isolated_permit("iso.pay", "iso.other")
         # Section 7 PR 2 (round 3): launching a side-effecting tool requires a ONE-USE launch capability
@@ -1538,12 +1559,13 @@ class RuntimeTests(unittest.TestCase):
         # unknown -- a distinct signal from a clean tool.failed.
         with tempfile.TemporaryDirectory() as directory:
             store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
-            tools = ToolRegistry()
+            tools = ToolRegistry(isolation_profile=_TEST_ISOLATION_PROFILE)
             tools.register_isolated(
                 "slow.side",
                 "isolated_tool_fixtures:slow_then_return",
                 timeout=1.0,
                 side_effecting=True,
+                reconcile="isolated_tool_fixtures:reconcile_charge",
                 env=self._isolated_env(),
             )
             host = make_host(store=store, allow_ephemeral_signing_key=True)
@@ -1566,11 +1588,18 @@ class RuntimeTests(unittest.TestCase):
             killed = next(event for event in result.audit if event["event"] == "tool.killed")
             self.assertEqual(killed["details"]["effect_status"], "unknown")
             self.assertEqual(killed["details"]["tool"], "slow.side")
+            # Section 7 PR 2b (G11): the effect-unknown audit event records WHAT containment the
+            # operator claimed, so an incident responder resolving this unknown effect sees it.
+            # Neutralize check: drop the two `if ... claim` lines in host._apply_decision -> this fails.
+            self.assertEqual(
+                killed["details"]["isolation_profile"],
+                {"mechanism": "external_container", "acknowledged_by": "test-suite"},
+            )
 
     # ---- Section 7 PR 2: effect ledger ---------------------------------------------------------
 
     def _charge_host(self, store, directory, target="idempotent_charge", reconcile="isolated_tool_fixtures:reconcile_charge"):
-        tools = ToolRegistry()
+        tools = ToolRegistry(isolation_profile=_TEST_ISOLATION_PROFILE)
         tools.register_isolated(
             "iso.charge", f"isolated_tool_fixtures:{target}", timeout=5.0, side_effecting=True,
             reconcile=reconcile, env=self._isolated_env(),
@@ -1648,6 +1677,11 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(result.status, "failed")  # tool raised after the effect landed
             eid = self._charge_eid(envelope, directory)
             self.assertEqual(store.get_effect(eid)["state"], "unknown")
+            # Section 7 PR 2b round 2 (G18): the tool.failed event self-records effect_status:"unknown"
+            # (as tool.killed already did), so an incident responder need not cross-reference the ledger.
+            # Neutralize: drop `failed_details["effect_status"] = "unknown"` in host._apply_decision -> fails.
+            failed = next(event for event in result.audit if event["event"] == "tool.failed")
+            self.assertEqual(failed["details"]["effect_status"], "unknown")
             # Reconcile finds the landed marker -> confirmed.
             self.assertEqual(host.reconcile_effect(eid, envelope.state.task_id), "confirmed")
             self.assertEqual(store.get_effect(eid)["state"], "confirmed")
@@ -1666,7 +1700,10 @@ class RuntimeTests(unittest.TestCase):
     def test_side_effecting_tool_missing_effect_id_param_fails_controlled(self):
         with tempfile.TemporaryDirectory() as directory:
             store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
-            host, envelope = self._charge_host(store, directory, target="no_effect_id_param", reconcile=None)
+            # reconcile is mandatory now (Section 7 PR 2b), and it is unrelated to what this test
+            # exercises (the WORKER-side controlled failure when the tool signature omits effect_id),
+            # so keep the default reconcile target -- it is never called here.
+            host, envelope = self._charge_host(store, directory, target="no_effect_id_param")
             result = host.run(envelope)
             self.assertEqual(result.status, "failed")
             failed = next(event for event in result.audit if event["event"] == "tool.failed")
@@ -1844,6 +1881,54 @@ class RuntimeTests(unittest.TestCase):
                     self.assertTrue(store.settle_effect_from_claim("e", "C", "reconciled", None, "did not land"))
                     self.assertEqual(store.get_effect("e")["state"], "reconciled")
 
+    def test_renew_effect_claim_extends_owner_and_fails_after_reclaim(self):  # G22 store (CALIBRATED)
+        # PR 2b round 3: the host renews its claim immediately before running a reconcile. renew re-stamps
+        # the lease for the OWNING claim (claim-id match, authoritative clock) and FAILS once a reclaimer
+        # has taken the row -- so a paused/expired holder that lost the row aborts instead of running
+        # concurrently. CALIBRATED: make renew_effect_claim return True unconditionally and the
+        # post-reclaim renew succeeds (both holders would proceed), so this test fails.
+        now = {"t": 1000}
+        clock = lambda: now["t"]  # noqa: E731
+        with tempfile.TemporaryDirectory() as directory:
+            stores = [("memory", InMemoryRuntimeStore(clock=clock)),
+                      ("sqlite", SQLiteRuntimeStore(Path(directory) / "eff.sqlite", clock=clock))]
+            for backend, store in stores:
+                with self.subTest(backend=backend):
+                    now["t"] = 1000
+                    store.record_effect_prepared("e", "t", "iso.charge", "{}")
+                    store.mark_effect_started("e")
+                    store.settle_effect("e", "unknown", None, "kill")
+                    self.assertTrue(store.claim_effect_for_reconcile("e", "A", 100))    # lease -> 1100
+                    now["t"] = 1050                                                     # still owned + live
+                    self.assertTrue(store.renew_effect_claim("e", "A", 100))            # extend -> 1150
+                    self.assertEqual(store.get_effect("e")["reconcile_lease_expires_at"], 1150)
+                    self.assertFalse(store.claim_effect_for_reconcile("e", "B", 100))   # A's renewed lease keeps B out
+                    now["t"] = 1200                                                     # A paused past the renewed lease
+                    self.assertTrue(store.claim_effect_for_reconcile("e", "B", 100))    # B reclaims, new owner id
+                    self.assertEqual(store.get_effect("e")["reconcile_claim_id"], "B")
+                    # A resumes and tries to renew before running -> FAILS (B owns) -> A aborts, no concurrent run.
+                    self.assertFalse(store.renew_effect_claim("e", "A", 100))
+                    self.assertEqual(store.get_effect("e")["reconcile_claim_id"], "B")  # B untouched
+                    now["t"] = 1250
+                    self.assertTrue(store.renew_effect_claim("e", "B", 100))            # the live owner can renew
+
+    @unittest.skipUnless(_has_tree_termination_primitive(), "isolated side-effecting tools need a process-tree termination primitive")
+    def test_reconcile_effect_aborts_when_claim_renewal_fails(self):  # G22 host (CALIBRATED)
+        # If the claim cannot be renewed right before running (a reclaimer took the row during a pause),
+        # reconcile_effect must NOT run the reconcile target. CALIBRATED: remove the renew-or-abort guard
+        # in host.reconcile_effect and the effect settles `confirmed` even though renewal failed.
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            host, envelope = self._charge_host(store, directory, target="charge_then_fail")
+            host.run(envelope)  # settles `unknown` (effect landed, tool then raised)
+            eid = self._charge_eid(envelope, directory)
+            with patch.object(store, "renew_effect_claim", return_value=False):
+                state = host.reconcile_effect(eid, envelope.state.task_id)
+            # The reconcile did NOT run: the claim (state `reconciling`) is left untouched, and the
+            # returned state is that same non-terminal state -- not `confirmed`/`reconciled`.
+            self.assertEqual(store.get_effect(eid)["state"], "reconciling")
+            self.assertEqual(state, "reconciling")
+
     def test_reconcile_claim_rejects_invalid_lease_or_owner(self):
         # Round-4 hardening (auditor note): the store validates its OWN inputs so a zero/negative lease
         # (which would make the claim instantly reclaimable, defeating exclusivity) or an empty owner id
@@ -1885,8 +1970,11 @@ class RuntimeTests(unittest.TestCase):
     def test_launch_capability_is_disarmed_when_not_consumed(self):
         # A capability armed but not consumed (invoke failed before the gate) must not outlive its one
         # intended launch. disarm() drops it, so a later invoke with it is refused.
-        registry = ToolRegistry()
-        registry.register_isolated("iso.pay", "isolated_tool_fixtures:echo", side_effecting=True, env=self._isolated_env())
+        registry = ToolRegistry(isolation_profile=_TEST_ISOLATION_PROFILE)
+        registry.register_isolated(
+            "iso.pay", "isolated_tool_fixtures:echo", side_effecting=True,
+            reconcile="isolated_tool_fixtures:reconcile_charge", env=self._isolated_env(),
+        )
         permit = self._isolated_permit("iso.pay")
         args = {"amount": 3}
         canonical_args = canonical_json(args).decode("utf-8")
@@ -2351,12 +2439,13 @@ class RuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runtime.sqlite"
             store = SQLiteRuntimeStore(path)
-            tools = ToolRegistry()
+            tools = ToolRegistry(isolation_profile=_TEST_ISOLATION_PROFILE)
             tools.register_isolated(
                 "slow.side",
                 "isolated_tool_fixtures:slow_then_return",
                 timeout=1.0,
                 side_effecting=True,
+                reconcile="isolated_tool_fixtures:reconcile_charge",
                 env=self._isolated_env(),
             )
             host = make_host(store=store, allow_ephemeral_signing_key=True)
@@ -3367,6 +3456,35 @@ class RuntimeTests(unittest.TestCase):
 
         with psycopg.connect(dsn, autocommit=True) as connection:
             connection.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema)))
+
+    @unittest.skipUnless(
+        os.environ.get("PORTMARK_TEST_POSTGRES_DSN") and PostgresRuntimeStore.available(),
+        "requires a real PostgreSQL",
+    )
+    def test_renew_effect_claim_on_postgres_uses_database_time(self):  # G22 Postgres (DB-time path)
+        # The DB-time renew statement (EXTRACT(EPOCH FROM clock_timestamp())) is a DIFFERENT code path
+        # from the injected-clock embedded stores, so exercise it against a live Postgres with a short
+        # REAL lease (auditor round-3 coverage note). Mirrors the SQLite/InMemory renew race: renew
+        # extends an owned claim, refuses a foreign claim, and -- once the lease expires and a reclaimer
+        # takes the row -- refuses the superseded holder (which must then NOT run its reconcile). The
+        # sleep is longer than the lease, so expiry is deterministic on wall-clock/DB time.
+        dsn = os.environ["PORTMARK_TEST_POSTGRES_DSN"]
+        schema = "portmark_renew_" + secrets.token_hex(8)
+        try:
+            store = PostgresRuntimeStore(dsn, schema=schema)
+            store.record_effect_prepared("e", "t", "iso.charge", "{}")
+            store.mark_effect_started("e")
+            store.settle_effect("e", "unknown", None, "kill")
+            self.assertTrue(store.claim_effect_for_reconcile("e", "A", 1))     # ~1s lease (database time)
+            self.assertTrue(store.renew_effect_claim("e", "A", 1))             # the owner can renew
+            self.assertFalse(store.renew_effect_claim("e", "WRONG", 1))        # a foreign claim is refused
+            time.sleep(1.4)                                                    # A's renewed lease expires
+            self.assertTrue(store.claim_effect_for_reconcile("e", "B", 5))     # B reclaims -> new owner id
+            self.assertEqual(store.get_effect("e")["reconcile_claim_id"], "B")
+            self.assertFalse(store.renew_effect_claim("e", "A", 1))            # superseded holder -> aborts (no concurrent run)
+            self.assertTrue(store.renew_effect_claim("e", "B", 5))             # the live owner can renew
+        finally:
+            self._drop_postgres_schema(dsn, schema)
 
     def _reopen_store(self, backend, store, verifier=None):
         if backend == "sqlite":
@@ -7902,6 +8020,187 @@ def registry():
                     with self.assertRaises(SystemExit):
                         cli_main()
             self.assertEqual(path.read_text(), before, "existing trust registry must survive")
+
+
+class IsolationProfileGateTests(unittest.TestCase):
+    """Section 7 PR 2b: the MANDATORY side-effecting startup gate (reconcile + acknowledged,
+    platform-appropriate IsolationProfile) and its launch-time re-check. The registration-gate tests
+    patch _has_tree_termination_primitive to True so they isolate the 2b logic and run on every
+    platform; they never spawn a worker (registration imports nothing and the pre-capability re-check
+    raises first). Fake module:function targets ("m:f"/"m:r") are valid at registration because it does
+    only a SYNTAX check -- it never imports them (PR 2b round 3 removed the import-based preflight)."""
+
+    def _profile(self, mechanism=IsolationMechanism.EXTERNAL_CONTAINER, by="ops"):
+        return IsolationProfile(mechanism=mechanism, acknowledged_by=by)
+
+    def _permit(self, name):
+        return Permit(
+            issuer="i", subject="s", audience="host", expires_at=int(time.time()) + 60,
+            nonce=f"n-{name}", grants=(ToolGrant(name),),
+        )
+
+    def test_isolation_profile_rejects_empty_or_non_enum(self):  # G1
+        with self.assertRaises(ValueError):
+            IsolationProfile(mechanism=IsolationMechanism.EXTERNAL_CONTAINER, acknowledged_by="   ")
+        with self.assertRaises(ValueError):
+            IsolationProfile(mechanism="external_container", acknowledged_by="ops")  # type: ignore[arg-type]
+        p = IsolationProfile(mechanism=IsolationMechanism.EXTERNAL_CONTAINER, acknowledged_by="ops")
+        self.assertEqual(p.audit_summary(), {"mechanism": "external_container", "acknowledged_by": "ops"})
+
+    def test_side_effecting_registration_requires_reconcile(self):  # G3 (CALIBRATED)
+        with patch("portmark.tools._has_tree_termination_primitive", return_value=True):
+            registry = ToolRegistry(isolation_profile=self._profile())
+            with self.assertRaisesRegex(SecurityError, "reconcile"):
+                registry.register_isolated("pay", "m:f", side_effecting=True)
+            self.assertNotIn("pay", registry.names())  # refused registration left no trace
+            registry.register_isolated("pay", "m:f", side_effecting=True, reconcile="m:r")
+            self.assertTrue(registry.is_side_effecting("pay"))
+
+    def test_side_effecting_registration_requires_acknowledged_profile(self):  # G4 (CALIBRATED)
+        with patch("portmark.tools._has_tree_termination_primitive", return_value=True):
+            no_profile = ToolRegistry()
+            with self.assertRaisesRegex(SecurityError, "IsolationProfile"):
+                no_profile.register_isolated("pay", "m:f", side_effecting=True, reconcile="m:r")
+            self.assertNotIn("pay", no_profile.names())
+            with_profile = ToolRegistry(isolation_profile=self._profile())
+            with_profile.register_isolated("pay", "m:f", side_effecting=True, reconcile="m:r")
+            self.assertIn("pay", with_profile.names())
+
+    def test_side_effecting_registration_couples_mechanism_to_platform(self):  # G5 (CALIBRATED)
+        with patch("portmark.tools._has_tree_termination_primitive", return_value=True):
+            # A platform with NO Windows Job Object (POSIX): os_job_object is refused, external ok.
+            with patch("portmark.tools._windows_job.available", return_value=False):
+                job_reg = ToolRegistry(isolation_profile=self._profile(IsolationMechanism.OS_JOB_OBJECT))
+                with self.assertRaisesRegex(SecurityError, "does not contain workers on this platform"):
+                    job_reg.register_isolated("pay", "m:f", side_effecting=True, reconcile="m:r")
+                ext_reg = ToolRegistry(isolation_profile=self._profile(IsolationMechanism.EXTERNAL_CONTAINER))
+                ext_reg.register_isolated("pay", "m:f", side_effecting=True, reconcile="m:r")
+                self.assertIn("pay", ext_reg.names())
+            # A platform WITH the Job Object (Windows): os_job_object is now genuine and accepted.
+            with patch("portmark.tools._windows_job.available", return_value=True):
+                job_ok = ToolRegistry(isolation_profile=self._profile(IsolationMechanism.OS_JOB_OBJECT))
+                job_ok.register_isolated("pay", "m:f", side_effecting=True, reconcile="m:r")
+                self.assertIn("pay", job_ok.names())
+
+    def test_reregistration_cannot_strip_reconcile_while_side_effecting(self):  # G8 (CALIBRATED)
+        with patch("portmark.tools._has_tree_termination_primitive", return_value=True):
+            registry = ToolRegistry(isolation_profile=self._profile())
+            registry.register_isolated("pay", "m:f", side_effecting=True, reconcile="m:r")
+            self.assertTrue(registry.is_side_effecting("pay"))
+            # Re-register side-effecting WITHOUT reconcile -> refused; prior state untouched.
+            with self.assertRaisesRegex(SecurityError, "reconcile"):
+                registry.register_isolated("pay", "m:f2", side_effecting=True)
+            self.assertTrue(registry.is_side_effecting("pay"))
+            self.assertTrue(registry.has_reconcile("pay"))
+            # Re-register as NON-side-effecting -> membership cleared (no stale side-effecting flag).
+            registry.register_isolated("pay", "m:f2", side_effecting=False)
+            self.assertFalse(registry.is_side_effecting("pay"))
+            # A plain thread register() of the same name also clears any stale membership.
+            registry._side_effecting.add("pay")
+            registry.register("pay", lambda arguments: {"ok": True})
+            self.assertFalse(registry.is_side_effecting("pay"))
+
+    def test_invoke_reasserts_side_effecting_contract_at_launch(self):  # G9 (CALIBRATED)
+        with patch("portmark.tools._has_tree_termination_primitive", return_value=True):
+            # (a) a side-effecting name with NO reconcile target (a stale flag the gate would never
+            #     create) fails closed at the launch boundary, before any capability is consumed.
+            reg = ToolRegistry(isolation_profile=self._profile())
+            reg.register_isolated("iso.x", "m:f", env={})  # non-side-effecting -> no reconcile
+            reg._side_effecting.add("iso.x")
+            with self.assertRaisesRegex(SecurityError, "reconcile"):
+                reg.invoke(self._permit("iso.x"), "iso.x", {}, launch_capability="whatever")
+            # (b) reconcile present but the IsolationProfile was dropped after registration.
+            reg2 = ToolRegistry(isolation_profile=self._profile())
+            reg2.register_isolated("pay", "m:f", side_effecting=True, reconcile="m:r")
+            reg2._isolation_profile = None
+            with self.assertRaisesRegex(SecurityError, "IsolationProfile"):
+                reg2.invoke(self._permit("pay"), "pay", {}, launch_capability="whatever")
+
+    def test_non_side_effecting_isolated_tool_needs_no_profile_or_reconcile(self):  # G10
+        registry = ToolRegistry()  # no profile acknowledged
+        registry.register_isolated("iso.read", "m:f", env={})  # no reconcile, not side-effecting
+        self.assertIn("iso.read", registry.names())
+        self.assertFalse(registry.is_side_effecting("iso.read"))
+        self.assertIsNone(registry.isolation_profile)
+
+    def test_reconcile_target_must_be_distinct_from_the_tool(self):  # G16 (CALIBRATED)
+        # A reconcile is observational; registering the effectful tool as its OWN reconcile target is
+        # the auditor's exploit (a reconcile execution then fires the charge). Refused at registration.
+        # Neutralize the `reconcile == target` check -> this registration is accepted.
+        registry = ToolRegistry(isolation_profile=self._profile())
+        with self.assertRaisesRegex(SecurityError, "DISTINCT function"):
+            registry.register_isolated(
+                "pay", "mytools:charge", side_effecting=True, reconcile="mytools:charge"
+            )
+        self.assertNotIn("pay", registry.names())
+        # A distinct reconcile target is accepted (preflight patched out by setUp).
+        registry.register_isolated("pay", "mytools:charge", side_effecting=True, reconcile="mytools:check")
+        self.assertIn("pay", registry.names())
+
+
+class ReconcileAuthorityAndSafetyTests(unittest.TestCase):
+    """Section 7 PR 2b: the private reconcile authority (G15) and registration that imports nothing (G21).
+    The authority test spawns a real worker, so it needs a process-tree termination primitive."""
+
+    def _env(self):
+        import portmark
+
+        src_dir = os.path.dirname(os.path.dirname(os.path.abspath(portmark.__file__)))
+        tests_dir = os.path.dirname(os.path.abspath(__file__))
+        return {"PYTHONPATH": os.pathsep.join([src_dir, tests_dir])}
+
+    @unittest.skipUnless(_has_tree_termination_primitive(), "reconcile preflight/authority spawn a worker")
+    def test_public_reconcile_runner_is_gone_and_authority_validates_the_row(self):  # G15 (CALIBRATED)
+        registry = ToolRegistry(isolation_profile=_TEST_ISOLATION_PROFILE)
+        registry.register_isolated(
+            "iso.charge", "isolated_tool_fixtures:idempotent_charge", side_effecting=True,
+            reconcile="isolated_tool_fixtures:reconcile_charge", env=self._env(),
+        )
+        # The public reconcile RUNNER that let any registry holder execute a target is gone.
+        self.assertFalse(hasattr(registry, "reconcile"))
+        rows: dict[str, dict] = {}
+        authority = registry.attach_effect_ledger(lambda eid: rows.get(eid))
+        with tempfile.TemporaryDirectory() as directory:
+            args = {"dir": directory, "amount": 5}  # reconcile_charge reads dir + amount
+            canonical_args = canonical_json(args).decode("utf-8")
+            # (a) fabricated effect_id -> no row -> refused (CALIBRATED: the row validation is what
+            #     refuses; neutralize it and a caller-fabricated effect runs the target -- the exploit).
+            with self.assertRaisesRegex(SecurityError, "reconciling"):
+                authority.run_reconcile("fabricated", "iso.charge", args, "claim-1")
+            # (b) row exists but not `reconciling` (never claimed) -> refused
+            rows["e-1"] = {"state": "unknown", "reconcile_claim_id": "claim-1", "tool": "iso.charge", "arguments_json": canonical_args}
+            with self.assertRaisesRegex(SecurityError, "reconciling"):
+                authority.run_reconcile("e-1", "iso.charge", args, "claim-1")
+            # (c) `reconciling` but a DIFFERENT owner claim -> refused (unguessable claim_id carries weight)
+            rows["e-1"] = {"state": "reconciling", "reconcile_claim_id": "OTHER", "tool": "iso.charge", "arguments_json": canonical_args}
+            with self.assertRaisesRegex(SecurityError, "reconciling"):
+                authority.run_reconcile("e-1", "iso.charge", args, "claim-1")
+            # (d) owned + `reconciling` but the arguments do not match the stored ones -> refused
+            rows["e-1"] = {"state": "reconciling", "reconcile_claim_id": "claim-1", "tool": "iso.charge", "arguments_json": canonical_args}
+            with self.assertRaisesRegex(SecurityError, "reconciling"):
+                authority.run_reconcile("e-1", "iso.charge", {"dir": directory, "amount": 99}, "claim-1")
+            # (e) a properly owned, matching `reconciling` row -> the target actually runs and returns its dict.
+            outcome = authority.run_reconcile("e-1", "iso.charge", args, "claim-1")
+            self.assertIn("landed", outcome)
+
+    def test_registration_does_not_import_the_reconcile_module(self):  # G21 (CALIBRATED)
+        # The auditor's round-3 repro, turned into a regression test: registering a side-effecting tool
+        # whose reconcile target is a module that WRITES A MARKER at import time must NOT write the marker
+        # -- registration executes no untrusted module-level code (module:function is a SYNTAX check only).
+        # CALIBRATED: add any import of the reconcile module to register_isolated and the marker appears.
+        with tempfile.TemporaryDirectory() as directory:
+            marker = os.path.join(directory, "imported.marker")
+            with patch.dict(os.environ, {"RECONCILE_IMPORT_MARKER": marker}):
+                registry = ToolRegistry(isolation_profile=_TEST_ISOLATION_PROFILE)
+                registry.register_isolated(
+                    "iso.charge", "isolated_tool_fixtures:idempotent_charge", side_effecting=True,
+                    reconcile="reconcile_import_marker:reconcile", env=self._env(),
+                )
+                self.assertIn("iso.charge", registry.names())  # registration succeeded
+                self.assertFalse(
+                    os.path.exists(marker),
+                    "registration must NOT import the reconcile module (no unledgered code execution)",
+                )
 
 
 if __name__ == "__main__":
