@@ -6,6 +6,32 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Section 8 — provider boundary (PR 1): HTTP transport safety (SSRF / redirects / DNS-rebinding / total deadline)
+
+- **`GenericHttpProvider` no longer follows redirects and validates the endpoint address.** The provider
+  was rewritten onto `http.client` so the transport is under Portmark's control. A 3xx response is now a
+  controlled failure (not followed) — following it was an SSRF vector and would have forwarded the bearer
+  token to another origin. The endpoint is resolved and every A/AAAA answer is rejected if it is loopback,
+  private, link-local, multicast, reserved, or unspecified (a mixed public+internal answer fails closed),
+  unless the new `allow_local_endpoint=True` is set for a loopback provider. IPv4-mapped IPv6
+  (`::ffff:127.0.0.1`) is normalized before classification. URL credentials, fragments, and malformed
+  hosts are rejected at construction; non-loopback endpoints must use https.
+- **DNS-rebinding defense.** The connection is made to the pre-validated IP literal (no re-resolution at
+  connect time), and the connected peer is verified to match before the request body is sent. TLS
+  certificate validation stays bound to the hostname (`server_hostname`) even though the socket connects
+  to the IP.
+- **Total end-to-end deadline.** `timeout` is now a monotonic deadline across connect, headers, and body,
+  re-armed before every read (via `read1`) — a slow-drip response that trickles within the socket idle
+  timeout can no longer hold the worker indefinitely. The response body is bounded during the read, and a
+  premature EOF / reset / malformed framing is raised as a controlled `ProviderError`.
+- **BEHAVIOR CHANGE — a provider failure now closes the task.** A provider failure after admission
+  (transport error, deadline, or malformed response) persists a **durable terminal `failed` checkpoint**
+  and a `provider.failed` audit event, then re-raises — an admitted task is never left represented only as
+  `running`. The task is closed; **a retry is a fresh call**, not a resume of the same task id. Previously
+  such a failure propagated out of `run()` leaving the checkpoint resumable as `running`.
+
+### Section 7 — tool execution isolation (PR 3): capability-based safe paths + tested container profile
+
 ### Section 7 — tool execution isolation (PR 3): capability-based safe paths + tested container profile
 
 - **Capability-based safe-path helper (`portmark.safe_paths.SafeRoot`).** An isolated tool that must

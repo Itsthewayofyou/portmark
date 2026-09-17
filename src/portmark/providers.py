@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import http.client
 import json
 import hashlib
 import base64
+import ipaddress
 import os
 import shutil
+import socket
+import ssl
 import subprocess  # nosec B404
 import sys
-import urllib.request
+import time
 from urllib.parse import urlparse
 from abc import ABC, abstractmethod
 from typing import Any
@@ -62,34 +66,215 @@ class DeterministicProvider(ModelProvider):
         )
 
 
-class GenericHttpProvider(ModelProvider):
-    """Provider-neutral JSON adapter for a local or remote model gateway."""
+class ProviderError(Exception):
+    """A controlled provider transport/response failure (Section 8, findings 1 + 3): a refused
+    redirect, a disallowed address, a DNS-rebinding mismatch, a total-deadline timeout, a premature
+    EOF/reset, or a non-200 status. Distinct from a bug -- but the host persists a durable `failed`
+    checkpoint on ANY decide() failure, so an admitted task is never left only as `running`."""
 
-    def __init__(self, endpoint: str, bearer_token: str | None = None, timeout: float = 30.0, max_response_bytes: int = 65_536) -> None:
-        scheme = urlparse(endpoint).scheme
-        if scheme not in {"http", "https"}:
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """Connects to a pre-validated IP while validating the TLS certificate against the ORIGINAL
+    hostname (server_hostname). Connecting to the literal we already classified -- not re-resolving
+    the hostname at connect time -- is the DNS-rebinding defense; the cert check stays on the name."""
+
+    def __init__(self, ip: str, port: int, hostname: str, timeout: float, context: ssl.SSLContext) -> None:
+        super().__init__(ip, port, timeout=timeout, context=context)
+        self._pin_hostname = hostname
+        self._ssl_context = context
+
+    def connect(self) -> None:
+        http.client.HTTPConnection.connect(self)  # TCP-connect to self.host, which is the pinned IP
+        self.sock = self._ssl_context.wrap_socket(self.sock, server_hostname=self._pin_hostname)
+
+
+def _classify_address(ip_str: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    # Normalize an IPv4-mapped IPv6 address (::ffff:127.0.0.1) to its IPv4 form BEFORE classifying --
+    # otherwise the mapped form sidesteps is_loopback/is_private (the classic SSRF bypass).
+    address = ipaddress.ip_address(ip_str)
+    if address.version == 6 and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    return address
+
+
+def _address_is_disallowed(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return bool(
+        address.is_loopback or address.is_private or address.is_link_local
+        or address.is_multicast or address.is_reserved or address.is_unspecified
+    )
+
+
+class GenericHttpProvider(ModelProvider):
+    """Provider-neutral JSON adapter for a local or remote model gateway.
+
+    Section 8 hardening (findings 1 + 3): no automatic redirects, SSRF address validation with a
+    DNS-rebinding pin, a total end-to-end deadline, and a bounded streaming read. Runs directly on
+    http.client so the transport -- connect target, TLS server_hostname, Host header, per-read
+    timeout, redirect handling -- is under our control rather than urllib's default opener.
+    """
+
+    def __init__(
+        self, endpoint: str, bearer_token: str | None = None, timeout: float = 30.0,
+        max_response_bytes: int = 65_536, allow_local_endpoint: bool = False,
+    ) -> None:
+        parsed = urlparse(endpoint)
+        if parsed.scheme not in {"http", "https"}:
             raise ValueError("provider endpoint must use http or https")
+        if parsed.username or parsed.password:
+            raise ValueError("provider endpoint must not contain credentials")
+        if parsed.fragment:
+            raise ValueError("provider endpoint must not contain a fragment")
+        host = parsed.hostname
+        if not host or any(character in host for character in "/\\?#@ \t\r\n"):
+            raise ValueError("provider endpoint host is missing or malformed")
         self.endpoint = endpoint
+        self._scheme = parsed.scheme
+        self._host = host
+        self._port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        path = parsed.path or "/"
+        self._path = path + (f"?{parsed.query}" if parsed.query else "")
+        default_port = self._port == (443 if parsed.scheme == "https" else 80)
+        self._host_header = host if default_port else f"{host}:{self._port}"
         self.bearer_token = bearer_token
         self.timeout = timeout
         self.max_response_bytes = max_response_bytes
+        self._allow_local = allow_local_endpoint
 
     def decide(self, state: AgentState, available_tools: tuple[str, ...], grants: tuple[ToolGrant, ...] = ()) -> ProviderDecision:
         body = json.dumps({"state": provider_state(state, grants), "available_tools": available_tools}).encode()
-        headers = {"Content-Type": "application/json"}
-        if self.bearer_token:
-            headers["Authorization"] = f"Bearer {self.bearer_token}"
-        request = urllib.request.Request(self.endpoint, data=body, headers=headers, method="POST")
-        # Endpoint scheme is validated at initialization.
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:  # nosec B310
-            raw = response.read(self.max_response_bytes + 1)
-        if len(raw) > self.max_response_bytes:
-            raise SecurityError("provider response exceeds output limit")
+        raw = self._post(body)
         try:
             value = json.loads(raw)
         except json.JSONDecodeError as error:
             raise SecurityError("provider response is malformed JSON") from error
         return _provider_decision(value)
+
+    # ---- Section 8 transport -------------------------------------------------------------------
+
+    def _resolve(self) -> list[tuple[int, str]]:
+        # A literal-IP endpoint is classified directly (no resolution). A hostname is resolved ONCE,
+        # and every A/AAAA answer is returned so the caller can reject a mixed public+private answer.
+        try:
+            literal = ipaddress.ip_address(self._host)
+            return [(socket.AF_INET6 if literal.version == 6 else socket.AF_INET, str(literal))]
+        except ValueError:
+            pass
+        try:
+            infos = socket.getaddrinfo(self._host, self._port, type=socket.SOCK_STREAM)
+        except socket.gaierror as error:
+            raise ProviderError(f"provider endpoint did not resolve: {error}") from error
+        answers = [(family, sockaddr[0]) for family, _t, _p, _c, sockaddr in infos
+                   if family in (socket.AF_INET, socket.AF_INET6)]
+        if not answers:
+            raise ProviderError("provider endpoint resolved to no usable address")
+        return answers
+
+    def _validated_target(self) -> tuple[int, str]:
+        answers = self._resolve()
+        # Fail closed on ANY disallowed answer (a mixed public+loopback response must not proceed on
+        # the public one), unless it is loopback AND the operator opted into a local provider.
+        for _family, ip in answers:
+            address = _classify_address(ip)
+            if _address_is_disallowed(address) and not (address.is_loopback and self._allow_local):
+                raise ProviderError(f"provider endpoint address is not permitted: {ip}")
+        family, ip = answers[0]
+        effective = _classify_address(ip)
+        if not effective.is_loopback and self._scheme != "https":
+            raise ProviderError("provider endpoint must use https unless it is a loopback address")
+        return family, ip
+
+    def _open_connection(self, ip: str, deadline: float) -> http.client.HTTPConnection:
+        # https connects through the pinned-IP + hostname-cert connection. Plain http skips the pin,
+        # but _validated_target permits http ONLY for a loopback address, so the http branch is
+        # loopback-only by construction -- a remote endpoint must be https and takes the pinned path.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ProviderError("provider deadline exceeded before connect")
+        if self._scheme == "https":
+            connection: http.client.HTTPConnection = _PinnedHTTPSConnection(
+                ip, self._port, self._host, remaining, ssl.create_default_context()
+            )
+        else:
+            connection = http.client.HTTPConnection(ip, self._port, timeout=remaining)
+        connection.connect()
+        return connection
+
+    def _post(self, body: bytes) -> bytes:
+        deadline = time.monotonic() + self.timeout
+        _family, ip = self._validated_target()
+        try:
+            connection = self._open_connection(ip, deadline)
+        except (OSError, ssl.SSLError) as error:
+            raise ProviderError(f"provider connection failed: {error}") from error
+        try:
+            # DNS-rebinding backstop: confirm the socket really connected to the address we validated.
+            # connection.sock is valid here (before getresponse, which may release it for a close).
+            if connection.sock is None:
+                raise ProviderError("provider connection has no socket")
+            if _classify_address(connection.sock.getpeername()[0]) != _classify_address(ip):
+                raise ProviderError("connected peer does not match the validated address")
+            return self._exchange(connection, body, deadline)
+        finally:
+            connection.close()
+
+    def _exchange(self, connection: http.client.HTTPConnection, body: bytes, deadline: float) -> bytes:
+        try:
+            # skip_host so we set Host ourselves (the hostname, not the pinned IP the socket is on).
+            connection.putrequest("POST", self._path, skip_host=True, skip_accept_encoding=True)
+            connection.putheader("Host", self._host_header)
+            connection.putheader("Content-Type", "application/json")
+            connection.putheader("Content-Length", str(len(body)))
+            if self.bearer_token:
+                connection.putheader("Authorization", f"Bearer {self.bearer_token}")
+            self._check_deadline(deadline)
+            connection.endheaders(body)
+            self._check_deadline(deadline)
+            response = connection.getresponse()
+        except (OSError, http.client.HTTPException) as error:
+            raise ProviderError(f"provider request failed: {error}") from error
+        # A redirect is NOT followed -- it is a controlled failure (SSRF vector + would forward the
+        # bearer token cross-origin). Any non-200 is likewise a provider failure.
+        if 300 <= response.status < 400:
+            raise ProviderError(f"provider returned an unfollowed redirect (HTTP {response.status})")
+        if response.status != 200:
+            raise ProviderError(f"provider returned HTTP {response.status}")
+        return self._read_bounded(response, deadline)
+
+    def _read_bounded(self, response: http.client.HTTPResponse, deadline: float) -> bytes:
+        # Bound the body DURING the read (never buffer unbounded) and enforce the total deadline. The
+        # socket carries a connect-time timeout (set from the remaining budget in _open_connection),
+        # which bounds a TOTAL stall (a read that gets no data). read1() returns whatever one recv
+        # yields, so a slow-drip is re-checked against the wall clock between chunks and aborted on the
+        # end-to-end deadline rather than trickling to completion (finding #3).
+        limit = self.max_response_bytes
+        buffer = bytearray()
+        while len(buffer) <= limit:
+            self._check_deadline(deadline)
+            try:
+                # read1(), not read(): read(amt) blocks until it has accumulated the full amt (or the
+                # Content-Length is met), so a slow-drip that trickles within the idle socket timeout
+                # keeps a single read() blocked for the whole body and defeats the deadline. read1()
+                # returns whatever one underlying recv yields, so the deadline is re-checked between
+                # chunks and a drip is aborted on the total clock (finding #3).
+                chunk = response.read1(min(65_536, limit + 1 - len(buffer)))
+            except (OSError, http.client.HTTPException) as error:
+                raise ProviderError(f"provider response read failed: {error}") from error
+            if not chunk:
+                # EOF. If the framing promised more (Content-Length not fully delivered), the body was
+                # truncated -- a controlled provider failure, not a valid short response (finding #3).
+                if getattr(response, "length", None):
+                    raise ProviderError("provider response ended prematurely")
+                return bytes(buffer)
+            buffer.extend(chunk)
+            if len(buffer) > limit:
+                raise SecurityError("provider response exceeds output limit")
+        raise SecurityError("provider response exceeds output limit")
+
+    def _check_deadline(self, deadline: float) -> None:
+        # Wall-clock check of the total end-to-end deadline (independent of the socket idle timeout,
+        # which a slow-drip can beat). Called between read1() chunks so a trickling response is aborted.
+        if deadline - time.monotonic() <= 0:
+            raise ProviderError("provider deadline exceeded")
 
 
 def _provider_decision(value: Any) -> ProviderDecision:

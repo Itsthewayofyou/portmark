@@ -131,6 +131,20 @@ what makes the SafeRoot the only reachable path.
 - A2A envelope -> host security layer: signed manifest, permit, state, previous audit head, and optional attestation. Controls: Ed25519 trust registry, audience and expiry checks, nonce consumption, audit-head signature verification. Evidence: `src/portmark/security.py`, `src/portmark/host.py`.
 - Host -> provider: projected state and available tool names. Controls: provider projection hides ungranted tool messages and narrows returned tool output fields. Evidence: `src/portmark/providers.py`, `src/portmark/projection.py`.
 - Provider -> host: provider decision JSON or Wasm return payload. Controls: response size cap, JSON/schema validation, allowed decision kinds, host-side permit and policy checks. Evidence: `src/portmark/providers.py`, `src/portmark/host.py`.
+- **HTTP provider transport (Section 8).** `GenericHttpProvider` runs on `http.client` with the transport
+  under Portmark's control: redirects are NOT followed (a 3xx is a controlled failure, closing the SSRF /
+  cross-origin-token-forwarding vector); the endpoint address is validated (every resolved A/AAAA answer
+  is rejected if loopback/private/link-local/multicast/reserved/unspecified — mixed answers fail closed —
+  IPv4-mapped IPv6 normalized first; loopback allowed only under `allow_local_endpoint`); the connection
+  is pinned to the pre-validated IP with a `getpeername` cross-check (DNS-rebinding defense) while TLS
+  cert validation stays on the hostname; and a single monotonic deadline bounds connect+headers+body,
+  re-armed before every `read1` so a slow-drip cannot hold the worker. A premature EOF/reset/timeout is a
+  controlled `ProviderError`. Evidence: `src/portmark/providers.py`.
+- **Durable provider-failure semantics (Section 8).** A provider failure AFTER admission (transport error,
+  deadline, malformed response, or any provider exception) closes the task to a durable terminal `failed`
+  checkpoint with a `provider.failed` audit event, then re-raises — extending the terminalization
+  guarantee: an admitted task is never left represented only as `running`. The task id is closed and a
+  retry is a fresh call, not a resume. Evidence: `src/portmark/host.py`.
 - Host -> tool: tool name and arguments proposed by provider. Controls: grant intersection, host policy constraints, approval tokens for high-impact tools, timeout, exception isolation, output serialization and size cap. Evidence: `src/portmark/security.py`, `src/portmark/tools.py`, `src/portmark/host.py`.
 - Host -> runtime store: nonce records, checkpoints, audit events, signed audit heads. Controls: transactions, uniqueness constraints, contiguous audit sequence checks, signed audit-head verification, three-state verifier. Evidence: `src/portmark/storage.py`.
 - Host -> external attestation verifier: canonical JSON evidence through stdin to an operator-supplied argv command. Controls: no shell, empty environment, timeout, stdout cap, generic rejection. Evidence: `src/portmark/security.py`, `ATTESTATION.md`.

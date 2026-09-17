@@ -482,9 +482,26 @@ class AgentHost:
             # decide; the host mutates the real state via _apply_decision below.
             projected_state = project_state_for_provider(state, effective.grants)
             try:
-                decision = provider.decide(projected_state, tool_names, effective.grants)
-            finally:
-                self.metrics.observe_duration("provider_decision_duration_seconds", time.monotonic() - decision_started)
+                try:
+                    decision = provider.decide(projected_state, tool_names, effective.grants)
+                finally:
+                    self.metrics.observe_duration("provider_decision_duration_seconds", time.monotonic() - decision_started)
+            except Exception:
+                # Section 8 finding #3: a provider failure AFTER admission (network reset, slow-drip
+                # timeout, malformed response, or any provider exception) must reach a DURABLE terminal
+                # checkpoint -- it must never leave the admitted task represented only as `running`.
+                # The provider only READ the projected state here (no tool ran, no effect landed), so
+                # closing the task as `failed` is safe; a retry is a fresh call. Persist a closed
+                # `failed` checkpoint + a `provider.failed` event, then re-raise so the caller still
+                # sees the error. Mirrors the step-exhaustion terminalization below.
+                state.status = "failed"
+                state.result = {"error": "provider failed"}
+                audit.append("provider.failed", {"error": "provider decision failed"})
+                if self._checkpoint_fits(effective, state):
+                    self._persist(envelope, effective, state, audit, persisted_events, closed=True)
+                else:
+                    self._terminalize_over_budget(envelope, effective, state, audit, persisted_events, None, False)
+                raise
             self.metrics.increment("provider.decisions")
             audit.append("provider.proposed", {"kind": decision.kind, "tool": decision.tool})
             tool_calls_before = state.tool_calls
