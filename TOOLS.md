@@ -329,8 +329,12 @@ arguments, so the invariant is **at most one effect per position** and provider 
 second effect at a position whose first effect is unresolved) — and records a `prepared` row, then
 advances it to `started` immediately before launch. After the call it settles the row:
 
-- **success → `confirmed`** (the result is stored; a later identical call *replays* it instead of
-  running the tool again);
+- **success → `confirmed`** (the result is stored; a later call at the same position with the **same
+  tool and arguments** *replays* it instead of running the tool again). A call that re-proposes the
+  position with a **different tool or different arguments** is **drift**: the host **refuses** it — it
+  never replays another call's recorded result and never re-runs at a bound position. A deterministic
+  resume re-proposes the same tool+args and replays cleanly; a drifted re-proposal hard-fails the task,
+  and reconcile (or a fresh call) resolves it;
 - **killed at the deadline → `unknown`**, and a **clean tool error → `unknown` too** — because the
   effect may have landed before the tool reported failure;
 - a non-serializable result → `unknown`.
@@ -340,7 +344,15 @@ per-task `tool_calls`, rebound from the durable checkpoint, monotonic and never 
 deliberately **not** bound to the checkpoint generation, which identifies the run, not the call).
 The host then: replays a `confirmed` effect; proceeds for a `prepared` row (a prior attempt never
 launched); and **refuses** a `started`/`unknown`/`reconciled` row — it **never auto-retries** an
-effect whose status is unknown, because a second run could double a real effect.
+effect whose status is unknown, because a second run could double a real effect. On a `confirmed` or
+`prepared` row the host also checks the current decision's tool + arguments against the row's recorded
+tool + arguments and **refuses on any drift** — it never replays another call's result or re-runs at a
+bound position.
+
+**The invoke gate is un-forgeable.** `ToolRegistry.invoke` runs a side-effecting tool only for an
+`effect_id` the host has recorded and marked `started` in the ledger — it checks that at the gate via
+a host-injected predicate (`bind_effect_ledger`), so a **caller-fabricated id cannot authorize a
+side-effecting call**. No id, an unbound registry, or an id that names no started row all fail closed.
 
 **The tool contract.** A side-effecting tool is called as `tool(arguments, effect_id)` and **must
 use the `effect_id` as its idempotency key** with the external system (e.g. a payment idempotency

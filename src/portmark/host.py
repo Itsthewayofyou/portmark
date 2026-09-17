@@ -103,6 +103,21 @@ class AgentHost:
         self._reload_policy = reload_policy
         self.metrics = metrics or RuntimeMetrics()
 
+    @property
+    def tools(self) -> ToolRegistry:
+        return self._tools
+
+    @tools.setter
+    def tools(self, registry: ToolRegistry) -> None:
+        # Section 7 PR 2 (round 2): whenever the host's registry is set -- at construction or a later
+        # swap -- bind its side-effecting gate to THIS host's durable ledger. invoke() then admits a
+        # side-effecting tool only for an effect_id the host recorded and marked `started`; a fabricated
+        # id names no such row and is refused at the gate. Binding on the setter (not once in __init__)
+        # is what makes it impossible to silently unbind by reassigning host.tools -- the registry holds
+        # no store, so this predicate is its only, host-controlled view of the ledger.
+        self._tools = registry
+        registry.bind_effect_ledger(self._effect_is_started)
+
     def run(self, envelope: AgentEnvelope) -> RunResult:
         started = time.monotonic()
         self.metrics.increment("runs.started")
@@ -795,6 +810,13 @@ class AgentHost:
         audit.append("agent.failed", state.result)
         return True, None
 
+    def _effect_is_started(self, effect_id: str) -> bool:
+        """The registry's gate predicate (bound in __init__): True only for an effect this host has
+        recorded and marked `started`. A fabricated effect_id names no row -> False -> the invoke gate
+        refuses the side-effecting call. Read-only; the effect_id PRIMARY KEY makes the lookup exact."""
+        row = self.store.get_effect(effect_id)
+        return row is not None and row["state"] == "started"
+
     def _effect_pre_launch(self, eid: str, task_id: str, tool: str, arguments: dict[str, Any]) -> tuple[str, Any]:
         """Effect-ledger state machine for a side-effecting tool BEFORE it launches (Section 7 PR 2).
 
@@ -813,17 +835,36 @@ class AgentHost:
         row = self.store.get_effect(eid)
         if row is not None:
             existing = row["state"]
-            if existing == "confirmed":
-                stored = row["result_json"]
-                return "replay", (json.loads(stored) if stored is not None else None)
             if existing == "started":
                 # A prior attempt launched (or was about to) and never settled -- the effect may have
-                # landed. Mark it unknown and refuse; the reconcile pass, not a retry, resolves it.
+                # landed. Settle unknown and refuse; the reconcile pass, not a retry, resolves it. This
+                # runs BEFORE the drift check below: the prior effect's resolution obligation is
+                # independent of whether the current decision drifted, and refusing-for-drift here would
+                # strand the row `started` (reconcile_effect only accepts `unknown`), leaving it
+                # permanently unreconcilable.
                 self.store.settle_effect(eid, "unknown", None, "host interrupted while the effect was in flight")
                 return "refuse", "effect is unknown after an interrupted run; reconcile before re-running"
             if existing in ("unknown", "reconciled"):
                 return "refuse", f"effect is {existing}; reconcile it or issue a new call -- never auto-retry"
-            # `prepared`: a prior attempt recorded intent but never launched -- safe to run.
+            # `confirmed` or `prepared`: this position is already BOUND to a (tool, arguments). The
+            # effect_id is position-only, so a provider re-proposing the same position with a different
+            # tool or different arguments must NOT replay the recorded result nor re-run at a bound
+            # position -- that would corrupt state and audit meaning (the auditor's round-2 finding).
+            # Refuse on any drift; a legitimate deterministic resume re-proposes the SAME tool+args and
+            # passes cleanly.
+            tool_drift = row["tool"] != tool
+            arg_drift = row["arguments_json"] != canonical_json(arguments).decode("utf-8")
+            if tool_drift or arg_drift:
+                what = "tool and arguments" if tool_drift and arg_drift else "tool" if tool_drift else "arguments"
+                return "refuse", (
+                    f"effect at this position was recorded for tool {row['tool']!r}; the current "
+                    f"decision drifts in {what} -- refusing to replay or re-run a drifted effect, "
+                    "reconcile or issue a new call instead"
+                )
+            if existing == "confirmed":
+                stored = row["result_json"]
+                return "replay", (json.loads(stored) if stored is not None else None)
+            # `prepared`: intent recorded, never launched, and same tool+args -- safe to run.
         else:
             self.store.record_effect_prepared(
                 eid, task_id, tool, canonical_json(arguments).decode("utf-8")

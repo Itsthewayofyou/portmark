@@ -147,6 +147,13 @@ class ToolRegistry:
         self._timeouts: dict[str, float] = {}
         self._max_output: dict[str, int] = {}
         self._side_effecting: set[str] = set()
+        # Section 7 PR 2 (round 2): the registry's only view of the durable effect ledger. AgentHost
+        # binds this to a predicate that answers "did the host record this effect_id and mark it
+        # `started`?" (bind_effect_ledger). invoke() then runs a side-effecting tool ONLY for such an
+        # id -- a fabricated string names no started row and is refused AT THE GATE. Left None the
+        # gate fails closed: an unbound registry cannot verify the ledger, so it refuses every
+        # side-effecting call rather than trusting the caller.
+        self._effect_started: Callable[[str], bool] | None = None
         self.default_timeout = default_timeout
         self.max_output_bytes = max_output_bytes
         # Section 7 #6/#3: defense-in-depth resource caps applied inside each isolated worker.
@@ -230,6 +237,15 @@ class ToolRegistry:
         if side_effecting:
             self._side_effecting.add(name)
 
+    def bind_effect_ledger(self, effect_started: Callable[[str], bool]) -> None:
+        """Bind this registry's side-effecting gate to the host's durable effect ledger (Section 7
+        PR 2, round 2). `effect_started(effect_id)` returns True only for an effect the host has
+        recorded and marked `started`. AgentHost calls this at construction; invoke() then admits a
+        side-effecting tool ONLY for such an id, so a caller-fabricated string (or a bare call that
+        skips the ledger) is refused at the gate rather than trusted. One registry serves one host's
+        ledger; a re-bind points the gate at the most recently bound host's store."""
+        self._effect_started = effect_started
+
     def is_side_effecting(self, name: str) -> bool:
         """Whether the tool is registered side-effecting (the host wraps it in the effect ledger)."""
         return name in self._side_effecting
@@ -277,16 +293,32 @@ class ToolRegistry:
         timeout = self._timeouts.get(name, self.default_timeout)
         cap = max_output_bytes if max_output_bytes is not None else self._max_output.get(name, self.max_output_bytes)
 
-        if name in self._side_effecting and effect_id is None:
-            # Fail closed at the invoke boundary: a side-effecting tool must be reached through the
-            # effect ledger, which supplies the host-derived effect_id. This does NOT prove the ledger
-            # actually recorded the effect (the registry has no store); it forces callers onto a
-            # ledger-aware path (AgentHost) instead of silently running a side-effecting tool with no
-            # idempotency key by calling invoke() directly.
-            raise ToolExecutionError(
-                f"tool {name!r} is side-effecting and must run through the effect ledger via AgentHost "
-                "(which supplies its effect_id); it cannot be invoked directly without one."
-            )
+        if name in self._side_effecting:
+            # Fail closed at the invoke boundary. A side-effecting tool runs ONLY for an effect the
+            # host recorded and marked `started` in the durable ledger. The gate CHECKS that fact via
+            # an injected predicate (bind_effect_ledger) -- it never trusts the caller to have done the
+            # recording. This closes the round-1 hole where any non-None effect_id string satisfied the
+            # gate: a fabricated id names no started row and is refused here; no id, or an unbound
+            # registry, also fails closed. The registry still holds no store, so this proves the effect
+            # is host-recorded, not (by itself) that the whole ledger lifecycle ran -- but a bare public
+            # string can no longer authorize a side-effecting call.
+            if effect_id is None:
+                raise ToolExecutionError(
+                    f"tool {name!r} is side-effecting and must run through the effect ledger via AgentHost "
+                    "(which supplies its effect_id); it cannot be invoked directly without one."
+                )
+            if self._effect_started is None:
+                raise ToolExecutionError(
+                    f"tool {name!r} is side-effecting but this ToolRegistry is not bound to an effect "
+                    "ledger; construct it via AgentHost (which calls bind_effect_ledger) so invoke can "
+                    "verify the host recorded the effect."
+                )
+            if not self._effect_started(effect_id):
+                raise SecurityError(
+                    f"effect_id {effect_id!r} does not name a started effect in the ledger; a "
+                    "side-effecting tool runs only for an effect the host has recorded and marked "
+                    "started -- a fabricated id cannot authorize one."
+                )
 
         if is_isolated:
             return self._invoke_isolated(self._isolated[name], arguments, timeout, cap, effect_id=effect_id)

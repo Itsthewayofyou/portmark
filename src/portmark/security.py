@@ -1103,12 +1103,15 @@ def effect_id(task_id: str, sequence: int) -> str:
 
     Why NOT the tool/arguments: binding them would let a provider that re-proposes the same position
     with DIFFERENT arguments (or a different tool) on a resume derive a NEW id and run a SECOND effect
-    while the first effect at that position is still unresolved -- the argument-drift hole. CONSEQUENCE
-    of excluding them: on such provider drift the host replays position K's RECORDED result even though
-    the current decision names different arguments (or a different tool), and `tool_results` is then
-    keyed by the new decision's tool with the recorded result. That is the deliberate trade -- one
-    unresolved effect per position beats a second effect. The ledger ROW still records the tool and
-    arguments (for reconcile and audit); only the id excludes them.
+    while the first effect at that position is still unresolved -- the argument-drift hole. The
+    invariant is **at most one effect per position**. Because the id excludes the tool and arguments,
+    the host does NOT silently replay a drifted position: `_effect_pre_launch` compares the current
+    decision's (tool, arguments) against the ledger ROW's recorded (tool, arguments_json) and REFUSES
+    on any drift -- it never replays another call's recorded result and never re-runs at a bound
+    position. A legitimate deterministic resume re-proposes the same tool+args and passes cleanly; a
+    drifted re-proposal hard-fails the task (settling `unknown` where a prior attempt was in flight),
+    so reconcile or a fresh call resolves it -- never a silent replay. The ledger ROW keeps the tool
+    and arguments for exactly this drift check plus reconcile and audit; only the id excludes them.
     """
     material = {"task_id": task_id, "sequence": sequence}
     return hashlib.sha256(canonical_json(material)).hexdigest()

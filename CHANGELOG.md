@@ -24,13 +24,17 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   not the call) **nor the tool/arguments**: binding those would let a provider that re-proposes the
   same position with different arguments (or a different tool) mint a NEW id and run a **second** effect
   while the first at that position is unresolved. The invariant is **at most one effect per position**.
-  Consequence: on such provider drift the host replays the position's recorded result even though the
-  current decision names different arguments/tool. The ledger row still records the tool and arguments
-  for reconcile and audit.
-- **The invoke boundary fails closed.** `ToolRegistry.invoke` refuses a side-effecting tool called
-  without an `effect_id`, so a caller cannot bypass the ledger by invoking a side-effecting tool
-  directly instead of through `AgentHost`. (The registry has no store, so this forces callers onto a
-  ledger-aware path; it does not by itself prove the ledger recorded the effect.)
+  Because the id excludes the tool and arguments, the host does **not** silently replay a drifted
+  position: `_effect_pre_launch` compares the current decision's (tool, arguments) against the ledger
+  row's recorded values and **refuses on any drift** — it never replays another call's result and never
+  re-runs at a bound position. A deterministic resume re-proposes the same tool+args and replays
+  cleanly; a drifted re-proposal hard-fails the task, and reconcile (or a fresh call) resolves it. The
+  ledger row records the tool and arguments for exactly this drift check plus reconcile and audit.
+- **The invoke gate is un-forgeable.** `ToolRegistry.invoke` runs a side-effecting tool only for an
+  `effect_id` the host recorded and marked `started` in the ledger — checked at the gate via a
+  host-injected predicate (`bind_effect_ledger`), so a caller-fabricated id cannot authorize one. No
+  id, an unbound registry, or an id that names no started row all fail closed. (The registry has no
+  store; the predicate is its only, host-controlled view of the ledger.)
 - **Side-effecting tools receive the effect id as an idempotency key.** The isolated worker calls a
   side-effecting tool as `tool(arguments, effect_id)` (the id travels in the request envelope, outside
   `arguments`, so the argument-name allowlist does not reject it); the tool must use it as its external

@@ -1461,15 +1461,29 @@ class RuntimeTests(unittest.TestCase):
             "iso.pay", "isolated_tool_fixtures:echo", side_effecting=True, env=self._isolated_env()
         )
         permit = self._isolated_permit("iso.pay")
-        # Section 7 PR 2a: a side-effecting tool must be reached through the effect ledger, which
-        # supplies a host-derived effect_id. A DIRECT invoke without one now fails closed at the
-        # registry boundary (it cannot bypass the ledger).
+        # Section 7 PR 2 (round 2): a side-effecting tool runs ONLY for an effect the host recorded and
+        # marked `started`. The registry checks that at the gate via an injected predicate, so a
+        # caller-supplied string can no longer authorize a side-effecting call (the auditor's P1).
         from portmark.tools import ToolExecutionError
+        # (a) No effect_id at all -> refuse.
         with self.assertRaisesRegex(ToolExecutionError, "must run through the effect ledger"):
             registry.invoke(permit, "iso.pay", {"amount": 10})
-        # With an effect_id (as AgentHost supplies) it runs, and the id reaches the tool.
+        # (b) An UNBOUND registry cannot verify the ledger, so even WITH an id it fails closed -- it
+        #     never trusts the caller's string on faith.
+        with self.assertRaisesRegex(ToolExecutionError, "not bound to an effect ledger"):
+            registry.invoke(permit, "iso.pay", {"amount": 10}, effect_id="e-test")
+        # Bind the gate to a ledger view, exactly as AgentHost does.
+        started: set[str] = set()
+        registry.bind_effect_ledger(lambda eid: eid in started)
+        # (c) CALIBRATED: a FABRICATED id names no started effect -> refuse. Calibration (gate ledger):
+        #     neutralize the `if not self._effect_started(effect_id)` check in invoke -> the forged id
+        #     runs the tool, and this assertion fails.
+        with self.assertRaisesRegex(SecurityError, "does not name a started effect"):
+            registry.invoke(permit, "iso.pay", {"amount": 10}, effect_id="forged")
+        # (d) An id the host recorded and marked started -> runs, and the id reaches the tool.
+        started.add("e-real")
         self.assertEqual(
-            registry.invoke(permit, "iso.pay", {"amount": 10}, effect_id="e-test"),
+            registry.invoke(permit, "iso.pay", {"amount": 10}, effect_id="e-real"),
             {"echo": {"amount": 10}},
         )
 
@@ -1649,6 +1663,49 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(base, effect_id("task", 0))        # deterministic
         self.assertNotEqual(base, effect_id("task", 1))     # position (sequence) distinguishes
         self.assertNotEqual(base, effect_id("other", 0))    # task distinguishes
+
+    @unittest.skipUnless(_has_tree_termination_primitive(), "isolated side-effecting tools need a process-tree termination primitive")
+    def test_replay_refuses_on_argument_drift(self):
+        # CALIBRATED (P1 round 2). Position 0 already holds a CONFIRMED effect recorded with amount=999.
+        # The provider re-proposes the SAME position with amount=5. Because the effect_id is
+        # position-only, the host must REFUSE -- never replay the amount=999 result, never re-run at a
+        # bound position. Calibration (gate ledger): drop the drift check in _effect_pre_launch -> the
+        # confirmed row REPLAYS and the run completes (tool.replayed), so status is not "failed".
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            host, envelope = self._charge_host(store, directory)
+            eid = self._charge_eid(envelope, directory)
+            store.record_effect_prepared(eid, envelope.state.task_id, "iso.charge",
+                                         canonical_json({"dir": directory, "amount": 999}).decode("utf-8"))
+            store.mark_effect_started(eid)
+            store.settle_effect(eid, "confirmed", canonical_json({"charged": 999}).decode("utf-8"), None)
+            result = host.run(envelope)
+            self.assertEqual(result.status, "failed")
+            refused = next(event for event in result.audit if event["event"] == "tool.refused")
+            self.assertIn("arguments", refused["details"]["reason"])
+            self.assertFalse((Path(directory) / "attempts.log").exists())  # the tool never ran
+            self.assertFalse(any(event["event"] == "tool.replayed" for event in result.audit))  # not replayed
+            self.assertFalse(any(event["event"] == "tool.executed" for event in result.audit))
+
+    @unittest.skipUnless(_has_tree_termination_primitive(), "isolated side-effecting tools need a process-tree termination primitive")
+    def test_replay_refuses_on_tool_drift(self):
+        # The auditor's exact case: "a different TOOL's result". Position 0 holds a confirmed effect
+        # recorded for tool "iso.other" (same arguments). The provider now proposes "iso.charge" at that
+        # position -> refuse; the host must not hand back another tool's recorded result.
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            host, envelope = self._charge_host(store, directory)
+            eid = self._charge_eid(envelope, directory)
+            store.record_effect_prepared(eid, envelope.state.task_id, "iso.other",
+                                         canonical_json({"dir": directory, "amount": 5}).decode("utf-8"))
+            store.mark_effect_started(eid)
+            store.settle_effect(eid, "confirmed", canonical_json({"charged": 777}).decode("utf-8"), None)
+            result = host.run(envelope)
+            self.assertEqual(result.status, "failed")
+            refused = next(event for event in result.audit if event["event"] == "tool.refused")
+            self.assertIn("tool", refused["details"]["reason"])
+            self.assertFalse((Path(directory) / "attempts.log").exists())  # the tool never ran
+            self.assertFalse(any(event["event"] == "tool.replayed" for event in result.audit))  # not replayed
 
     def test_sqlite_v9_to_v10_adds_tool_effects(self):
         # Section 7 PR 2a (G2, upgrade path). An existing v9 SQLite store opened by v10 code migrates
