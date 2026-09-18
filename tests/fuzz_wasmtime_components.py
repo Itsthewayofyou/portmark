@@ -29,10 +29,12 @@ import argparse
 import base64
 import json
 import os
+import queue
 import random
 import signal
 import subprocess  # nosec B404 - fixed argv only: this interpreter + this script, no shell
 import sys
+import threading
 import time
 from collections import Counter
 from pathlib import Path
@@ -48,10 +50,27 @@ CAPSULE_PATH = ROOT / "capsules" / "research-agent.component.wasm.b64"
 # exhaustion is itself a controlled trap, so this changes speed, not the property under test.
 INPROC_FUEL = 10_000_000
 INPROC_CASE_SLOW_SECONDS = 5.0
+# Per-case watchdog: no result within this long -> the case is a HANG finding and the child is
+# killed, so one bad input can never stall a CI lane.
+INPROC_CASE_WATCHDOG_SECONDS = 20.0
+FUZZ_CHILD_MEMORY_LIMIT = 512 * MIB
+# Every stage the campaign claims to reach; a corpus regression that loses one fails the run.
+REQUIRED_STAGES = ("ran", "decode", "limits", "link", "run", "export", "call", "outcome")
 E2E_DEADLINE_MARGIN_SECONDS = 1.5
 COUNT_LIMITS = {"instances": 8, "memories": 2, "tables": 4, "table_elements": 10_000}
-# A crash signal from the worker is a finding. SIGKILL is our own deadline/overflow kill.
-_OWN_KILL = -getattr(signal, "SIGKILL", 9)
+# The worker's ONLY legitimate exit codes: 0 = decision printed, 1 = controlled rejection.
+_WORKER_EXIT_CODES = (0, 1)
+
+
+def _describe_exit(returncode: Any) -> str:
+    if isinstance(returncode, int) and returncode < 0:
+        try:
+            return f"{returncode} (signal {signal.Signals(-returncode).name})"
+        except ValueError:
+            return f"{returncode} (signal {-returncode})"
+    if isinstance(returncode, int) and returncode >= 0xC0000000:
+        return f"{returncode} (NTSTATUS 0x{returncode:08X})"
+    return repr(returncode)
 _UNCONTROLLED_MARKERS = ("Traceback (most recent call last)", "panicked at", "RUST_BACKTRACE")
 
 
@@ -214,8 +233,13 @@ def stage_of(error_type: str, message: str) -> str:
 
 # --------------------------------------------------------------------------- in-process arm
 
-def _inproc_worker(seed: int, start: int, stop: int, abort_at: int | None) -> None:
-    """Child process: run cases [start, stop) through _execute, one JSON line per case."""
+def _inproc_worker(seed: int, start: int, stop: int, abort_at: int | None, hang_at: int | None) -> None:
+    """Child process: run cases [start, stop) through _execute, one JSON line per case.
+
+    OS memory cap: POSIX applies RLIMIT_AS here (when the platform enforces it); on Windows the
+    PARENT launches this child inside a Job Object with a per-process memory limit. Where neither
+    is available (e.g. macOS), the child runs uncapped -- the parent prints that explicitly.
+    """
     from portmark.providers import _worker_memory_cap_enforceable
     from portmark.tool_subprocess_runner import _apply_resource_limits
     from portmark.wasmtime_component_runner import _controlled_errors, _execute
@@ -223,11 +247,13 @@ def _inproc_worker(seed: int, start: int, stop: int, abort_at: int | None) -> No
     seeds = build_seeds()
     controlled = _controlled_errors()
     if sys.platform != "win32" and _worker_memory_cap_enforceable():
-        if _apply_resource_limits({"address_space": 512 * MIB}):
+        if _apply_resource_limits({"address_space": FUZZ_CHILD_MEMORY_LIMIT}):
             raise SystemExit("could not apply the worker memory cap in the fuzz child")
     for index in range(start, stop):
         if abort_at is not None and index == abort_at:  # calibration hook: simulate a native crash
             os.abort()
+        if hang_at is not None and index == hang_at:  # calibration hook: simulate a compile hang
+            time.sleep(3600)
         label, component = generate_case(seeds, seed, index)
         started = time.monotonic()
         record: dict[str, Any] = {"i": index, "label": label}
@@ -246,9 +272,88 @@ def _inproc_worker(seed: int, start: int, stop: int, abort_at: int | None) -> No
         print(json.dumps(record), flush=True)
 
 
+def inproc_cap_status() -> str:
+    """How the in-process child is memory-capped on this platform (printed with every campaign)."""
+    from portmark import _windows_job
+    from portmark.providers import _worker_memory_cap_enforceable
+
+    if sys.platform == "win32":
+        return "Job Object 512 MiB" if _windows_job.available() else "UNCAPPED (no Job Object)"
+    return "RLIMIT_AS 512 MiB" if _worker_memory_cap_enforceable() else "UNCAPPED (no enforceable OS cap)"
+
+
+def _launch_inproc_child(argv: list[str]) -> Any:
+    """Start the child; on Windows inside a kill-on-close Job Object with the 512 MiB memory limit
+    (the same race-free launcher the native provider uses). Returns a providers._Worker."""
+    from portmark import _windows_job
+    from portmark.providers import _launch_plain, _windows_job_launcher
+
+    popen_kwargs = {"stdin": subprocess.DEVNULL, "stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
+    if sys.platform == "win32" and _windows_job.available():
+        return _windows_job_launcher(FUZZ_CHILD_MEMORY_LIMIT)(argv, popen_kwargs)
+    return _launch_plain(argv, popen_kwargs)
+
+
+def _run_child_streaming(argv: list[str], watchdog: float) -> tuple[list[dict[str, Any]], int | None, bool, str]:
+    """Run one child, reading its per-case lines as they arrive. If no line arrives within
+    `watchdog` seconds, the child is killed (hung). Returns (records, returncode, hung, stderr_tail)."""
+    worker = _launch_inproc_child(argv)
+    process = worker.process
+    lines: queue.Queue[bytes | None] = queue.Queue()
+    stderr_tail: list[bytes] = []
+
+    def read_stdout() -> None:
+        for line in iter(process.stdout.readline, b""):
+            lines.put(line)
+        lines.put(None)
+
+    def read_stderr() -> None:
+        for line in iter(process.stderr.readline, b""):
+            stderr_tail.append(line)
+            del stderr_tail[:-5]
+
+    readers = [threading.Thread(target=read_stdout, daemon=True), threading.Thread(target=read_stderr, daemon=True)]
+    for reader in readers:
+        reader.start()
+    records, hung = [], False
+    try:
+        while True:
+            try:
+                line = lines.get(timeout=watchdog)
+            except queue.Empty:
+                hung = True
+                worker.kill()
+                break
+            if line is None:
+                break
+            if line.startswith(b"{"):
+                records.append(json.loads(line))
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            worker.kill()
+        for reader in readers:
+            reader.join(timeout=5)
+    finally:
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        worker.close()
+    tail = (b"".join(stderr_tail).decode("utf-8", "replace").strip().splitlines() or [""])[-1][:160]
+    return records, process.returncode, hung, tail
+
+
 def run_inproc_arm(cases: int, seed: int = DEFAULT_SEED, abort_at: int | None = None,
+                   hang_at: int | None = None, watchdog: float = INPROC_CASE_WATCHDOG_SECONDS,
                    max_restarts: int = 25) -> dict[str, Any]:
-    """Run `cases` cases in child process(es). A child death is recorded and the run resumes."""
+    """Run `cases` cases in child process(es), with a per-case watchdog.
+
+    A child death OR a hang is recorded as a finding naming the exact case, and the run resumes at
+    the next case, so one bad input can never stall the campaign for longer than the watchdog.
+    """
     records: list[dict[str, Any]] = []
     findings: list[str] = []
     next_index, restarts = 0, 0
@@ -257,24 +362,27 @@ def run_inproc_arm(cases: int, seed: int = DEFAULT_SEED, abort_at: int | None = 
                 "--seed", str(seed), "--start", str(next_index), "--stop", str(cases)]
         if abort_at is not None:
             argv += ["--abort-at", str(abort_at)]
-        child = subprocess.run(  # nosec B603 - fixed argv: this interpreter + this script
-            argv, capture_output=True, text=True, timeout=max(120, cases), check=False,
-        )
-        seen = [json.loads(line) for line in child.stdout.splitlines() if line.startswith("{")]
+        if hang_at is not None:
+            argv += ["--hang-at", str(hang_at)]
+        seen, returncode, hung, stderr_tail = _run_child_streaming(argv, watchdog)
         records.extend(seen)
         next_index = (seen[-1]["i"] + 1) if seen else next_index
-        if child.returncode != 0 and next_index < cases:
-            findings.append(
-                f"in-process child died at case {next_index} (seed {seed}) with returncode "
-                f"{child.returncode}: {(child.stderr.strip().splitlines() or [''])[-1][:160]}"
-            )
-            next_index += 1  # skip the crasher and resume
-            restarts += 1
-            if restarts > max_restarts:
-                findings.append(f"in-process arm stopped after {max_restarts} child deaths")
-                break
-        elif child.returncode != 0:
-            findings.append(f"in-process child exited {child.returncode} after the last case")
+        if next_index >= cases and not hung and returncode == 0:
+            break
+        if next_index >= cases:
+            findings.append(f"in-process child exited {returncode} after the last case")
+            break
+        if hung:
+            findings.append(f"in-process case {next_index} (seed {seed}) HUNG: no result within {watchdog} s; "
+                            f"child killed")
+        else:
+            findings.append(f"in-process child died at case {next_index} (seed {seed}) with returncode "
+                            f"{returncode}: {stderr_tail}")
+        next_index += 1  # skip the bad case and resume
+        restarts += 1
+        if restarts > max_restarts:
+            findings.append(f"in-process arm stopped after {max_restarts} child deaths or hangs")
+            break
     for record in records:
         findings.extend(check_inproc_record(record))
     return {"records": records, "findings": findings}
@@ -319,10 +427,14 @@ def check_e2e_result(label: str, elapsed: float, timeout: float, error: BaseExce
         findings.append(f"{label}: provider returned an invalid decision {decision!r}")
     if run is not None:
         returncode = run.get("returncode")
-        if isinstance(returncode, int) and returncode < 0 and returncode != _OWN_KILL:
-            findings.append(f"{label}: worker died from signal {-returncode}")
-        if returncode == _OWN_KILL and not (run.get("timed_out") or run.get("overflowed")):
-            findings.append(f"{label}: worker SIGKILLed without a deadline/overflow reason")
+        # Platform-neutral exit-code rule (PR #82 review). The worker exits 0 (decision) or 1
+        # (controlled rejection) and nothing else. Every other code is a crash -- a negative POSIX
+        # signal, or a positive Windows NTSTATUS such as 0xC0000005 (access violation) or
+        # 0xC0000409 (fail-fast) -- UNLESS the parent itself killed the worker for its deadline or
+        # an output overflow (POSIX SIGKILL; on Windows TerminateJobObject exits with code 1).
+        killed_by_parent = bool(run.get("timed_out") or run.get("overflowed"))
+        if returncode not in _WORKER_EXIT_CODES and not killed_by_parent:
+            findings.append(f"{label}: worker exited abnormally with code {_describe_exit(returncode)}")
         if error is not None and not run.get("overflowed") and run.get("stdout"):
             findings.append(f"{label}: a failed decision still wrote stdout")
     return findings
@@ -404,7 +516,7 @@ def coverage_findings(records: list[dict[str, Any]], min_past_header: float = 0.
     past_header = 1 - stages.get("header", 0) / len(records)
     if past_header < min_past_header:
         findings.append(f"coverage: only {past_header:.0%} of cases got past the header")
-    for required in ("ran", "decode", "limits", "link", "run"):
+    for required in REQUIRED_STAGES:
         if stages.get(required, 0) == 0:
             findings.append(f"coverage: no case reached stage {required!r}")
     return findings
@@ -420,6 +532,7 @@ def run_campaign(inproc_cases: int, e2e_cases: int, seed: int = DEFAULT_SEED) ->
 
     stages = Counter(record.get("stage") for record in records)
     distinct = len({record.get("msg") for record in records if record.get("outcome") == "controlled"})
+    print(f"[fuzz] in-process child memory cap: {inproc_cap_status()}")
     print(f"[fuzz] seed={seed} platform={sys.platform} in-process cases={len(records)} "
           f"({time.monotonic() - started:.1f}s total)")
     print("[fuzz] in-process stages: " + ", ".join(f"{k}={v}" for k, v in stages.most_common()))
@@ -445,9 +558,10 @@ def main() -> None:
     parser.add_argument("--start", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--stop", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--abort-at", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--hang-at", type=int, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.inproc_worker:
-        _inproc_worker(args.seed, args.start, args.stop, args.abort_at)
+        _inproc_worker(args.seed, args.start, args.stop, args.abort_at, args.hang_at)
         return
     if run_campaign(args.inproc_cases, args.e2e_cases, args.seed):
         raise SystemExit(1)

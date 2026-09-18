@@ -8687,6 +8687,66 @@ class RuntimeTests(unittest.TestCase):
         header_only = [{"stage": "header"}] * 10
         self.assertTrue(fuzz.coverage_findings(header_only))
 
+    def test_component_fuzz_exit_code_oracle_is_platform_neutral(self):
+        # PR #82 review: a Windows native crash exits with a POSITIVE NTSTATUS, which the old
+        # "negative code = signal" rule scored as a clean rejection. Only 0 and 1 are legitimate,
+        # unless the parent recorded its own deadline/overflow kill.
+        import fuzz_wasmtime_components as fuzz
+
+        rejected = RuntimeError("native Wasmtime component rejected: ...")
+        must_flag = {
+            "Windows access violation 0xC0000005": {"returncode": 0xC0000005},
+            "Windows fail-fast 0xC0000409": {"returncode": 0xC0000409},
+            "POSIX SIGSEGV": {"returncode": -11},
+            "POSIX SIGABRT": {"returncode": -6},
+            "unexpected exit 2": {"returncode": 2},
+            "SIGKILL without a parent kill": {"returncode": -9},
+        }
+        for label, run in must_flag.items():
+            with self.subTest(case=label):
+                findings = fuzz.check_e2e_result(label, 0.1, 2.0, rejected, None, {**run, "stdout": b""})
+                self.assertTrue(any("exited abnormally" in finding for finding in findings), findings)
+        must_pass = {
+            "controlled rejection": {"returncode": 1},
+            "POSIX deadline kill": {"returncode": -9, "timed_out": True},
+            "Windows deadline kill (TerminateJobObject)": {"returncode": 1, "timed_out": True},
+            "overflow kill": {"returncode": -9, "overflowed": True},
+        }
+        for label, run in must_pass.items():
+            with self.subTest(case=label):
+                self.assertEqual(fuzz.check_e2e_result(label, 0.1, 2.0, rejected, None, {**run, "stdout": b""}), [])
+        self.assertEqual(fuzz.check_e2e_result("decision", 0.1, 2.0, None,
+                                               ProviderDecision("tool", "catalog.search", {}),
+                                               {"returncode": 0, "stdout": b"{}"}), [])
+
+    def test_component_fuzz_coverage_requires_every_claimed_stage(self):
+        # PR #82 review: the coverage check must require every stage the campaign claims, so a corpus
+        # regression that loses any one of them fails instead of staying green.
+        import fuzz_wasmtime_components as fuzz
+
+        self.assertEqual(set(fuzz.REQUIRED_STAGES),
+                         {"ran", "decode", "limits", "link", "run", "export", "call", "outcome"})
+        full = [{"stage": stage} for stage in fuzz.REQUIRED_STAGES] * 5
+        self.assertEqual(fuzz.coverage_findings(full), [])
+        for missing in fuzz.REQUIRED_STAGES:
+            with self.subTest(missing=missing):
+                findings = fuzz.coverage_findings([record for record in full if record["stage"] != missing])
+                self.assertEqual(findings, [f"coverage: no case reached stage {missing!r}"])
+
+    @unittest.skipUnless(HAS_REAL_WASMTIME, "requires portmark[wasmtime]")
+    def test_real_native_wasmtime_component_fuzz_watchdog_records_a_hang_and_resumes(self):
+        # PR #82 review: one hanging case must not stall a CI lane. The child hangs at case 10; the
+        # per-case watchdog must report exactly that case, kill the child, and run cases 11-19.
+        import fuzz_wasmtime_components as fuzz
+
+        started = time.monotonic()
+        result = fuzz.run_inproc_arm(20, hang_at=10, watchdog=3.0)
+        hung = [finding for finding in result["findings"] if "HUNG" in finding]
+        self.assertEqual(len(hung), 1, result["findings"])
+        self.assertIn("case 10", hung[0])
+        self.assertEqual(sorted(record["i"] for record in result["records"]), [i for i in range(20) if i != 10])
+        self.assertLess(time.monotonic() - started, 30)
+
     @unittest.skipUnless(HAS_REAL_WASMTIME, "requires portmark[wasmtime]")
     def test_real_native_wasmtime_component_fuzz_detects_a_crashing_child_and_resumes(self):
         # Calibration of the crash path: the child aborts (a stand-in for a native crash) at case 20;

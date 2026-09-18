@@ -22,6 +22,17 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   - A **coverage check** fails a corpus that mostly dies at the header, and every case is reported
     by the stage where it stopped.
   - It runs in the `native-wasmtime` CI job on all four platforms (3000 + 30 cases).
+  - Review round 2: the worker exit-code rule is now **platform-neutral**. Only 0 (decision) and 1
+    (controlled rejection) are legitimate, unless the parent killed the worker for its deadline or
+    an overflow. A positive Windows NTSTATUS crash (0xC0000005, 0xC0000409) is no longer scored as
+    a clean rejection.
+  - The in-process child runs under the same **512 MiB OS cap** as the worker: `RLIMIT_AS` on
+    POSIX, and a Job Object launched by the parent on Windows. The cap is printed with every run,
+    and `UNCAPPED` is printed where none is enforceable (macOS). A **per-case watchdog** (20 s)
+    records a hang as a finding naming its case, kills the child, and resumes, so one input can no
+    longer stall a CI lane.
+  - The coverage check now requires every claimed stage: ran, decode, limits, link, run, export,
+    call, outcome.
 - **Finding, fixed: the native provider accepted WebAssembly TEXT.** `wasmtime.component.Component`
   also parses the `.wat` text format, so the capsule's source compiled and ran as a provider. The
   worker now refuses anything that is not a **binary Component Model artifact** (Wasm magic +
