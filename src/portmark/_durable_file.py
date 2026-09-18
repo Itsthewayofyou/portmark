@@ -120,5 +120,3 @@ def sidecar_lock(path: str) -> Iterator[None]:
             _release_exclusive_lock(fd)
         finally:
             os.close(fd)
-
-
