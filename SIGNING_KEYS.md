@@ -205,6 +205,13 @@ applied retroactively (there is no signing time to judge against). But a v1 head
 that is now **revoked** is `revoked-key-legacy-v1` (rejected): without a `signed_at`, pre-compromise
 signing cannot be established, so a compromised key's v1 heads cannot be trusted as pre-compromise.
 
+**Migration anchor (`anchor_status`).** `verify-audit` also reports `anchor_status` for event 0 of
+a migrated task: `none` (not a migration), `verified`, `legacy-anchor` (an anchor written before the
+source proof was kept), or `invalid`. `verified` means the SOURCE host's signed handoff head was
+re-checked against this registry for the `migration` key purpose. The handoff head is a v1 head, so
+the legacy v1 policy above applies: if the source key is later revoked, the anchor becomes `invalid`.
+Keep the source host's keys in the destination's registry, or its migrated tasks cannot be verified.
+
 **Limitation (build to it, do not oversell).** `signed_at` is set by the signer, so a *compromised*
 key can backdate it. `signed_at` cleanly handles benign expiry/rotation, but on its own it does not
 prove a head was signed before compromise. Compromise-sensitive "signed before time T" proof

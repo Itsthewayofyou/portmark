@@ -2409,7 +2409,10 @@ def _check_migration_anchor(verifier: AuditHeadVerifier | None, head_result: Aud
         return AuditVerificationResult("invalid", "migration anchor proof is incomplete or malformed", head_result.head_status, "invalid")
     if verifier is None:  # unreachable: a valid head_result required a verifier
         return AuditVerificationResult("unverifiable", "trust registry is not configured", head_result.head_status, "unverifiable")
-    payload = audit_head_payload(anchor["previous_audit_task_id"], anchor["previous_audit_host_id"], head_hash, sequence)
+    # debt: v1-only anchor payload (correct because host.py signs the migration handoff head
+    # without signed_at); upgrade when the handoff head is signed as v2 -- then store the
+    # anchor's signed_at and rebuild with _audit_head_payload_for, or every new anchor reports invalid.
+    payload = audit_head_payload(anchor["previous_audit_task_id"], anchor["previous_audit_host_id"], str(head_hash), sequence)
     try:
         evaluation = verifier.evaluate_audit_head(
             anchor["previous_audit_signature_key_id"], payload, anchor["previous_audit_signature"], required_usage="migration"

@@ -3867,14 +3867,14 @@ class RuntimeTests(unittest.TestCase):
                     # time, so the anchor can no longer be shown to predate the compromise.
                     revoked = dataclasses.replace(trusted_identity_for(source_signer), revoked=True)
                     revoked_registry = TrustRegistry((trusted_identity_for(destination_signer), revoked))
-                    auditor_store._audit_head_verifier = revoked_registry
+                    auditor_store.set_audit_head_verifier(revoked_registry)
                     after_revocation = auditor_store.verify_audit_chain_status(second.task_id)
                     self.assertEqual((after_revocation.status, after_revocation.anchor_status), ("invalid", "invalid"))
                     self.assertIn("revoked-key-legacy-v1", after_revocation.reason)
 
                     # A source key scoped to audit-only cannot stand as a migration proof.
                     audit_only = dataclasses.replace(trusted_identity_for(source_signer), usages=("audit",))
-                    auditor_store._audit_head_verifier = TrustRegistry((trusted_identity_for(destination_signer), audit_only))
+                    auditor_store.set_audit_head_verifier(TrustRegistry((trusted_identity_for(destination_signer), audit_only)))
                     wrong_usage = auditor_store.verify_audit_chain_status(second.task_id)
                     self.assertEqual((wrong_usage.status, wrong_usage.anchor_status), ("invalid", "invalid"))
                     self.assertIn("usage-violation", wrong_usage.reason)
@@ -3897,6 +3897,41 @@ class RuntimeTests(unittest.TestCase):
             self.assertNotIn("previous_audit_signature", second.audit[0]["details"]["migration"])
             legacy = destination_store.verify_audit_chain_status(second.task_id)
             self.assertEqual((legacy.status, legacy.anchor_status), ("valid", "legacy-anchor"), legacy.reason)
+
+    def test_stripping_the_anchor_proof_from_a_real_chain_is_tamper_not_legacy(self):
+        # Legacy tolerance must not be a downgrade path: removing the proof fields from a real
+        # Section 10 chain breaks event 0's hash, so it is reported as tampering, never as
+        # `legacy-anchor`.
+        source_signer, destination_signer = self._migration_signers("anchor-strip")
+        with self._sqlite_dual_store_case(source_signer, destination_signer) as (backend, source_store, destination_store):
+            _, _, second = self._migrate_once(backend, source_store, destination_store, source_signer, destination_signer)
+            self.assertEqual(destination_store.verify_audit_chain_status(second.task_id).anchor_status, "verified")
+            with self._raw_sqlite(destination_store.path) as connection:
+                row = connection.execute(
+                    "SELECT details_json FROM audit_events WHERE task_id = ? AND sequence = 0", (second.task_id,)
+                ).fetchone()
+                details = json.loads(row[0])
+                for field in ("previous_audit_task_id", "previous_audit_signature_key_id", "previous_audit_signature"):
+                    del details["migration"][field]
+                connection.execute(
+                    "UPDATE audit_events SET details_json = ? WHERE task_id = ? AND sequence = 0",
+                    (json.dumps(details), second.task_id),
+                )
+            stripped = destination_store.verify_audit_chain_status(second.task_id)
+            self.assertEqual((stripped.status, stripped.reason), ("invalid", "audit event hash is invalid"))
+            self.assertNotEqual(stripped.anchor_status, "legacy-anchor")
+
+    def test_in_memory_store_reverifies_the_migration_anchor(self):
+        source_signer, destination_signer = self._migration_signers("anchor-memory")
+        source_store, destination_store = InMemoryRuntimeStore(), InMemoryRuntimeStore()
+        _, _, second = self._migrate_once("memory", source_store, destination_store, source_signer, destination_signer)
+        destination_store.set_audit_head_verifier(TrustRegistry((trusted_identity_for(destination_signer), trusted_identity_for(source_signer))))
+        verified = destination_store.verify_audit_chain_status(second.task_id)
+        self.assertEqual((verified.status, verified.anchor_status), ("valid", "verified"), verified.reason)
+        revoked = dataclasses.replace(trusted_identity_for(source_signer), revoked=True)
+        destination_store.set_audit_head_verifier(TrustRegistry((trusted_identity_for(destination_signer), revoked)))
+        after_revocation = destination_store.verify_audit_chain_status(second.task_id)
+        self.assertEqual((after_revocation.status, after_revocation.anchor_status), ("invalid", "invalid"))
 
     def test_migration_anchor_check_rejects_each_altered_or_missing_proof_field(self):
         from portmark.storage import AuditVerificationResult, _check_migration_anchor
