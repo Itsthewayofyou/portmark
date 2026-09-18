@@ -409,6 +409,127 @@ def _read_component_file(path: str, max_component_bytes: int) -> bytes:
     return component
 
 
+def _kill_process(process: subprocess.Popen) -> None:
+    """Best-effort terminate; a process that already exited is left alone."""
+    if process.poll() is not None:
+        return
+    try:
+        process.kill()
+    except OSError:
+        pass
+
+
+def _run_bounded(
+    argv: list[str],
+    request: bytes,
+    *,
+    timeout: float,
+    max_output_bytes: int,
+    env: dict[str, str],
+    stderr_cap: int = 4096,
+) -> tuple[int | None, bytes, str, bool, bool]:
+    """Run a subprocess, draining stdout/stderr on reader threads under a hard byte cap.
+
+    Unlike ``subprocess.run(capture_output=True)``, output is bounded DURING the read: the
+    instant stdout passes ``max_output_bytes`` the process is killed and reading stops, so a
+    hostile child cannot exhaust host memory before a post-hoc size check (finding #5). stderr
+    is retained only up to ``stderr_cap`` bytes but kept draining past it, so the pipe never
+    blocks the child yet the retained error text cannot itself grow without bound.
+
+    Reader threads start BEFORE stdin is written: the stdin payload (base64 component + context)
+    far exceeds the OS pipe buffer, so writing first would deadlock -- host blocked writing stdin
+    while the child blocks writing stdout. One monotonic deadline bounds the whole call and every
+    wait derives its remaining budget from it, so no phase can re-spend the full timeout.
+
+    Returns ``(returncode, stdout_bytes, stderr_text, timed_out, overflowed)``.
+
+    debt: ``process.kill()`` ends only the direct child, not a descendant tree. Sufficient here:
+    the Wasm guest receives NO imports (it cannot spawn) and the node/runner executable paths are
+    host-controlled. Upgrade to the tools.py isolated-executor (process-group / Job Object
+    kill-tree) if the runner ever gains spawn/exec capability.
+    """
+    deadline = time.monotonic() + timeout
+    process = subprocess.Popen(  # nosec B603
+        argv,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    stdout_buffer = bytearray()
+    stderr_buffer = bytearray()
+    overflow = threading.Event()
+
+    def drain_stdout() -> None:
+        stream = process.stdout
+        if stream is None:
+            return
+        try:
+            while True:
+                chunk = stream.read(65_536)
+                if not chunk:
+                    break
+                stdout_buffer.extend(chunk)
+                if len(stdout_buffer) > max_output_bytes:
+                    overflow.set()
+                    _kill_process(process)
+                    break
+        except (OSError, ValueError):
+            pass
+
+    def drain_stderr() -> None:
+        stream = process.stderr
+        if stream is None:
+            return
+        try:
+            while True:
+                chunk = stream.read(65_536)
+                if not chunk:
+                    break
+                if len(stderr_buffer) < stderr_cap:
+                    stderr_buffer.extend(chunk[: stderr_cap - len(stderr_buffer)])
+        except (OSError, ValueError):
+            pass
+
+    out_reader = threading.Thread(target=drain_stdout, daemon=True)
+    err_reader = threading.Thread(target=drain_stderr, daemon=True)
+    timed_out = False
+    try:
+        out_reader.start()
+        err_reader.start()
+        if process.stdin is not None:
+            try:
+                process.stdin.write(request)
+                process.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+        try:
+            process.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _kill_process(process)
+            try:
+                process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                pass
+        # Flat grace, NOT deadline-derived: the process has exited (natural EOF, overflow kill, or
+        # confirmed timeout kill) so the readers are draining a closed pipe. A deadline-derived join
+        # could block far past the caller's budget on the overflow path, where the deadline may have
+        # plenty left (cf. the round-1 finding on waits that re-spend the full timeout).
+        out_reader.join(timeout=2.0)
+        err_reader.join(timeout=2.0)
+    finally:
+        _kill_process(process)
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+    stderr_text = bytes(stderr_buffer).decode("utf-8", "replace").strip()
+    return process.returncode, bytes(stdout_buffer), stderr_text, timed_out, overflow.is_set()
+
+
 class WasmDecisionProvider(ModelProvider):
     """Runs WIT-shaped portable agent decision logic in Wasm with no ambient imports."""
 
@@ -454,23 +575,32 @@ class WasmDecisionProvider(ModelProvider):
         encoded_component = base64.b64encode(self._component).decode("ascii")
         context_json = encode_component_input(component_context(view, available_tools))
         checkpoint_json = encode_component_input(component_checkpoint(view))
-        try:
-            # Shell is disabled and the executable/runner paths are host-controlled.
-            process = subprocess.run(  # nosec B603
-                [self._node, self._runner],
-                input=json.dumps({"component": encoded_component, "context_json": context_json, "checkpoint_json": checkpoint_json}),
-                capture_output=True, text=True, timeout=self._timeout, check=False,
-                # Node needs the normal Windows process environment to initialize.
-                # The Wasm guest cannot observe it because the module receives no imports.
-                env=os.environ.copy(),
-            )
-        except subprocess.TimeoutExpired as error:
-            raise RuntimeError("Wasm capsule exceeded its execution deadline") from error
-        if process.returncode != 0:
-            raise RuntimeError("Wasm capsule rejected: " + process.stderr.strip())
-        if len(process.stdout.encode()) > self._max_output_bytes:
+        request = json.dumps(
+            {"component": encoded_component, "context_json": context_json, "checkpoint_json": checkpoint_json}
+        ).encode("utf-8")
+        # Shell is disabled and the executable/runner paths are host-controlled. Node needs the
+        # normal process environment to initialize; the Wasm guest cannot observe it because the
+        # module receives no imports. Output is drained under a hard byte cap (see _run_bounded).
+        returncode, stdout_bytes, stderr_text, timed_out, overflowed = _run_bounded(
+            [self._node, self._runner],
+            request,
+            timeout=self._timeout,
+            max_output_bytes=self._max_output_bytes,
+            env=os.environ.copy(),
+        )
+        # Precedence: an overflow kill leaves returncode == -SIGKILL, so the output-limit and
+        # deadline outcomes must be reported BEFORE the generic non-zero-exit rejection.
+        if timed_out:
+            raise RuntimeError("Wasm capsule exceeded its execution deadline")
+        if overflowed:
             raise RuntimeError("Wasm component decision exceeded output limit")
-        return decode_component_decision(process.stdout, available_tools)
+        if returncode != 0:
+            raise RuntimeError("Wasm capsule rejected: " + stderr_text)
+        try:
+            stdout_text = stdout_bytes.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise RuntimeError("Wasm capsule produced invalid output") from error
+        return decode_component_decision(stdout_text, available_tools)
 
 
 class NativeWasmtimeComponentProvider(ModelProvider):
@@ -519,30 +649,33 @@ class NativeWasmtimeComponentProvider(ModelProvider):
         context_json = encode_component_input(component_context(view, available_tools))
         checkpoint_json = encode_component_input(component_checkpoint(view))
         environment = _wasmtime_subprocess_env()
-        try:
-            process = subprocess.run(  # nosec B603
-                [sys.executable, "-m", "portmark.wasmtime_component_runner"],
-                input=json.dumps({
-                    "component": base64.b64encode(self._component).decode("ascii"),
-                    "context_json": context_json,
-                    "checkpoint_json": checkpoint_json,
-                    "max_output_bytes": self._max_output_bytes,
-                    "max_fuel": self._max_fuel,
-                    "max_memory_bytes": self._max_memory_bytes,
-                }),
-                capture_output=True,
-                text=True,
-                timeout=self._timeout,
-                check=False,
-                env=environment,
-            )
-        except subprocess.TimeoutExpired as error:
-            raise RuntimeError("native Wasmtime component exceeded its execution deadline") from error
-        if process.returncode != 0:
-            error_text = process.stderr.strip()
-            if len(error_text.encode()) > 4096:
-                error_text = error_text.encode()[:4096].decode("utf-8", "replace")
-            raise RuntimeError("native Wasmtime component rejected: " + error_text)
-        if len(process.stdout.encode()) > self._max_output_bytes:
+        request = json.dumps({
+            "component": base64.b64encode(self._component).decode("ascii"),
+            "context_json": context_json,
+            "checkpoint_json": checkpoint_json,
+            "max_output_bytes": self._max_output_bytes,
+            "max_fuel": self._max_fuel,
+            "max_memory_bytes": self._max_memory_bytes,
+        }).encode("utf-8")
+        # Bounded incremental drain (see _run_bounded): defence-in-depth alongside the guest's
+        # fuel/memory bounds, so hostile runner output cannot buffer without limit.
+        returncode, stdout_bytes, stderr_text, timed_out, overflowed = _run_bounded(
+            [sys.executable, "-m", "portmark.wasmtime_component_runner"],
+            request,
+            timeout=self._timeout,
+            max_output_bytes=self._max_output_bytes,
+            env=environment,
+        )
+        # Same precedence as the Node path: overflow/deadline outcomes beat the non-zero-exit
+        # rejection because an overflow kill sets returncode == -SIGKILL.
+        if timed_out:
+            raise RuntimeError("native Wasmtime component exceeded its execution deadline")
+        if overflowed:
             raise RuntimeError("native Wasmtime component decision exceeded output limit")
-        return decode_component_decision(process.stdout, available_tools)
+        if returncode != 0:
+            raise RuntimeError("native Wasmtime component rejected: " + stderr_text)
+        try:
+            stdout_text = stdout_bytes.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise RuntimeError("native Wasmtime component produced invalid output") from error
+        return decode_component_decision(stdout_text, available_tools)
