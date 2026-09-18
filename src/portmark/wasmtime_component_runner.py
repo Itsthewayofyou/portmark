@@ -5,6 +5,8 @@ import binascii
 import io
 import json
 import sys
+
+from .json_guard import strict_json_loads
 from contextlib import redirect_stdout
 from typing import Any
 
@@ -81,7 +83,7 @@ def _normalize_outcome(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
     if isinstance(value, str):
-        parsed = json.loads(value)
+        parsed = strict_json_loads(value)
         if not isinstance(parsed, dict):
             raise RuntimeError("component outcome string must decode to a JSON object")
         return parsed

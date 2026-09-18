@@ -21,6 +21,7 @@ from .component_bindings import component_checkpoint, component_context, decode_
 from .models import ProviderDecision, ProviderView
 from .projection import provider_state
 from .security import SecurityError
+from .json_guard import StrictJSONError, strict_json_loads
 
 DEFAULT_MAX_WASM_COMPONENT_BYTES = 10_000_000
 # CPU (instruction) and memory ceilings for a native Wasmtime guest. A legitimate
@@ -166,9 +167,9 @@ class GenericHttpProvider(ModelProvider):
         body = json.dumps({"state": provider_state(view), "available_tools": available_tools}).encode()
         raw = self._post(body)
         try:
-            value = json.loads(raw)
-        except json.JSONDecodeError as error:
-            raise SecurityError("provider response is malformed JSON") from error
+            value = strict_json_loads(raw, max_bytes=self.max_response_bytes)
+        except StrictJSONError as error:
+            raise SecurityError("provider response is malformed or unsafe JSON") from error
         return _provider_decision(value)
 
     # ---- Section 8 transport -------------------------------------------------------------------

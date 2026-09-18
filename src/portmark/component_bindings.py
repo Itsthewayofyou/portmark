@@ -5,6 +5,7 @@ from typing import Any
 
 from .models import ProviderDecision, ProviderView
 from .projection import provider_state
+from .json_guard import StrictJSONError, strict_json_loads
 
 
 WIT_PACKAGE = "portmark:agent@1.0.0"
@@ -36,9 +37,9 @@ def encode_component_input(value: dict[str, Any]) -> str:
 
 def decode_component_decision(raw: str, available_tools: tuple[str, ...]) -> ProviderDecision:
     try:
-        value = json.loads(raw)
-    except json.JSONDecodeError as error:
-        raise RuntimeError("Wasm component returned malformed decision JSON") from error
+        value = strict_json_loads(raw)
+    except StrictJSONError as error:
+        raise RuntimeError("Wasm component returned malformed or unsafe decision JSON") from error
     if not isinstance(value, dict):
         raise RuntimeError("Wasm component decision must be a JSON object")
     outcome = value.get("outcome")
@@ -80,6 +81,6 @@ def _decode_json_value(raw: Any, label: str) -> Any:
     if not isinstance(raw, str):
         raise RuntimeError(f"Wasm component {label} must be encoded as a JSON string")
     try:
-        return json.loads(raw)
-    except json.JSONDecodeError as error:
-        raise RuntimeError(f"Wasm component {label} is malformed JSON") from error
+        return strict_json_loads(raw)
+    except StrictJSONError as error:
+        raise RuntimeError(f"Wasm component {label} is malformed or unsafe JSON") from error

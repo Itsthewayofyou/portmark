@@ -6,6 +6,26 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Section 8 — provider boundary (PR 3): strict JSON at untrusted decode boundaries (finding #4)
+
+- **Untrusted JSON is now parsed strictly** wherever it crosses a trust boundary: the HTTP provider
+  response, the Wasm component decision (Python-side decode, including the nested `arguments_json` /
+  `content_json` strings, and the native `wasmtime` runner's in-subprocess outcome decode), and the
+  inbound A2A request body. A new stdlib-only `portmark.json_guard.strict_json_loads` helper:
+  - **rejects duplicate object keys** — stdlib `json` silently keeps the last value, an ambiguity that
+    lets a second copy of a key slip past a validator that inspected the first;
+  - **bounds nesting depth** (cap 64) with a string-aware pre-scan *before* parsing — an admitted,
+    over-deep document would otherwise drive the host's own recursive processing (e.g. the projection
+    deep-copy, canonical hashing) into `RecursionError`, and a pure-Python `json` build recurses in the
+    parser itself; the guard makes over-deep input a clean rejection instead;
+  - **enforces an optional byte cap** and turns invalid UTF-8 / malformed / over-limit input into a
+    single `StrictJSONError` that each caller maps to its own error (HTTP → `SecurityError`, Wasm →
+    `RuntimeError`, A2A → JSON-RPC `-32700` parse error).
+- Per-kind decision schema validation (allowed `kind`/`outcome`, tool-name and destination shape) is
+  unchanged. No behavior change for well-formed input.
+- Out of scope, stated explicitly: `tools.py` subprocess output is **operator-trusted host code**, not an
+  untrusted provider/adapter boundary, so it is not covered by finding #4.
+
 ### Section 8 — provider boundary (PR 2): canonical detached ProviderView
 
 - **BREAKING API — providers now receive a `ProviderView`, not `AgentState`.** `ModelProvider.decide`

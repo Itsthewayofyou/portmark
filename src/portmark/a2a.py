@@ -19,6 +19,7 @@ from collections.abc import Callable
 from typing import Any, Iterator
 from urllib.parse import urlsplit
 
+from .json_guard import StrictJSONError, strict_json_loads
 from .a2a_types import A2ARequestError, error_response, make_agent_card, parse_jsonrpc_request, success_response, task_from_run_result
 from .host import AgentHost
 from .models import AgentEnvelope, AgentManifest, AgentState, AttestationEvidence, Permit, ResourceBudget, ToolGrant
@@ -574,8 +575,8 @@ class A2ARouter:
         request_id: str | int | None = None
         try:
             try:
-                payload = json.loads(body)
-            except json.JSONDecodeError as exc:
+                payload = strict_json_loads(body, max_bytes=MAX_REQUEST_BYTES)
+            except StrictJSONError as exc:
                 raise A2ARequestError(-32700, "parse error", 400) from exc
             if self.a2a_adapter == "sdk":
                 try:
