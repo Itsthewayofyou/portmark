@@ -44,9 +44,15 @@ def decode_component_decision(raw: str, available_tools: tuple[str, ...]) -> Pro
         raise RuntimeError("Wasm component decision must be a JSON object")
     outcome = value.get("outcome")
     if outcome == "tool":
+        # Strict per-outcome schema (finding #4, Low): exactly {outcome, request}, and the nested
+        # request is exactly {name, arguments_json} -- an unknown/contradictory field is rejected,
+        # not silently ignored. Wasm migrate `content_json` (below) is accepted by the schema but
+        # not currently propagated: pre-existing behavior, unchanged by this PR.
+        _reject_unexpected_component_keys(value, {"outcome", "request"}, "tool decision")
         request = value.get("request")
         if not isinstance(request, dict):
             raise RuntimeError("Wasm component tool decision is missing a request")
+        _reject_unexpected_component_keys(request, {"name", "arguments_json"}, "tool request")
         name = request.get("name")
         if not isinstance(name, str) or not name:
             raise RuntimeError("Wasm component tool decision has an invalid tool name")
@@ -54,20 +60,23 @@ def decode_component_decision(raw: str, available_tools: tuple[str, ...]) -> Pro
             return ProviderDecision("fail", content={"error": "required capability unavailable"})
         arguments = _decode_json_object(request.get("arguments_json", "{}"), "tool arguments")
         return ProviderDecision("tool", name, arguments)
-    if outcome == "completed":
-        return ProviderDecision("complete", content=_decode_json_value(value.get("content_json", "null"), "completion content"))
-    if outcome == "awaiting-input":
-        return ProviderDecision("await_input", content=_decode_json_value(value.get("content_json", "null"), "awaiting-input content"))
+    if outcome in {"completed", "awaiting-input", "failed", "suspended"}:
+        _reject_unexpected_component_keys(value, {"outcome", "content_json"}, f"{outcome} decision")
+        kind = {"completed": "complete", "awaiting-input": "await_input", "failed": "fail", "suspended": "await_input"}[outcome]
+        return ProviderDecision(kind, content=_decode_json_value(value.get("content_json", "null"), f"{outcome} content"))
     if outcome == "migrate":
+        _reject_unexpected_component_keys(value, {"outcome", "destination", "content_json"}, "migrate decision")
         destination = value.get("destination")
         if not isinstance(destination, str) or not destination:
             raise RuntimeError("Wasm component migration decision has an invalid destination")
         return ProviderDecision("migrate", destination=destination)
-    if outcome == "failed":
-        return ProviderDecision("fail", content=_decode_json_value(value.get("content_json", "null"), "failure content"))
-    if outcome == "suspended":
-        return ProviderDecision("await_input", content=_decode_json_value(value.get("content_json", "null"), "suspension content"))
     raise RuntimeError("Wasm component returned an unknown outcome")
+
+
+def _reject_unexpected_component_keys(value: dict[str, Any], allowed: set[str], label: str) -> None:
+    extra = set(value) - allowed
+    if extra:
+        raise RuntimeError(f"Wasm component {label} has unexpected fields: {sorted(extra)}")
 
 
 def _decode_json_object(raw: Any, label: str) -> dict[str, Any]:

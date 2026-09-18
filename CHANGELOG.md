@@ -18,11 +18,20 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
     over-deep document would otherwise drive the host's own recursive processing (e.g. the projection
     deep-copy, canonical hashing) into `RecursionError`, and a pure-Python `json` build recurses in the
     parser itself; the guard makes over-deep input a clean rejection instead;
-  - **enforces an optional byte cap** and turns invalid UTF-8 / malformed / over-limit input into a
-    single `StrictJSONError` that each caller maps to its own error (HTTP → `SecurityError`, Wasm →
-    `RuntimeError`, A2A → JSON-RPC `-32700` parse error).
-- Per-kind decision schema validation (allowed `kind`/`outcome`, tool-name and destination shape) is
-  unchanged. No behavior change for well-formed input.
+  - **rejects non-finite numbers** — `NaN` / `Infinity` / `-Infinity` (via `parse_constant`) and the
+    overflow form `1e999`→`inf` (via `parse_float`); non-finite floats have no safe meaning across the
+    boundary (comparisons, constraints, and hashing disagree on them);
+  - **enforces an optional byte cap** and turns invalid UTF-8 / malformed / over-limit input — and an
+    integer past Python's int-string digit limit (~4300 digits), which is a bare `ValueError`, not a
+    `JSONDecodeError` — into a single `StrictJSONError` that each caller maps to its own error (HTTP →
+    `SecurityError`, Wasm → `RuntimeError`, A2A → JSON-RPC `-32700` parse error).
+- **Strict per-kind decision schemas.** `_provider_decision` and the Wasm `decode_component_decision`
+  now reject fields that do not belong to the decision's kind (and the nested Wasm `request` object),
+  so a `complete` cannot also carry a `tool`/`destination`/unknown key and a validator keying off `kind`
+  stays unambiguous. Allowed shapes: tool = `{kind, tool, optional arguments}`; migrate = `{kind,
+  destination, optional content}`; terminal (`complete`/`await_input`/`fail`) = `{kind, optional content}`;
+  Wasm tool request = `{name, arguments_json}`. Wasm migrate `content_json` is accepted by the schema
+  but not currently propagated (pre-existing, unchanged here). Well-formed decisions are unaffected.
 - Out of scope, stated explicitly: `tools.py` subprocess output is **operator-trusted host code**, not an
   untrusted provider/adapter boundary, so it is not covered by finding #4.
 

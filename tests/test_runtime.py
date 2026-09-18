@@ -4023,6 +4023,51 @@ class RuntimeTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "malformed or unsafe decision JSON"):
                     decode_component_decision(raw, ("catalog.search",))
 
+    def test_strict_json_rejects_non_finite_numbers(self):
+        # Section 8 finding #4 follow-up (Medium): stdlib json accepts NaN / Infinity / -Infinity
+        # (parse_constant) and overflows 1e999 to +inf (parse_float). Non-finite floats have no safe
+        # meaning across the boundary -- comparisons, constraints, and hashing disagree on them -- so
+        # the strict decoder must reject them, keyword and overflow forms alike, nested included.
+        from portmark.json_guard import StrictJSONError, strict_json_loads
+        for token in ("NaN", "Infinity", "-Infinity", "1e999", "[NaN]", '{"x": 1e999}', '{"a": [1, -Infinity]}'):
+            with self.subTest(token=token):
+                with self.assertRaises(StrictJSONError):
+                    strict_json_loads(token)
+        # legitimate finite floats still parse
+        self.assertEqual(strict_json_loads('{"a": 3.14, "b": [1, 2.0, -5.0]}'), {"a": 3.14, "b": [1, 2.0, -5.0]})
+
+    def test_strict_json_rejects_oversized_integer_as_domain_error(self):
+        # An integer past Python's int-string digit limit raises a bare ValueError inside json.loads,
+        # NOT a JSONDecodeError -- it must surface as StrictJSONError so a caller catching that one
+        # type is not bypassed by an uncaught ValueError.
+        from portmark.json_guard import StrictJSONError, strict_json_loads
+        with self.assertRaises(StrictJSONError):
+            strict_json_loads("1" + "0" * 5000)
+
+    def test_provider_decision_rejects_contradictory_or_unknown_fields(self):
+        # Section 8 finding #4 follow-up (Low): the auditor's exact payload -- a `complete` decision
+        # also carrying tool/arguments/destination/unknown -- must be rejected, not silently ignored.
+        from portmark.providers import _provider_decision
+        from portmark.security import SecurityError
+        with self.assertRaisesRegex(SecurityError, "unexpected fields"):
+            _provider_decision({"kind": "complete", "tool": "payments.reserve", "arguments": {"amount": 999}, "destination": "host:evil", "unknown": True})
+        # a tool decision may not carry a destination; a migrate may not carry a tool
+        with self.assertRaisesRegex(SecurityError, "unexpected fields"):
+            _provider_decision({"kind": "tool", "tool": "catalog.search", "destination": "host:x"})
+        with self.assertRaisesRegex(SecurityError, "unexpected fields"):
+            _provider_decision({"kind": "migrate", "destination": "host:x", "tool": "payments.reserve"})
+        # valid per-kind decisions still decode
+        self.assertEqual(_provider_decision({"kind": "complete", "content": {"ok": True}}).kind, "complete")
+        self.assertEqual(_provider_decision({"kind": "tool", "tool": "catalog.search", "arguments": {"q": 1}}).tool, "catalog.search")
+
+    def test_wasm_decision_rejects_unknown_fields(self):
+        # Equivalent strict schema on Wasm outcomes AND the nested request object.
+        from portmark.component_bindings import decode_component_decision
+        with self.assertRaisesRegex(RuntimeError, "unexpected fields"):
+            decode_component_decision('{"outcome": "completed", "request": {"name": "x"}, "destination": "host:evil", "unknown": true}', ("catalog.search",))
+        with self.assertRaisesRegex(RuntimeError, "unexpected fields"):
+            decode_component_decision('{"outcome": "tool", "request": {"name": "catalog.search", "arguments_json": "{}", "destination": "evil"}}', ("catalog.search",))
+
     @contextmanager
     def _three_store_context(self, backend):
         # Three stores (2 sources + 1 destination) on one backend, for the section 4 #7

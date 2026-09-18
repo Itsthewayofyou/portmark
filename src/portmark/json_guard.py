@@ -17,6 +17,7 @@ optional byte cap, and turns malformed / non-UTF-8 / over-limit input into one `
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 # Legit envelopes / decisions nest ~8-15 deep; json.loads hits RecursionError near the ~1000
@@ -28,6 +29,22 @@ class StrictJSONError(ValueError):
     """Untrusted JSON rejected: malformed, invalid UTF-8, over the size cap, too deeply nested, or
     containing duplicate object keys. A `ValueError` subclass (as `json.JSONDecodeError` already is)
     so a caller can catch this one type and map it to its own error."""
+
+
+def _reject_non_finite_constant(token: str) -> Any:
+    # parse_constant fires for the JSON keywords NaN / Infinity / -Infinity, which stdlib json
+    # accepts by default. They are not standard JSON and carry no safe meaning across the boundary
+    # (comparisons, constraints, hashing, and provider-specific processing disagree on them).
+    raise StrictJSONError(f"non-finite JSON constant not allowed: {token}")
+
+
+def _reject_non_finite_float(token: str) -> float:
+    # parse_float fires for every float token. `1e999` is valid JSON syntax but overflows to inf in
+    # Python -- caught here, where the constant hook cannot see it (it is a number, not a keyword).
+    value = float(token)
+    if not math.isfinite(value):
+        raise StrictJSONError(f"non-finite number not allowed: {token}")
+    return value
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -84,6 +101,19 @@ def strict_json_loads(raw: str | bytes | bytearray, *, max_bytes: int | None = N
         raise StrictJSONError(f"JSON input exceeds the size cap ({max_bytes} bytes)")
     _check_depth(text, max_depth)
     try:
-        return json.loads(text, object_pairs_hook=_reject_duplicate_keys)
-    except json.JSONDecodeError as error:
-        raise StrictJSONError("malformed JSON") from error
+        return json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_non_finite_constant,
+            parse_float=_reject_non_finite_float,
+        )
+    except StrictJSONError:
+        # A hook (duplicate key / non-finite number) already raised our own error -- keep it.
+        raise
+    except ValueError as error:
+        # JSONDecodeError (malformed) AND other ValueErrors the scanner can raise on unsafe but
+        # syntactically-shaped input -- notably an integer past Python's int-string digit limit
+        # (~4300 digits), which is a bare ValueError, not a JSONDecodeError. Both become one
+        # StrictJSONError so a caller catching StrictJSONError cannot be bypassed by an uncaught
+        # ValueError. (Integer magnitude is thus bounded by Python's default limit, surfaced here.)
+        raise StrictJSONError("malformed or unsafe JSON") from error

@@ -350,21 +350,38 @@ class GenericHttpProvider(ModelProvider):
             pass
 
 
+def _require_exact_keys(value: dict[str, Any], allowed: set[str], required: set[str], label: str) -> None:
+    # Strict per-kind decision schema (finding #4, Low): reject fields that do not belong to this
+    # decision kind, so a `complete` cannot also smuggle a `tool`/`destination` and a validator that
+    # keys off `kind` alone stays unambiguous. Only known keys are permitted; missing required keys
+    # (kind, plus tool/destination for those kinds) are rejected too.
+    keys = set(value)
+    extra = keys - allowed
+    if extra:
+        raise SecurityError(f"provider {label} decision has unexpected fields: {sorted(extra)}")
+    missing = required - keys
+    if missing:
+        raise SecurityError(f"provider {label} decision is missing required fields: {sorted(missing)}")
+
+
 def _provider_decision(value: Any) -> ProviderDecision:
     if not isinstance(value, dict):
         raise SecurityError("provider response must be a JSON object")
     kind = value.get("kind")
     if kind == "tool":
+        _require_exact_keys(value, {"kind", "tool", "arguments"}, {"kind", "tool"}, "tool")
         tool = value.get("tool")
         if not isinstance(tool, str) or not tool:
             raise SecurityError("provider tool decision has an invalid tool name")
         arguments = value.get("arguments", {})
         if not isinstance(arguments, dict):
             raise SecurityError("provider tool decision arguments must be a JSON object")
-        return ProviderDecision("tool", tool=tool, arguments=arguments, content=value.get("content"), destination=value.get("destination"))
+        return ProviderDecision("tool", tool=tool, arguments=arguments)
     if kind in {"complete", "await_input", "fail"}:
+        _require_exact_keys(value, {"kind", "content"}, {"kind"}, kind)
         return ProviderDecision(kind, content=value.get("content"))
     if kind == "migrate":
+        _require_exact_keys(value, {"kind", "destination", "content"}, {"kind", "destination"}, "migrate")
         destination = value.get("destination")
         if not isinstance(destination, str) or not destination:
             raise SecurityError("provider migration decision has an invalid destination")
