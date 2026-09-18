@@ -8123,6 +8123,67 @@ class RuntimeTests(unittest.TestCase):
         finally:
             os.unlink(capsule.name)
 
+    def _wasm_providers_under_test(self, component):
+        """Build both Wasm providers from `component`; the Node one without needing real node."""
+        from portmark.providers import WasmDecisionProvider
+
+        with patch("portmark.providers.shutil.which", return_value="/usr/bin/node"):
+            node_provider = WasmDecisionProvider(component)
+        return {"node": node_provider, "wasmtime": NativeWasmtimeComponentProvider(component)}
+
+    def test_wasm_providers_execute_the_frozen_bytes_their_digest_names(self):
+        # Section 9 finding #2: the digest was computed once but the caller's (mutable) object was
+        # re-read on every decide, so a bytearray mutated after construction executed different
+        # code under the original signed digest. The provider must freeze a private copy.
+        original = b"\x00asm-original-component"
+        expected_digest = "sha256:" + hashlib.sha256(original).hexdigest()
+        for make_buffer in (bytearray, lambda data: memoryview(bytearray(data))):
+            buffer = make_buffer(original)
+            providers = self._wasm_providers_under_test(buffer)
+            buffer[:] = b"X" * len(original)  # mutate AFTER construction
+            for name, provider in providers.items():
+                with self.subTest(provider=name, buffer=type(buffer).__name__):
+                    sent = []
+
+                    def capture(argv, request, **kwargs):
+                        sent.append(base64.b64decode(json.loads(request)["component"]))
+                        return 1, b"", "stop after capture", False, False
+
+                    with patch("portmark.providers._run_bounded", side_effect=capture):
+                        with self.assertRaises(RuntimeError):
+                            provider.decide(provider_view(AgentState("task", "goal")), ("catalog.search",))
+                    self.assertEqual(provider.component_digest, expected_digest)
+                    self.assertEqual(sent, [original])
+                    self.assertEqual("sha256:" + hashlib.sha256(sent[0]).hexdigest(), provider.component_digest)
+
+    def test_wasm_providers_reject_non_bytes_like_components(self):
+        # bytes(5) would silently become five zero bytes and bytes([1, 2]) accepts a list of
+        # ints -- neither is a component. Only real byte buffers are accepted.
+        for value in (5, True, "component", [1, 2]):
+            for name in ("node", "wasmtime"):
+                with self.subTest(provider=name, value=value):
+                    with self.assertRaisesRegex(RuntimeError, "bytes-like"):
+                        if name == "node":
+                            from portmark.providers import WasmDecisionProvider
+
+                            with patch("portmark.providers.shutil.which", return_value="/usr/bin/node"):
+                                WasmDecisionProvider(value)
+                        else:
+                            NativeWasmtimeComponentProvider(value)
+
+    @unittest.skipUnless(HAS_REAL_WASMTIME, "requires portmark[wasmtime]")
+    def test_real_native_wasmtime_runs_signed_bytes_after_caller_mutates_buffer(self):
+        # End to end through the host's signed-manifest digest check (host.py): mutate the
+        # caller's buffer after the provider is built; the ORIGINAL signed component must run.
+        capsule = Path(__file__).parents[1] / "capsules" / "research-agent.component.wasm.b64"
+        buffer = bytearray(base64.b64decode(capsule.read_bytes().strip(), validate=True))
+        provider = NativeWasmtimeComponentProvider(buffer)
+        buffer[:] = b"X" * len(buffer)
+        host = make_host(providers={"wasm": provider})
+        result = host.run(make_demo_envelope(host, "portable native component", "wasm"))
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.result["summary"], "Native Wasmtime component resumed from checkpoint")
+
     def test_factory_selects_optional_native_wasmtime_provider(self):
         with self._fake_wasmtime_runtime():
             capsule = tempfile.NamedTemporaryFile(delete=False)

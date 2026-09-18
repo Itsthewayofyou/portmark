@@ -392,6 +392,23 @@ def _provider_decision(value: Any) -> ProviderDecision:
     raise SecurityError("provider response kind is not supported")
 
 
+def _freeze_component(component: Any) -> bytes:
+    """Take an immutable private copy of the component bytes (Section 9, finding #2).
+
+    The provider publishes ``component_digest`` once, and the host checks it against the signed
+    manifest (host.py), but the bytes are read again on every ``decide``. Keeping the caller's
+    object let a mutable ``bytearray`` change after construction, so the code that ran was not the
+    code the signed digest names. Freeze FIRST, then size-check, hash, and execute that one copy.
+
+    ``memoryview`` accepts only real byte buffers. Plain ``bytes(value)`` is NOT a safe freeze:
+    ``bytes(5)`` silently yields five zero bytes and ``bytes([1, 2])`` accepts a list of ints.
+    """
+    try:
+        return bytes(memoryview(component))
+    except TypeError as error:
+        raise RuntimeError("Wasm component must be bytes-like") from error
+
+
 def _read_component_file(path: str, max_component_bytes: int) -> bytes:
     if max_component_bytes < 1:
         raise ValueError("max_component_bytes must be at least 1")
@@ -566,6 +583,7 @@ class WasmDecisionProvider(ModelProvider):
         node = shutil.which("node")
         if not node:
             raise RuntimeError("Node.js is required to execute WebAssembly capsules")
+        component = _freeze_component(component)
         if len(component) > max_component_bytes:
             raise RuntimeError("Wasm component exceeds input limit")
         self._node = node
@@ -630,6 +648,7 @@ class NativeWasmtimeComponentProvider(ModelProvider):
         max_fuel: int = DEFAULT_WASM_FUEL,
         max_memory_bytes: int = DEFAULT_WASM_MEMORY_BYTES,
     ) -> None:
+        component = _freeze_component(component)
         if len(component) > max_component_bytes:
             raise RuntimeError("Wasm component exceeds input limit")
         if max_fuel < 1:

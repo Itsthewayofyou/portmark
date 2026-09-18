@@ -6,6 +6,26 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Section 9 — native Wasmtime sandbox (PR 1): executed bytes always match the signed digest (finding #2)
+
+- **Wasm providers now freeze the component bytes before anything else.** Both
+  `NativeWasmtimeComponentProvider` and the Node `WasmDecisionProvider` computed `component_digest`
+  once at construction but kept the caller's object and re-read it on every `decide`. A mutable
+  `bytearray` (or a `memoryview` over one) changed after construction therefore executed different
+  code while the provider still presented the original digest — and passed the host's
+  signed-manifest digest check. The providers now take a private immutable copy first, then
+  size-check, hash, and execute that one copy (the auditor reported the native provider; the Node
+  provider had the same bug and is fixed in the same change).
+- **Only real byte buffers are accepted.** The copy uses `memoryview`, not plain `bytes(value)`:
+  `bytes(5)` silently yields five zero bytes and `bytes([1, 2])` accepts a list of ints. A non-bytes
+  component (int, bool, str, list) is now refused with `RuntimeError("Wasm component must be
+  bytes-like")` instead of an incidental `TypeError`. `from_file` paths were never affected
+  (`_read_component_file` returns immutable `bytes`).
+- Tests: mutate-after-construction for both providers with `bytearray` and `memoryview` (the bytes
+  sent to the worker must hash to the published digest), non-bytes rejection, and a real-Wasmtime
+  end-to-end run through `host.run` that must execute the original signed component after the
+  caller's buffer is overwritten. Each was confirmed to fail with the freeze neutralized.
+
 ### Section 8 — provider boundary (PR 4): bounded Wasm subprocess output (finding #5)
 
 - **Wasm provider output is now bounded DURING the read, not after buffering.** Both the Node
