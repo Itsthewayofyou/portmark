@@ -17,8 +17,9 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   size-check, hash, and execute that one copy (the auditor reported the native provider; the Node
   provider had the same bug and is fixed in the same change).
 - **Only real byte buffers are accepted.** The copy uses `memoryview`, not plain `bytes(value)`:
-  `bytes(5)` silently yields five zero bytes and `bytes([1, 2])` accepts a list of ints. A non-bytes
-  component (int, bool, str, list) is now refused with `RuntimeError("Wasm component must be
+  `bytes(5)` silently yields five zero bytes and `bytes([1, 2])` accepts a list of ints. The buffer
+  must also be one-dimensional with one-byte items, so an `array('i', ...)` is not reinterpreted as
+  its raw memory. A non-bytes component (int, bool, str, list, int array) is now refused with `RuntimeError("Wasm component must be
   bytes-like")` instead of an incidental `TypeError`. `from_file` paths were never affected
   (`_read_component_file` returns immutable `bytes`).
 - Tests: mutate-after-construction for both providers with `bytearray` and `memoryview` (the bytes

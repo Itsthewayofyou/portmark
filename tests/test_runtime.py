@@ -8158,8 +8158,11 @@ class RuntimeTests(unittest.TestCase):
 
     def test_wasm_providers_reject_non_bytes_like_components(self):
         # bytes(5) would silently become five zero bytes and bytes([1, 2]) accepts a list of
-        # ints -- neither is a component. Only real byte buffers are accepted.
-        for value in (5, True, "component", [1, 2]):
+        # ints -- neither is a component. Only real byte buffers are accepted: an int array is a
+        # buffer, but its raw memory must not be reinterpreted as component bytes.
+        import array
+
+        for value in (5, True, "component", [1, 2], array.array("i", [1, 2, 3])):
             for name in ("node", "wasmtime"):
                 with self.subTest(provider=name, value=value):
                     with self.assertRaisesRegex(RuntimeError, "bytes-like"):

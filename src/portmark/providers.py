@@ -400,13 +400,18 @@ def _freeze_component(component: Any) -> bytes:
     object let a mutable ``bytearray`` change after construction, so the code that ran was not the
     code the signed digest names. Freeze FIRST, then size-check, hash, and execute that one copy.
 
-    ``memoryview`` accepts only real byte buffers. Plain ``bytes(value)`` is NOT a safe freeze:
+    ``memoryview`` accepts only buffer objects. Plain ``bytes(value)`` is NOT a safe freeze:
     ``bytes(5)`` silently yields five zero bytes and ``bytes([1, 2])`` accepts a list of ints.
+    The buffer must also be one-dimensional with one-byte items, so an ``array('i', ...)`` or a
+    multi-dimensional buffer is refused instead of being reinterpreted as its raw memory.
     """
     try:
-        return bytes(memoryview(component))
+        view = memoryview(component)
     except TypeError as error:
         raise RuntimeError("Wasm component must be bytes-like") from error
+    if view.ndim != 1 or view.itemsize != 1:
+        raise RuntimeError("Wasm component must be bytes-like")
+    return bytes(view)
 
 
 def _read_component_file(path: str, max_component_bytes: int) -> bytes:
