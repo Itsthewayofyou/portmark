@@ -343,6 +343,20 @@ manifest-based capsule system (the pattern that prompted issue #23): there is no
 host-import surface to scope. The scoping lives at the tool layer, where the only
 exercisable authority actually is.
 
+### Native Wasmtime resource ceiling (Section 9)
+
+**Decision: memory consumption by a native component is bounded by an OS ceiling on the whole
+worker, not only by Wasmtime's store limit.** Wasmtime's `memory_size` limit applies to each linear
+memory separately, so a small component declaring hundreds of memories could multiply it (reproduced
+by the external audit: 301 memories under a 64 KiB setting). The store now also caps instance,
+memory, table, and table-element counts, and the worker process runs under `RLIMIT_AS` (POSIX) or a
+Job Object per-process memory limit (Windows). That ceiling also bounds JIT compilation, which fuel
+does not meter; concurrent workers are capped at two. The provider refuses limits that do not fit
+together, and refuses to start where the OS ceiling cannot be enforced unless the operator opts out
+(`allow_uncapped_worker=True`). Residual: the ceiling is per worker process, so host-wide memory
+use is bounded by the worker cap × concurrent workers plus the host itself; a host-wide cgroup
+remains the deployment's job (see the container profile).
+
 **Enforcement:** `test_wit_world_declares_no_host_imports` fails if any `import`
 is added to the world, and `test_wasm_with_ambient_wasi_import_cannot_instantiate`
 proves a component that imports host functions cannot instantiate. If a future

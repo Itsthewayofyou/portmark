@@ -225,3 +225,11 @@ native Component Model example.
 The runtime instantiates the signed component bytes through an empty
 `wasmtime.component.Linker`, runs them in a short-lived Python worker with a
 deadline, and passes only projected context and checkpoint JSON.
+
+The worker runs under an OS memory ceiling (512 MiB by default) and the store limits listed in
+[WASM_COMPONENTS.md](WASM_COMPONENTS.md). At most two native Wasmtime workers run at once; a
+decision that cannot get a worker slot before its deadline fails with "worker capacity exhausted".
+On a platform that cannot enforce the OS ceiling (the provider checks this at start-up), the native
+engine refuses to start. To run it uncapped anyway, build the provider yourself with
+`NativeWasmtimeComponentProvider(..., allow_uncapped_worker=True)` and pass it to
+`make_host(providers={"wasm": ...})`; every run then logs an "uncapped" warning.

@@ -24,6 +24,7 @@ CREATE_NO_WINDOW = 0x08000000
 
 _JobObjectExtendedLimitInformation = 9
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+_JOB_OBJECT_LIMIT_PROCESS_MEMORY = 0x00000100
 _THREAD_SUSPEND_RESUME = 0x0002
 _TH32CS_SNAPTHREAD = 0x00000004
 
@@ -118,8 +119,15 @@ def _check(result, name):
     return result
 
 
-def create_kill_on_close_job() -> int:
-    """Create a Job Object that kills its whole tree when the last handle closes."""
+def create_kill_on_close_job(process_memory_limit: int | None = None) -> int:
+    """Create a Job Object that kills its whole tree when the last handle closes.
+
+    ``process_memory_limit`` (bytes), when given, also sets JOB_OBJECT_LIMIT_PROCESS_MEMORY: each
+    process in the job is refused COMMITTED memory past that limit (Section 9, finding #1 -- the
+    native Wasmtime worker's OS ceiling on Windows). Commit charge, not address space: it is the
+    Windows counterpart of the POSIX RLIMIT_AS cap, not an identical measure. Configuring it fails
+    closed like the kill-on-close flag: the job handle is closed and the error re-raised.
+    """
     import ctypes
     k = _kernel32()
     extended, _ = _structs()
@@ -127,13 +135,18 @@ def create_kill_on_close_job() -> int:
     try:
         info = extended()
         info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if process_memory_limit is not None:
+            if process_memory_limit < 1:
+                raise ValueError("process_memory_limit must be positive")
+            info.BasicLimitInformation.LimitFlags |= _JOB_OBJECT_LIMIT_PROCESS_MEMORY
+            info.ProcessMemoryLimit = process_memory_limit
         _check(
             k.SetInformationJobObject(handle, _JobObjectExtendedLimitInformation,
                                       ctypes.byref(info), ctypes.sizeof(info)),
             "SetInformationJobObject",
         )
-    except OSError:
-        # Do not leak the job handle if configuring the kill-on-close limit failed.
+    except (OSError, ValueError):
+        # Do not leak the job handle if configuring the job limits failed.
         k.CloseHandle(handle)
         raise
     return handle

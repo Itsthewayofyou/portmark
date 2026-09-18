@@ -39,9 +39,15 @@ These are enforced by the host, not requested politely from the agent:
   ([`wasm_runner.mjs`](https://github.com/Itsthewayofyou/portmark/blob/main/src/portmark/wasm_runner.mjs))
   This bounds *access*, not *consumption*: on the default Node runner the guest can still grow its
   own linear memory unbounded and exhaust host RAM before the wall-clock deadline fires — the Node
-  path caps time, not memory. Only the optional native Wasmtime engine bounds guest memory as well
-  (`store.set_limits(memory_size=…)` alongside a fuel budget in
-  [`wasmtime_component_runner.py`](https://github.com/Itsthewayofyou/portmark/blob/main/src/portmark/wasmtime_component_runner.py)).
+  path caps time, not memory. The optional native Wasmtime engine bounds memory in three layers
+  that are checked to agree: a **per-memory** limit (64 MiB), limits on how many instances,
+  memories, and tables a component may create (so it cannot multiply the per-memory limit), and
+  an **OS memory ceiling on the whole worker process** (512 MiB: `RLIMIT_AS` on POSIX, a Job
+  Object on Windows), which also covers JIT compilation, which the fuel budget does not meter. On
+  a platform where that OS ceiling cannot be enforced, the native engine refuses to start unless
+  the operator opts out explicitly. See
+  [`wasmtime_component_runner.py`](https://github.com/Itsthewayofyou/portmark/blob/main/src/portmark/wasmtime_component_runner.py)
+  and [WASM_COMPONENTS.md](https://github.com/Itsthewayofyou/portmark/blob/main/WASM_COMPONENTS.md).
   A deployment that must resist a memory-exhaustion capsule should select `--wasm-engine wasmtime`.
 - **Permits can only narrow on migration.** One hop, bound to the named destination, grants and
   budgets cannot increase, and further delegation is disabled. A visiting agent cannot accept a

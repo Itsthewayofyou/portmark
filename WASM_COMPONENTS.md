@@ -39,6 +39,34 @@ example. The default `capsules/research-agent.wasm.b64` file is a core Wasm
 module for the Node runner and native Wasmtime rejects it with a component
 parser error.
 
+### Native Wasmtime resource limits
+
+Wasmtime applies its memory limit to **each linear memory separately**, not to their total. The
+native provider therefore enforces three layers, and refuses at construction if they do not fit:
+
+| Layer | Default | Enforced by |
+|---|---|---|
+| Size of each linear memory | 64 MiB (`max_memory_bytes`) | Wasmtime store limit |
+| Instances / memories / tables / table elements | 8 / 2 / 4 / 10,000 | Wasmtime store limits |
+| Whole worker process (Python, Wasmtime, JIT compiler, guest) | 512 MiB (`worker_memory_limit`) | `RLIMIT_AS` (POSIX) or a Job Object per-process memory limit (Windows) |
+| Guest CPU | 1,000,000,000 fuel units | Wasmtime fuel |
+| Worker CPU, including compilation | deadline + `RLIMIT_CPU` (POSIX) | OS |
+| Workers running at once | 2 | provider-wide semaphore; waiting spends the same deadline |
+
+The provider checks `max_memories × max_memory_bytes + 256 MiB worker baseline ≤ worker_memory_limit`.
+The real example capsule needs 1 instance, 1 memory, 0 tables, and 64 KiB.
+
+The OS ceiling is applied inside the worker after its trusted imports and **before** the Wasmtime
+engine is built, so compilation runs capped. On POSIX the provider first proves that the platform
+*enforces* the cap (a child caps itself and must fail to allocate past it). Where no enforced
+ceiling is available, construction fails unless the operator passes
+`allow_uncapped_worker=True`; each run is then logged as uncapped.
+
+The engine configuration is explicit, not inherited from Wasmtime's defaults: single-threaded
+compilation, deterministic relaxed SIMD, NaN canonicalization (results match across x86-64 and
+AArch64), and threads, shared memory, memory64, multi-memory, GC, exceptions, stack switching, wide
+arithmetic, and custom page sizes switched off.
+
 ## Default JSON-Lowered Capsule ABI
 
 The default Node adapter expects a core Wasm module that exports:
