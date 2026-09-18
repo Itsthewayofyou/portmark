@@ -8305,14 +8305,20 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsNone(kwargs["launch"])
 
     @unittest.skipUnless(sys.platform == "win32", "Windows Job Object launch path")
-    def test_native_wasmtime_provider_launches_worker_in_memory_capped_job_on_windows(self):
-        request, kwargs = self._capture_native_request(NativeWasmtimeComponentProvider(b"component"))
-        self.assertEqual(request["rlimits"], {})
-        self.assertIsNotNone(kwargs["launch"])
-        with patch("portmark.tools._launch_windows_job_tree") as launch_tree:
-            launch_tree.return_value = SimpleNamespace(_process=object(), terminate_tree=None, close=None)
-            kwargs["launch"](["worker"], {})
-        self.assertEqual(launch_tree.call_args.kwargs["process_memory_limit"], 512 * 1024 * 1024)
+    def test_native_wasmtime_decision_runs_in_real_memory_capped_job_on_windows(self):
+        # NOT mocked: a real decision (fake wasmtime module, real worker process) goes through the
+        # REAL Job Object launcher and _run_bounded's kill/close handoff. The spy only records the
+        # call -- it wraps the real launcher, so the worker genuinely runs inside the capped job.
+        import portmark.tools as tools_module
+
+        real_launch = tools_module._launch_windows_job_tree
+        with self._fake_wasmtime_runtime():
+            provider = NativeWasmtimeComponentProvider(b"native-component", timeout=10.0)
+            with patch.object(tools_module, "_launch_windows_job_tree", wraps=real_launch) as spy:
+                decision = provider.decide(provider_view(AgentState("task", "goal")), ("catalog.search",))
+        self.assertEqual(decision.tool, "catalog.search")
+        self.assertEqual(spy.call_count, 1)
+        self.assertEqual(spy.call_args.kwargs["process_memory_limit"], 512 * 1024 * 1024)
 
     def test_native_wasmtime_blocks_uncapped_platform_unless_operator_opts_out(self):
         # Owner decision: where no OS memory ceiling can be ENFORCED, refuse by default; an explicit
