@@ -281,6 +281,7 @@ flowchart LR
 - Provider endpoints can be configured with `http` for local gateways; production operators must keep non-loopback provider traffic protected.
 - `GET /.well-known/agent-card.json`, `/healthz`, and `/readyz` intentionally disclose limited operational metadata.
 - A tool failing at call time ends the whole run, so one flaky upstream costs every other reading the agent had collected. Deliberate — see Recorded Decisions below.
+- Audit-history rollback is detected only relative to the surviving local audit floor (Section 10). Whole-machine rollback, copying the database with its floor, forks across hosts, a compromised host's signing, and backdating before compromise are NOT detected -- see Recorded Decisions.
 - Two constraint sets that narrow the same argument in ways Portmark cannot prove are narrower cause the grant to be dropped rather than merged. Availability is traded for the guarantee that merging never creates authority.
 
 ## Recorded Decisions
@@ -362,6 +363,43 @@ is added to the world, and `test_wasm_with_ambient_wasi_import_cannot_instantiat
 proves a component that imports host functions cannot instantiate. If a future
 design gives components direct host imports, both guards force the scoped
 host-capability grant to be designed at that moment, not bolted on after.
+
+### Local audit floor, remote witness later (Section 10)
+
+**Decision (owner, 2026-09-18): a local monotonic floor now, behind a general witness contract; a
+remote transparency service later.** The external audit showed that a restored older SQLite snapshot
+verified as `valid`: the signed head lives in the database it authenticates, and nothing outside it
+remembered a newer head. Each host now keeps one signed floor record (`--audit-floor-path`), outside
+the runtime database: per-task highest sequence and head, the trust-registry version and digest, a
+format version, and an epoch. It is compared before use (at start, and inside every save transaction
+before signing) and advanced as the last step inside the save transaction, BEFORE the commit, so no
+commit is acknowledged that the floor has not recorded (auditor round 2: advancing after the commit
+left a one-commit window that a crash plus a restore erased without evidence). A commit that fails
+after the floor write leaves the floor ahead: refused until `floor-reset`, never lowered automatically
+-- an availability cost accepted for a fail-closed boundary. Heads adopted at start must fully verify
+first. A missing floor that the database recorded is refused, never rebuilt; a database with a floor
+cannot be started without it; recovery is the explicit `floor-reset` command.
+
+It detects rollback or divergence of the database or trust registry **relative to the surviving
+authoritative floor file**. It does **not** detect:
+
+1. whole-machine rollback that restores both the database and the floor;
+2. copying the database and the floor together (or running clones with independent floor copies);
+3. forks across separate hosts;
+4. heads signed by a compromised host;
+5. backdated signing before compromise.
+
+Also: a database rolled back to before the floor was first created, combined with deleting the
+floor, looks like a first run (the "floor exists" marker lives in that database).
+
+The floor is ONE implementation of `MonotonicWitness` (`src/portmark/witness.py`). A transparency
+service can later replace or supplement it (check both) without changing audit-head semantics; that is
+what would address non-detections 1-3.
+
+**Enforcement:** `tests/test_audit_floor.py` -- database rollback (the audit's reproduction), registry
+rollback that would re-trust a revoked key, a clone behind the floor, a clone that diverged on its own
+floor copy, concurrent writers (threads and processes), crash before/after the floor write, a floor
+that stays unwritable, corrupted and deleted floors, and backup restore followed by `floor-reset`.
 
 ## Quality Check
 

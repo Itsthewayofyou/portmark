@@ -5331,7 +5331,7 @@ class RuntimeTests(unittest.TestCase):
                     cli_main()
             self.assertEqual(
                 json.loads(output.getvalue()),
-                {"task_id": result.task_id, "status": "valid", "head_status": "valid", "anchor_status": "none", "reason": "audit head verified"},
+                {"task_id": result.task_id, "status": "valid", "head_status": "valid", "anchor_status": "none", "floor_status": "no-floor", "reason": "audit head verified"},
             )
 
             output = io.StringIO()
@@ -5342,7 +5342,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, 2)
             self.assertEqual(
                 json.loads(output.getvalue()),
-                {"task_id": result.task_id, "status": "unverifiable", "head_status": "unverifiable", "anchor_status": "", "reason": "trust registry is not configured"},
+                {"task_id": result.task_id, "status": "unverifiable", "head_status": "unverifiable", "anchor_status": "", "floor_status": "no-floor", "reason": "trust registry is not configured"},
             )
 
             with self._raw_sqlite(path) as connection:
@@ -5355,7 +5355,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, 1)
             self.assertEqual(
                 json.loads(output.getvalue()),
-                {"task_id": result.task_id, "status": "invalid", "head_status": "", "anchor_status": "", "reason": "stored audit head does not match audit events"},
+                {"task_id": result.task_id, "status": "invalid", "head_status": "", "anchor_status": "", "floor_status": "no-floor", "reason": "stored audit head does not match audit events"},
             )
 
             output = io.StringIO()
@@ -5366,7 +5366,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, 1)
             self.assertEqual(
                 json.loads(output.getvalue()),
-                {"task_id": "missing-task", "status": "invalid", "head_status": "", "anchor_status": "", "reason": "audit chain is missing"},
+                {"task_id": "missing-task", "status": "invalid", "head_status": "", "anchor_status": "", "floor_status": "no-floor", "reason": "audit chain is missing"},
             )
 
     def test_host_security_guards_are_directly_reachable(self):

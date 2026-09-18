@@ -6,15 +6,18 @@ import os
 import secrets
 import shlex
 import sys
-import tempfile
-import time
-from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 from .a2a import A2AAuthConfig, serve
 from .config import RuntimeConfig
 from .factory import HOST_ID, build_envelope, make_demo_envelope, make_host, signer_from_environment
+from ._durable_file import (  # noqa: F401 -- re-exported names kept for keygen callers/tests
+    _acquire_exclusive_lock,
+    _release_exclusive_lock,
+    atomic_write_bytes,
+    sidecar_lock as _registry_write_lock,
+)
 from .logging_config import configure_logging
 from .tool_loading import ToolLoaderError, load_tools
 
@@ -29,111 +32,9 @@ def _reject_control_characters(parser: argparse.ArgumentParser, name: str, value
 
 def _atomic_write_json(path: str, obj: dict) -> None:
     # Atomic replace so a crash mid-write never leaves a half-written trust registry
-    # (finding #14). Preserve the existing file's permissions when replacing it.
-    directory = os.path.dirname(os.path.abspath(path)) or "."
-    try:
-        mode: int | None = os.stat(path).st_mode & 0o777
-    except OSError:
-        mode = None
-    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".trust-registry-", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(obj, handle, indent=2)
-            handle.flush()
-            os.fsync(handle.fileno())
-        if mode is not None:
-            os.chmod(tmp, mode)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-    # Durability: fsync the parent directory so the rename itself survives a crash, not
-    # just the file contents (finding #4). Not all platforms permit opening a directory
-    # for fsync (Windows); best-effort there.
-    try:
-        dir_fd = os.open(directory, os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
-    except OSError:
-        pass
-
-
-def _acquire_exclusive_lock(fd: int, timeout: float = 30.0) -> None:
-    """Take an exclusive, OS-released lock on `fd` (finding #4).
-
-    fcntl (POSIX) and msvcrt (Windows) locks are both released by the kernel when the
-    holding process dies, so neither can leave a stale lock the way an O_EXCL lock FILE
-    would. POSIX flock blocks; msvcrt has no blocking whole-file primitive, so we spin on
-    the non-blocking variant until we win or the timeout elapses (then surface the error).
-    On a platform offering neither primitive the lock is a documented no-op.
-    """
-    try:
-        import fcntl
-    except ImportError:
-        fcntl = None  # type: ignore[assignment]
-    if fcntl is not None:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        return
-    try:
-        import msvcrt
-    except ImportError:
-        return  # neither fcntl nor msvcrt: documented no-op (write stays crash-atomic)
-    deadline = time.monotonic() + timeout
-    while True:
-        try:
-            os.lseek(fd, 0, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]  # Windows-only; stubs absent on POSIX
-            return
-        except OSError:
-            if time.monotonic() >= deadline:
-                raise
-            time.sleep(0.05)
-
-
-def _release_exclusive_lock(fd: int) -> None:
-    # Closing the fd releases either lock, but release explicitly and match the msvcrt
-    # locked range (offset 0, 1 byte) so the unlock is well-formed.
-    try:
-        import fcntl
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        return
-    except ImportError:
-        pass
-    try:
-        import msvcrt
-        os.lseek(fd, 0, os.SEEK_SET)
-        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]  # Windows-only; stubs absent on POSIX
-    except (ImportError, OSError):
-        pass
-
-
-@contextmanager
-def _registry_write_lock(path: str):
-    """Serialize read -> validate -> merge -> replace across concurrent writers (finding #4).
-
-    Locks a SIDE-CAR file (`<path>.lock`) that is never renamed. Locking `path` itself is
-    defeated by the atomic `os.replace`: it swaps the inode, so a second writer locks the
-    NEW inode and proceeds concurrently, silently discarding the first writer's rotation
-    entry. POSIX uses fcntl.flock, Windows uses msvcrt.locking; on a platform offering
-    neither, the write stays crash-atomic but concurrent merges are not serialized.
-    """
-    lock_path = path + ".lock"
-    directory = os.path.dirname(os.path.abspath(lock_path)) or "."
-    os.makedirs(directory, exist_ok=True)
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-    try:
-        _acquire_exclusive_lock(fd)
-        yield
-    finally:
-        try:
-            _release_exclusive_lock(fd)
-        finally:
-            os.close(fd)
+    # (finding #14); file + parent-directory fsync and permission preservation live in
+    # _durable_file, shared with the Section 10 audit floor.
+    atomic_write_bytes(path, json.dumps(obj, indent=2).encode("utf-8"), prefix=".trust-registry-")
 
 
 def _write_out_registry(parser: argparse.ArgumentParser, path: str, new_registry: dict, merge: bool) -> None:
@@ -174,8 +75,67 @@ def _write_out_registry_locked(parser: argparse.ArgumentParser, path: str, new_r
                     parser.error(f"trust registry already has key id {entry['key_id']!r} with a different public key")
                 continue  # identical entry already present -> no-op
             merged.append(entry)
-        registry = {**existing, "identities": merged}
+        # Section 10 PR B: every rewrite raises the registry's monotonic version, so an audit
+        # floor that recorded the newer registry refuses an older copy restored later.
+        prior_version = existing.get("version", 0)
+        registry = {**existing, "identities": merged, "version": (prior_version if isinstance(prior_version, int) else 0) + 1}
+    else:
+        registry = {**new_registry, "version": 1}
     _atomic_write_json(path, registry)
+
+
+def _registry_identity(path: str | None) -> tuple[int | None, str | None]:
+    """(version, digest) of the trust registry FILE, as the audit floor records them."""
+    if not path:
+        return None, None
+    from .security import TrustSource
+
+    source = TrustSource.from_path(path)
+    return source.version, source.digest
+
+
+def _apply_audit_floor(parser, config, store, audit_verifier, task_id, verification):
+    from .witness import FloorError, LocalFloorWitness, apply_floor
+
+    if not config.audit_floor_path:
+        return apply_floor(verification, None, store, task_id, None, None)
+    if audit_verifier is None:
+        return replace(verification, status="invalid" if verification.status == "invalid" else "unverifiable",
+                       floor_status="floor-unverifiable")
+    try:
+        witness = LocalFloorWitness.for_verification(config.audit_floor_path, audit_verifier)
+    except FloorError as error:
+        return replace(verification, status="invalid", reason=verification.reason if verification.status == "invalid" else str(error),
+                       floor_status=error.code)
+    if witness is None:
+        # No file at the given path: apply_floor distinguishes "never created" from "lost" via the marker,
+        # but needs the host id -- which is the configured one.
+        witness = LocalFloorWitness(config.audit_floor_path, config.host_id, None, audit_verifier)
+    version, digest = _registry_identity(config.trust_registry_path)
+    return apply_floor(verification, witness, store, task_id, version, digest)
+
+
+def _run_floor_reset(parser: argparse.ArgumentParser, args: argparse.Namespace, config, store) -> None:
+    from .security import TrustSource
+    from .witness import FloorError, LocalFloorWitness, reset_audit_floor
+
+    if not args.confirm:
+        parser.error("floor-reset accepts the CURRENT database as truth; re-run with --confirm once the cause is understood")
+    if store is None or not config.audit_floor_path or not config.trust_registry_path:
+        parser.error("floor-reset requires --store-path, --audit-floor-path, and --trust-registry-path")
+    trust = TrustSource.from_path(config.trust_registry_path)
+    signer = signer_from_environment(config.host_id, config.trust_registry_path, trust=trust)
+    if getattr(signer, "ephemeral", None) is not False:
+        parser.error("floor-reset must sign with the host's stable audit key (PORTMARK_ED25519_PRIVATE_KEY_B64), not a generated one")
+    store.set_audit_head_verifier(trust)
+    witness = LocalFloorWitness(config.audit_floor_path, config.host_id, signer, signer)
+    try:
+        epoch = reset_audit_floor(witness, store, args.reason, trust.version or None, trust.digest, allow_legacy_anchor=args.allow_legacy_anchor)
+    except FloorError as error:
+        print(json.dumps({"host_id": config.host_id, "status": "refused", "floor_status": error.code, "reason": str(error)}, indent=2))
+        raise SystemExit(1) from error
+    print(f"WARNING: audit floor for {config.host_id} was reset to epoch {epoch}; the current database is now the baseline.", file=sys.stderr)
+    print(json.dumps({"host_id": config.host_id, "status": "reset", "epoch": epoch}, indent=2))
 
 
 def _run_keygen(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -266,6 +226,11 @@ def main() -> None:
     parser.add_argument("--policy-path", help="JSON host policy path")
     parser.add_argument("--tools", dest="tools_loader", help="load installed tools from module:function returning a ToolRegistry")
     parser.add_argument("--trust-registry-path", help="JSON trust registry path for envelope signing keys")
+    parser.add_argument(
+        "--audit-floor-path",
+        help="this host's signed audit floor file (Section 10), OUTSIDE the store directory; detects rollback of the "
+        "database or trust registry relative to the surviving floor file (PORTMARK_AUDIT_FLOOR_PATH)",
+    )
     parser.add_argument("--reload-policy", action="store_true", help="reload the JSON host policy before each run")
     parser.add_argument("--attestation-verifier-command", help="shell-free argv string for an external attestation verifier")
     parser.add_argument("--require-attestation", action="store_true", help="require attestation before execution and migration")
@@ -304,6 +269,15 @@ def main() -> None:
     envelope_parser.add_argument("--tool", action="append", dest="tools", help="grant this tool; repeatable; replaces the spec's grants")
     envelope_parser.add_argument("--audience", help=f"host id that may run this envelope; must equal the host's --host-id (default {HOST_ID})")
     envelope_parser.add_argument("--format", choices=("jsonrpc", "envelope"), default="jsonrpc", help="'jsonrpc' emits a ready-to-POST message/send request")
+    floor_reset = subparsers.add_parser(
+        "floor-reset",
+        help="OPERATOR RECOVERY: accept the current database as truth and start a new audit-floor epoch",
+    )
+    floor_reset.add_argument("--reason", required=True, help="why the floor is being reset (recorded in the floor)")
+    floor_reset.add_argument("--confirm", action="store_true", help="required: acknowledge that the current database is accepted as truth")
+    floor_reset.add_argument(
+        "--allow-legacy-anchor", action="store_true", help="accept complete pre-Section-10 migration anchors while re-verifying chains"
+    )
     verify_audit = subparsers.add_parser("verify-audit")
     verify_audit.add_argument("--task-id", required=True, help="task id whose audit chain should be verified")
     verify_audit.add_argument(
@@ -341,11 +315,22 @@ def main() -> None:
                 file=sys.stderr,
             )
         verification = store.verify_audit_chain_status(args.task_id, allow_legacy_anchor=args.allow_legacy_anchor)
-        print(json.dumps({"task_id": args.task_id, "status": verification.status, "head_status": verification.head_status, "anchor_status": verification.anchor_status, "reason": verification.reason}, indent=2))
+        verification = _apply_audit_floor(parser, config, store, audit_verifier, args.task_id, verification)
+        print(json.dumps({
+            "task_id": args.task_id,
+            "status": verification.status,
+            "head_status": verification.head_status,
+            "anchor_status": verification.anchor_status,
+            "floor_status": verification.floor_status,
+            "reason": verification.reason,
+        }, indent=2))
         if verification.status == "invalid":
             raise SystemExit(1)
         if verification.status == "unverifiable":
             raise SystemExit(2)
+        return
+    if args.command == "floor-reset":
+        _run_floor_reset(parser, args, config, store)
         return
     if args.tools_loader and not config.policy_path:
         parser.error("--tools requires --policy-path or PORTMARK_POLICY_PATH")
@@ -366,6 +351,7 @@ def main() -> None:
         require_attestation=config.require_attestation,
         allow_local_provider_endpoint=config.allow_local_provider_endpoint,
         tools=tools,
+        audit_floor_path=config.audit_floor_path,
     )
     if args.command == "demo":
         provider = "wasm" if config.wasm_component else ("http" if config.provider_endpoint else "deterministic")

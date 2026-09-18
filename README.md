@@ -362,6 +362,7 @@ stable interface to substitute against.
 | --- | --- | --- |
 | Trust registry | JSON registry loaded from `PORTMARK_TRUST_REGISTRY_PATH`, with key IDs, issuers, audiences, validity windows, and revocation | PKI- or KMS-backed key distribution and rotation |
 | Storage | `SQLiteRuntimeStore` behind the `RuntimeStore` protocol | a shared database for multi-host deployments |
+| Audit witness | local signed audit floor (`--audit-floor-path`) behind the `MonotonicWitness` contract; detects rollback relative to the surviving floor file only | append-only/WORM storage for the floor, or a remote transparency service for whole-machine and cross-host rollback |
 | Wasm bindings | WIT contract executed through a JSON-lowered adapter on Node, with optional native Wasmtime Component Model execution | deployment-selected Wasmtime version and component build pipeline |
 | A2A types | generated-style A2A 1.0 subset isolated in `a2a_types.py`, with optional `a2a-sdk` validation | deployment-selected official SDK/server integration |
 | Attestation | signed mock evidence and optional external verifier command checked by `AttestationPolicy` against RATS-style roles | the target platform's TEE quote verifier and sealed-storage backend |
