@@ -353,5 +353,476 @@ class sqlite3_connection:
         self._connection.close()
 
 
+# ==================================================================================================
+# Integration: the floor wired into make_host / _persist / verify-audit / floor-reset, attacked
+# end to end. Every scenario uses a REAL host, a REAL SQLite database, and a REAL floor file.
+# ==================================================================================================
+
+from contextlib import redirect_stderr, redirect_stdout  # noqa: E402
+import io  # noqa: E402
+import shutil  # noqa: E402
+import sqlite3  # noqa: E402
+import threading  # noqa: E402
+from unittest.mock import patch  # noqa: E402
+
+from portmark.cli import main as cli_main  # noqa: E402
+from portmark.models import ProviderDecision  # noqa: E402
+from portmark.providers import ModelProvider  # noqa: E402
+from portmark.witness import apply_floor  # noqa: E402
+
+
+class SuspendProvider(ModelProvider):
+    """Suspends on every decision, so the same task can be resumed and its chain advanced. The
+    `tag` lands in the audited request, so two hosts with different tags write DIFFERENT events."""
+
+    def __init__(self, tag="original"):
+        self.tag = tag
+
+    def decide(self, state, available_tools, grants=()):
+        return ProviderDecision("await_input", content={"need": "more", "tag": self.tag})
+
+
+def b64(raw):
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+class Deployment:
+    """One host's on-disk layout: store dir, a SEPARATE floor dir, and a trust registry."""
+
+    def __init__(self, root):
+        self.root = Path(root)
+        self.store_path = self.root / "db" / "runtime.sqlite"
+        self.floor_path = self.root / "floor" / "audit-floor.json"
+        self.registry_path = self.root / "trust" / "trust.json"
+        for directory in (self.store_path.parent, self.floor_path.parent, self.registry_path.parent):
+            directory.mkdir(parents=True, exist_ok=True)
+        self.signer = host_signer()
+        self.write_registry(1)
+
+    def write_registry(self, version, extra=(), host_revoked=False, drop_version=False):
+        identities = [{
+            "key_id": self.signer.key_id, "issuer": HOST, "public_key_b64": b64(self.signer.public_key_bytes()),
+            "allowed_audiences": ["*"], "revoked": host_revoked,
+        }, *extra]
+        document = {"identities": identities} if drop_version else {"version": version, "identities": identities}
+        self.registry_path.write_text(json.dumps(document), encoding="utf-8")
+
+    def store(self):
+        return SQLiteRuntimeStore(self.store_path)
+
+    def host(self, floor=True, tag="original", **kwargs):
+        return make_host(
+            host_id=HOST, signer=self.signer, store=self.store(), providers={"suspender": SuspendProvider(tag)},
+            audit_floor_path=str(self.floor_path) if floor else None, **kwargs,
+        )
+
+    def env(self):
+        return {
+            "PORTMARK_ED25519_PRIVATE_KEY_B64": b64(HOST_KEY),
+            "PORTMARK_SIGNING_KEY_ID": self.signer.key_id,
+            "PORTMARK_SIGNING_ISSUER": HOST,
+        }
+
+    def registry_host(self):
+        # A host whose signer is bound to the on-disk, versioned trust registry (registry floor active).
+        with patch.dict(os.environ, self.env()):
+            return make_host(
+                host_id=HOST, store=self.store(), trust_registry_path=str(self.registry_path),
+                providers={"suspender": SuspendProvider()}, audit_floor_path=str(self.floor_path),
+            )
+
+    def snapshot(self, name):
+        target = self.root / f"{name}.sqlite"
+        source = sqlite3.connect(self.store_path)
+        destination = sqlite3.connect(target)
+        try:
+            source.backup(destination)
+        finally:
+            source.close()
+            destination.close()
+        return target
+
+    def restore(self, snapshot):
+        for suffix in ("", "-wal", "-shm"):
+            Path(str(self.store_path) + suffix).unlink(missing_ok=True)
+        shutil.copyfile(snapshot, self.store_path)
+
+    def verify_cli(self, task_id, floor=True):
+        argv = ["portmark", "--host-id", HOST, "--store-path", str(self.store_path), "--trust-registry-path", str(self.registry_path)]
+        if floor:
+            argv += ["--audit-floor-path", str(self.floor_path)]
+        argv += ["verify-audit", "--task-id", task_id]
+        stdout = io.StringIO()
+        code = 0
+        with patch.object(sys, "argv", argv), redirect_stdout(stdout), redirect_stderr(io.StringIO()):
+            try:
+                cli_main()
+            except SystemExit as exit_:
+                code = exit_.code
+        return code, json.loads(stdout.getvalue())
+
+
+def start_task(host, goal="floor"):
+    envelope = make_demo_envelope(host, goal, "suspender")
+    host.signer.seal(envelope)
+    result = host.run(envelope)
+    assert result.status == "awaiting_input", result.status  # nosec B101 -- test fixture precondition
+    return envelope, result
+
+
+def resume(host, envelope):
+    host.signer.seal(envelope)
+    return host.run(envelope)
+
+
+class AuditFloorAttackTests(unittest.TestCase):
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.d = Deployment(self._dir.name)
+
+    def tearDown(self):
+        self._dir.cleanup()
+
+    def assertBootRefused(self, code, make=None):
+        with self.assertRaises(ValueError) as raised:
+            (make or self.d.host)()
+        self.assertIn(f"({code})", str(raised.exception))
+        return raised.exception
+
+    # -- High #1: the auditor's reproduction ------------------------------------------------------
+    def test_restored_older_snapshot_is_refused_at_boot_and_by_verify_audit(self):
+        host = self.d.host()
+        envelope, first = start_task(host)
+        task_id = first.task_id
+        snapshot = self.d.snapshot("sequence-1")
+        resume(host, envelope)  # the chain advances; the floor advances after the commit
+        self.assertEqual(self.d.verify_cli(task_id), (0, self.d.verify_cli(task_id)[1]))
+        self.assertEqual(self.d.verify_cli(task_id)[1]["floor_status"], "anchored")
+
+        self.d.restore(snapshot)
+        # Without the floor the restored copy still verifies: exactly the finding (documents the limit).
+        code, report = self.d.verify_cli(task_id, floor=False)
+        self.assertEqual((code, report["status"], report["floor_status"]), (0, "valid", "no-floor"))
+        # With the surviving floor: refused at boot and by verify-audit.
+        self.assertBootRefused("rolled-back")
+        code, report = self.d.verify_cli(task_id)
+        self.assertEqual((code, report["status"], report["floor_status"]), (1, "invalid", "rolled-back"))
+
+    def test_a_host_already_running_refuses_to_write_over_a_rolled_back_database(self):
+        host = self.d.host()
+        envelope, first = start_task(host)
+        older_envelope = copy_envelope(envelope, first)  # matches the snapshot's checkpoint generation
+        snapshot = self.d.snapshot("before")
+        resume(host, envelope)
+        head_before = self.d.store().audit_head(first.task_id)
+        self.d.restore(snapshot)
+        restored_head = self.d.store().audit_head(first.task_id)
+        # The replayed older envelope passes the checkpoint compare-and-swap against the RESTORED
+        # database, so only the floor's compare-before-use (inside the transaction) can stop it.
+        with self.assertRaisesRegex(SecurityError, "rolled back"):
+            resume(host, older_envelope)
+        self.assertEqual(self.d.store().audit_head(first.task_id), restored_head)  # nothing committed
+        self.assertNotEqual(head_before, restored_head)
+
+    # -- Medium #4: trust-registry rollback -------------------------------------------------------
+    def test_restoring_an_older_registry_that_still_trusts_a_revoked_key_is_refused(self):
+        peer = host_signer(bytes(range(3, 35)), key_id="peer-key", issuer="host:peer")
+        peer_entry = {"key_id": peer.key_id, "issuer": "host:peer", "public_key_b64": b64(peer.public_key_bytes()), "allowed_audiences": ["*"]}
+        self.d.write_registry(1, extra=[peer_entry])
+        old_registry = self.d.registry_path.read_bytes()
+        self.d.write_registry(2, extra=[{**peer_entry, "revoked": True}])  # the revocation
+        host = self.d.registry_host()
+        start_task(host)
+        self.assertEqual(LocalFloorWitness(self.d.floor_path, HOST, self.d.signer, self.d.signer).load()["registry"]["version"], 2)
+
+        self.d.registry_path.write_bytes(old_registry)  # restore the pre-revocation registry
+        self.assertBootRefused("registry-rolled-back", self.d.registry_host)
+        code, report = self.d.verify_cli(start_task_id(self.d))
+        self.assertEqual((code, report["floor_status"]), (1, "registry-rolled-back"))
+
+        self.d.write_registry(2, extra=[peer_entry])  # same version, different content
+        self.assertBootRefused("registry-forked", self.d.registry_host)
+        self.d.write_registry(3, extra=[{**peer_entry, "revoked": True}])  # a NEWER registry is fine
+        self.d.registry_host()
+
+    def test_an_unversioned_registry_cannot_be_used_with_a_floor(self):
+        self.d.write_registry(0, drop_version=True)
+        with self.assertRaisesRegex(ValueError, "VERSIONED trust registry"):
+            self.d.registry_host()
+
+    # -- cloned databases, relative to the surviving authoritative floor ------------------------
+    def test_a_cloned_database_that_fell_behind_the_floor_is_refused(self):
+        host = self.d.host()
+        envelope, first = start_task(host)
+        clone = self.d.snapshot("clone")
+        resume(host, envelope)  # the original moves on; the floor follows it
+        self.d.restore(clone)  # run the stale clone against the authoritative floor
+        self.assertBootRefused("rolled-back")
+
+    def test_a_clone_that_diverged_on_an_independent_floor_copy_is_refused_as_forked(self):
+        host = self.d.host()
+        envelope, first = start_task(host)
+        clone_db = self.d.snapshot("clone")
+        floor_copy = self.d.root / "floor-copy.json"
+        shutil.copyfile(self.d.floor_path, floor_copy)
+        resume(host, envelope)  # original: event N = X, authoritative floor records X
+
+        # The clone runs on its OWN floor copy (a documented non-detection while separate) ...
+        authoritative = self.d.floor_path.read_bytes()
+        self.d.restore(clone_db)
+        shutil.copyfile(floor_copy, self.d.floor_path)
+        clone_host = self.d.host(tag="clone")  # a different decision -> different event content
+        clone_envelope = copy_envelope(envelope, first)
+        resume(clone_host, clone_envelope)  # clone: event N = Y
+        # ... but paired again with the SURVIVING authoritative floor, the divergence is detected.
+        self.d.floor_path.write_bytes(authoritative)
+        self.assertBootRefused("forked")
+        code, report = self.d.verify_cli(first.task_id)
+        self.assertEqual((code, report["floor_status"]), (1, "forked"))
+
+    # -- concurrent writers --------------------------------------------------------------------
+    def test_concurrent_writers_share_one_floor_without_losing_an_advance(self):
+        hosts = [self.d.host() for _ in range(3)]
+        task_ids, errors = [], []
+
+        def worker(host):
+            try:
+                for n in range(4):
+                    envelope, first = start_task(host, f"concurrent {n}")
+                    resume(host, envelope)
+                    task_ids.append(first.task_id)
+            except Exception as error:  # noqa: BLE001 -- surfaced below
+                errors.append(error)
+
+        threads = [threading.Thread(target=worker, args=(host,)) for host in hosts]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=120)
+        self.assertEqual(errors, [])
+        body = LocalFloorWitness(self.d.floor_path, HOST, self.d.signer, self.d.signer).load()
+        store = self.d.store()
+        for task_id in task_ids:
+            head_hash, sequence = store.audit_head(task_id)
+            self.assertEqual(body["tasks"][task_id], {"sequence": sequence, "head_hash": head_hash})
+        self.assertEqual(len(task_ids), 12)
+
+    # -- crashes around the floor advance --------------------------------------------------------
+    def test_crash_between_commit_and_floor_advance_is_benign_lag_and_recovers(self):
+        host = self.d.host()
+        envelope, first = start_task(host)
+        floor_before = self.d.floor_path.read_bytes()
+        resume(host, envelope)
+        # The crash window: the database commit landed, the process died before the floor write.
+        self.d.floor_path.write_bytes(floor_before)
+        self.assertEqual(self.d.verify_cli(first.task_id)[1]["floor_status"], "anchored")  # lag is not an alarm
+        self.d.host()  # restart: boot recovery adopts the head this host signed
+        witnessed = LocalFloorWitness(self.d.floor_path, HOST, self.d.signer, self.d.signer).witnessed_head(first.task_id)
+        self.assertEqual(witnessed, self.d.store().audit_head(first.task_id))
+
+    def test_a_failed_floor_write_is_retried_before_the_next_commit(self):
+        host = self.d.host()
+        envelope, first = start_task(host)
+        real = LocalFloorWitness.advance_heads
+        calls = {"n": 0}
+
+        def fail_once(witness, heads):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("transient I/O error")
+            return real(witness, heads)
+
+        with patch.object(LocalFloorWitness, "advance_heads", fail_once):
+            with self.assertLogs("portmark.host", "ERROR"):
+                second = resume(host, envelope)  # the committed run still succeeds
+        self.assertEqual(second.status, "awaiting_input")
+        self.assertEqual(host._floor_pending, {})  # caught up at the next persist
+        self.assertEqual(self.d.verify_cli(first.task_id)[1]["floor_status"], "anchored")
+
+    def test_a_floor_that_stays_unwritable_stops_new_work_after_one_commit(self):
+        host = self.d.host()
+        envelope, first = start_task(host)
+        head_before = self.d.store().audit_head(first.task_id)
+        with patch.object(LocalFloorWitness, "advance_heads", side_effect=OSError("read-only volume")):
+            with self.assertLogs("portmark.host", "ERROR"):
+                with self.assertRaisesRegex(SecurityError, "audit floor is behind committed heads"):
+                    resume(host, envelope)  # first commit lands, its advance fails, the NEXT commit refuses
+        witnessed = LocalFloorWitness(self.d.floor_path, HOST, self.d.signer, self.d.signer).witnessed_head(first.task_id)
+        self.assertEqual(witnessed, head_before)  # the floor is behind by exactly the one commit
+        self.assertEqual(self.d.store().audit_head(first.task_id)[1], head_before[1] + 1)
+        self.d.host()  # writable again: a restart recovers the lag
+        self.assertEqual(self.d.verify_cli(first.task_id)[1]["floor_status"], "anchored")
+
+    def test_crash_after_the_floor_advance_needs_no_recovery(self):
+        host = self.d.host()
+        envelope, first = start_task(host)
+        resume(host, envelope)
+        self.d.host()  # restart: boot compares every witnessed task and accepts
+        self.assertEqual(self.d.verify_cli(first.task_id)[1]["floor_status"], "anchored")
+
+    def test_a_rolled_back_persist_leaves_the_floor_untouched(self):
+        host = self.d.host()
+        envelope, first = start_task(host)
+        stale = copy_envelope(envelope, first)
+        resume(host, envelope)
+        floor_before = self.d.floor_path.read_bytes()
+        with self.assertRaisesRegex(SecurityError, "stale checkpoint generation"):
+            resume(host, stale)  # save_checkpoint's CAS refuses -> the transaction rolls back
+        self.assertEqual(self.d.floor_path.read_bytes(), floor_before)
+
+    # -- corrupted / deleted floors -------------------------------------------------------------
+    def test_corrupted_floor_refuses_boot_and_verification(self):
+        host = self.d.host()
+        _, first = start_task(host)
+        data = bytearray(self.d.floor_path.read_bytes())
+        index = data.index(b'"sequence":') + len(b'"sequence":')
+        data[index] = ord("9") if data[index] != ord("9") else ord("8")
+        self.d.floor_path.write_bytes(bytes(data))
+        self.assertBootRefused("floor-corrupt")
+        code, report = self.d.verify_cli(first.task_id)
+        self.assertEqual((code, report["floor_status"]), (1, "floor-corrupt"))
+
+    def test_deleted_floor_is_refused_never_rebuilt(self):
+        host = self.d.host()
+        _, first = start_task(host)
+        self.d.floor_path.unlink()
+        self.assertBootRefused("floor-missing")
+        self.assertFalse(self.d.floor_path.exists())
+        code, report = self.d.verify_cli(first.task_id)
+        self.assertEqual((code, report["floor_status"]), (1, "floor-missing"))
+
+    # -- backup restoration + the operator recovery procedure --------------------------------------
+    def test_backup_restore_is_refused_until_an_explicit_operator_reset(self):
+        host = self.d.host()
+        _, kept = start_task(host, "in the backup")
+        backup = self.d.snapshot("nightly")
+        _, lost = start_task(host, "after the backup")
+        self.d.restore(backup)
+        self.assertBootRefused("rolled-back")
+
+        base = ["portmark", "--host-id", HOST, "--store-path", str(self.d.store_path), "--trust-registry-path", str(self.d.registry_path),
+                "--audit-floor-path", str(self.d.floor_path), "floor-reset", "--reason", "restored nightly backup after disk loss"]
+        with patch.dict(os.environ, self.d.env()), patch.object(sys, "argv", base), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                cli_main()  # no --confirm
+        self.assertEqual(raised.exception.code, 2)
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch.dict(os.environ, self.d.env()), patch.object(sys, "argv", base + ["--confirm"]), redirect_stdout(stdout), redirect_stderr(stderr):
+            cli_main()
+        self.assertEqual(json.loads(stdout.getvalue()), {"host_id": HOST, "status": "reset", "epoch": 2})
+        self.assertIn("WARNING: audit floor for host:floor was reset to epoch 2", stderr.getvalue())
+
+        self.d.registry_host()  # boots again on the new epoch (the reset recorded the registry)
+        body = LocalFloorWitness(self.d.floor_path, HOST, self.d.signer, self.d.signer).load()
+        self.assertEqual(body["resets"][0]["reason"], "restored nightly backup after disk loss")
+        self.assertIsNotNone(body["resets"][0]["prior_floor_sha256"])
+        self.assertIn(kept.task_id, body["tasks"])
+        self.assertNotIn(lost.task_id, body["tasks"])
+        self.assertEqual(self.d.verify_cli(kept.task_id)[1]["floor_status"], "anchored")
+        # An OLD floor put back after the reset is refused (epoch mismatch).
+
+    # -- configuration guards ---------------------------------------------------------------------
+    def test_floor_configuration_guards(self):
+        with self.assertRaisesRegex(ValueError, "OUTSIDE the store directory"):
+            make_host(host_id=HOST, signer=self.d.signer, store=self.d.store(), audit_floor_path=str(self.d.store_path.parent / "floor.json"))
+        with self.assertRaisesRegex(ValueError, "durable store"):
+            make_host(host_id=HOST, signer=self.d.signer, store=InMemoryRuntimeStore(), audit_floor_path=str(self.d.floor_path))
+        with self.assertLogs("portmark.factory", "WARNING") as logs:
+            self.d.host(floor=False)
+        self.assertIn("will NOT be detected", "".join(logs.output))
+
+    def test_a_task_the_floor_never_witnessed_is_unverifiable(self):
+        no_floor_host = self.d.host(floor=False)
+        _, before = start_task(no_floor_host, "before the floor existed")
+        # Created before the floor: boot adopts it (this host signed it), so it becomes anchored.
+        self.d.host()
+        self.assertEqual(self.d.verify_cli(before.task_id)[1]["floor_status"], "anchored")
+        # A task in the database the floor has never seen (e.g. another host's) is not anchored.
+        result = apply_floor(self.d.store().verify_audit_chain_status("ghost"), LocalFloorWitness(self.d.floor_path, HOST, None, self.d.signer),
+                             self.d.store(), "ghost", None, None)
+        self.assertEqual(result.status, "invalid")  # missing chain stays invalid
+        other = self.d.store()
+        with patch.object(other, "audit_head", return_value=("h", 1)):
+            result = apply_floor(dataclasses.replace(before_result(self.d, before.task_id), status="valid"),
+                                 LocalFloorWitness(self.d.floor_path, HOST, None, self.d.signer), other, "never-seen", None, None)
+        self.assertEqual((result.status, result.floor_status), ("unverifiable", "not-anchored"))
+
+
+def before_result(deployment, task_id):
+    store = deployment.store()
+    store.set_audit_head_verifier(deployment.signer)
+    return store.verify_audit_chain_status(task_id)
+
+
+def start_task_id(deployment):
+    store = deployment.store()
+    return store.audit_heads_for_host(HOST)[0][0]
+
+
+def copy_envelope(envelope, first):
+    # The suspended envelope as it stood after the first run (for a stale-replay / clone resume).
+    import copy
+
+    clone = copy.deepcopy(envelope)
+    clone.state.checkpoint_generation = first.checkpoint["checkpoint_generation"]
+    return clone
+
+
+@unittest.skipUnless(os.environ.get("PORTMARK_TEST_POSTGRES_DSN"), "needs a live Postgres (PORTMARK_TEST_POSTGRES_DSN)")
+class AuditFloorPostgresTests(unittest.TestCase):
+    """The same floor on the PostgreSQL store: marker table, transaction reads, rollback refusal."""
+
+    def setUp(self):
+        import secrets
+
+        from portmark.storage import PostgresRuntimeStore
+
+        self.dsn = os.environ["PORTMARK_TEST_POSTGRES_DSN"]
+        self.schema = "portmark_floor_" + secrets.token_hex(6)
+        self.make_store = lambda: PostgresRuntimeStore(self.dsn, schema=self.schema)
+        self._dir = tempfile.TemporaryDirectory()
+        self.floor_path = Path(self._dir.name) / "audit-floor.json"
+        self.signer = host_signer()
+
+    def tearDown(self):
+        import psycopg
+        from psycopg import sql
+
+        with psycopg.connect(self.dsn, autocommit=True) as connection:
+            connection.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(self.schema)))
+        self._dir.cleanup()
+
+    def host(self):
+        return make_host(host_id=HOST, signer=self.signer, store=self.make_store(), providers={"suspender": SuspendProvider()},
+                         audit_floor_path=str(self.floor_path))
+
+    def test_postgres_store_anchors_and_refuses_a_rolled_back_chain(self):
+        from portmark.storage import POSTGRES_SCHEMA_VERSION
+
+        self.assertEqual(POSTGRES_SCHEMA_VERSION, 10)
+        host = self.host()
+        envelope, first = start_task(host)
+        store = self.make_store()
+        self.assertEqual(store.audit_floor_marker(HOST), (1, False))
+        early_hash, early_sequence = store.audit_head(first.task_id)
+        resume(host, envelope)
+        head_hash, sequence = store.audit_head(first.task_id)
+        self.assertEqual(store.audit_event_hash(first.task_id, sequence - 1), head_hash)
+        self.assertIn((first.task_id, head_hash, sequence), store.audit_heads_for_host(HOST))
+        witnessed = LocalFloorWitness(self.floor_path, HOST, self.signer, self.signer).witnessed_head(first.task_id)
+        self.assertEqual(witnessed, (head_hash, sequence))
+        # "Restore" the earlier state in place: drop the later events and put the old head back.
+        import psycopg
+        from psycopg import sql
+
+        with psycopg.connect(self.dsn, autocommit=True) as connection:
+            connection.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(self.schema)))
+            connection.execute("DELETE FROM audit_events WHERE task_id = %s AND sequence >= %s", (first.task_id, early_sequence))
+            connection.execute("UPDATE audit_heads SET head_hash = %s, sequence = %s WHERE task_id = %s", (early_hash, early_sequence, first.task_id))
+        with self.assertRaises(ValueError) as raised:
+            self.host()
+        self.assertIn("(rolled-back)", str(raised.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

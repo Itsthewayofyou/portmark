@@ -6,6 +6,41 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Section 10 — audit chain (PR B): local audit floor behind a monotonic-witness contract (findings #1 High, #4 Medium)
+
+- **Rollback is detected relative to a signed floor outside the database (High, #1).** A restored older,
+  internally consistent SQLite snapshot verified as `valid`. Each host now keeps one signed audit floor
+  (`--audit-floor-path` / `PORTMARK_AUDIT_FLOOR_PATH`, outside the store directory): format version,
+  host ID, epoch, trust-registry version + digest, and the highest sequence + head per task, signed by
+  the host's audit key (`audit` purpose; a revoked key is refused). Writes: cross-process sidecar lock
+  -> read -> verify -> merge -> sign -> temp file -> fsync -> replace -> parent-directory fsync.
+- **Compare-before-use, advance-after-commit.** At start the host compares every witnessed task with the
+  database; inside every save transaction, before signing, it compares the task's chain. Behind =
+  `rolled-back`, different content = `forked`: refused, nothing committed. The floor advances only
+  after the durable commit; a failed advance is retried before the next commit or new work is refused
+  (never more than one commit of lag); a crash in that window is recovered at the next start.
+- **Refusal, not reconstruction.** A database marker (`audit_floor_markers`, SQLite schema 12 /
+  PostgreSQL 10) records that a floor exists and its epoch. A missing floor the database recorded is
+  refused (`floor-missing`), never rebuilt; a database older than the floor (`db-older-than-floor`)
+  or from another epoch (`epoch-mismatch`) is refused. A pending marker state makes creation and reset
+  crash-safe.
+- **Trust-registry rollback floor (Medium, #4; closes deferred #13).** Registries carry a monotonic
+  top-level `version` (keygen writes 1, `keygen --force` raises it). The floor records version + digest
+  and refuses a lower version (an old copy that still trusts a revoked key) or one version with two
+  digests. A floor requires a versioned registry.
+- **Operator recovery:** `portmark floor-reset --reason TEXT --confirm` re-verifies every chain this
+  host signed (never launders a tampered one), writes the next epoch at the current heads, and records
+  time, reason, prior epoch, and the prior floor's SHA-256. Never automatic.
+- **`verify-audit --audit-floor-path`** adds `floor_status`: `anchored` (0), `not-anchored` (2), or a
+  refusal code (1). Without a floor: `no-floor` (rollback not detectable); a durable store without a
+  floor logs a warning at start.
+- **Exact guarantee, documented in OPERATIONS.md and THREAT_MODEL.md:** rollback or divergence relative
+  to the surviving authoritative floor file. NOT detected: whole-machine rollback of database + floor;
+  copying database + floor together (or clones with independent floor copies); forks across hosts;
+  a compromised host's signing; backdating before compromise. The remote transparency witness stays
+  deferred; it would plug in behind the same `MonotonicWitness` contract.
+- Backup guidance changed: do NOT back up or restore the floor with the database set.
+
 ### Section 10 — audit chain (PR A): one-snapshot verification, migration proof kept, storage doc (findings #2 local half, #3, #5)
 
 - **Verification reads one snapshot (Medium, #3).** `verify_audit_chain_status` read the events and the

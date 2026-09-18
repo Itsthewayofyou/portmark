@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import shlex
 import secrets
 import time
+from pathlib import Path
 
 from .host import AgentHost
 from .metrics import RuntimeMetrics
@@ -14,6 +16,9 @@ from .providers import DeterministicProvider, GenericHttpProvider, ModelProvider
 from .security import AttestationPolicy, EnvelopeSigner, EnvelopeSigningIdentity, ExternalAttestationVerifier, HmacEnvelopeSigner, HostPolicy, MigrationAttesterProtocol, TrustRegistry, TrustSource, _b64url_decode, validate_constraints
 from .storage import RuntimeStore, create_runtime_store
 from .tools import ToolRegistry, demo_registry
+from .witness import FloorError, LocalFloorWitness, floor_path_inside, open_audit_floor
+
+logger = logging.getLogger(__name__)
 
 
 HOST_ID = "host:local-demo"
@@ -82,6 +87,7 @@ def make_host(
     providers: dict[str, ModelProvider] | None = None,
     allow_ephemeral_signing_key: bool = False,
     allow_local_provider_endpoint: bool | None = None,
+    audit_floor_path: str | None = None,
 ) -> AgentHost:
     # Note the asymmetry with `tools`, which REPLACES the demo registry.
     # Providers merge over the constructed defaults instead, so passing an
@@ -209,7 +215,10 @@ def make_host(
                 "currently trusted, active, unexpired, unrevoked, and authorized for the 'audit' usage in "
                 "the trust registry that verifies audit heads. Rotate to a usable key before starting the host."
             )
-    return AgentHost(
+    audit_floor = _open_audit_floor(
+        audit_floor_path or os.environ.get("PORTMARK_AUDIT_FLOOR_PATH"), host_id, host_signer, configured_store, trust_source
+    )
+    host = AgentHost(
         host_id,
         host_signer,
         policy,
@@ -224,6 +233,48 @@ def make_host(
         reload_policy=reload_policy,
         metrics=metrics,
     )
+    host.audit_floor = audit_floor
+    return host
+
+
+def _open_audit_floor(
+    floor_path: str | None, host_id: str, signer: EnvelopeSigningIdentity, store: RuntimeStore | None, trust_source: TrustSource | None
+) -> LocalFloorWitness | None:
+    """Section 10 PR B: boot-time audit-floor checks. Every refusal is a boot ValueError, like the
+    neighbouring signing-key checks, never a lazy failure on the first persist."""
+    durable = bool(getattr(store, "is_durable", False))
+    if not floor_path:
+        if durable:
+            logger.warning(
+                "durable store without an audit floor (--audit-floor-path / PORTMARK_AUDIT_FLOOR_PATH): a rollback of "
+                "the database or trust registry to an older consistent copy will NOT be detected"
+            )
+        return None
+    if not durable:
+        raise ValueError("an audit floor requires a durable store; an in-memory store has nothing to roll back")
+    store_path = getattr(store, "path", None)
+    if store_path is not None and floor_path_inside(floor_path, str(Path(store_path).resolve().parent)):
+        raise ValueError(
+            "the audit floor must live OUTSIDE the store directory (a backup or restore of that directory would "
+            "carry the floor with the database, defeating it)"
+        )
+    if not (hasattr(signer, "sign_audit_floor") and hasattr(signer, "verify_audit_floor")):
+        raise ValueError("the host signer cannot sign an audit floor (needs sign_audit_floor/verify_audit_floor)")
+    registry_version: int | None = None
+    registry_digest: str | None = None
+    if trust_source is not None:
+        if trust_source.version < 1:
+            raise ValueError(
+                "an audit floor requires a VERSIONED trust registry (top-level \"version\": an integer >= 1, raised on "
+                "every change; `portmark keygen --force` does this) so an older registry can be refused"
+            )
+        registry_version, registry_digest = trust_source.version, trust_source.digest
+    witness = LocalFloorWitness(floor_path, host_id, signer, signer)
+    try:
+        open_audit_floor(witness, store, registry_version, registry_digest)
+    except FloorError as error:
+        raise ValueError(f"audit floor refused to start ({error.code}): {error}") from error
+    return witness
 
 
 SPEC_FIELDS = frozenset(

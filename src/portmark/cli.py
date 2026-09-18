@@ -6,7 +6,7 @@ import os
 import secrets
 import shlex
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 from .a2a import A2AAuthConfig, serve
@@ -82,6 +82,60 @@ def _write_out_registry_locked(parser: argparse.ArgumentParser, path: str, new_r
     else:
         registry = {**new_registry, "version": 1}
     _atomic_write_json(path, registry)
+
+
+def _registry_identity(path: str | None) -> tuple[int | None, str | None]:
+    """(version, digest) of the trust registry FILE, as the audit floor records them."""
+    if not path:
+        return None, None
+    from .security import TrustSource
+
+    source = TrustSource.from_path(path)
+    return source.version, source.digest
+
+
+def _apply_audit_floor(parser, config, store, audit_verifier, task_id, verification):
+    from .witness import FloorError, LocalFloorWitness, apply_floor
+
+    if not config.audit_floor_path:
+        return apply_floor(verification, None, store, task_id, None, None)
+    if audit_verifier is None:
+        return replace(verification, status="invalid" if verification.status == "invalid" else "unverifiable",
+                       floor_status="floor-unverifiable")
+    try:
+        witness = LocalFloorWitness.for_verification(config.audit_floor_path, audit_verifier)
+    except FloorError as error:
+        return replace(verification, status="invalid", reason=verification.reason if verification.status == "invalid" else str(error),
+                       floor_status=error.code)
+    if witness is None:
+        # No file at the given path: apply_floor distinguishes "never created" from "lost" via the marker,
+        # but needs the host id -- which is the configured one.
+        witness = LocalFloorWitness(config.audit_floor_path, config.host_id, None, audit_verifier)
+    version, digest = _registry_identity(config.trust_registry_path)
+    return apply_floor(verification, witness, store, task_id, version, digest)
+
+
+def _run_floor_reset(parser: argparse.ArgumentParser, args: argparse.Namespace, config, store) -> None:
+    from .security import TrustSource
+    from .witness import FloorError, LocalFloorWitness, reset_audit_floor
+
+    if not args.confirm:
+        parser.error("floor-reset accepts the CURRENT database as truth; re-run with --confirm once the cause is understood")
+    if store is None or not config.audit_floor_path or not config.trust_registry_path:
+        parser.error("floor-reset requires --store-path, --audit-floor-path, and --trust-registry-path")
+    trust = TrustSource.from_path(config.trust_registry_path)
+    signer = signer_from_environment(config.host_id, config.trust_registry_path, trust=trust)
+    if getattr(signer, "ephemeral", None) is not False:
+        parser.error("floor-reset must sign with the host's stable audit key (PORTMARK_ED25519_PRIVATE_KEY_B64), not a generated one")
+    store.set_audit_head_verifier(trust)
+    witness = LocalFloorWitness(config.audit_floor_path, config.host_id, signer, signer)
+    try:
+        epoch = reset_audit_floor(witness, store, args.reason, trust.version or None, trust.digest, allow_legacy_anchor=args.allow_legacy_anchor)
+    except FloorError as error:
+        print(json.dumps({"host_id": config.host_id, "status": "refused", "floor_status": error.code, "reason": str(error)}, indent=2))
+        raise SystemExit(1) from error
+    print(f"WARNING: audit floor for {config.host_id} was reset to epoch {epoch}; the current database is now the baseline.", file=sys.stderr)
+    print(json.dumps({"host_id": config.host_id, "status": "reset", "epoch": epoch}, indent=2))
 
 
 def _run_keygen(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -172,6 +226,11 @@ def main() -> None:
     parser.add_argument("--policy-path", help="JSON host policy path")
     parser.add_argument("--tools", dest="tools_loader", help="load installed tools from module:function returning a ToolRegistry")
     parser.add_argument("--trust-registry-path", help="JSON trust registry path for envelope signing keys")
+    parser.add_argument(
+        "--audit-floor-path",
+        help="this host's signed audit floor file (Section 10), OUTSIDE the store directory; detects rollback of the "
+        "database or trust registry relative to the surviving floor file (PORTMARK_AUDIT_FLOOR_PATH)",
+    )
     parser.add_argument("--reload-policy", action="store_true", help="reload the JSON host policy before each run")
     parser.add_argument("--attestation-verifier-command", help="shell-free argv string for an external attestation verifier")
     parser.add_argument("--require-attestation", action="store_true", help="require attestation before execution and migration")
@@ -210,6 +269,15 @@ def main() -> None:
     envelope_parser.add_argument("--tool", action="append", dest="tools", help="grant this tool; repeatable; replaces the spec's grants")
     envelope_parser.add_argument("--audience", help=f"host id that may run this envelope; must equal the host's --host-id (default {HOST_ID})")
     envelope_parser.add_argument("--format", choices=("jsonrpc", "envelope"), default="jsonrpc", help="'jsonrpc' emits a ready-to-POST message/send request")
+    floor_reset = subparsers.add_parser(
+        "floor-reset",
+        help="OPERATOR RECOVERY: accept the current database as truth and start a new audit-floor epoch",
+    )
+    floor_reset.add_argument("--reason", required=True, help="why the floor is being reset (recorded in the floor)")
+    floor_reset.add_argument("--confirm", action="store_true", help="required: acknowledge that the current database is accepted as truth")
+    floor_reset.add_argument(
+        "--allow-legacy-anchor", action="store_true", help="accept complete pre-Section-10 migration anchors while re-verifying chains"
+    )
     verify_audit = subparsers.add_parser("verify-audit")
     verify_audit.add_argument("--task-id", required=True, help="task id whose audit chain should be verified")
     verify_audit.add_argument(
@@ -247,11 +315,22 @@ def main() -> None:
                 file=sys.stderr,
             )
         verification = store.verify_audit_chain_status(args.task_id, allow_legacy_anchor=args.allow_legacy_anchor)
-        print(json.dumps({"task_id": args.task_id, "status": verification.status, "head_status": verification.head_status, "anchor_status": verification.anchor_status, "reason": verification.reason}, indent=2))
+        verification = _apply_audit_floor(parser, config, store, audit_verifier, args.task_id, verification)
+        print(json.dumps({
+            "task_id": args.task_id,
+            "status": verification.status,
+            "head_status": verification.head_status,
+            "anchor_status": verification.anchor_status,
+            "floor_status": verification.floor_status,
+            "reason": verification.reason,
+        }, indent=2))
         if verification.status == "invalid":
             raise SystemExit(1)
         if verification.status == "unverifiable":
             raise SystemExit(2)
+        return
+    if args.command == "floor-reset":
+        _run_floor_reset(parser, args, config, store)
         return
     if args.tools_loader and not config.policy_path:
         parser.error("--tools requires --policy-path or PORTMARK_POLICY_PATH")
@@ -272,6 +351,7 @@ def main() -> None:
         require_attestation=config.require_attestation,
         allow_local_provider_endpoint=config.allow_local_provider_endpoint,
         tools=tools,
+        audit_floor_path=config.audit_floor_path,
     )
     if args.command == "demo":
         provider = "wasm" if config.wasm_component else ("http" if config.provider_endpoint else "deterministic")

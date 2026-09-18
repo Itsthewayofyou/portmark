@@ -38,7 +38,8 @@ import hashlib
 import json
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Protocol
@@ -109,6 +110,23 @@ def check_registry_against(floor_registry: dict[str, Any] | None, version: int |
     return None
 
 
+@contextmanager
+def _reader_lock(path: str) -> Iterator[None]:
+    # Readers take the writers' lock when they can (see LocalFloorWitness.load). An auditor reading
+    # a floor on read-only storage cannot create the lock file; then it reads unlocked -- nothing
+    # there can write concurrently -- instead of misreporting the floor as corrupt.
+    try:
+        lock = sidecar_lock(path)
+        lock.__enter__()
+    except OSError:
+        yield
+        return
+    try:
+        yield
+    finally:
+        lock.__exit__(None, None, None)
+
+
 def _file_sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -131,6 +149,25 @@ class LocalFloorWitness:
         self._signer = signer
         self._verifier = verifier
 
+    @classmethod
+    def for_verification(cls, path: str | os.PathLike[str], verifier: Any) -> "LocalFloorWitness | None":
+        """A read-only handle for an offline verifier that does not know the host id: the id is
+        taken from the file and then BOUND by the signature check (the key's issuer must equal
+        it). None if the file does not exist."""
+        try:
+            with _reader_lock(str(path)):
+                with open(path, "rb") as handle:
+                    data = handle.read()
+            document = json.loads(data)
+            host_id = document["body"]["host_id"]
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise FloorError("floor-corrupt", "audit floor is unreadable or malformed") from error
+        if not isinstance(host_id, str) or not host_id:
+            raise FloorError("floor-corrupt", "audit floor host_id is malformed")
+        return cls(path, host_id, None, verifier)
+
     # -- reading ---------------------------------------------------------------------------
     def read_raw(self) -> bytes | None:
         try:
@@ -142,7 +179,16 @@ class LocalFloorWitness:
             raise FloorError("floor-corrupt", f"audit floor {self.path} is unreadable: {error}") from error
 
     def load(self) -> dict[str, Any] | None:
-        """The verified floor body, or None if the file does not exist."""
+        """The verified floor body, or None if the file does not exist.
+
+        Reads take the same cross-process lock as writes: on Windows a file that another handle
+        holds open cannot be replaced, so an unlocked reader could make a concurrent writer's
+        `os.replace` fail. (The lock is not re-entrant: code already holding it uses _load_locked.)
+        """
+        with _reader_lock(self.path):
+            return self._load_locked()
+
+    def _load_locked(self) -> dict[str, Any] | None:
         raw = self.read_raw()
         return None if raw is None else self._verified_body(raw)
 
@@ -196,7 +242,7 @@ class LocalFloorWitness:
         # read -> verify -> merge -> write under the cross-process lock, so two processes advancing
         # different tasks never lose each other's entry and the floor never lowers.
         with sidecar_lock(self.path):
-            body = self.load()
+            body = self._load_locked()
             if body is None:
                 raise FloorError("floor-missing", f"audit floor {self.path} disappeared; refusing to rebuild it")
             if mutate(body):
@@ -382,7 +428,8 @@ def reset_audit_floor(
             failures.append(f"{task_id}: {result.status} ({result.reason})")
     if failures:
         raise FloorError("reset-refused", "refusing to reset the audit floor over chains that do not verify: " + "; ".join(failures))
-    raw = witness.read_raw()
+    with _reader_lock(witness.path):
+        raw = witness.read_raw()
     prior_epoch = 0
     prior_resets: list[dict[str, Any]] = []
     if raw is not None:

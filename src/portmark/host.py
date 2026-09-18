@@ -6,6 +6,7 @@ import threading
 import time
 from dataclasses import asdict, replace
 from collections.abc import Callable
+import logging
 from typing import Any
 
 from .metrics import RuntimeMetrics
@@ -15,6 +16,8 @@ from .providers import ModelProvider
 from .security import _MIGRATION_RECEIPT_FIELDS, _OPTIONAL_MIGRATION_RECEIPT_FIELDS, AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, MigrationAttesterProtocol, SecurityError, arguments_hash, audit_head_payload, canonical_json, effect_id, migration_envelope_digest, migration_receipt_payload, verified_approval_token
 from .storage import InMemoryRuntimeStore, RuntimeStore
 from .tools import ToolExecutionError, ToolKilledError, ToolRegistry
+
+logger = logging.getLogger(__name__)
 
 
 class _TaskCancelled(Exception):
@@ -85,6 +88,12 @@ class AgentHost:
         self.tools = tools
         self.providers = providers
         self.store = store or InMemoryRuntimeStore()
+        # Section 10 PR B: the monotonic witness (local audit floor), set by make_host after its
+        # boot checks pass. None = no floor configured. `_floor_pending` holds heads committed to
+        # the database whose floor advance failed; the next persist must advance them first.
+        self.audit_floor: Any = None
+        self._floor_pending: dict[str, tuple[str, int]] = {}
+        self._floor_lock = threading.Lock()
         # Section 7 PR 2 (round 3): give the tool registry a READ-ONLY view of this host's durable
         # ledger so it can validate a launch-arm request against the real `started` row. `tools` is a
         # plain attribute again (the round-2 auto-binding property setter is gone -- the gate no longer
@@ -1313,7 +1322,19 @@ class AgentHost:
         # provider decision, tool call, approval, or migration — and the nonce it tried
         # to reuse and the audit it tried to append are rolled back with it. The store
         # owns the generation; state.checkpoint_generation is only the CAS assertion.
+        floor = self.audit_floor
+        if floor is not None:
+            self._catch_up_audit_floor(floor)
         with self.store.transaction() as transaction:
+            if floor is not None:
+                # Section 10 PR B, compare-before-use: inside the transaction and BEFORE signing, the
+                # database chain must not be behind or diverged from the floor. A refusal raises here
+                # and rolls back the nonce, events, and checkpoint together; the floor is untouched.
+                floor.check_head(
+                    state.task_id,
+                    transaction.audit_head(state.task_id),
+                    lambda index: transaction.audit_event_hash(state.task_id, index),
+                )
             if consume_nonce is not None:
                 transaction.consume_nonce(consume_nonce, envelope.permit.subject, envelope.permit.audience, state.task_id)
             # Finding #3 (Option B): sign audit heads as v2 with an attested signed_at so
@@ -1384,4 +1405,38 @@ class AgentHost:
                     state.task_id, migration["permit"]["audience"], canonical_json(migration).decode("utf-8")
                 )
         state.checkpoint_generation = new_generation
+        if floor is not None:
+            self._advance_audit_floor(floor, state.task_id)
         return len(audit.events)
+
+    def _advance_audit_floor(self, floor: Any, task_id: str) -> None:
+        # Section 10 PR B, advance-after-durable-commit. The database commit above already
+        # succeeded, so a floor failure here must NOT make the committed run look failed: the
+        # database being AHEAD of the floor is benign lag. Record it; the next persist must
+        # advance it first (_catch_up_audit_floor) or refuse, so lag never exceeds one commit.
+        head = self.store.audit_head(task_id)
+        if head is None:
+            return
+        try:
+            floor.advance_head(task_id, head[1], head[0])
+        except Exception as error:  # noqa: BLE001 -- any failure (I/O, lock, fork) is the same: pending
+            logger.error("audit floor advance failed after commit for task %s (database ahead of floor): %s", task_id, error)
+            with self._floor_lock:
+                self._floor_pending[task_id] = head
+
+    def _catch_up_audit_floor(self, floor: Any) -> None:
+        with self._floor_lock:
+            pending = dict(self._floor_pending)
+        if not pending:
+            return
+        try:
+            floor.advance_heads(pending)
+        except Exception as error:
+            raise SecurityError(
+                f"audit floor is behind committed heads and cannot be advanced ({error}); refusing new work "
+                "until the floor is writable (or `portmark floor-reset` after investigation)"
+            ) from error
+        with self._floor_lock:
+            for task_id, head in pending.items():
+                if self._floor_pending.get(task_id) == head:
+                    del self._floor_pending[task_id]

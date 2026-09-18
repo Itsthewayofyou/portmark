@@ -23,6 +23,7 @@ class RuntimeConfig:
     store_path: str | None = None
     policy_path: str | None = None
     trust_registry_path: str | None = None
+    audit_floor_path: str | None = None
     reload_policy: bool = False
     attestation_verifier_command: tuple[str, ...] | None = None
     require_attestation: bool = False
@@ -52,6 +53,7 @@ class RuntimeConfig:
             store_path=os.environ.get("PORTMARK_STORE_PATH"),
             policy_path=os.environ.get("PORTMARK_POLICY_PATH"),
             trust_registry_path=os.environ.get("PORTMARK_TRUST_REGISTRY_PATH"),
+            audit_floor_path=os.environ.get("PORTMARK_AUDIT_FLOOR_PATH"),
             reload_policy=os.environ.get("PORTMARK_RELOAD_POLICY") == "1",
             attestation_verifier_command=_argv(os.environ.get("PORTMARK_ATTESTATION_VERIFIER_COMMAND")),
             require_attestation=os.environ.get("PORTMARK_REQUIRE_ATTESTATION") == "1",
@@ -87,6 +89,7 @@ class RuntimeConfig:
             store_path=args.store_path or self.store_path,
             policy_path=args.policy_path or self.policy_path,
             trust_registry_path=args.trust_registry_path or self.trust_registry_path,
+            audit_floor_path=getattr(args, "audit_floor_path", None) or self.audit_floor_path,
             reload_policy=bool(args.reload_policy or self.reload_policy),
             attestation_verifier_command=_argv(getattr(args, "attestation_verifier_command", None)) or self.attestation_verifier_command,
             require_attestation=bool(getattr(args, "require_attestation", False) or self.require_attestation),

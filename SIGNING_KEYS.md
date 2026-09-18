@@ -65,6 +65,16 @@ used for the wrong audience, lacks the required usage, or the signature bytes do
 same validity predicate (trusted AND not-revoked AND active AND not-expired) gates admission and
 `/readyz`; key-id lookup alone is never treated as "usable".
 
+The registry may carry a top-level `version` (an integer >= 1, raised on every change; `keygen` writes
+`1` and `keygen --force` raises it). A host with an audit floor requires it: the floor records the
+version and digest in use and refuses an older version (for example a copy from before a revocation)
+or the same version with different content. See OPERATIONS.md, Audit Floor.
+
+**Audit floor signature.** The host signs its audit floor with its audit key, so that key needs the
+`audit` purpose (absent `usages` = unrestricted). Verification is authenticity only (the key is
+re-used every save), but a **revoked** key is refused: a compromised key could otherwise sign a
+lowered floor. The legacy HMAC signer produces a MAC, which only a holder of the same key can check.
+
 `not_before`/`expires_at` must be integers (a JSON boolean is rejected, not coerced) and `revoked`
 must be a boolean; a duplicate `key_id` in a registry is rejected, not silently collapsed.
 

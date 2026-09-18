@@ -12,6 +12,7 @@ Runtime configuration can come from environment variables or CLI flags:
 - `PORTMARK_SIGNING_ISSUER`
 - `PORTMARK_ALLOWED_AUDIENCES`
 - `PORTMARK_TRUST_REGISTRY_PATH` / `--trust-registry-path`
+- `PORTMARK_AUDIT_FLOOR_PATH` / `--audit-floor-path` (see Audit Floor below)
 - `PORTMARK_POLICY_PATH` / `--policy-path`
 - `PORTMARK_RELOAD_POLICY` / `--reload-policy`
 - `PORTMARK_ATTESTATION_VERIFIER_COMMAND` / `--attestation-verifier-command`
@@ -42,6 +43,7 @@ Trust registries are JSON files:
 
 ```json
 {
+  "version": 3,
   "identities": [
     {
       "key_id": "issuer-key",
@@ -57,6 +59,11 @@ Trust registries are JSON files:
 ```
 
 Use unique key IDs, short key lifetimes, and explicit `allowed_audiences` where possible. For emergency revocation, set `revoked: true`, deploy the trust registry, and restart hosts or use the deployment's config reload mechanism.
+
+`version` is a monotonic integer (>= 1). **Raise it on every change** (`portmark keygen --force` does).
+A host with an audit floor records it and refuses to start on a registry with a LOWER version (for
+example an old copy that still trusts a revoked key) or the same version with different content.
+A floor requires a versioned registry.
 
 Ed25519 is the default signer. The legacy HMAC signer is blocked unless
 `PORTMARK_ALLOW_LEGACY_HMAC=unsafe-test-only` and a non-empty
@@ -144,6 +151,58 @@ portmark --store-backend postgres --store-path postgresql://user:pass@db/portmar
 
 The command prints `{"status": "valid"}` and exits 0 for an intact chain whose stored audit head is signed by a trusted host key. It prints `{"status": "invalid"}` and exits 1 when the task is missing or when event sequence, previous hash, event hash, stored audit-head validation, missing signature material, trust-registry rejection, or audit-head signature validation fails. It prints `{"status": "unverifiable"}` and exits 2 when the local verifier cannot prove the signed head because no trust registry is configured. Treat invalid results as tampered or corrupted task history; treat unverifiable results as an operator configuration failure and re-run with `--trust-registry-path`.
 
+## Audit Floor
+
+A signed audit head is stored in the same database as the events it signs, so an older, internally
+consistent copy of the database verifies as current. The **audit floor** is a small signed file,
+kept **outside** the store directory, that remembers the newest audit head this host wrote for each
+task and the trust-registry version it runs with. Configure it with `--audit-floor-path` /
+`PORTMARK_AUDIT_FLOOR_PATH` (a durable store is required; the path must not be inside the store
+directory). A durable store without a floor logs a warning at start.
+
+- **At start** the host refuses to run (and names the reason) if the database or registry is older
+  than the floor (`rolled-back`, `registry-rolled-back`), diverges from it (`forked`,
+  `registry-forked`), the floor is corrupt or signed by the wrong key (`floor-corrupt`), a floor this
+  database recorded is gone (`floor-missing` -- it is **never** rebuilt automatically), the database
+  predates the floor (`db-older-than-floor`), or they come from different reset epochs
+  (`epoch-mismatch`).
+- **On every save** the chain is compared with the floor inside the database transaction, before
+  signing; the floor advances only after the commit is durable. If the floor write fails after a
+  commit, the next save must catch it up first or it refuses new work, so the floor is never more
+  than one commit behind. A crash in that window is recovered at the next start.
+- **`verify-audit --audit-floor-path FLOOR`** adds `floor_status`: `anchored` (exit 0), `not-anchored`
+  (the floor never saw this task; exit 2), or a refusal code (exit 1). Without the flag it reports
+  `no-floor` and cannot detect rollback.
+
+**Where to put it.** On storage that is NOT restored together with the database: a separate volume,
+ideally append-only or WORM (write once, read many) storage. Do not include it in the database backup.
+
+**What it guarantees, exactly.** It detects rollback or divergence of the database or trust registry **relative to the surviving
+authoritative floor file**. It does **not** detect:
+
+1. whole-machine rollback that restores both the database and the floor;
+2. copying the database and the floor together (or running clones with independent floor copies);
+3. forks across separate hosts;
+4. heads signed by a compromised host;
+5. backdated signing before compromise.
+
+Also: a database rolled back to before the floor was first created, combined with deleting the
+floor, looks like a first run (the "floor exists" marker lives in that database).
+
+**Recovery (operator only).** When a refusal is understood -- for example you deliberately restored a
+database backup after losing the disk -- accept the current database as the new baseline:
+
+```bash
+portmark --host-id HOST --store-path runtime.sqlite --trust-registry-path trust.json \
+  --audit-floor-path /var/lib/portmark-floor/audit-floor.json \
+  floor-reset --reason "restored 2026-09-18 nightly backup after disk loss" --confirm
+```
+
+`floor-reset` re-verifies every chain this host signed (it refuses to launder a tampered chain), writes
+a new floor at the current heads with the next epoch, and records the time, reason, prior epoch, and
+the prior floor file's SHA-256 in the floor. It needs the host's stable signing key in the
+environment. It is never run automatically: work done after the backup is lost and the reset says so.
+
 ## Metrics
 
 `AgentHost` owns an in-process `RuntimeMetrics` instance. Embedders can pass
@@ -171,9 +230,14 @@ Back up these assets together:
 
 Restore them as a consistent set. Restoring an old database with a newer policy is allowed, but old approval tokens may fail policy-hash validation.
 
+**Do not back up or restore the audit floor with this set.** Restoring the floor together with the
+database defeats it (non-detection 1 above). After restoring an older database, a host with a floor
+refuses to start (`rolled-back`); run `floor-reset` deliberately, with the reason, once the restore is
+understood. Restoring an older trust registry is refused the same way (`registry-rolled-back`).
+
 ## Storage Migrations
 
-SQLite runtime databases carry their schema version in `PRAGMA user_version`. Hosts migrate version `0` stores to the current baseline on open and refuse to open databases with a newer schema version than the runtime supports. Postgres stores keep their schema version in the `portmark_schema` table in the configured schema. Back up the runtime database before deploying runtime versions that include storage migrations, and validate representative task IDs with `verify-audit` after migration.
+SQLite runtime databases (current version 12) carry their schema version in `PRAGMA user_version`. Hosts migrate version `0` stores to the current baseline on open and refuse to open databases with a newer schema version than the runtime supports. Postgres stores (current version 10) keep their schema version in the `portmark_schema` table in the configured schema. Back up the runtime database before deploying runtime versions that include storage migrations, and validate representative task IDs with `verify-audit` after migration.
 
 ## Incident Response
 

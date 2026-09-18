@@ -39,8 +39,8 @@ If any write fails, the transaction is rolled back. For example, a duplicate aud
 Each durable store records its schema version and migrates forward on open. A store whose version is
 **newer** than the running code fails closed, so an older runtime never writes to an unknown schema.
 
-- **SQLite:** version in `PRAGMA user_version`. Current version: **11** (`SQLITE_SCHEMA_VERSION`).
-- **PostgreSQL:** version in the single-row `portmark_schema` table. Current version: **9**
+- **SQLite:** version in `PRAGMA user_version`. Current version: **12** (`SQLITE_SCHEMA_VERSION`).
+- **PostgreSQL:** version in the single-row `portmark_schema` table. Current version: **10**
   (`POSTGRES_SCHEMA_VERSION`). DDL runs behind a session-level advisory lock and uses
   `ADD COLUMN IF NOT EXISTS`, so concurrent first opens are safe. The Postgres version numbers are
   NOT the same as the SQLite ones; both reach the same current tables below.
@@ -60,6 +60,7 @@ SQLite migration steps (each step runs once, in order):
 | 9 | New `task_cancellations` (durable cancellation). |
 | 10 | New `tool_effects` + index on `task_id` (effect ledger). |
 | 11 | `tool_effects` gains `reconcile_claim_id`, `reconcile_lease_expires_at` (reconcile lease). |
+| 12 | New `audit_floor_markers` (Section 10 audit floor; PostgreSQL version 10). |
 
 ## Tables
 
@@ -109,6 +110,13 @@ SQLite migration steps (each step runs once, in order):
 - `task_id`: primary key; presence means cancelled
 - `cancelled_at`
 
+`audit_floor_markers`
+
+- `host_id`: primary key
+- `epoch`: the audit floor's current epoch (raised by `floor-reset`)
+- `pending`: set while a floor is being created or reset (crash recovery), then cleared
+- `updated_at`
+
 `tool_effects`
 
 - `effect_id`: primary key (host-derived)
@@ -137,7 +145,9 @@ internally consistent histories are not `valid`.
   source key is revoked later, the anchor reports `invalid`: it cannot be shown to predate the revocation.
 - **What this does not prove.** Verification checks the database against itself and the trust registry.
   It does not know whether a NEWER head once existed: restoring an older, internally consistent database
-  still verifies. Rollback detection is the separate audit floor (Section 10 PR B).
+  still verifies by itself. Rollback detection is the audit floor: a signed file OUTSIDE the database
+  (`--audit-floor-path`; see OPERATIONS.md, Audit Floor), checked at start, inside every save
+  transaction, and by `verify-audit --audit-floor-path` (`floor_status`).
 
 ## Recovery
 
