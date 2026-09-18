@@ -205,6 +205,21 @@ applied retroactively (there is no signing time to judge against). But a v1 head
 that is now **revoked** is `revoked-key-legacy-v1` (rejected): without a `signed_at`, pre-compromise
 signing cannot be established, so a compromised key's v1 heads cannot be trusted as pre-compromise.
 
+**Migration anchor (`anchor_status`).** `verify-audit` also reports `anchor_status` for event 0 of
+a migrated task: `none` (not a migration), `verified`, `legacy-anchor` (an anchor written before the
+source proof was kept), or `invalid`.
+
+A `legacy-anchor` has no source proof to re-check, so by default it is `status: unverifiable` and
+the CLI exits **2**. `verify-audit --allow-legacy-anchor` accepts a COMPLETE pre-Section-10 anchor
+as `valid` (exit 0), keeps `anchor_status: legacy-anchor`, says in `reason` that the source proof was
+not independently reverified, and prints a warning to stderr (stdout stays valid JSON). This flag is
+**temporary migration compatibility, not an equivalent security mode**; it is never relabelled
+`verified`. It never rescues a partial or malformed anchor (wrong key set, a missing proof field, a bad
+value): those are `invalid`, exit 1. Automation must read `anchor_status`, not only the exit code. `verified` means the SOURCE host's signed handoff head was
+re-checked against this registry for the `migration` key purpose. The handoff head is a v1 head, so
+the legacy v1 policy above applies: if the source key is later revoked, the anchor becomes `invalid`.
+Keep the source host's keys in the destination's registry, or its migrated tasks cannot be verified.
+
 **Limitation (build to it, do not oversell).** `signed_at` is set by the signer, so a *compromised*
 key can backdate it. `signed_at` cleanly handles benign expiry/rotation, but on its own it does not
 prove a head was signed before compromise. Compromise-sensitive "signed before time T" proof

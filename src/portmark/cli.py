@@ -306,6 +306,14 @@ def main() -> None:
     envelope_parser.add_argument("--format", choices=("jsonrpc", "envelope"), default="jsonrpc", help="'jsonrpc' emits a ready-to-POST message/send request")
     verify_audit = subparsers.add_parser("verify-audit")
     verify_audit.add_argument("--task-id", required=True, help="task id whose audit chain should be verified")
+    verify_audit.add_argument(
+        "--allow-legacy-anchor",
+        action="store_true",
+        help=(
+            "TEMPORARY migration compatibility: accept a complete pre-Section-10 migration anchor (no kept source "
+            "proof) as valid instead of unverifiable. The source proof is NOT reverified; not an equivalent security mode"
+        ),
+    )
     args = parser.parse_args()
     from .security import load_trust_registry
     from .storage import create_runtime_store
@@ -324,8 +332,16 @@ def main() -> None:
     if args.command == "verify-audit":
         if store is None:
             parser.error("verify-audit requires --store-path or PORTMARK_STORE_PATH")
-        verification = store.verify_audit_chain_status(args.task_id)
-        print(json.dumps({"task_id": args.task_id, "status": verification.status, "head_status": verification.head_status, "reason": verification.reason}, indent=2))
+        if args.allow_legacy_anchor:
+            # stderr, so stdout stays one valid JSON document for automation.
+            print(
+                "WARNING: --allow-legacy-anchor is a temporary migration-compatibility mode, NOT an equivalent "
+                "security mode: a legacy migration anchor is accepted without independently reverifying the "
+                "source proof. Check anchor_status in the output.",
+                file=sys.stderr,
+            )
+        verification = store.verify_audit_chain_status(args.task_id, allow_legacy_anchor=args.allow_legacy_anchor)
+        print(json.dumps({"task_id": args.task_id, "status": verification.status, "head_status": verification.head_status, "anchor_status": verification.anchor_status, "reason": verification.reason}, indent=2))
         if verification.status == "invalid":
             raise SystemExit(1)
         if verification.status == "unverifiable":
