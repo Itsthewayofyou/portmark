@@ -1019,8 +1019,12 @@ class _WindowsJobProcessTree(_ProcessTree):
             _windows_job.close_handle(self._job)
 
 
-def _launch_windows_job_tree(argv: list[str], common: dict[str, Any]) -> _ProcessTree:
-    job = _windows_job.create_kill_on_close_job()
+def _launch_windows_job_tree(
+    argv: list[str], common: dict[str, Any], process_memory_limit: int | None = None,
+) -> _ProcessTree:
+    # process_memory_limit: optional per-process committed-memory ceiling for the job (Section 9;
+    # used by the native Wasmtime provider's worker). The isolated-tool executor passes none.
+    job = _windows_job.create_kill_on_close_job(process_memory_limit)
     try:
         process = subprocess.Popen(  # nosec B603
             argv,

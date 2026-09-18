@@ -6,6 +6,49 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Section 9 — native Wasmtime sandbox (PR 2): real aggregate ceiling, bounded compilation, deterministic engine (findings #1, #3, #4)
+
+- **The native Wasmtime memory limit is no longer only per memory (finding #1, High).** Wasmtime
+  applies `memory_size` to each linear memory separately; a small component declaring many memories
+  multiplied it (the audit instantiated 301 memories under a 64 KiB setting). The store now also
+  caps instances (8), memories (2), tables (4), and table elements (10,000). The per-memory default
+  drops from 256 MiB to **64 MiB**.
+- **The whole worker process now runs under an OS memory ceiling (#1, #3).** 512 MiB by default:
+  `RLIMIT_AS` on POSIX, applied inside the worker after its trusted imports and before the Engine
+  is built, so JIT compilation, which fuel does not meter, is capped too. On Windows the worker is
+  launched inside a Job Object (the isolated-tool executor's race-free suspended-assign-resume
+  launch) with a new per-process memory limit. `RLIMIT_CPU` also bounds compilation CPU on POSIX.
+  Wasmtime's reservations are sized to the guest limit so that the cap is usable at all: with
+  default reservations, the worker fails under a 1 GiB address-space cap.
+- **The limits must agree, or the provider refuses to start:**
+  `max_memories × max_memory_bytes + 256 MiB worker baseline ≤ worker_memory_limit`.
+- **Fail closed where no OS ceiling can be enforced.** The provider proves enforcement at start-up
+  (POSIX: a child caps itself and must fail to allocate past the cap; Windows: Job Objects
+  available). Without it, construction fails unless the operator passes
+  `allow_uncapped_worker=True`; every uncapped run is then logged as a warning.
+- **Bounded concurrent compilation (#3).** Single-threaded compilation (`parallel_compilation`
+  off), and at most two native workers at once. Waiting for a worker slot spends the decision's
+  own deadline, so a saturated host fails closed ("worker capacity exhausted") and never queues
+  past the timeout.
+- **Deterministic, explicit engine configuration (#4).** Deterministic relaxed SIMD and NaN
+  canonicalization, so results match across x86-64 and AArch64. Every Wasm proposal is set
+  explicitly instead of inheriting Wasmtime's changing defaults: threads, shared memory, memory64,
+  multi-memory, GC (proposal and runtime), exceptions, tail calls, typed function references, stack
+  switching, wide arithmetic, custom page sizes, and component-model map types are off. A test
+  enumerates every proposal setter wasmtime-py exposes and fails if one is left unassigned, so a
+  proposal added by a Wasmtime upgrade cannot silently inherit a default (review round 2: tail
+  calls and typed function references were still default-on).
+  (Cross-architecture and Windows CI lanes follow in the next Section 9 PR.)
+- Docs: README, WASM_COMPONENTS.md, OPERATIONS.md, and THREAT_MODEL.md now describe per-memory versus
+  aggregate limits accurately. The README previously said native Wasmtime "bounds guest memory".
+- Tests: the auditor's 301-memory component plus instance, memory, table, and table-element
+  overflows refused by their own limits; two full-size memories still admitted; limit-invariant
+  refusal; OS caps sent to and enforced inside the worker (a 32 MiB cap fails, 512 MiB succeeds);
+  the self-check can report "not enforced"; uncapped-platform block and opt-out; worker-slot
+  deadline; canonical NaN `0x7fc00000` (hand-derived from the Wasm spec); five default-enabled
+  proposals refused, against a default-config control; Windows Job Object memory limit (Windows
+  CI). Each defense was confirmed to make its test fail when neutralized.
+
 ### Section 9 — native Wasmtime sandbox (PR 1): executed bytes always match the signed digest (finding #2)
 
 - **Wasm providers now freeze the component bytes before anything else.** Both

@@ -4,7 +4,10 @@ import http.client
 import json
 import hashlib
 import base64
+import functools
 import ipaddress
+import logging
+import math
 import os
 import shutil
 import socket
@@ -17,6 +20,7 @@ from urllib.parse import urlparse
 from abc import ABC, abstractmethod
 from typing import Any
 
+from . import _windows_job
 from .component_bindings import component_checkpoint, component_context, decode_component_decision, encode_component_input
 from .models import ProviderDecision, ProviderView
 from .projection import provider_state
@@ -28,7 +32,31 @@ DEFAULT_MAX_WASM_COMPONENT_BYTES = 10_000_000
 # single decision consumes tens of fuel units and a small memory; these leave huge
 # headroom while trapping a runaway loop or memory.grow. See finding #6.
 DEFAULT_WASM_FUEL = 1_000_000_000
-DEFAULT_WASM_MEMORY_BYTES = 256 * 1024 * 1024
+_MiB = 1024 * 1024
+# Section 9 (#1/#3): the native Wasmtime ceiling is three layers that must agree.
+#  1. Store: memory_size is PER LINEAR MEMORY; instances/memories/tables/table_elements cap how
+#     many of each a component may create, so it cannot multiply the per-memory ceiling.
+#  2. Aggregate guest memory = DEFAULT_WASM_MAX_MEMORIES x DEFAULT_WASM_MEMORY_BYTES (128 MiB).
+#  3. OS: the whole worker (Python + wasmtime + JIT compiler + guest) runs under an address-space
+#     cap (POSIX RLIMIT_AS) or a per-process commit cap (Windows Job Object).
+# Invariant, checked at provider construction:
+#     max_memories x max_memory_bytes + WASMTIME_WORKER_BASELINE_BYTES <= worker_memory_limit
+# The real capsule needs 1 instance, 1 memory, 0 tables and 64 KiB; the rest is headroom.
+DEFAULT_WASM_MEMORY_BYTES = 64 * _MiB  # per linear memory (was 256 MiB before Section 9)
+DEFAULT_WASM_MAX_INSTANCES = 8
+DEFAULT_WASM_MAX_MEMORIES = 2
+DEFAULT_WASM_MAX_TABLES = 4
+DEFAULT_WASM_MAX_TABLE_ELEMENTS = 10_000
+# Python + the wasmtime wheel + compiler working set. Probed: the worker runs, with two 64 MiB
+# memories grown to their cap, under a 384 MiB address-space cap.
+WASMTIME_WORKER_BASELINE_BYTES = 256 * _MiB
+DEFAULT_WASMTIME_WORKER_MEMORY_LIMIT = 512 * _MiB
+# Workers (each compiles its component afresh) allowed at once, separate from request
+# concurrency: N concurrent decisions no longer mean N simultaneous native compilers (#3).
+DEFAULT_MAX_CONCURRENT_WASMTIME_WORKERS = 2
+_WASMTIME_WORKER_SLOTS = threading.BoundedSemaphore(DEFAULT_MAX_CONCURRENT_WASMTIME_WORKERS)
+
+logger = logging.getLogger(__name__)
 
 # Finding #6: the native Wasmtime provider launches a child Python that imports the
 # arch-specific `wasmtime` wheel. Passing env={PYTHONPATH only} stripped SYSTEMROOT,
@@ -449,6 +477,88 @@ def _kill_process(process: subprocess.Popen) -> None:
         pass
 
 
+# A child that proves the POSIX address-space cap is ENFORCED, not merely accepted: it caps
+# itself, then allocates twice the cap. Exit 0 only if that allocation is refused.
+_CAP_SELF_CHECK = (
+    "import resource, sys\n"
+    "cap = 256 * 1024 * 1024\n"
+    "resource.setrlimit(resource.RLIMIT_AS, (cap, cap))\n"
+    "try:\n"
+    "    bytearray(2 * cap)\n"
+    "except MemoryError:\n"
+    "    sys.exit(0)\n"
+    "sys.exit(3)\n"
+)
+
+
+@functools.lru_cache(maxsize=1)
+def _worker_memory_cap_enforceable() -> bool:
+    """Whether this platform can put an ENFORCED memory ceiling on the native Wasmtime worker.
+
+    Windows: a Job Object with a per-process memory limit. POSIX: RLIMIT_AS -- proven once per
+    process by a self-check child, because a platform may accept ``setrlimit`` without enforcing
+    it (an accepted-but-ignored cap is the silent, worse case). Decided by behaviour, not by an OS
+    name list. Cached: the answer cannot change within a process.
+    """
+    if sys.platform == "win32":
+        return _windows_job.available()
+    try:
+        import resource  # noqa: F401 -- presence check only
+    except ImportError:
+        return False
+    try:
+        result = subprocess.run(  # nosec B603 - fixed argv, host interpreter, no shell
+            [sys.executable, "-c", _CAP_SELF_CHECK],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=30, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+class _Worker:
+    """A launched worker: the process, how to kill it, and how to release it."""
+
+    def __init__(self, process: subprocess.Popen, kill: Any = None, close: Any = None) -> None:
+        self.process = process
+        self._kill = kill or (lambda: _kill_process(process))
+        self._close = close or (lambda: None)
+
+    def kill(self) -> None:
+        if self.process.poll() is not None:
+            return
+        try:
+            self._kill()
+        except OSError:
+            pass
+
+    def close(self) -> None:
+        try:
+            self._close()
+        except OSError:
+            pass
+
+
+def _launch_plain(argv: list[str], popen_kwargs: dict[str, Any]) -> _Worker:
+    return _Worker(subprocess.Popen(argv, **popen_kwargs))  # nosec B603
+
+
+def _windows_job_launcher(process_memory_limit: int) -> Any:
+    """Launch inside a kill-on-close Job Object with a per-process memory ceiling (Windows).
+
+    Reuses the isolated-tool executor's race-free launch (suspended -> assign -> resume) and its
+    fail-closed cleanup; a failed job setup raises instead of falling back to an unmanaged child.
+    """
+    from .tools import _launch_windows_job_tree
+
+    def launch(argv: list[str], popen_kwargs: dict[str, Any]) -> _Worker:
+        tree = _launch_windows_job_tree(argv, popen_kwargs, process_memory_limit=process_memory_limit)
+        return _Worker(tree._process, kill=tree.terminate_tree, close=tree.close)
+
+    return launch
+
+
 def _run_bounded(
     argv: list[str],
     request: bytes,
@@ -457,6 +567,7 @@ def _run_bounded(
     max_output_bytes: int,
     env: dict[str, str],
     stderr_cap: int = 4096,
+    launch: Any = None,
 ) -> tuple[int | None, bytes, str, bool, bool]:
     """Run a subprocess, draining stdout/stderr on reader threads under a hard byte cap.
 
@@ -476,6 +587,10 @@ def _run_bounded(
     blocked writer unblocks with ``BrokenPipeError``. Every wait derives its budget from that one
     deadline, so no phase can re-spend the full timeout.
 
+    ``launch(argv, popen_kwargs) -> _Worker`` selects how the child starts and is killed; the
+    default is a plain ``Popen``. The native Wasmtime provider passes a Job Object launcher on
+    Windows so the worker runs under a per-process memory ceiling (Section 9, #1).
+
     Returns ``(returncode, stdout_bytes, stderr_text, timed_out, overflowed)``.
 
     debt: ``process.kill()`` ends only the direct child, not a descendant tree. Sufficient here:
@@ -484,13 +599,11 @@ def _run_bounded(
     kill-tree) if the runner ever gains spawn/exec capability.
     """
     deadline = time.monotonic() + timeout
-    process = subprocess.Popen(  # nosec B603
+    worker = (launch or _launch_plain)(
         argv,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
+        {"stdin": subprocess.PIPE, "stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "env": env},
     )
+    process = worker.process
     stdout_buffer = bytearray()
     stderr_buffer = bytearray()
     overflow = threading.Event()
@@ -507,7 +620,7 @@ def _run_bounded(
                 stdout_buffer.extend(chunk)
                 if len(stdout_buffer) > max_output_bytes:
                     overflow.set()
-                    _kill_process(process)
+                    worker.kill()
                     break
         except (OSError, ValueError):
             pass
@@ -549,7 +662,7 @@ def _run_bounded(
             process.wait(timeout=max(0.0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             timed_out = True
-            _kill_process(process)
+            worker.kill()
             try:
                 process.wait(timeout=2.0)
             except subprocess.TimeoutExpired:
@@ -564,13 +677,14 @@ def _run_bounded(
         err_reader.join(timeout=2.0)
         writer.join(timeout=2.0)
     finally:
-        _kill_process(process)
+        worker.kill()
         for stream in (process.stdin, process.stdout, process.stderr):
             if stream is not None:
                 try:
                     stream.close()
                 except OSError:
                     pass
+        worker.close()
     stderr_text = bytes(stderr_buffer).decode("utf-8", "replace").strip()
     return process.returncode, bytes(stdout_buffer), stderr_text, timed_out, overflow.is_set()
 
@@ -583,8 +697,10 @@ class WasmDecisionProvider(ModelProvider):
     # (spec cap 4 GiB) plus the subprocess wall-clock (memory.grow past the OS limit
     # returns -1 gracefully and degrades to a CPU loop the deadline catches). An OS
     # RLIMIT_AS is unusable here because V8 reserves multi-GB of virtual space at
-    # startup. The native Wasmtime engine (the default) enforces real fuel + memory
-    # limits. Upgrade when the Node path becomes primary or needs a hard memory cap.
+    # startup (this is about V8 only; the native Wasmtime worker DOES run under an
+    # RLIMIT_AS cap -- see _engine_config). The optional native Wasmtime engine enforces
+    # real fuel + memory limits. Upgrade when the Node path becomes primary or needs a
+    # hard memory cap.
 
     def __init__(
         self,
@@ -648,7 +764,14 @@ class WasmDecisionProvider(ModelProvider):
 
 
 class NativeWasmtimeComponentProvider(ModelProvider):
-    """Runs a Component Model provider through wasmtime-py."""
+    """Runs a Component Model provider through wasmtime-py in a short-lived, OS-capped worker.
+
+    Section 9 resource model (see the constants at the top of this module): per-memory
+    ``max_memory_bytes`` plus instance/memory/table count limits inside the store, an OS memory
+    ceiling on the whole worker process, a cap on concurrent workers, and fuel for guest CPU.
+    Where the OS ceiling cannot be enforced, construction is REFUSED unless the operator opts out
+    with ``allow_uncapped_worker=True`` (every run is then logged as uncapped).
+    """
 
     def __init__(
         self,
@@ -658,17 +781,54 @@ class NativeWasmtimeComponentProvider(ModelProvider):
         max_component_bytes: int = DEFAULT_MAX_WASM_COMPONENT_BYTES,
         max_fuel: int = DEFAULT_WASM_FUEL,
         max_memory_bytes: int = DEFAULT_WASM_MEMORY_BYTES,
+        *,
+        max_instances: int = DEFAULT_WASM_MAX_INSTANCES,
+        max_memories: int = DEFAULT_WASM_MAX_MEMORIES,
+        max_tables: int = DEFAULT_WASM_MAX_TABLES,
+        max_table_elements: int = DEFAULT_WASM_MAX_TABLE_ELEMENTS,
+        worker_memory_limit: int = DEFAULT_WASMTIME_WORKER_MEMORY_LIMIT,
+        allow_uncapped_worker: bool = False,
     ) -> None:
         component = _freeze_component(component, max_component_bytes)
         if max_fuel < 1:
             raise RuntimeError("max_fuel must be positive")
         if max_memory_bytes < 1:
             raise RuntimeError("max_memory_bytes must be positive")
+        for name, value in (
+            ("max_instances", max_instances), ("max_memories", max_memories),
+            ("max_tables", max_tables), ("max_table_elements", max_table_elements),
+            ("worker_memory_limit", worker_memory_limit),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise RuntimeError(f"{name} must be a positive integer")
+        # The layers must agree, or the store limits and the OS ceiling can disagree and one of
+        # them is only advisory: every memory the store admits, at full size, plus the worker's own
+        # baseline, must fit inside the OS ceiling.
+        guest_ceiling = max_memories * max_memory_bytes
+        if guest_ceiling + WASMTIME_WORKER_BASELINE_BYTES > worker_memory_limit:
+            raise RuntimeError(
+                "native Wasmtime limits do not fit the worker memory ceiling: "
+                f"max_memories x max_memory_bytes ({guest_ceiling}) + worker baseline "
+                f"({WASMTIME_WORKER_BASELINE_BYTES}) exceeds worker_memory_limit ({worker_memory_limit})"
+            )
+        self._os_capped = _worker_memory_cap_enforceable()
+        if not self._os_capped and not allow_uncapped_worker:
+            raise RuntimeError(
+                "native Wasmtime needs an enforceable OS memory ceiling for its worker, and this "
+                "platform does not provide one; pass allow_uncapped_worker=True to run it uncapped"
+            )
         self._component = component
         self._timeout = timeout
         self._max_output_bytes = max_output_bytes
         self._max_fuel = max_fuel
         self._max_memory_bytes = max_memory_bytes
+        self._count_limits = {
+            "instances": max_instances,
+            "memories": max_memories,
+            "tables": max_tables,
+            "table_elements": max_table_elements,
+        }
+        self._worker_memory_limit = worker_memory_limit
         self.component_digest = "sha256:" + hashlib.sha256(component).hexdigest()
 
     @classmethod
@@ -680,9 +840,22 @@ class NativeWasmtimeComponentProvider(ModelProvider):
         max_component_bytes: int = DEFAULT_MAX_WASM_COMPONENT_BYTES,
         max_fuel: int = DEFAULT_WASM_FUEL,
         max_memory_bytes: int = DEFAULT_WASM_MEMORY_BYTES,
+        **limits: Any,
     ) -> "NativeWasmtimeComponentProvider":
         component = _read_component_file(path, max_component_bytes)
-        return cls(component, timeout, max_output_bytes, max_component_bytes, max_fuel, max_memory_bytes)
+        return cls(component, timeout, max_output_bytes, max_component_bytes, max_fuel, max_memory_bytes, **limits)
+
+    def _worker_rlimits(self) -> dict[str, int]:
+        # POSIX caps, applied inside the worker before the Engine exists. CPU seconds cover JIT
+        # compilation, which fuel does not meter. Windows uses the Job Object instead (launcher).
+        if not self._os_capped or sys.platform == "win32":
+            return {}
+        return {"address_space": self._worker_memory_limit, "cpu_seconds": math.ceil(self._timeout) + 1}
+
+    def _worker_launcher(self) -> Any:
+        if self._os_capped and sys.platform == "win32":
+            return _windows_job_launcher(self._worker_memory_limit)
+        return None
 
     def decide(
         self,
@@ -699,16 +872,29 @@ class NativeWasmtimeComponentProvider(ModelProvider):
             "max_output_bytes": self._max_output_bytes,
             "max_fuel": self._max_fuel,
             "max_memory_bytes": self._max_memory_bytes,
+            **self._count_limits,
+            "rlimits": self._worker_rlimits(),
         }).encode("utf-8")
-        # Bounded incremental drain (see _run_bounded): defence-in-depth alongside the guest's
-        # fuel/memory bounds, so hostile runner output cannot buffer without limit.
-        returncode, stdout_bytes, stderr_text, timed_out, overflowed = _run_bounded(
-            [sys.executable, "-m", "portmark.wasmtime_component_runner"],
-            request,
-            timeout=self._timeout,
-            max_output_bytes=self._max_output_bytes,
-            env=environment,
-        )
+        if not self._os_capped:
+            logger.warning("native Wasmtime worker is running WITHOUT an OS memory ceiling (allow_uncapped_worker)")
+        # One deadline covers waiting for a worker slot AND the run, so a busy host cannot stretch
+        # a decision past its timeout; a slot that does not free up in time fails closed.
+        deadline = time.monotonic() + self._timeout
+        if not _WASMTIME_WORKER_SLOTS.acquire(timeout=self._timeout):
+            raise RuntimeError("native Wasmtime worker capacity exhausted before the execution deadline")
+        try:
+            # Bounded incremental drain (see _run_bounded): defence-in-depth alongside the guest's
+            # fuel/memory bounds, so hostile runner output cannot buffer without limit.
+            returncode, stdout_bytes, stderr_text, timed_out, overflowed = _run_bounded(
+                [sys.executable, "-m", "portmark.wasmtime_component_runner"],
+                request,
+                timeout=max(0.0, deadline - time.monotonic()),
+                max_output_bytes=self._max_output_bytes,
+                env=environment,
+                launch=self._worker_launcher(),
+            )
+        finally:
+            _WASMTIME_WORKER_SLOTS.release()
         # Same precedence as the Node path: overflow/deadline outcomes beat the non-zero-exit
         # rejection because an overflow kill sets returncode == -SIGKILL.
         if timed_out:

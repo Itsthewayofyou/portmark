@@ -7941,7 +7941,7 @@ class RuntimeTests(unittest.TestCase):
                 "        self.engine = engine\n"
                 "    def set_fuel(self, fuel):\n"
                 "        pass\n"
-                "    def set_limits(self, memory_size=-1):\n"
+                "    def set_limits(self, memory_size=-1, table_elements=-1, instances=-1, tables=-1, memories=-1):\n"
                 "        pass\n",
                 encoding="utf-8",
             )
@@ -8225,6 +8225,268 @@ class RuntimeTests(unittest.TestCase):
         result = host.run(make_demo_envelope(host, "portable native component", "wasm"))
         self.assertEqual(result.status, "completed")
         self.assertEqual(result.result["summary"], "Native Wasmtime component resumed from checkpoint")
+
+    # ---- Section 9 PR 2: aggregate resource ceiling + deterministic engine config ----
+
+    @staticmethod
+    def _many_instance_component(core_body, instances):
+        from wasmtime import wat2wasm
+
+        instantiations = " ".join(["(core instance (instantiate $m))"] * instances)
+        return bytes(wat2wasm(f"(component (core module $m {core_body}) {instantiations})"))
+
+    @unittest.skipUnless(HAS_REAL_WASMTIME, "requires portmark[wasmtime]")
+    def test_real_native_wasmtime_refuses_components_past_store_count_limits(self):
+        # Section 9 #1: memory_size is PER MEMORY in Wasmtime, so a component could multiply it by
+        # declaring many memories/instances (the auditor's 301-memory, 4 KiB component). The store
+        # now caps the counts too; each case must be refused by ITS limit, not incidentally.
+        five_tables = " ".join(["(table 1 funcref)"] * 5)
+        cases = (
+            ("auditor 301 memories", self._many_instance_component("(memory 1)", 301), "memory count too high"),
+            ("3 memories", self._many_instance_component("(memory 1)", 3), "memory count too high"),
+            ("50 instances", self._many_instance_component("", 50), "instance count too high"),
+            ("5 tables", self._many_instance_component(five_tables, 1), "table count too high"),
+            ("20000 table elements", self._many_instance_component("(table 20000 funcref)", 1), "table minimum size"),
+        )
+        for label, component, reason in cases:
+            with self.subTest(case=label):
+                provider = NativeWasmtimeComponentProvider(component)
+                with self.assertRaisesRegex(RuntimeError, reason):
+                    provider.decide(provider_view(AgentState("task", "goal")), ("catalog.search",))
+
+    @unittest.skipUnless(HAS_REAL_WASMTIME, "requires portmark[wasmtime]")
+    def test_real_native_wasmtime_admits_two_memories_grown_to_the_per_memory_cap(self):
+        # The limits are a ceiling, not a ban: two memories (the default max) each grown to the full
+        # 64 MiB per-memory cap still fit inside the 512 MiB worker ceiling. Reaching the export
+        # check proves instantiation (and both grows) succeeded under the OS cap.
+        grow = '(memory 1) (func (drop (memory.grow (i32.const 1023)))) (start 0)'
+        provider = NativeWasmtimeComponentProvider(self._many_instance_component(grow, 2))
+        with self.assertRaisesRegex(RuntimeError, "does not export resume"):
+            provider.decide(provider_view(AgentState("task", "goal")), ("catalog.search",))
+
+    def test_native_wasmtime_provider_refuses_limits_that_exceed_worker_ceiling(self):
+        # The store limits and the OS ceiling must agree or one is only advisory:
+        # max_memories x max_memory_bytes + 256 MiB baseline <= worker_memory_limit (512 MiB).
+        from portmark.providers import WASMTIME_WORKER_BASELINE_BYTES
+
+        mib = 1024 * 1024
+        self.assertEqual(WASMTIME_WORKER_BASELINE_BYTES, 256 * mib)
+        NativeWasmtimeComponentProvider(b"component", max_memories=4)  # 4 x 64 + 256 == 512: fits
+        with self.assertRaisesRegex(RuntimeError, "do not fit the worker memory ceiling"):
+            NativeWasmtimeComponentProvider(b"component", max_memories=5)  # 576 > 512
+        with self.assertRaisesRegex(RuntimeError, "do not fit the worker memory ceiling"):
+            NativeWasmtimeComponentProvider(b"component", max_memory_bytes=200 * mib)
+        for name in ("max_instances", "max_memories", "max_tables", "max_table_elements", "worker_memory_limit"):
+            for bad in (0, -1, True, 1.5):
+                with self.subTest(name=name, value=bad):
+                    with self.assertRaisesRegex(RuntimeError, "positive integer"):
+                        NativeWasmtimeComponentProvider(b"component", **{name: bad})
+
+    def _capture_native_request(self, provider):
+        sent = []
+
+        def capture(argv, request, **kwargs):
+            sent.append((json.loads(request), kwargs))
+            return 1, b"", "stop after capture", False, False
+
+        with patch("portmark.providers._run_bounded", side_effect=capture):
+            with self.assertRaises(RuntimeError):
+                provider.decide(provider_view(AgentState("task", "goal")), ("catalog.search",))
+        return sent[0]
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX worker caps; Windows uses a Job Object")
+    def test_native_wasmtime_provider_sends_count_limits_and_os_caps_to_worker(self):
+        request, kwargs = self._capture_native_request(NativeWasmtimeComponentProvider(b"component", timeout=2.0))
+        self.assertEqual(
+            {key: request[key] for key in ("max_memory_bytes", "instances", "memories", "tables", "table_elements")},
+            {"max_memory_bytes": 64 * 1024 * 1024, "instances": 8, "memories": 2, "tables": 4, "table_elements": 10_000},
+        )
+        self.assertEqual(request["rlimits"], {"address_space": 512 * 1024 * 1024, "cpu_seconds": 3})
+        self.assertIsNone(kwargs["launch"])
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows Job Object launch path")
+    def test_native_wasmtime_decision_runs_in_real_memory_capped_job_on_windows(self):
+        # NOT mocked: a real decision (fake wasmtime module, real worker process) goes through the
+        # REAL Job Object launcher and _run_bounded's kill/close handoff. The spy only records the
+        # call -- it wraps the real launcher, so the worker genuinely runs inside the capped job.
+        import portmark.tools as tools_module
+
+        real_launch = tools_module._launch_windows_job_tree
+        with self._fake_wasmtime_runtime():
+            provider = NativeWasmtimeComponentProvider(b"native-component", timeout=10.0)
+            with patch.object(tools_module, "_launch_windows_job_tree", wraps=real_launch) as spy:
+                decision = provider.decide(provider_view(AgentState("task", "goal")), ("catalog.search",))
+        self.assertEqual(decision.tool, "catalog.search")
+        self.assertEqual(spy.call_count, 1)
+        self.assertEqual(spy.call_args.kwargs["process_memory_limit"], 512 * 1024 * 1024)
+
+    def test_native_wasmtime_blocks_uncapped_platform_unless_operator_opts_out(self):
+        # Owner decision: where no OS memory ceiling can be ENFORCED, refuse by default; an explicit
+        # opt-out runs uncapped, warns on every run, and requests no OS caps it cannot apply.
+        with patch("portmark.providers._worker_memory_cap_enforceable", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "enforceable OS memory ceiling"):
+                NativeWasmtimeComponentProvider(b"component")
+            provider = NativeWasmtimeComponentProvider(b"component", allow_uncapped_worker=True)
+            with self.assertLogs("portmark.providers", level="WARNING") as logs:
+                request, kwargs = self._capture_native_request(provider)
+        self.assertIn("WITHOUT an OS memory ceiling", "\n".join(logs.output))
+        self.assertEqual(request["rlimits"], {})
+        self.assertIsNone(kwargs["launch"])
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "RLIMIT_AS is enforced on Linux")
+    def test_worker_memory_cap_self_check_detects_enforcement_and_can_fail(self):
+        from portmark import providers as providers_module
+
+        providers_module._worker_memory_cap_enforceable.cache_clear()
+        try:
+            self.assertTrue(providers_module._worker_memory_cap_enforceable())
+            # Prove the oracle can say no: a self-check whose over-cap allocation is NOT refused.
+            providers_module._worker_memory_cap_enforceable.cache_clear()
+            with patch.object(providers_module, "_CAP_SELF_CHECK", "import sys\nsys.exit(3)\n"):
+                self.assertFalse(providers_module._worker_memory_cap_enforceable())
+        finally:
+            providers_module._worker_memory_cap_enforceable.cache_clear()
+
+    @unittest.skipUnless(HAS_REAL_WASMTIME and sys.platform != "win32", "requires portmark[wasmtime] on POSIX")
+    def test_real_native_wasmtime_worker_runs_under_the_requested_os_address_space_cap(self):
+        # The cap is applied INSIDE the worker before the Engine is built, so compilation runs capped.
+        # A 32 MiB cap leaves no room for an Engine: the worker must fail and emit no decision. The
+        # same request at the default 512 MiB succeeds -- so the failure is the cap, not the input.
+        capsule = (Path(__file__).parents[1] / "capsules" / "research-agent.component.wasm.b64").read_text().strip()
+        mib = 1024 * 1024
+
+        def run_worker(address_space):
+            request = {
+                "component": capsule, "context_json": "{}", "checkpoint_json": "{}",
+                "max_output_bytes": 65_536, "max_fuel": 10**9, "max_memory_bytes": 64 * mib,
+                "instances": 8, "memories": 2, "tables": 4, "table_elements": 10_000,
+                "rlimits": {"address_space": address_space, "cpu_seconds": 5},
+            }
+            return subprocess.run(  # nosec B603 - fixed argv, host interpreter, no shell
+                [sys.executable, "-m", "portmark.wasmtime_component_runner"],
+                input=json.dumps(request).encode(), capture_output=True, timeout=60, check=False,
+            )
+
+        capped = run_worker(32 * mib)
+        self.assertNotEqual(capped.returncode, 0)
+        self.assertEqual(capped.stdout, b"")
+        normal = run_worker(512 * mib)
+        self.assertEqual(normal.returncode, 0, normal.stderr)
+        self.assertIn(b'"outcome"', normal.stdout)
+
+    def test_native_wasmtime_worker_slots_bound_concurrency_and_honour_the_deadline(self):
+        # Section 9 #3: every decision compiles in a fresh worker, so concurrent decisions are capped
+        # separately from request concurrency. Waiting for a slot spends the SAME deadline as the
+        # run: a saturated host fails closed on time instead of queueing past the timeout.
+        slots = threading.BoundedSemaphore(1)
+        with self._fake_wasmtime_runtime(), patch("portmark.providers._WASMTIME_WORKER_SLOTS", slots):
+            provider = NativeWasmtimeComponentProvider(b"native-component", timeout=0.3)
+            self.assertTrue(slots.acquire(blocking=False))  # another decision holds the only slot
+            started = time.monotonic()
+            with self.assertRaisesRegex(RuntimeError, "capacity exhausted before the execution deadline"):
+                provider.decide(provider_view(AgentState("task", "goal")), ("catalog.search",))
+            self.assertLess(time.monotonic() - started, 1.5)
+            slots.release()
+            generous = NativeWasmtimeComponentProvider(b"native-component", timeout=10.0)
+            decision = generous.decide(provider_view(AgentState("task", "goal")), ("catalog.search",))
+            self.assertEqual(decision.tool, "catalog.search")
+            self.assertTrue(slots.acquire(blocking=False), "a finished decision must release its slot")
+            slots.release()
+
+    @unittest.skipUnless(HAS_REAL_WASMTIME, "requires portmark[wasmtime]")
+    def test_real_native_wasmtime_engine_config_canonicalizes_nan(self):
+        # Section 9 #4. Expected value is HAND-DERIVED from the WebAssembly spec's canonical f32 NaN
+        # (sign 0, quiet bit set, zero payload = 0x7fc00000) -- not produced by running this code.
+        # Without canonicalization, x86-64 hardware yields 0xffc00000 for 0.0/0.0 (sign bit set),
+        # which a guest could observe and branch on differently across architectures.
+        from wasmtime import Engine, Instance, Module, Store, wat2wasm
+
+        from portmark.wasmtime_component_runner import _engine_config
+
+        engine = Engine(_engine_config(64 * 1024 * 1024))
+        store = Store(engine)
+        store.set_fuel(1_000_000)
+        module = Module(engine, wat2wasm(
+            '(module (func (export "nan") (param f32 f32) (result i32)'
+            " local.get 0 local.get 1 f32.div i32.reinterpret_f32))"
+        ))
+        nan = Instance(store, module, []).exports(store)["nan"]
+        self.assertEqual(nan(store, 0.0, 0.0) & 0xFFFFFFFF, 0x7FC00000)
+
+    @unittest.skipUnless(HAS_REAL_WASMTIME, "requires portmark[wasmtime]")
+    def test_real_native_wasmtime_engine_config_locks_default_enabled_proposals(self):
+        # Each feature below is ACCEPTED by Wasmtime 48's default Config (the control arm), so its
+        # refusal under the hardened config is evidence the lock bites -- not a no-op.
+        from wasmtime import Config, Engine, Module, wat2wasm
+
+        from portmark.wasmtime_component_runner import _engine_config
+
+        features = {
+            "threads / shared memory": "(module (memory 1 1 shared))",
+            "memory64": "(module (memory i64 1))",
+            "multi-memory": "(module (memory 1) (memory 1))",
+            "gc": "(module (type (struct (field i32))))",
+            "exceptions": "(module (tag))",
+            "tail call": "(module (func $f (return_call $f)))",
+            "typed function references": "(module (type $t (func)) (func (param (ref $t))))",
+        }
+        hardened = Engine(_engine_config(64 * 1024 * 1024))
+        default = Engine(Config())
+        for name, source in features.items():
+            with self.subTest(feature=name):
+                wasm = wat2wasm(source)
+                Module(default, wasm)  # control: accepted by default
+                with self.assertRaises(Exception):
+                    Module(hardened, wasm)
+
+    @unittest.skipUnless(HAS_REAL_WASMTIME, "requires portmark[wasmtime]")
+    def test_real_native_wasmtime_engine_config_assigns_every_proposal_setter(self):
+        # PR #79 review: two default-on proposals were left unassigned. Enumerate EVERY proposal
+        # setter the installed wasmtime-py exposes and require _engine_config to assign each one,
+        # so a proposal added by a Wasmtime upgrade fails this test until it is decided explicitly.
+        import inspect
+
+        import wasmtime
+
+        from portmark.wasmtime_component_runner import _engine_config
+
+        def is_proposal_setter(name):
+            attribute = inspect.getattr_static(wasmtime.Config, name)
+            return (
+                (name.startswith("wasm_") or name in {"gc_support", "shared_memory"})
+                and isinstance(attribute, property) and attribute.fset is not None
+            )
+
+        proposals = {name for name in dir(wasmtime.Config) if is_proposal_setter(name)}
+        assigned = set()
+
+        class RecordingConfig(wasmtime.Config):
+            def __setattr__(self, name, value):
+                assigned.add(name)
+                super().__setattr__(name, value)
+
+        with patch.object(wasmtime, "Config", RecordingConfig):
+            _engine_config(64 * 1024 * 1024)
+        self.assertIn("wasm_tail_call", proposals)  # the enumeration itself is not empty/broken
+        self.assertEqual(sorted(proposals - assigned), [])
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows Job Object memory limit")
+    def test_windows_job_process_memory_limit_refuses_allocation_past_the_ceiling(self):
+        # Section 9 #1 on Windows: the worker's OS ceiling is the Job Object's per-process memory
+        # limit. Same child, with and without the limit, so a refusal can only come from the limit.
+        from portmark.tools import _launch_windows_job_tree
+
+        mib = 1024 * 1024
+        argv = [sys.executable, "-c", f"bytearray({256 * mib})"]
+        common = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+        for limit, should_succeed in ((None, True), (128 * mib, False)):
+            with self.subTest(limit=limit):
+                tree = _launch_windows_job_tree(argv, dict(common), process_memory_limit=limit)
+                try:
+                    returncode = tree.wait(timeout=30)
+                finally:
+                    tree.close()
+                self.assertEqual(returncode == 0, should_succeed, f"returncode={returncode}")
 
     def test_factory_selects_optional_native_wasmtime_provider(self):
         with self._fake_wasmtime_runtime():
