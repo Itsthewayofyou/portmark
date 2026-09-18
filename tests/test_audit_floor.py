@@ -695,23 +695,52 @@ class AuditFloorAttackTests(unittest.TestCase):
         witnessed = LocalFloorWitness(self.d.floor_path, HOST, self.d.signer, self.d.signer).witnessed_head(first.task_id)
         self.assertEqual(witnessed, self.d.store().audit_head(first.task_id))
 
-    def test_boot_never_adopts_a_forged_head_into_the_floor(self):
-        # Auditor round 2 (Medium) reproduction: a stored head raised to a higher sequence with an
-        # arbitrary hash used to be adopted into the signed floor at restart.
+    def test_boot_refuses_a_forged_head_instead_of_adopting_it(self):
+        # Auditor round 2 reproduction: a stored head raised to a higher sequence with an arbitrary
+        # hash. It is never written into the floor, and (round 3) startup FAILS instead of continuing.
         host = self.d.host()
         _, first = start_task(host)
-        witnessed_before = LocalFloorWitness(self.d.floor_path, HOST, self.d.signer, self.d.signer).witnessed_head(first.task_id)
+        floor_before = self.d.floor_path.read_bytes()
         with sqlite3_connection(self.d.store_path) as connection:
             connection.execute("UPDATE audit_heads SET head_hash = 'evil-head', sequence = sequence + 1 WHERE task_id = ?", (first.task_id,))
-        with self.assertLogs("portmark.witness", "ERROR") as logs:
-            self.d.host()
-        self.assertIn(f"NOT adopting task {first.task_id}", "".join(logs.output))
-        witnessed = LocalFloorWitness(self.d.floor_path, HOST, self.d.signer, self.d.signer).witnessed_head(first.task_id)
-        self.assertEqual(witnessed, witnessed_before)  # the floor is not contaminated
+        error = self.assertBootRefused("unverified-head")
+        self.assertIn(first.task_id, str(error))
+        self.assertEqual(self.d.floor_path.read_bytes(), floor_before)  # the floor is not contaminated
         code, report = self.d.verify_cli(first.task_id)
         self.assertEqual((code, report["status"]), (1, "invalid"))
 
-    def test_boot_does_not_adopt_a_head_that_changes_during_verification(self):
+    def test_auditor_round_3_invalid_pre_floor_task_blocks_startup(self):
+        # Round 3 reproduction: a valid task written BEFORE the floor existed, its head then corrupted,
+        # then the floor enabled. Startup used to log "NOT adopting" and continue; a later resume then
+        # wrote the invalid head into the floor. Now startup refuses and the floor is never created.
+        no_floor = make_host(host_id=HOST, signer=self.d.signer, store=self.d.store(), providers={"suspender": SuspendProvider()})
+        envelope, first = start_task(no_floor)
+        with sqlite3_connection(self.d.store_path) as connection:
+            connection.execute("UPDATE audit_heads SET head_hash = 'corrupted' WHERE task_id = ?", (first.task_id,))
+        self.assertBootRefused("unverified-head")
+        body = LocalFloorWitness(self.d.floor_path, HOST, self.d.signer, self.d.signer).load()
+        self.assertNotIn(first.task_id, body["tasks"] if body else {})
+
+    def test_a_save_never_lets_the_floor_witness_an_unwitnessed_invalid_chain(self):
+        # The same class on the runtime path: a task the floor has never witnessed (its entry lost, or
+        # another host's task in a shared database) whose chain is invalid must not be witnessed by
+        # the next save.
+        host = self.d.host()
+        envelope, first = start_task(host)
+        witness = LocalFloorWitness(self.d.floor_path, HOST, self.d.signer, self.d.signer)
+        body = witness.load()
+        del body["tasks"][first.task_id]
+        witness.create(body["epoch"], body["registry"], body["tasks"], body["resets"])  # a legitimately signed floor without it
+        with sqlite3_connection(self.d.store_path) as connection:
+            connection.execute("UPDATE audit_heads SET head_hash = 'corrupted' WHERE task_id = ?", (first.task_id,))
+        floor_before = self.d.floor_path.read_bytes()
+        head_before = self.d.store().audit_head(first.task_id)
+        with self.assertRaisesRegex(SecurityError, "is not in the audit floor and its chain does not verify"):
+            resume(host, envelope)
+        self.assertEqual(self.d.floor_path.read_bytes(), floor_before)
+        self.assertEqual(self.d.store().audit_head(first.task_id), head_before)  # nothing committed
+
+    def test_boot_refuses_a_head_that_changes_during_verification(self):
         no_floor = make_host(host_id=HOST, signer=self.d.signer, store=self.d.store(), providers={"suspender": SuspendProvider()})
         _, first = start_task(no_floor)  # written before any floor existed: an adoption candidate
         original = SQLiteRuntimeStore.verify_audit_chain_status
@@ -723,10 +752,24 @@ class AuditFloorAttackTests(unittest.TestCase):
             return verdict
 
         with patch.object(SQLiteRuntimeStore, "verify_audit_chain_status", verify_then_move_head):
-            with self.assertLogs("portmark.witness", "ERROR") as logs:
-                self.d.host()
-        self.assertIn("head changed while it was being verified", "".join(logs.output))
-        self.assertIsNone(LocalFloorWitness(self.d.floor_path, HOST, self.d.signer, self.d.signer).witnessed_head(first.task_id))
+            error = self.assertBootRefused("unverified-head")
+        self.assertIn("head changed while it was being verified", str(error))
+
+    def test_boot_adoption_never_applies_the_legacy_anchor_override(self):
+        # Policy (auditor round 3): adoption verifies strictly. Complete pre-Section-10 anchors are
+        # accepted only by an explicit `floor-reset --allow-legacy-anchor`.
+        no_floor = make_host(host_id=HOST, signer=self.d.signer, store=self.d.store(), providers={"suspender": SuspendProvider()})
+        start_task(no_floor)
+        original = SQLiteRuntimeStore.verify_audit_chain_status
+        seen = []
+
+        def record(store, task_id, allow_legacy_anchor=False):
+            seen.append(allow_legacy_anchor)
+            return original(store, task_id, allow_legacy_anchor=allow_legacy_anchor)
+
+        with patch.object(SQLiteRuntimeStore, "verify_audit_chain_status", record):
+            self.d.host()
+        self.assertEqual(seen, [False])
 
     def test_a_database_with_a_floor_cannot_be_started_without_it(self):
         self.d.host()

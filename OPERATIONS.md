@@ -175,9 +175,17 @@ directory). A durable store without a floor logs a warning at start.
   rolled back", so the task is refused (`rolled-back`) and the floor is never lowered automatically.
   The host logs this as CRITICAL. Recovery is `floor-reset` (below), after confirming the cause.
 - **At start**, heads this host signed that the floor has not seen (tasks from before the floor
-  existed, or a floor restored from an older copy) are adopted only if their WHOLE chain verifies and
-  the head is unchanged right before the write. Anything else is skipped and logged, never written
-  into the floor.
+  existed, or a floor restored from an older copy) are adopted only if their WHOLE chain verifies
+  strictly and the head is unchanged right before the write. If ANY such head fails, the host
+  **refuses to start** (`unverified-head`, naming the tasks) -- skipping it would let a later save
+  write that invalid head into the floor. Investigate the database first; `floor-reset` re-verifies
+  every chain and refuses invalid ones too.
+- **On every save**, a task that already has a chain but that the floor has never witnessed (for
+  example another host's task in a shared database) must verify strictly before the floor records it;
+  otherwise the save is refused and nothing is committed.
+- **Legacy migration anchors.** Adoption and the save check verify strictly: a complete
+  pre-Section-10 migration anchor (`legacy-anchor`) is not accepted silently. To bring such tasks under
+  the floor, run `floor-reset --allow-legacy-anchor` (explicit, recorded).
 - **A database with a floor cannot be started without it.** Once a floor exists for a host, starting
   that host without `--audit-floor-path` is refused, so the floor cannot be switched off silently.
 - **`verify-audit --audit-floor-path FLOOR`** adds `floor_status`: `anchored` (exit 0), `not-anchored`

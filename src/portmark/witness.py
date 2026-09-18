@@ -368,7 +368,8 @@ def open_audit_floor(witness: LocalFloorWitness, store: Any, registry_version: i
       none    + floor         -> REFUSE db-older-than-floor (DB from before the floor existed)
       active(e1) + floor(e2)  -> REFUSE epoch-mismatch (DB or floor from another reset epoch)
     Then: registry check + advance, and every witnessed task is compared with the database;
-    heads this host signed that the floor has not seen are adopted ONLY if their chain verifies.
+    heads this host signed that the floor has not seen are adopted ONLY if their chain verifies strictly;
+    any that does not FAILS startup (FloorError unverified-head).
     """
     host_id = witness.host_id
     marker = store.audit_floor_marker(host_id)
@@ -402,25 +403,36 @@ def open_audit_floor(witness: LocalFloorWitness, store: Any, registry_version: i
         if outcome in (ROLLED_BACK, FORKED):
             raise FloorError(outcome, f"task {task_id!r}: the database is {'OLDER than' if outcome == ROLLED_BACK else 'diverged from'} the audit floor")
     # Adopt this host's heads that are new to (or ahead of) the floor: tasks written before the floor
-    # existed, or while a host ran without it. With the floor advanced BEFORE every commit, a
-    # database head ahead of the floor is otherwise never produced, so each candidate is treated as
-    # untrusted (auditor round 2, Medium): adopt it only if its WHOLE chain verifies, and only if the
-    # head is still exactly the verified one immediately before the advance. A candidate that fails is
-    # skipped and logged -- never written into the signed floor, where it would have to be reset out.
+    # existed, or a floor restored from an older copy. Each candidate is untrusted: it is adopted only
+    # if its WHOLE chain verifies STRICTLY (no legacy-anchor override: complete pre-Section-10 anchors
+    # are accepted only by an explicit `floor-reset --allow-legacy-anchor`) and the head is unchanged
+    # right before the write. ANY failing candidate FAILS STARTUP (auditor round 3): logging and
+    # continuing let a later save of that task write its invalid head into the floor.
     # debt: O(tasks) scan + a verify and a floor write per adopted task at boot; upgrade to a
     # sharded/append-only floor when a host carries enough tasks that boot becomes slow.
+    rejected: list[str] = []
+    adopt: dict[str, tuple[str, int]] = {}
     for task_id, head_hash, sequence in store.audit_heads_for_host(host_id):
         witnessed = body["tasks"].get(task_id)
         if witnessed is not None and sequence <= witnessed["sequence"]:
             continue
-        verdict = store.verify_audit_chain_status(task_id, allow_legacy_anchor=True)
+        verdict = store.verify_audit_chain_status(task_id, allow_legacy_anchor=False)
         if not verdict.valid:
-            logger.error("audit floor: NOT adopting task %s -- its chain does not verify (%s: %s)", task_id, verdict.status, verdict.reason)
-            continue
-        if store.audit_head(task_id) != (head_hash, sequence):
-            logger.error("audit floor: NOT adopting task %s -- its head changed while it was being verified", task_id)
-            continue
-        witness.advance_heads({task_id: (head_hash, sequence)})
+            rejected.append(f"{task_id}: chain does not verify ({verdict.status}: {verdict.reason})")
+        elif store.audit_head(task_id) != (head_hash, sequence):
+            rejected.append(f"{task_id}: head changed while it was being verified")
+        else:
+            adopt[task_id] = (head_hash, sequence)
+    if rejected:
+        raise FloorError(
+            "unverified-head",
+            "refusing to start: these heads are not in the audit floor and cannot be verified, so they will "
+            "not be witnessed: " + "; ".join(rejected) + ". Investigate the database; `portmark floor-reset` "
+            "(with --allow-legacy-anchor only for complete pre-Section-10 migration anchors) re-verifies and "
+            "rebaselines once it is sound.",
+        )
+    if adopt:
+        witness.advance_heads(adopt)
 
 
 def reset_audit_floor(

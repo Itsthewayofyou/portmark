@@ -1332,6 +1332,18 @@ class AgentHost:
                         transaction.audit_head(state.task_id),
                         lambda index: transaction.audit_event_hash(state.task_id, index),
                     )
+                    # Auditor round 3: a task the floor has NEVER witnessed but that already has a chain
+                    # (e.g. another host's task in a shared database, or one whose floor entry was lost)
+                    # must verify STRICTLY before this save lets the floor record it. Otherwise the floor
+                    # would witness the head of a chain that is itself invalid.
+                    current_head = transaction.audit_head(state.task_id)
+                    if current_head is not None and floor.witnessed_head(state.task_id) is None:
+                        verdict = self.store.verify_audit_chain_status(state.task_id)
+                        if not verdict.valid:
+                            raise SecurityError(
+                                f"task {state.task_id!r} is not in the audit floor and its chain does not verify "
+                                f"({verdict.status}: {verdict.reason}); refusing to witness it"
+                            )
                 if consume_nonce is not None:
                     transaction.consume_nonce(consume_nonce, envelope.permit.subject, envelope.permit.audience, state.task_id)
                 # Finding #3 (Option B): sign audit heads as v2 with an attested signed_at so

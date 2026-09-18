@@ -21,9 +21,12 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   commit let "commit N+1, crash, restore N" boot as anchored). A floor write failure rolls the
   transaction back. A commit failure after the floor write leaves the floor ahead: refused until
   `floor-reset`, never lowered automatically, logged CRITICAL.
-- **Adoption at start is verified (auditor round 2, Medium).** Heads new to or ahead of the floor are
-  adopted only if their whole chain verifies and the head is unchanged right before the write; a forged
-  head is skipped and logged, never written into the floor.
+- **Adoption at start is verified (auditor rounds 2 and 3, Medium).** Heads new to or ahead of the floor
+  are adopted only if their whole chain verifies STRICTLY and the head is unchanged right before the
+  write. Any failing candidate FAILS STARTUP (`unverified-head`) -- round 2 logged and continued, and a
+  later save could then write the invalid head into the floor. On every save, a task the floor has never
+  witnessed must also verify strictly before the floor records it. Adoption no longer applies the
+  legacy-anchor override; `floor-reset --allow-legacy-anchor` is the explicit path.
 - **`advance_registry` enforces its own contract (auditor round 2, Low):** one version, two digests is
   refused (`registry-forked`) by the mutator itself.
 - **The floor cannot be switched off silently:** a database that has a floor for a host refuses to
