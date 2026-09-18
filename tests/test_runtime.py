@@ -8632,6 +8632,27 @@ class RuntimeTests(unittest.TestCase):
                          "catalog.search")  # the same capsule in binary form still runs
 
     @unittest.skipUnless(HAS_REAL_WASMTIME, "requires portmark[wasmtime]")
+    def test_real_native_wasmtime_parser_still_refuses_core_module_without_the_binary_check(self):
+        # Defense in depth: the binary-component check now refuses core modules first, so this pins
+        # the SECOND layer -- with that check bypassed, Wasmtime's component parser must still refuse
+        # a core module. (Text input, by contrast, IS accepted by Wasmtime -- why the check exists.)
+        from wasmtime import wat2wasm
+
+        import portmark.wasmtime_component_runner as runner
+
+        limits = {"instances": 8, "memories": 2, "tables": 4, "table_elements": 10_000}
+        core_module = bytes(wat2wasm('(module (func (export "resume") (result i32) i32.const 0))'))
+        with patch.object(runner, "_require_binary_component", lambda component: None):
+            with self.assertRaisesRegex(Exception, "parse a wasm module|component parser|failed to parse") as caught:
+                runner._execute(core_module, "{}", "{}", max_fuel=10**7, max_memory_bytes=64 * 1024 * 1024,
+                                count_limits=dict(limits))
+            self.assertIsInstance(caught.exception, runner._controlled_errors())
+        for empty_or_short in (b"", b"\x00as", b"\x00asm\x0d\x00"):
+            with self.subTest(component=empty_or_short):
+                with self.assertRaisesRegex(RuntimeError, "not a binary Component Model artifact"):
+                    runner._require_binary_component(empty_or_short)
+
+    @unittest.skipUnless(HAS_REAL_WASMTIME, "requires portmark[wasmtime]")
     def test_real_native_wasmtime_component_fuzz_smoke_campaign_finds_nothing(self):
         # A small slice of the campaign (the CI native-wasmtime job runs a larger one per platform).
         import fuzz_wasmtime_components as fuzz
