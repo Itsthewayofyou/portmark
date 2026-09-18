@@ -4068,6 +4068,176 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "unexpected fields"):
             decode_component_decision('{"outcome": "tool", "request": {"name": "catalog.search", "arguments_json": "{}", "destination": "evil"}}', ("catalog.search",))
 
+    # --- Section 8 finding #5 (Medium): bounded subprocess output for the Wasm providers ---
+    # `subprocess.run(capture_output=True)` buffers ALL output before any size check, so a hostile
+    # capsule can OOM the host before the cap runs. `_run_bounded` drains under a hard byte cap and
+    # kills the child the instant it overflows. These tests drive the helper directly with a fake
+    # Python producer (no Node/wasmtime dependency, so they run on every CI job).
+
+    def _write_producer(self):
+        # A controllable child: reads stdin (optional), writes PROD_STDOUT bytes to stdout and
+        # PROD_STDERR bytes to stderr in 64 KiB chunks, then -- only if it finished all output --
+        # touches PROD_MARKER and exits PROD_EXIT. The marker is the cut-off oracle: if the helper
+        # killed it early, the marker never appears.
+        script = (
+            "import os, sys, time\n"
+            # Sleep mode: never read stdin, just wait then exit. Used to prove a large stdin write
+            # cannot hold the caller past the deadline (the write must be off the main thread).
+            "if os.environ.get('PROD_SLEEP'):\n"
+            "    time.sleep(float(os.environ['PROD_SLEEP']))\n"
+            "    sys.exit(int(os.environ.get('PROD_EXIT', '0')))\n"
+            "chunk = b'x' * 65536\n"
+            # Echo mode: read stdin in chunks and write each straight to stdout, INTERLEAVED. This
+            # is what makes a large stdin + large stdout deadlock when readers start after the stdin
+            # write -- the child blocks writing stdout (no reader) and so stops draining stdin.
+            "if os.environ.get('PROD_ECHO') == '1':\n"
+            "    while True:\n"
+            "        data = sys.stdin.buffer.read(65536)\n"
+            "        if not data:\n"
+            "            break\n"
+            "        try:\n"
+            "            sys.stdout.buffer.write(data); sys.stdout.buffer.flush()\n"
+            "        except (BrokenPipeError, OSError):\n"
+            "            os._exit(0)\n"
+            "    marker = os.environ.get('PROD_MARKER')\n"
+            "    if marker:\n"
+            "        open(marker, 'w').close()\n"
+            "    sys.exit(0)\n"
+            "if os.environ.get('PROD_READ_STDIN') == '1':\n"
+            "    sys.stdin.buffer.read()\n"
+            "def emit(stream, total):\n"
+            "    written = 0\n"
+            "    while written < total:\n"
+            "        n = min(len(chunk), total - written)\n"
+            "        try:\n"
+            "            stream.write(chunk[:n]); stream.flush()\n"
+            "        except (BrokenPipeError, OSError):\n"
+            "            os._exit(0)\n"
+            "        written += n\n"
+            "emit(sys.stdout.buffer, int(os.environ.get('PROD_STDOUT', '0')))\n"
+            "emit(sys.stderr.buffer, int(os.environ.get('PROD_STDERR', '0')))\n"
+            "marker = os.environ.get('PROD_MARKER')\n"
+            "if marker:\n"
+            "    open(marker, 'w').close()\n"
+            "sys.exit(int(os.environ.get('PROD_EXIT', '0')))\n"
+        )
+        handle = tempfile.NamedTemporaryFile("w", suffix=".py", delete=False)
+        handle.write(script)
+        handle.close()
+        self.addCleanup(lambda: os.path.exists(handle.name) and os.unlink(handle.name))
+        return handle.name
+
+    def test_wasm_bounded_stdout_flood_cut_off(self):
+        # A capsule that floods stdout is killed DURING the read: overflow is flagged and the
+        # producer never reaches its completion marker. This is the finding #5 fix -- with
+        # subprocess.run restored the producer writes all 4 MB and the marker appears (the bite).
+        from portmark.providers import _run_bounded
+        producer = self._write_producer()
+        marker = tempfile.NamedTemporaryFile(delete=False)
+        marker.close()
+        os.unlink(marker.name)  # the producer creates it only on full completion
+        self.addCleanup(lambda: os.path.exists(marker.name) and os.unlink(marker.name))
+        env = dict(os.environ, PROD_STDOUT="4000000", PROD_MARKER=marker.name)
+        rc, out, err, timed_out, overflowed = _run_bounded(
+            [sys.executable, producer], b"", timeout=10.0, max_output_bytes=65_536, env=env
+        )
+        self.assertTrue(overflowed)
+        self.assertFalse(timed_out)
+        self.assertFalse(os.path.exists(marker.name), "producer ran to completion -- output was NOT cut off")
+        self.assertLessEqual(len(out), 65_536 + 65_536)  # buffered at most cap + one chunk
+
+    def test_wasm_bounded_accepts_exactly_at_limit(self):
+        # The cap is a true byte cap: output of exactly max_output_bytes is accepted; one byte over
+        # is rejected as overflow. Flipping the comparison in the helper breaks one of these.
+        from portmark.providers import _run_bounded
+        producer = self._write_producer()
+        for total, expect_overflow in ((65_536, False), (65_537, True)):
+            with self.subTest(total=total):
+                marker = tempfile.NamedTemporaryFile(delete=False)
+                marker.close()
+                os.unlink(marker.name)
+                self.addCleanup(lambda m=marker.name: os.path.exists(m) and os.unlink(m))
+                env = dict(os.environ, PROD_STDOUT=str(total), PROD_MARKER=marker.name)
+                rc, out, err, timed_out, overflowed = _run_bounded(
+                    [sys.executable, producer], b"", timeout=10.0, max_output_bytes=65_536, env=env
+                )
+                self.assertEqual(overflowed, expect_overflow)
+                if not expect_overflow:
+                    self.assertEqual(rc, 0)
+                    self.assertEqual(len(out), total)
+                    self.assertTrue(os.path.exists(marker.name))
+
+    def test_wasm_bounded_stderr_flood(self):
+        # stderr is bounded independently: a capsule that exits nonzero with a huge stderr yields a
+        # small retained error string (which the decide path interpolates into its message), never
+        # a multi-MB string. stdout stays under its cap so this is a clean nonzero-exit, not overflow.
+        from portmark.providers import _run_bounded
+        producer = self._write_producer()
+        env = dict(os.environ, PROD_STDERR="4000000", PROD_EXIT="1")
+        rc, out, err, timed_out, overflowed = _run_bounded(
+            [sys.executable, producer], b"", timeout=10.0, max_output_bytes=65_536, env=env
+        )
+        self.assertNotEqual(rc, 0)
+        self.assertFalse(overflowed)
+        self.assertLessEqual(len(err.encode()), 4096)
+
+    def test_wasm_bounded_large_stdin_concurrent_stdout(self):
+        # Readers start BEFORE stdin is written, so a large stdin payload sent while the child is
+        # also writing a large stdout cannot deadlock (host blocked on write vs child blocked on
+        # write). With the ordering reversed (write stdin fully, THEN start readers) this deadlocks
+        # and the call times out -- the bite that ONLY this test catches.
+        from portmark.providers import _run_bounded
+        producer = self._write_producer()
+        request = b"y" * 2_000_000  # >> the ~64 KiB OS pipe buffer
+        env = dict(os.environ, PROD_ECHO="1")  # child echoes stdin->stdout, interleaved
+        rc, out, err, timed_out, overflowed = _run_bounded(
+            [sys.executable, producer], request, timeout=15.0, max_output_bytes=4_000_000, env=env
+        )
+        self.assertFalse(timed_out, "large stdin + large stdout deadlocked (stdin written before readers started)")
+        self.assertFalse(overflowed)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(out), 2_000_000)
+
+    def test_wasm_bounded_overflow_message_precedence(self):
+        # An overflow kill leaves returncode == -SIGKILL, i.e. nonzero. decide() must report the
+        # output-limit (and deadline) outcomes BEFORE the generic "rejected: <stderr>" branch, or a
+        # killed-for-overflow capsule is mislabelled a rejection. Drive decide with a stubbed helper
+        # so no Node install is needed. Reversing the precedence flips the first assertion.
+        from unittest.mock import patch
+        from portmark.providers import WasmDecisionProvider
+        with patch("portmark.providers.shutil.which", return_value="/usr/bin/node"):
+            provider = WasmDecisionProvider(b"component-bytes", max_output_bytes=64)
+        view = provider_view(AgentState("task", "goal"))
+        cases = (
+            ((-9, b"", "some stderr noise", False, True), "exceeded output limit"),
+            ((-9, b"", "some stderr noise", True, False), "exceeded its execution deadline"),
+            ((1, b"", "boom", False, False), "Wasm capsule rejected: boom"),
+        )
+        for ret, expected in cases:
+            with self.subTest(expected=expected):
+                with patch("portmark.providers._run_bounded", return_value=ret):
+                    with self.assertRaisesRegex(RuntimeError, expected):
+                        provider.decide(view, ("catalog.search",))
+
+    def test_wasm_bounded_stdin_write_does_not_bypass_deadline(self):
+        # Round-2 finding (Medium): a large stdin write must NOT hold the caller past the deadline
+        # when the child never reads stdin (a wedged / failed-to-start runner). stdin is written on
+        # a supervised writer thread, so process.wait enforces the one absolute deadline even while
+        # the write blocks; the deadline kill closes the child's stdin read end, unblocking the
+        # writer. Neutralizing to a synchronous main-thread stdin write makes this block ~the
+        # child's sleep with timed_out=False (the bite: elapsed >> deadline).
+        from portmark.providers import _run_bounded
+        producer = self._write_producer()
+        request = b"z" * 4_000_000  # >> the OS pipe buffer, so a synchronous write blocks
+        env = dict(os.environ, PROD_SLEEP="5")  # child sleeps 5s WITHOUT reading stdin
+        start = time.monotonic()
+        rc, out, err, timed_out, overflowed = _run_bounded(
+            [sys.executable, producer], request, timeout=0.5, max_output_bytes=65_536, env=env
+        )
+        elapsed = time.monotonic() - start
+        self.assertTrue(timed_out, "deadline not enforced while the stdin write blocked")
+        self.assertLess(elapsed, 3.0, "stdin write bypassed the execution deadline")
+
     @contextmanager
     def _three_store_context(self, backend):
         # Three stores (2 sources + 1 destination) on one backend, for the section 4 #7

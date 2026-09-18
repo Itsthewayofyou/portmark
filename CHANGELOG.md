@@ -6,6 +6,33 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Section 8 — provider boundary (PR 4): bounded Wasm subprocess output (finding #5)
+
+- **Wasm provider output is now bounded DURING the read, not after buffering.** Both the Node
+  (`WasmDecisionProvider`) and native Wasmtime (`NativeWasmtimeComponentProvider`) providers replaced
+  `subprocess.run(capture_output=True)` — which reads the child's entire stdout/stderr into memory
+  before any size check — with a stdlib `_run_bounded` helper that drains stdout on a reader thread
+  under a hard byte cap and **kills the child the instant it overflows**. A hostile capsule can no
+  longer exhaust host memory before the post-hoc cap runs. Specifics:
+  - **stderr is bounded independently** (retained up to 4 KiB but kept draining past it, so the pipe
+    never blocks the child) — a multi-megabyte stderr can no longer flow unbounded into the
+    "Wasm capsule rejected: …" error string;
+  - **stdin is written on a supervised writer thread** (reader threads start before it), so a large
+    stdin payload (base64 component + context, well past the OS pipe buffer) cannot deadlock against
+    the child's stdout write, and — the round-2 audit fix — a child that never reads stdin (a wedged
+    or failed-to-start runner) can no longer hold the caller past the deadline: `process.wait`
+    supervises the one absolute deadline even while the write blocks, and the deadline kill closes the
+    child's stdin read end so the writer unblocks with `BrokenPipeError`;
+  - **one monotonic deadline** bounds the whole call; every wait derives its remaining budget from it,
+    so no phase can re-spend the full timeout;
+  - **overflow/deadline outcomes take precedence over the non-zero-exit branch** — an overflow kill
+    leaves `returncode == -SIGKILL`, so the output-limit / deadline errors are reported instead of a
+    misleading "rejected" message. Existing error strings and the accept-at-exactly-the-limit boundary
+    are preserved.
+  - Tree-kill is deliberately not used here: the Wasm guest receives no imports (it cannot spawn) and
+    the node/runner executable paths are host-controlled — marked with a `debt:` upgrade trigger for if
+    the runner ever gains spawn capability. Evidence: `src/portmark/providers.py` (`_run_bounded`).
+
 ### Section 8 — provider boundary (PR 3): strict JSON at untrusted decode boundaries (finding #4)
 
 - **Untrusted JSON is now parsed strictly** wherever it crosses a trust boundary: the HTTP provider
