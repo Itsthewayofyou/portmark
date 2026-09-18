@@ -55,7 +55,7 @@ class AuditHeadVerifier(Protocol):
     def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None, required_usage: str = "audit") -> None:
         ...
 
-    def evaluate_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None) -> "AuditHeadEvaluation":
+    def evaluate_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None, required_usage: str = "audit") -> "AuditHeadEvaluation":
         ...
 
 
@@ -468,7 +468,7 @@ class TrustRegistry:
         except (InvalidSignature, ValueError) as error:
             raise SecurityError("audit head signature is invalid") from error
 
-    def evaluate_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None) -> AuditHeadEvaluation:
+    def evaluate_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None, required_usage: str = "audit") -> AuditHeadEvaluation:
         # Historical verification (finding #3, Option B). Authenticity first, then validity
         # judged AT SIGNING TIME for v2 heads (signed_at in the payload); v1 heads fall under
         # a documented legacy policy. Returns a rich status instead of raising, so the audit
@@ -478,8 +478,10 @@ class TrustRegistry:
         identity = self._identities.get(key_id)
         if identity is None:
             return AuditHeadEvaluation(False, "untrusted", "audit head signing key is not trusted")
-        if not _identity_permits(identity, "audit"):
-            return AuditHeadEvaluation(False, "usage-violation", "audit head signing key lacks the required 'audit' usage")
+        # required_usage: "migration" when re-checking a migration anchor kept at the
+        # destination (Section 10 F2); the source signed that head for the migration purpose.
+        if not _identity_permits(identity, required_usage):
+            return AuditHeadEvaluation(False, "usage-violation", f"audit head signing key lacks the required '{required_usage}' usage")
         if payload.get("host_id") != identity.issuer:
             return AuditHeadEvaluation(False, "host-mismatch", "audit head signer identity does not match host")
         try:
@@ -731,11 +733,11 @@ class TrustSource:
         else:
             registry.verify_audit_head(key_id, payload, signature, now, required_usage=required_usage)
 
-    def evaluate_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None) -> AuditHeadEvaluation:
+    def evaluate_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None, required_usage: str = "audit") -> AuditHeadEvaluation:
         registry = self._verified_file()
         if self._overlay.has_key(key_id):
-            return self._overlay.evaluate_audit_head(key_id, payload, signature, now)
-        return registry.evaluate_audit_head(key_id, payload, signature, now)
+            return self._overlay.evaluate_audit_head(key_id, payload, signature, now, required_usage=required_usage)
+        return registry.evaluate_audit_head(key_id, payload, signature, now, required_usage=required_usage)
 
     def verify_migration_receipt(self, receipt: dict[str, Any], now: int | None = None) -> None:
         registry = self._verified_file()
@@ -1343,8 +1345,8 @@ class EnvelopeSigner:
     def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None, required_usage: str = "audit") -> None:
         self.registry.verify_audit_head(key_id, payload, signature, now, required_usage=required_usage)
 
-    def evaluate_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None) -> AuditHeadEvaluation:
-        return self.registry.evaluate_audit_head(key_id, payload, signature, now)
+    def evaluate_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None, required_usage: str = "audit") -> AuditHeadEvaluation:
+        return self.registry.evaluate_audit_head(key_id, payload, signature, now, required_usage=required_usage)
 
 
 class HmacEnvelopeSigner:
@@ -1386,9 +1388,9 @@ class HmacEnvelopeSigner:
         if not hmac.compare_digest(expected, signature):
             raise SecurityError("audit head signature is invalid")
 
-    def evaluate_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None) -> AuditHeadEvaluation:
-        # Legacy HMAC has no trust registry, revocation, or key lifecycle -- authenticity is
-        # all it can attest. Distinguish only signature validity; a valid v1 head is legacy.
+    def evaluate_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None, required_usage: str = "audit") -> AuditHeadEvaluation:
+        # Legacy HMAC has no trust registry, revocation, key lifecycle, or usages (required_usage
+        # is accepted for interface parity) -- authenticity is all it can attest. Distinguish only signature validity; a valid v1 head is legacy.
         if key_id != self.key_id:
             return AuditHeadEvaluation(False, "untrusted", "audit head signing key is not trusted")
         expected = hmac.new(self._key, canonical_json(payload), hashlib.sha256).hexdigest()

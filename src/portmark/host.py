@@ -1232,10 +1232,17 @@ class AgentHost:
                 # the first audit event. It lands inside the hashed event, making the
                 # migration point durable and tamper-evident. Finding #3.
                 self._verify_previous_audit_head(envelope, original_task_id)
+                # Section 10 F2: also keep the source's PROOF (key id, signature, and the
+                # original source-signed task id), so a later auditor can re-verify the
+                # anchor from this destination database alone. Anchors written before this
+                # carry only the first three fields and verify as `legacy-anchor`.
                 anchor = {
                     "previous_audit_hash": envelope.previous_audit_hash,
                     "previous_audit_sequence": envelope.previous_audit_sequence,
                     "previous_audit_host_id": envelope.previous_audit_host_id,
+                    "previous_audit_task_id": original_task_id,
+                    "previous_audit_signature_key_id": envelope.previous_audit_signature_key_id,
+                    "previous_audit_signature": envelope.previous_audit_signature,
                 }
                 return envelope.previous_audit_hash, 0, anchor
             return envelope.previous_audit_hash, stored[1], None

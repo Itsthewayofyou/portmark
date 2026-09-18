@@ -7,13 +7,21 @@ import threading
 import time
 from collections.abc import Generator
 from contextlib import AbstractContextManager, contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Callable, Literal, Protocol
 
 from .models import AgentState
-from .security import AUDIT_HASH_VERSION, AuditHeadVerifier, SecurityError, _audit_head_payload_for, audit_event_record, canonical_json
+from .security import (
+    AUDIT_HASH_VERSION,
+    AuditHeadVerifier,
+    SecurityError,
+    _audit_head_payload_for,
+    audit_event_record,
+    audit_head_payload,
+    canonical_json,
+)
 
 
 SQLITE_SCHEMA_VERSION = 11
@@ -84,6 +92,10 @@ class AuditVerificationResult:
     status: AuditVerificationStatus
     reason: str
     head_status: str = ""
+    # Section 10 F2: verdict on a migration anchor in event 0 -- "none" (not a migration),
+    # "verified", "legacy-anchor" (pre-Section-10 anchor without the source proof), or
+    # "invalid"/"registry-unavailable". Empty when verification stopped before this check.
+    anchor_status: str = ""
 
     @property
     def valid(self) -> bool:
@@ -622,7 +634,8 @@ class InMemoryRuntimeStore:
                 previous = event["hash"]
             if head["head_hash"] != previous or head["sequence"] != len(events):
                 return AuditVerificationResult("invalid", "stored audit head does not match audit events")
-            return _verify_head_signature(self._audit_head_verifier, task_id, head)
+            head_result = _verify_head_signature(self._audit_head_verifier, task_id, head)
+            return _check_migration_anchor(self._audit_head_verifier, head_result, events[0]["details"])
 
     def verify_audit_chain(self, task_id: str) -> bool:
         return self.verify_audit_chain_status(task_id).valid
@@ -1300,6 +1313,13 @@ class SQLiteRuntimeStore:
 
     def verify_audit_chain_status(self, task_id: str) -> AuditVerificationResult:
         with self._connection() as connection:
+            # Section 10 F3: read the events and the head from ONE snapshot. The connection is
+            # autocommit (isolation_level=None), so without an explicit transaction each SELECT
+            # sees its own snapshot and a writer committing between them made a healthy chain
+            # report "stored audit head does not match". Under WAL a deferred read transaction
+            # pins its snapshot at the first read and does not block writers. The `with
+            # connection` exit ends it.
+            connection.execute("BEGIN DEFERRED")
             rows = connection.execute(
                 "SELECT sequence, event, details_json, previous_hash, hash, host_id FROM audit_events WHERE task_id = ? ORDER BY sequence",
                 (task_id,),
@@ -1311,6 +1331,7 @@ class SQLiteRuntimeStore:
         if not rows or head is None:
             return AuditVerificationResult("invalid", "audit chain is missing")
         previous = rows[0]["previous_hash"] if rows else ""
+        first_details: Any = None
         for expected_sequence, row in enumerate(rows):
             if row["sequence"] != expected_sequence or row["previous_hash"] != previous:
                 return AuditVerificationResult("invalid", "audit chain sequence or previous hash is inconsistent")
@@ -1318,6 +1339,8 @@ class SQLiteRuntimeStore:
                 details = json.loads(row["details_json"])
             except json.JSONDecodeError:
                 return AuditVerificationResult("invalid", "audit event details are malformed")
+            if expected_sequence == 0:
+                first_details = details
             if not _audit_event_hash_matches(
                 row["sequence"], row["event"], details, row["previous_hash"], row["host_id"], row["hash"]
             ):
@@ -1329,7 +1352,7 @@ class SQLiteRuntimeStore:
             return AuditVerificationResult("invalid", "signed audit head sequence is malformed")
         if head["head_hash"] != previous or head_sequence != len(rows):
             return AuditVerificationResult("invalid", "stored audit head does not match audit events")
-        return _verify_head_signature(
+        head_result = _verify_head_signature(
             self._audit_head_verifier,
             task_id,
             {
@@ -1341,6 +1364,7 @@ class SQLiteRuntimeStore:
                 "signed_at": head["signed_at"],
             },
         )
+        return _check_migration_anchor(self._audit_head_verifier, head_result, first_details)
 
     def verify_audit_chain(self, task_id: str) -> bool:
         return self.verify_audit_chain_status(task_id).valid
@@ -1861,7 +1885,16 @@ class PostgresRuntimeStore:
             return (row["head_hash"], int(row["sequence"])) if row is not None else None
 
     def verify_audit_chain_status(self, task_id: str) -> AuditVerificationResult:
+        psycopg, _, _, _ = _postgres_modules()
         with self._connect() as connection:
+            # Section 10 F3: READ COMMITTED takes a new snapshot per statement, so a writer
+            # committing between the two SELECTs made a healthy chain report "stored audit head
+            # does not match". End the transaction _connect opened for SET search_path (a
+            # session-level setting, it survives the commit), then read both inside one
+            # REPEATABLE READ, READ ONLY transaction: one snapshot for events and head.
+            connection.commit()
+            connection.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
+            connection.read_only = True
             rows = connection.execute(
                 "SELECT sequence, event, details_json, previous_hash, hash, host_id FROM audit_events WHERE task_id = %s ORDER BY sequence",
                 (task_id,),
@@ -1873,6 +1906,7 @@ class PostgresRuntimeStore:
         if not rows or head is None:
             return AuditVerificationResult("invalid", "audit chain is missing")
         previous = rows[0]["previous_hash"] if rows else ""
+        first_details: Any = None
         for expected_sequence, row in enumerate(rows):
             if row["sequence"] != expected_sequence or row["previous_hash"] != previous:
                 return AuditVerificationResult("invalid", "audit chain sequence or previous hash is inconsistent")
@@ -1880,6 +1914,8 @@ class PostgresRuntimeStore:
                 details = json.loads(row["details_json"])
             except json.JSONDecodeError:
                 return AuditVerificationResult("invalid", "audit event details are malformed")
+            if expected_sequence == 0:
+                first_details = details
             if not _audit_event_hash_matches(
                 row["sequence"], row["event"], details, row["previous_hash"], row["host_id"], row["hash"]
             ):
@@ -1891,7 +1927,7 @@ class PostgresRuntimeStore:
             return AuditVerificationResult("invalid", "signed audit head sequence is malformed")
         if head["head_hash"] != previous or head_sequence != len(rows):
             return AuditVerificationResult("invalid", "stored audit head does not match audit events")
-        return _verify_head_signature(
+        head_result = _verify_head_signature(
             self._audit_head_verifier,
             task_id,
             {
@@ -1903,6 +1939,7 @@ class PostgresRuntimeStore:
                 "signed_at": head["signed_at"],
             },
         )
+        return _check_migration_anchor(self._audit_head_verifier, head_result, first_details)
 
     def verify_audit_chain(self, task_id: str) -> bool:
         return self.verify_audit_chain_status(task_id).valid
@@ -2335,3 +2372,55 @@ def _verify_head_signature(verifier: AuditHeadVerifier | None, task_id: str, hea
         return AuditVerificationResult("unverifiable", str(error), head_status="registry-unavailable")
     status: AuditVerificationStatus = "valid" if evaluation.ok else "invalid"
     return AuditVerificationResult(status, evaluation.detail, head_status=evaluation.head_status)
+
+
+# The source proof a Section 10 anchor carries in addition to the pre-Section-10 fields.
+_ANCHOR_PROOF_FIELDS = ("previous_audit_task_id", "previous_audit_signature_key_id", "previous_audit_signature")
+
+
+def _check_migration_anchor(verifier: AuditHeadVerifier | None, head_result: AuditVerificationResult, first_details: Any) -> AuditVerificationResult:
+    """Re-verify a migration anchor from this database alone (Section 10 F2).
+
+    A migration admission records the source's signed audit head in event 0's details
+    (`host._audit_start`). The anchor is inside the hashed, head-signed chain, so it cannot be
+    altered or stripped without breaking the destination's own signature -- this check adds
+    that the SOURCE's proof is still authentic under the current trust registry. The source
+    signed a v1 head for the "migration" purpose, so it is evaluated under the v1 historical
+    policy with that usage: a source key revoked since is reported, not silently accepted.
+    """
+    if not head_result.valid:
+        return head_result
+    anchor = first_details.get("migration") if isinstance(first_details, dict) else None
+    if anchor is None:
+        return replace(head_result, anchor_status="none")
+    if not isinstance(anchor, dict):
+        return AuditVerificationResult("invalid", "migration anchor is malformed", head_result.head_status, "invalid")
+    if not any(field in anchor for field in _ANCHOR_PROOF_FIELDS):
+        return replace(head_result, anchor_status="legacy-anchor")
+    head_hash = anchor.get("previous_audit_hash")
+    sequence = anchor.get("previous_audit_sequence")
+    strings = (head_hash, anchor.get("previous_audit_host_id"), *(anchor.get(field) for field in _ANCHOR_PROOF_FIELDS))
+    if (
+        not all(isinstance(value, str) and value for value in strings)
+        or not isinstance(sequence, int)
+        or isinstance(sequence, bool)
+        or sequence <= 0
+    ):
+        return AuditVerificationResult("invalid", "migration anchor proof is incomplete or malformed", head_result.head_status, "invalid")
+    if verifier is None:  # unreachable: a valid head_result required a verifier
+        return AuditVerificationResult("unverifiable", "trust registry is not configured", head_result.head_status, "unverifiable")
+    payload = audit_head_payload(anchor["previous_audit_task_id"], anchor["previous_audit_host_id"], head_hash, sequence)
+    try:
+        evaluation = verifier.evaluate_audit_head(
+            anchor["previous_audit_signature_key_id"], payload, anchor["previous_audit_signature"], required_usage="migration"
+        )
+    except SecurityError as error:
+        return AuditVerificationResult("unverifiable", str(error), head_result.head_status, "registry-unavailable")
+    if not evaluation.ok:
+        return AuditVerificationResult(
+            "invalid",
+            f"migration anchor proof failed ({evaluation.head_status}): {evaluation.detail}",
+            head_result.head_status,
+            "invalid",
+        )
+    return replace(head_result, anchor_status="verified")

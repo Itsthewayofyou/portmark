@@ -1,4 +1,5 @@
 import copy
+import dataclasses
 import functools
 import asyncio
 import base64
@@ -21,6 +22,7 @@ import tempfile
 import socket
 import threading
 import time
+import types
 import unittest
 import urllib.error
 import urllib.request
@@ -47,6 +49,7 @@ from portmark.security import (
     ApprovalAuthority,
     AttestationAuthority,
     AttestationPolicy,
+    AuditLog,
     EnvelopeSigner,
     audit_event_record,
     ExternalAttestationVerifier,
@@ -61,6 +64,7 @@ from portmark.security import (
     generate_signing_material,
     load_trust_registry,
 )
+from portmark.host import AgentHost
 from portmark.storage import POSTGRES_SCHEMA_VERSION, SQLITE_BUSY_TIMEOUT_MS, SQLITE_SCHEMA_VERSION, InMemoryRuntimeStore, PostgresRuntimeStore, SQLiteRuntimeStore
 from portmark.cli import main as cli_main
 from portmark.tools import (
@@ -3736,6 +3740,200 @@ class RuntimeTests(unittest.TestCase):
                     # The anchor ties this chain to the source's actual head hash.
                     self.assertEqual(anchor["previous_audit_hash"], first.audit[-1]["hash"])
 
+    # -- Section 10 F3: verification reads events and head from ONE snapshot -----------------
+    class _InterleavingConnection:
+        """Wraps a real store connection and runs `hook` right after the audit_events read
+        returns, before the audit_heads read -- the exact interleaving the auditor used."""
+
+        def __init__(self, inner, hook):
+            object.__setattr__(self, "_inner", inner)
+            object.__setattr__(self, "_hook", hook)
+
+        def execute(self, query, *args):
+            cursor = self._inner.execute(query, *args)
+            if "FROM audit_events" in query and self._hook is not None:
+                rows = cursor.fetchall()
+                hook = self._hook
+                object.__setattr__(self, "_hook", None)
+                hook()
+                return types.SimpleNamespace(fetchall=lambda: rows, fetchone=lambda: rows[0] if rows else None)
+            return cursor
+
+        def __enter__(self):
+            self._inner.__enter__()
+            return self
+
+        def __exit__(self, *exc):
+            return self._inner.__exit__(*exc)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def __setattr__(self, name, value):
+            setattr(self._inner, name, value)
+
+    def _commit_one_more_audit_event(self, store, task_id, host_id, signer):
+        head_hash, sequence = store.audit_head(task_id)
+        log = AuditLog(head_hash, sequence, host_id)
+        log.append("interleaved.write", {"note": "committed between the two verification reads"})
+        signed_at = int(time.time())
+        with store.transaction() as transaction:
+            transaction.append_audit_events(
+                task_id,
+                host_id,
+                log.events,
+                lambda head, seq: (signer.key_id, signer.sign_audit_head(task_id, host_id, head, seq, signed_at=signed_at), signed_at),
+            )
+
+    def test_verify_audit_reads_events_and_head_from_one_snapshot_under_a_concurrent_commit(self):
+        signer = EnvelopeSigner.generate("snapshot-key", "host:local-demo", ("host:local-demo",))
+        for context in self._store_case_contexts(signer):
+            with context as (backend, store):
+                with self.subTest(backend=backend):
+                    host = make_host(signer=signer, store=store, allow_ephemeral_signing_key=True)
+                    task_id = host.run(make_demo_envelope(host, f"{backend} snapshot")).task_id
+                    _, before = store.audit_head(task_id)
+                    original_connect = store._connect
+                    armed = {"used": False}
+
+                    def connect():
+                        connection = original_connect()
+                        if armed["used"]:
+                            return connection
+                        armed["used"] = True
+                        return self._InterleavingConnection(
+                            connection, lambda: self._commit_one_more_audit_event(store, task_id, host.host_id, signer)
+                        )
+
+                    with patch.object(store, "_connect", side_effect=connect):
+                        interleaved = store.verify_audit_chain_status(task_id)
+                    # The writer really committed between the reads...
+                    self.assertEqual(store.audit_head(task_id)[1], before + 1)
+                    # ...but the verifier saw one consistent snapshot (the pre-commit chain).
+                    self.assertEqual(interleaved.status, "valid", interleaved.reason)
+                    stable = store.verify_audit_chain_status(task_id)
+                    self.assertEqual(stable.status, "valid", stable.reason)
+
+    # -- Section 10 F2: the destination keeps the source's migration proof -------------------
+    def _migrate_once(self, backend, source_store, destination_store, source_signer, destination_signer):
+        source = make_host(host_id="host:source", signer=source_signer, store=source_store, allow_ephemeral_signing_key=True)
+        destination = make_host(host_id="host:destination", signer=destination_signer, store=destination_store, allow_ephemeral_signing_key=True)
+        source.policy.migration = MigrationPolicy(allowed=True, destinations=(destination.host_id,))
+        provider = MigrateThenCompleteProvider(destination.host_id)
+        source.providers["migrator"] = provider
+        destination.providers["migrator"] = provider
+        envelope = make_demo_envelope(source, f"{backend} anchored migration", "migrator")
+        object.__setattr__(envelope.permit, "delegation_allowed", True)
+        source_signer.seal(envelope)
+        first = source.run(envelope)
+        migrated = envelope_from_dict(first.migration_envelope)
+        second = destination.run(migrated)
+        self.assertEqual(second.status, "completed")
+        return envelope, migrated, second
+
+    def _migration_signers(self, prefix):
+        source_signer = EnvelopeSigner.generate(f"{prefix}-source-key", "host:source", ("host:source", "host:destination"))
+        destination_signer = trust_signer(
+            EnvelopeSigner.generate(f"{prefix}-destination-key", "host:destination", ("host:destination",)),
+            source_signer,
+        )
+        return source_signer, destination_signer
+
+    def test_migration_anchor_keeps_the_source_proof_and_reverifies_from_the_destination_alone(self):
+        source_signer, destination_signer = self._migration_signers("anchor")
+        for context in self._dual_store_case_contexts(source_signer, destination_signer):
+            with context as (backend, source_store, destination_store):
+                with self.subTest(backend=backend):
+                    envelope, migrated, second = self._migrate_once(backend, source_store, destination_store, source_signer, destination_signer)
+                    anchor = second.audit[0]["details"]["migration"]
+                    self.assertEqual(anchor["previous_audit_task_id"], envelope.state.task_id)
+                    self.assertEqual(anchor["previous_audit_signature_key_id"], source_signer.key_id)
+                    self.assertEqual(anchor["previous_audit_signature"], migrated.previous_audit_signature)
+
+                    verified = destination_store.verify_audit_chain_status(second.task_id)
+                    self.assertEqual((verified.status, verified.anchor_status), ("valid", "verified"), verified.reason)
+
+                    # An independent auditor holding ONLY the destination database and a trust
+                    # registry (no source store, no host objects) re-validates the source proof.
+                    auditor_registry = TrustRegistry((trusted_identity_for(destination_signer), trusted_identity_for(source_signer)))
+                    if backend == "sqlite":
+                        auditor_store = SQLiteRuntimeStore(destination_store.path, auditor_registry)
+                    else:
+                        auditor_store = PostgresRuntimeStore(destination_store.dsn, auditor_registry, schema=destination_store.schema)
+                    audited = auditor_store.verify_audit_chain_status(second.task_id)
+                    self.assertEqual((audited.status, audited.anchor_status), ("valid", "verified"), audited.reason)
+
+                    # The source key is revoked later: the v1 migration head carries no signing
+                    # time, so the anchor can no longer be shown to predate the compromise.
+                    revoked = dataclasses.replace(trusted_identity_for(source_signer), revoked=True)
+                    revoked_registry = TrustRegistry((trusted_identity_for(destination_signer), revoked))
+                    auditor_store._audit_head_verifier = revoked_registry
+                    after_revocation = auditor_store.verify_audit_chain_status(second.task_id)
+                    self.assertEqual((after_revocation.status, after_revocation.anchor_status), ("invalid", "invalid"))
+                    self.assertIn("revoked-key-legacy-v1", after_revocation.reason)
+
+                    # A source key scoped to audit-only cannot stand as a migration proof.
+                    audit_only = dataclasses.replace(trusted_identity_for(source_signer), usages=("audit",))
+                    auditor_store._audit_head_verifier = TrustRegistry((trusted_identity_for(destination_signer), audit_only))
+                    wrong_usage = auditor_store.verify_audit_chain_status(second.task_id)
+                    self.assertEqual((wrong_usage.status, wrong_usage.anchor_status), ("invalid", "invalid"))
+                    self.assertIn("usage-violation", wrong_usage.reason)
+
+    def test_pre_section_10_migration_anchor_still_verifies_as_legacy(self):
+        # A chain written before Section 10 has the 3-field anchor. It must keep verifying (no
+        # hash-version bump: the recompute uses the stored details), reported as legacy-anchor.
+        source_signer, destination_signer = self._migration_signers("legacy-anchor")
+        original_audit_start = AgentHost._audit_start
+
+        def legacy_audit_start(host, envelope, original_task_id):
+            previous_hash, start, anchor = original_audit_start(host, envelope, original_task_id)
+            if anchor is not None:
+                anchor = {key: anchor[key] for key in ("previous_audit_hash", "previous_audit_sequence", "previous_audit_host_id")}
+            return previous_hash, start, anchor
+
+        with self._sqlite_dual_store_case(source_signer, destination_signer) as (backend, source_store, destination_store):
+            with patch.object(AgentHost, "_audit_start", legacy_audit_start):
+                _, _, second = self._migrate_once(backend, source_store, destination_store, source_signer, destination_signer)
+            self.assertNotIn("previous_audit_signature", second.audit[0]["details"]["migration"])
+            legacy = destination_store.verify_audit_chain_status(second.task_id)
+            self.assertEqual((legacy.status, legacy.anchor_status), ("valid", "legacy-anchor"), legacy.reason)
+
+    def test_migration_anchor_check_rejects_each_altered_or_missing_proof_field(self):
+        from portmark.storage import AuditVerificationResult, _check_migration_anchor
+
+        source_signer, destination_signer = self._migration_signers("anchor-fields")
+        with self._sqlite_dual_store_case(source_signer, destination_signer) as (backend, source_store, destination_store):
+            _, _, second = self._migrate_once(backend, source_store, destination_store, source_signer, destination_signer)
+        anchor = second.audit[0]["details"]["migration"]
+        registry = TrustRegistry((trusted_identity_for(destination_signer), trusted_identity_for(source_signer)))
+        head_ok = AuditVerificationResult("valid", "audit head verified", "valid")
+        self.assertEqual(_check_migration_anchor(registry, head_ok, {"migration": anchor}).anchor_status, "verified")
+        self.assertEqual(_check_migration_anchor(registry, head_ok, {"agent": "x"}).anchor_status, "none")
+        altered = {
+            "previous_audit_hash": "0" * 64,
+            "previous_audit_sequence": anchor["previous_audit_sequence"] + 1,
+            "previous_audit_host_id": "host:destination",
+            "previous_audit_task_id": "some-other-task",
+            "previous_audit_signature_key_id": destination_signer.key_id,
+            "previous_audit_signature": destination_signer.sign_audit_head("t", "host:destination", "0" * 64, 1),
+        }
+        for field, value in altered.items():
+            with self.subTest(altered=field):
+                result = _check_migration_anchor(registry, head_ok, {"migration": {**anchor, field: value}})
+                self.assertEqual((result.status, result.anchor_status), ("invalid", "invalid"), result.reason)
+        for field in ("previous_audit_task_id", "previous_audit_signature_key_id", "previous_audit_signature", "previous_audit_hash"):
+            with self.subTest(missing=field):
+                partial = {key: value for key, value in anchor.items() if key != field}
+                result = _check_migration_anchor(registry, head_ok, {"migration": partial})
+                self.assertEqual((result.status, result.anchor_status), ("invalid", "invalid"), result.reason)
+        for bad_sequence in (True, 0, "3"):
+            with self.subTest(sequence=bad_sequence):
+                result = _check_migration_anchor(registry, head_ok, {"migration": {**anchor, "previous_audit_sequence": bad_sequence}})
+                self.assertEqual(result.status, "invalid")
+        # A failing head is never upgraded by the anchor check.
+        head_bad = AuditVerificationResult("invalid", "stored audit head does not match audit events")
+        self.assertIs(_check_migration_anchor(registry, head_bad, {"migration": anchor}), head_bad)
+
     def test_migration_payload_is_projected_to_destination_grants(self):
         # Section 4 #6 (payload confidentiality). A tool result carries fields beyond
         # the grant's output_projection ceiling. The provider path already enforces that
@@ -5031,7 +5229,7 @@ class RuntimeTests(unittest.TestCase):
                     cli_main()
             self.assertEqual(
                 json.loads(output.getvalue()),
-                {"task_id": result.task_id, "status": "valid", "head_status": "valid", "reason": "audit head verified"},
+                {"task_id": result.task_id, "status": "valid", "head_status": "valid", "anchor_status": "none", "reason": "audit head verified"},
             )
 
             output = io.StringIO()
@@ -5042,7 +5240,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, 2)
             self.assertEqual(
                 json.loads(output.getvalue()),
-                {"task_id": result.task_id, "status": "unverifiable", "head_status": "unverifiable", "reason": "trust registry is not configured"},
+                {"task_id": result.task_id, "status": "unverifiable", "head_status": "unverifiable", "anchor_status": "", "reason": "trust registry is not configured"},
             )
 
             with self._raw_sqlite(path) as connection:
@@ -5055,7 +5253,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, 1)
             self.assertEqual(
                 json.loads(output.getvalue()),
-                {"task_id": result.task_id, "status": "invalid", "head_status": "", "reason": "stored audit head does not match audit events"},
+                {"task_id": result.task_id, "status": "invalid", "head_status": "", "anchor_status": "", "reason": "stored audit head does not match audit events"},
             )
 
             output = io.StringIO()
@@ -5066,7 +5264,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, 1)
             self.assertEqual(
                 json.loads(output.getvalue()),
-                {"task_id": "missing-task", "status": "invalid", "head_status": "", "reason": "audit chain is missing"},
+                {"task_id": "missing-task", "status": "invalid", "head_status": "", "anchor_status": "", "reason": "audit chain is missing"},
             )
 
     def test_host_security_guards_are_directly_reachable(self):

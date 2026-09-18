@@ -325,7 +325,7 @@ def main() -> None:
         if store is None:
             parser.error("verify-audit requires --store-path or PORTMARK_STORE_PATH")
         verification = store.verify_audit_chain_status(args.task_id)
-        print(json.dumps({"task_id": args.task_id, "status": verification.status, "head_status": verification.head_status, "reason": verification.reason}, indent=2))
+        print(json.dumps({"task_id": args.task_id, "status": verification.status, "head_status": verification.head_status, "anchor_status": verification.anchor_status, "reason": verification.reason}, indent=2))
         if verification.status == "invalid":
             raise SystemExit(1)
         if verification.status == "unverifiable":

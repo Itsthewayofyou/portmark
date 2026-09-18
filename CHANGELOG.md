@@ -6,6 +6,27 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Section 10 — audit chain (PR A): one-snapshot verification, migration proof kept, storage doc (findings #2 local half, #3, #5)
+
+- **Verification reads one snapshot (Medium, #3).** `verify_audit_chain_status` read the events and the
+  head in two separate queries. A writer committing between them made a healthy chain report
+  `stored audit head does not match audit events` (a false tamper alarm under load). Both reads now run
+  in one read transaction: SQLite `BEGIN DEFERRED` (WAL, writers not blocked); PostgreSQL
+  `REPEATABLE READ, READ ONLY`. New test commits a real writer between the two reads on both backends.
+- **The destination keeps the source's migration proof (High, #2 local half).** The migration anchor in
+  event 0 now also stores the original task ID, the source key ID, and the source signature, not only
+  the head hash, sequence, and host. `verify-audit` re-verifies that source signature against the
+  trust registry (for the `migration` purpose), so an auditor with only the destination database can
+  re-validate the handoff. New `anchor_status` in the result and CLI output: `none`, `verified`,
+  `legacy-anchor` (older 3-field anchors keep verifying, no hash-format change), or `invalid`.
+  `evaluate_audit_head` gains `required_usage` (default `audit`). A source key revoked after the handoff
+  makes the anchor `invalid`: the v1 handoff head has no signing time to prove it came first.
+- **RUNTIME_STORAGE.md was stale (Low, #5).** It said SQLite schema v3; the code is at SQLite 11 and
+  PostgreSQL 9. It now lists every migration step and every current table, and says plainly that
+  verification does not detect a rollback to an older consistent database (that is PR B).
+- Not in this PR: rollback/fork detection and the trust-registry floor (Section 10 PR B, local audit
+  floor behind a general monotonic-witness contract).
+
 ### Section 9 follow-up: malformed-component fuzz campaign
 
 - **New `tests/fuzz_wasmtime_components.py`**, deterministic (seeded), in two parts:
