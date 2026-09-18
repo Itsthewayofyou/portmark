@@ -8427,6 +8427,8 @@ class RuntimeTests(unittest.TestCase):
             "multi-memory": "(module (memory 1) (memory 1))",
             "gc": "(module (type (struct (field i32))))",
             "exceptions": "(module (tag))",
+            "tail call": "(module (func $f (return_call $f)))",
+            "typed function references": "(module (type $t (func)) (func (param (ref $t))))",
         }
         hardened = Engine(_engine_config(64 * 1024 * 1024))
         default = Engine(Config())
@@ -8436,6 +8438,37 @@ class RuntimeTests(unittest.TestCase):
                 Module(default, wasm)  # control: accepted by default
                 with self.assertRaises(Exception):
                     Module(hardened, wasm)
+
+    @unittest.skipUnless(HAS_REAL_WASMTIME, "requires portmark[wasmtime]")
+    def test_real_native_wasmtime_engine_config_assigns_every_proposal_setter(self):
+        # PR #79 review: two default-on proposals were left unassigned. Enumerate EVERY proposal
+        # setter the installed wasmtime-py exposes and require _engine_config to assign each one,
+        # so a proposal added by a Wasmtime upgrade fails this test until it is decided explicitly.
+        import inspect
+
+        import wasmtime
+
+        from portmark.wasmtime_component_runner import _engine_config
+
+        def is_proposal_setter(name):
+            attribute = inspect.getattr_static(wasmtime.Config, name)
+            return (
+                (name.startswith("wasm_") or name in {"gc_support", "shared_memory"})
+                and isinstance(attribute, property) and attribute.fset is not None
+            )
+
+        proposals = {name for name in dir(wasmtime.Config) if is_proposal_setter(name)}
+        assigned = set()
+
+        class RecordingConfig(wasmtime.Config):
+            def __setattr__(self, name, value):
+                assigned.add(name)
+                super().__setattr__(name, value)
+
+        with patch.object(wasmtime, "Config", RecordingConfig):
+            _engine_config(64 * 1024 * 1024)
+        self.assertIn("wasm_tail_call", proposals)  # the enumeration itself is not empty/broken
+        self.assertEqual(sorted(proposals - assigned), [])
 
     @unittest.skipUnless(sys.platform == "win32", "Windows Job Object memory limit")
     def test_windows_job_process_memory_limit_refuses_allocation_past_the_ceiling(self):

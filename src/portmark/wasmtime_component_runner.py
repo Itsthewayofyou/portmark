@@ -121,18 +121,24 @@ def _engine_config(max_memory_bytes: int) -> Any:
     config.wasm_relaxed_simd = True
     config.wasm_relaxed_simd_deterministic = True
     config.cranelift_nan_canonicalization = True
-    # Lock the proposal set. Off: host-dependent or unneeded surface. Each "off" below that
-    # Wasmtime 48 enables by default is proven refused by a test (threads, memory64,
-    # multi-memory, gc, exceptions); the rest are already off by default and pinned here.
+    # Lock the proposal set: EVERY proposal setter wasmtime-py 48 exposes is assigned here, so none
+    # inherits a default that can drift on upgrade. Off: host-dependent or unneeded surface. Each
+    # "off" below that Wasmtime 48 enables by default is proven refused by a test (threads,
+    # memory64, multi-memory, gc, exceptions, tail call, typed function references); the rest are
+    # already off by default and pinned here.
     config.wasm_threads = False
     config.shared_memory = False
     config.wasm_memory64 = False
     config.wasm_multi_memory = False
     config.wasm_gc = False
+    config.gc_support = False  # the GC runtime itself, not only the proposal
     config.wasm_exceptions = False
+    config.wasm_tail_call = False
+    config.wasm_function_references = False
     config.wasm_stack_switching = False
     config.wasm_wide_arithmetic = False
     config.wasm_custom_page_sizes = False
+    config.wasm_component_model_map = False  # component-model map types proposal
     # On: what the Component Model contract needs.
     config.wasm_component_model = True
     config.wasm_multi_value = True

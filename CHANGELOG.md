@@ -33,7 +33,11 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
 - **Deterministic, explicit engine configuration (#4).** Deterministic relaxed SIMD and NaN
   canonicalization, so results match across x86-64 and AArch64. Every Wasm proposal is set
   explicitly instead of inheriting Wasmtime's changing defaults: threads, shared memory, memory64,
-  multi-memory, GC, exceptions, stack switching, wide arithmetic, and custom page sizes are off.
+  multi-memory, GC (proposal and runtime), exceptions, tail calls, typed function references, stack
+  switching, wide arithmetic, custom page sizes, and component-model map types are off. A test
+  enumerates every proposal setter wasmtime-py exposes and fails if one is left unassigned, so a
+  proposal added by a Wasmtime upgrade cannot silently inherit a default (review round 2: tail
+  calls and typed function references were still default-on).
   (Cross-architecture and Windows CI lanes follow in the next Section 9 PR.)
 - Docs: README, WASM_COMPONENTS.md, OPERATIONS.md, and THREAT_MODEL.md now describe per-memory versus
   aggregate limits accurately. The README previously said native Wasmtime "bounds guest memory".

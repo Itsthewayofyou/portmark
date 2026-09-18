@@ -64,8 +64,10 @@ ceiling is available, construction fails unless the operator passes
 
 The engine configuration is explicit, not inherited from Wasmtime's defaults: single-threaded
 compilation, deterministic relaxed SIMD, NaN canonicalization (results match across x86-64 and
-AArch64), and threads, shared memory, memory64, multi-memory, GC, exceptions, stack switching, wide
-arithmetic, and custom page sizes switched off.
+AArch64), and threads, shared memory, memory64, multi-memory, GC (proposal and runtime), exceptions, tail
+calls, typed function references, stack switching, wide arithmetic, custom page sizes, and
+component-model map types switched off. Every proposal setter is assigned; a test fails if a
+Wasmtime upgrade adds one that is not.
 
 ## Default JSON-Lowered Capsule ABI
 
