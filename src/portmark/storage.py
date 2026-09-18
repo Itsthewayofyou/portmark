@@ -24,8 +24,8 @@ from .security import (
 )
 
 
-SQLITE_SCHEMA_VERSION = 11
-POSTGRES_SCHEMA_VERSION = 9
+SQLITE_SCHEMA_VERSION = 12
+POSTGRES_SCHEMA_VERSION = 10
 
 # Section 4 #3: a migration lease is bounded. Zero/negative would defeat exclusivity (two workers
 # could claim the same row at the same instant); an unbounded lease would let a dead worker hold a
@@ -96,6 +96,9 @@ class AuditVerificationResult:
     # "verified", "legacy-anchor" (pre-Section-10 anchor without the source proof), or
     # "invalid"/"registry-unavailable". Empty when verification stopped before this check.
     anchor_status: str = ""
+    # Section 10 PR B: verdict of the audit floor (verify-audit --audit-floor-path): "anchored",
+    # "not-anchored", "no-floor", or a refusal code (rolled-back, forked, floor-missing, ...).
+    floor_status: str = ""
 
     @property
     def valid(self) -> bool:
@@ -113,6 +116,13 @@ class RuntimeTransaction(Protocol):
         commit or roll back together: a cancel that lands first is observed and rolls the redeem
         back; one that lands after is caught by a later pre-launch re-check.
         """
+        ...
+
+    def audit_head(self, task_id: str) -> tuple[str, int] | None:
+        """The stored head as seen INSIDE this transaction (Section 10 PR B floor check)."""
+        ...
+
+    def audit_event_hash(self, task_id: str, sequence: int) -> str | None:
         ...
 
     def append_audit_events(self, task_id: str, host_id: str, events: tuple[dict[str, Any], ...], sign_head: AuditHeadSigner | None = None) -> None:
@@ -371,6 +381,7 @@ class InMemoryRuntimeStore:
         # cancel cannot interleave with a redeem) and again before the tool launches.
         self._cancelled: set[str] = set()
         self._effects: dict[str, dict[str, Any]] = {}
+        self._floor_markers: dict[str, tuple[int, bool]] = {}
         self._audit_head_verifier: AuditHeadVerifier | None = None
         # Section 4 #3: the lease clock is a CONSTRUCTION dependency, never a per-call parameter --
         # so a caller of claim/release/dead_letter cannot pass a forged "now" to steal a live lease.
@@ -640,6 +651,24 @@ class InMemoryRuntimeStore:
     def verify_audit_chain(self, task_id: str) -> bool:
         return self.verify_audit_chain_status(task_id).valid
 
+    # -- Section 10 PR B: audit-floor support (reads + the per-host marker) ------------------
+    def audit_heads_for_host(self, host_id: str) -> list[tuple[str, str, int]]:
+        with self._lock:
+            return [(task_id, head["head_hash"], int(head["sequence"])) for task_id, head in self._audit_heads.items() if head.get("host_id") == host_id]
+
+    def audit_event_hash(self, task_id: str, sequence: int) -> str | None:
+        with self._lock:
+            events = self._audit_events.get(task_id, [])
+            return events[sequence]["hash"] if 0 <= sequence < len(events) else None
+
+    def audit_floor_marker(self, host_id: str) -> tuple[int, bool] | None:
+        with self._lock:
+            return self._floor_markers.get(host_id)
+
+    def set_audit_floor_marker(self, host_id: str, epoch: int, pending: bool) -> None:
+        with self._lock:
+            self._floor_markers[host_id] = (epoch, pending)
+
 
 class _InMemoryTransaction:
     def __init__(self, store: InMemoryRuntimeStore) -> None:
@@ -685,6 +714,14 @@ class _InMemoryTransaction:
     def is_task_cancelled(self, task_id: str) -> bool:
         # Read within the held transaction lock so the redeem-vs-cancel decision is atomic.
         return task_id in self._store._cancelled
+
+    def audit_head(self, task_id: str) -> tuple[str, int] | None:
+        head = self._store._audit_heads.get(task_id)
+        return None if head is None else (head["head_hash"], int(head["sequence"]))
+
+    def audit_event_hash(self, task_id: str, sequence: int) -> str | None:
+        events = self._store._audit_events.get(task_id, [])
+        return events[sequence]["hash"] if 0 <= sequence < len(events) else None
 
     def append_audit_events(self, task_id: str, host_id: str, events: tuple[dict[str, Any], ...], sign_head: AuditHeadSigner | None = None) -> None:
         current = self._store._audit_events.setdefault(task_id, [])
@@ -820,6 +857,7 @@ class SQLiteRuntimeStore:
             8: self._migrate_to_v9,
             9: self._migrate_to_v10,
             10: self._migrate_to_v11,
+            11: self._migrate_to_v12,
         }
         migration = migrations.get(version)
         if migration is None:
@@ -1029,6 +1067,23 @@ class SQLiteRuntimeStore:
         if "reconcile_lease_expires_at" not in existing:
             connection.execute("ALTER TABLE tool_effects ADD COLUMN reconcile_lease_expires_at INTEGER")
         connection.execute("PRAGMA user_version = 11")
+
+    def _migrate_to_v12(self, connection: sqlite3.Connection) -> None:
+        # Section 10 PR B: the audit-floor "initialized" marker, one row per host. The floor file
+        # lives OUTSIDE this database; this row records that a floor exists (and its epoch), so a
+        # floor that later disappears is refused instead of silently rebuilt, and a database from
+        # before the floor was created (or before an operator reset) is detected.
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS audit_floor_markers (
+                host_id TEXT PRIMARY KEY,
+                epoch INTEGER NOT NULL,
+                pending INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL
+            );
+            PRAGMA user_version = 12;
+            """
+        )
 
     def transaction(self) -> AbstractContextManager[RuntimeTransaction]:
         return _SQLiteTransaction(self)
@@ -1369,6 +1424,32 @@ class SQLiteRuntimeStore:
     def verify_audit_chain(self, task_id: str) -> bool:
         return self.verify_audit_chain_status(task_id).valid
 
+    # -- Section 10 PR B: audit-floor support (reads + the per-host marker) ------------------
+    def audit_heads_for_host(self, host_id: str) -> list[tuple[str, str, int]]:
+        with self._connection() as connection:
+            rows = connection.execute("SELECT task_id, head_hash, sequence FROM audit_heads WHERE host_id = ?", (host_id,)).fetchall()
+        return [(row["task_id"], row["head_hash"], int(row["sequence"])) for row in rows]
+
+    def audit_event_hash(self, task_id: str, sequence: int) -> str | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT hash FROM audit_events WHERE task_id = ? AND sequence = ?", (task_id, sequence)
+            ).fetchone()
+        return None if row is None else row["hash"]
+
+    def audit_floor_marker(self, host_id: str) -> tuple[int, bool] | None:
+        with self._connection() as connection:
+            row = connection.execute("SELECT epoch, pending FROM audit_floor_markers WHERE host_id = ?", (host_id,)).fetchone()
+        return None if row is None else (int(row["epoch"]), bool(row["pending"]))
+
+    def set_audit_floor_marker(self, host_id: str, epoch: int, pending: bool) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                "INSERT INTO audit_floor_markers (host_id, epoch, pending, updated_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT (host_id) DO UPDATE SET epoch = EXCLUDED.epoch, pending = EXCLUDED.pending, updated_at = EXCLUDED.updated_at",
+                (host_id, epoch, pending, int(time.time())),
+            )
+
 
 class PostgresRuntimeStore:
     is_durable = True
@@ -1581,6 +1662,17 @@ class PostgresRuntimeStore:
         # nullable; ADD COLUMN IF NOT EXISTS upgrades an existing (v8) store idempotently.
         connection.execute("ALTER TABLE tool_effects ADD COLUMN IF NOT EXISTS reconcile_claim_id TEXT")
         connection.execute("ALTER TABLE tool_effects ADD COLUMN IF NOT EXISTS reconcile_lease_expires_at BIGINT")
+        # Section 10 PR B (schema v10): the audit-floor "initialized" marker, one row per host.
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audit_floor_markers (
+                host_id TEXT PRIMARY KEY,
+                epoch BIGINT NOT NULL,
+                pending BOOLEAN NOT NULL DEFAULT FALSE,
+                updated_at BIGINT NOT NULL
+            )
+            """
+        )
         connection.execute(
             """
             INSERT INTO portmark_schema (singleton, version)
@@ -1944,6 +2036,32 @@ class PostgresRuntimeStore:
     def verify_audit_chain(self, task_id: str) -> bool:
         return self.verify_audit_chain_status(task_id).valid
 
+    # -- Section 10 PR B: audit-floor support (reads + the per-host marker) ------------------
+    def audit_heads_for_host(self, host_id: str) -> list[tuple[str, str, int]]:
+        with self._connect() as connection:
+            rows = connection.execute("SELECT task_id, head_hash, sequence FROM audit_heads WHERE host_id = %s", (host_id,)).fetchall()
+        return [(row["task_id"], row["head_hash"], int(row["sequence"])) for row in rows]
+
+    def audit_event_hash(self, task_id: str, sequence: int) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT hash FROM audit_events WHERE task_id = %s AND sequence = %s", (task_id, sequence)
+            ).fetchone()
+        return None if row is None else row["hash"]
+
+    def audit_floor_marker(self, host_id: str) -> tuple[int, bool] | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT epoch, pending FROM audit_floor_markers WHERE host_id = %s", (host_id,)).fetchone()
+        return None if row is None else (int(row["epoch"]), bool(row["pending"]))
+
+    def set_audit_floor_marker(self, host_id: str, epoch: int, pending: bool) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO audit_floor_markers (host_id, epoch, pending, updated_at) VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT (host_id) DO UPDATE SET epoch = EXCLUDED.epoch, pending = EXCLUDED.pending, updated_at = EXCLUDED.updated_at",
+                (host_id, epoch, pending, int(time.time())),
+            )
+
 
 class _PostgresTransaction:
     def __init__(self, store: PostgresRuntimeStore) -> None:
@@ -1993,6 +2111,20 @@ class _PostgresTransaction:
             (task_id,),
         ).fetchone()
         return row is not None
+
+    def audit_head(self, task_id: str) -> tuple[str, int] | None:
+        if self._connection is None:
+            raise RuntimeError("Postgres transaction was not opened")
+        row = self._connection.execute("SELECT head_hash, sequence FROM audit_heads WHERE task_id = %s", (task_id,)).fetchone()
+        return None if row is None else (row["head_hash"], int(row["sequence"]))
+
+    def audit_event_hash(self, task_id: str, sequence: int) -> str | None:
+        if self._connection is None:
+            raise RuntimeError("Postgres transaction was not opened")
+        row = self._connection.execute(
+            "SELECT hash FROM audit_events WHERE task_id = %s AND sequence = %s", (task_id, sequence)
+        ).fetchone()
+        return None if row is None else row["hash"]
 
     def append_audit_events(self, task_id: str, host_id: str, events: tuple[dict[str, Any], ...], sign_head: AuditHeadSigner | None = None) -> None:
         if self._connection is None:
@@ -2197,6 +2329,20 @@ class _SQLiteTransaction:
             (task_id,),
         ).fetchone()
         return row is not None
+
+    def audit_head(self, task_id: str) -> tuple[str, int] | None:
+        if self._connection is None:
+            raise RuntimeError("SQLite transaction was not opened")
+        row = self._connection.execute("SELECT head_hash, sequence FROM audit_heads WHERE task_id = ?", (task_id,)).fetchone()
+        return None if row is None else (row["head_hash"], int(row["sequence"]))
+
+    def audit_event_hash(self, task_id: str, sequence: int) -> str | None:
+        if self._connection is None:
+            raise RuntimeError("SQLite transaction was not opened")
+        row = self._connection.execute(
+            "SELECT hash FROM audit_events WHERE task_id = ? AND sequence = ?", (task_id, sequence)
+        ).fetchone()
+        return None if row is None else row["hash"]
 
     def append_audit_events(self, task_id: str, host_id: str, events: tuple[dict[str, Any], ...], sign_head: AuditHeadSigner | None = None) -> None:
         if self._connection is None:

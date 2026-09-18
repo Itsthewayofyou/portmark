@@ -118,6 +118,15 @@ def _audit_head_payload_for(task_id: str, host_id: str, head_hash: str, sequence
     return audit_head_payload_v2(task_id, host_id, head_hash, sequence, signed_at)
 
 
+AUDIT_FLOOR_TYPE = "portmark.audit-floor.v1"
+
+
+def audit_floor_payload(body: dict[str, Any]) -> dict[str, Any]:
+    # Section 10 PR B: the bytes a host signs for its audit floor record. The type tag keeps a
+    # floor signature from ever being accepted as an audit-head or receipt signature.
+    return {"type": AUDIT_FLOOR_TYPE, "body": body}
+
+
 def migration_envelope_digest(sealed_envelope: dict[str, Any]) -> str:
     """blake2b-256 hex over the canonical form of a sealed migrated envelope dict (S4 #2).
 
@@ -393,7 +402,10 @@ def _identity_unusable_reason(identity: Any, now: int) -> str | None:
 
 
 class TrustRegistry:
-    def __init__(self, identities: tuple[TrustedIdentity, ...] = ()) -> None:
+    def __init__(self, identities: tuple[TrustedIdentity, ...] = (), version: int = 0) -> None:
+        # Section 10 PR B: the registry file's monotonic `version` (0 = unversioned). The audit
+        # floor records it so an older registry (one that predates a revocation) is refused.
+        self.version = version
         # Build via add() rather than a dict comprehension so a duplicate key id in the
         # input is REJECTED, not silently collapsed to the last entry (finding #15).
         self._identities: dict[str, TrustedIdentity] = {}
@@ -467,6 +479,30 @@ class TrustRegistry:
             )
         except (InvalidSignature, ValueError) as error:
             raise SecurityError("audit head signature is invalid") from error
+
+    def verify_audit_floor(self, key_id: str, body: dict[str, Any], signature: str) -> None:
+        """Authenticate a host's audit floor record (Section 10 PR B).
+
+        The floor is audit evidence, so it needs the `audit` purpose and the signing key's issuer
+        must be the floor's host. Authenticity only: the floor is re-signed on every advance by the
+        host's CURRENT key, so expiry is not applied, but a REVOKED key is refused -- a
+        compromised key could otherwise sign a lowered floor that re-enables rollback.
+        """
+        identity = self._identities.get(key_id)
+        if identity is None:
+            raise SecurityError("audit floor signing key is not trusted")
+        if identity.revoked:
+            raise SecurityError("audit floor signing key has been revoked")
+        if not _identity_permits(identity, "audit"):
+            raise SecurityError("audit floor signing key lacks the required 'audit' usage")
+        if body.get("host_id") != identity.issuer:
+            raise SecurityError("audit floor signer does not match the floor's host")
+        try:
+            Ed25519PublicKey.from_public_bytes(identity.public_key).verify(
+                _b64url_decode(signature), canonical_json(audit_floor_payload(body))
+            )
+        except (InvalidSignature, ValueError) as error:
+            raise SecurityError("audit floor signature is invalid") from error
 
     def evaluate_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None, required_usage: str = "audit") -> AuditHeadEvaluation:
         # Historical verification (finding #3, Option B). Authenticity first, then validity
@@ -589,7 +625,10 @@ def _parse_trust_registry(value: Any) -> TrustRegistry:
     identities = value.get("identities")
     if not isinstance(identities, list):
         raise ValueError("trust registry identities must be a list")
-    registry = TrustRegistry()
+    version = value.get("version", 0)
+    if "version" in value and (isinstance(version, bool) or not isinstance(version, int) or version < 1):
+        raise ValueError("trust registry version must be an integer >= 1")
+    registry = TrustRegistry(version=version)
     for item in identities:
         if not isinstance(item, dict):
             raise ValueError("trust registry identity entries must be objects")
@@ -680,6 +719,10 @@ class TrustSource:
     def digest(self) -> str:
         return self._digest
 
+    @property
+    def version(self) -> int:
+        return self._file_registry.version
+
     def _verified_file(self) -> TrustRegistry:
         try:
             with open(self._path, "rb") as file:
@@ -732,6 +775,13 @@ class TrustSource:
             self._overlay.verify_audit_head(key_id, payload, signature, now, required_usage=required_usage)
         else:
             registry.verify_audit_head(key_id, payload, signature, now, required_usage=required_usage)
+
+    def verify_audit_floor(self, key_id: str, body: dict[str, Any], signature: str) -> None:
+        registry = self._verified_file()
+        if self._overlay.has_key(key_id):
+            self._overlay.verify_audit_floor(key_id, body, signature)
+        else:
+            registry.verify_audit_floor(key_id, body, signature)
 
     def evaluate_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None, required_usage: str = "audit") -> AuditHeadEvaluation:
         registry = self._verified_file()
@@ -1348,6 +1398,14 @@ class EnvelopeSigner:
     def evaluate_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None, required_usage: str = "audit") -> AuditHeadEvaluation:
         return self.registry.evaluate_audit_head(key_id, payload, signature, now, required_usage=required_usage)
 
+    def sign_audit_floor(self, body: dict[str, Any]) -> str:
+        if body.get("host_id") != self.issuer:
+            raise SecurityError("audit floor host does not match signing identity")
+        return _b64url_encode(self._private_key.sign(canonical_json(audit_floor_payload(body))))
+
+    def verify_audit_floor(self, key_id: str, body: dict[str, Any], signature: str) -> None:
+        self.registry.verify_audit_floor(key_id, body, signature)
+
 
 class HmacEnvelopeSigner:
     """Legacy dependency-free demo signer. Do not use for production trust domains."""
@@ -1387,6 +1445,18 @@ class HmacEnvelopeSigner:
         expected = hmac.new(self._key, canonical_json(payload), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(expected, signature):
             raise SecurityError("audit head signature is invalid")
+
+    def sign_audit_floor(self, body: dict[str, Any]) -> str:
+        return hmac.new(self._key, canonical_json(audit_floor_payload(body)), hashlib.sha256).hexdigest()
+
+    def verify_audit_floor(self, key_id: str, body: dict[str, Any], signature: str) -> None:
+        # A MAC, not a signature: only a holder of the same key can check it (so an offline
+        # auditor without the key cannot). Legacy demo path, documented in SIGNING_KEYS.md.
+        if key_id != self.key_id:
+            raise SecurityError("audit floor signing key is not trusted")
+        expected = hmac.new(self._key, canonical_json(audit_floor_payload(body)), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, signature):
+            raise SecurityError("audit floor signature is invalid")
 
     def evaluate_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None, required_usage: str = "audit") -> AuditHeadEvaluation:
         # Legacy HMAC has no trust registry, revocation, key lifecycle, or usages (required_usage
