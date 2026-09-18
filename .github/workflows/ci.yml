@@ -86,6 +86,11 @@ jobs:
         run: python -c "import platform, sys, importlib.metadata as m; print(sys.platform, platform.machine(), 'wasmtime', m.version('wasmtime'))"
       - name: Run native Wasmtime regression (real engine)
         run: python -m unittest discover -s tests -k real_native_wasmtime -v
+      - name: Run malformed-component fuzz campaign (real engine)
+        # Deterministic (fixed seed): any finding reproduces from its printed case index. Fails on
+        # any uncontrolled error, worker crash signal, deadline overrun, leftover worker, or a
+        # corpus too shallow to prove anything (coverage check).
+        run: python tests/fuzz_wasmtime_components.py --inproc-cases 3000 --e2e-cases 30
 
   postgres-store:
     runs-on: ubuntu-latest

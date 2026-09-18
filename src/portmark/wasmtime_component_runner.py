@@ -47,12 +47,10 @@ def main() -> None:
         raise SystemExit(1)
 
     try:
-        from wasmtime import Engine, Store
-        try:
-            from wasmtime import WasmtimeError
-        except ImportError:
-            WasmtimeError = RuntimeError
-        from wasmtime.component import Component, Linker
+        # Load the native wheel NOW, before the OS caps below (see the ORDER comment). _execute
+        # imports the names it uses; this import exists only to front-load the native library.
+        import wasmtime.component  # noqa: F401
+        controlled_errors = _controlled_errors()
     except ImportError as error:
         _fail(error)
         raise SystemExit(1)
@@ -70,27 +68,84 @@ def main() -> None:
     try:
         captured_stdout = _CappedTextIO(max_output_bytes)
         with redirect_stdout(captured_stdout):
-            # Bound guest CPU with fuel (deterministic instruction budget), each linear memory
-            # with memory_size, and the NUMBER of instances/memories/tables/table elements, so
-            # a component cannot multiply the per-memory ceiling by declaring many memories
-            # (Section 9, #1). The worker process itself is capped by the OS (above).
-            engine = Engine(_engine_config(max_memory_bytes))
-            store = Store(engine)
-            store.set_fuel(max_fuel)
-            store.set_limits(memory_size=max_memory_bytes, **count_limits)
-            instance = Linker(engine).instantiate(store, Component(engine, component))
-            resume = instance.get_func(store, "resume")
-            if resume is None:
-                raise RuntimeError("component does not export resume")
-            result = resume(store, context_json, checkpoint_json)
-            resume.post_return(store)
-        outcome = json.dumps(_normalize_outcome(result))
+            result = _execute(
+                component, context_json, checkpoint_json,
+                max_fuel=max_fuel, max_memory_bytes=max_memory_bytes, count_limits=count_limits,
+            )
+        outcome = json.dumps(result)
         if len(outcome.encode()) > max_output_bytes:
             raise RuntimeError("component outcome exceeds output limit")
         print(outcome, end="")
-    except (WasmtimeError, RuntimeError, TypeError, ValueError, json.JSONDecodeError) as error:
+    except controlled_errors as error:
         _fail(error)
         raise SystemExit(1)
+
+
+# Binary Wasm magic, and the layer field of a Component Model binary (bytes 6-7). The version
+# (bytes 4-5) is left to Wasmtime's binary parser, so a future component version is not refused here.
+_WASM_MAGIC = b"\x00asm"
+_COMPONENT_LAYER = b"\x01\x00"
+
+
+def _require_binary_component(component: bytes) -> None:
+    """Refuse anything that is not a BINARY Component Model artifact, before Wasmtime sees it.
+
+    Found by the component fuzzer: ``wasmtime.component.Component`` also accepts the WebAssembly
+    TEXT format -- input without the binary magic was handed to the WAT parser, and the capsule's
+    ``.wat`` source compiled and ran as a provider. The contract is a binary component, so the text
+    parser (and core modules) are unneeded untrusted-input surface. Checked on the exact bytes that
+    are then compiled, so nothing else reaches Wasmtime.
+    """
+    if component[:4] != _WASM_MAGIC or component[6:8] != _COMPONENT_LAYER:
+        raise RuntimeError("component is not a binary Component Model artifact")
+
+
+def _controlled_errors() -> tuple[type[BaseException], ...]:
+    """Exceptions main() turns into a controlled rejection (one line on stderr, exit 1).
+
+    Anything else escapes as an uncontrolled traceback; the component fuzzer
+    (tests/fuzz_wasmtime_components.py) uses this same tuple and reports any other type as a finding.
+    """
+    try:
+        from wasmtime import WasmtimeError
+    except ImportError:
+        WasmtimeError = RuntimeError
+    return (WasmtimeError, RuntimeError, TypeError, ValueError, json.JSONDecodeError)
+
+
+def _execute(
+    component: bytes,
+    context_json: str,
+    checkpoint_json: str,
+    *,
+    max_fuel: int,
+    max_memory_bytes: int,
+    count_limits: dict[str, int],
+) -> dict[str, Any]:
+    """Compile, instantiate, and run one component; return its normalized outcome.
+
+    The single execution path: the worker's main() calls it, and so does the in-process arm of
+    the component fuzzer, so the fuzzer exercises exactly what runs in production.
+    """
+    from wasmtime import Engine, Store
+    from wasmtime.component import Component, Linker
+
+    _require_binary_component(component)
+    # Bound guest CPU with fuel (deterministic instruction budget), each linear memory
+    # with memory_size, and the NUMBER of instances/memories/tables/table elements, so
+    # a component cannot multiply the per-memory ceiling by declaring many memories
+    # (Section 9, #1). The worker process itself is capped by the OS (see main()).
+    engine = Engine(_engine_config(max_memory_bytes))
+    store = Store(engine)
+    store.set_fuel(max_fuel)
+    store.set_limits(memory_size=max_memory_bytes, **count_limits)
+    instance = Linker(engine).instantiate(store, Component(engine, component))
+    resume = instance.get_func(store, "resume")
+    if resume is None:
+        raise RuntimeError("component does not export resume")
+    result = resume(store, context_json, checkpoint_json)
+    resume.post_return(store)
+    return _normalize_outcome(result)
 
 
 def _engine_config(max_memory_bytes: int) -> Any:
