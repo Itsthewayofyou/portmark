@@ -1431,6 +1431,10 @@ class AgentHost:
             return
         try:
             floor.advance_heads(pending)
+        except SecurityError:
+            # A floor refusal (e.g. `forked`: the floor already holds a DIFFERENT head for that
+            # sequence) is a divergence, not an I/O problem -- keep its own code and message.
+            raise
         except Exception as error:
             raise SecurityError(
                 f"audit floor is behind committed heads and cannot be advanced ({error}); refusing new work "

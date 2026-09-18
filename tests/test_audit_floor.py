@@ -653,6 +653,36 @@ class AuditFloorAttackTests(unittest.TestCase):
         self.d.host()  # writable again: a restart recovers the lag
         self.assertEqual(self.d.verify_cli(first.task_id)[1]["floor_status"], "anchored")
 
+    def test_a_pending_head_that_forks_the_floor_is_reported_as_a_fork(self):
+        host = self.d.host()
+        envelope, first = start_task(host)
+        head_hash, sequence = self.d.store().audit_head(first.task_id)
+        host._floor_pending[first.task_id] = ("not-the-witnessed-head", sequence)
+        with self.assertRaises(FloorError) as raised:
+            resume(host, envelope)
+        self.assertEqual(raised.exception.code, FORKED)
+
+    def test_the_cli_passes_the_floor_path_to_the_host(self):
+        # config -> merged_with_args -> make_host(audit_floor_path=...): a CLI-started host must not
+        # silently run floorless.
+        argv = ["portmark", "--host-id", HOST, "--store-path", str(self.d.store_path), "--trust-registry-path", str(self.d.registry_path),
+                "--audit-floor-path", str(self.d.floor_path), "demo", "cli floor"]
+        stdout = io.StringIO()
+        with patch.dict(os.environ, self.d.env()), patch.object(sys, "argv", argv), redirect_stdout(stdout), redirect_stderr(io.StringIO()):
+            cli_main()
+        task_id = json.loads(stdout.getvalue())["task_id"]
+        body = LocalFloorWitness(self.d.floor_path, HOST, self.d.signer, self.d.signer).load()
+        self.assertIsNotNone(body, "the CLI-started host ran without its audit floor")
+        self.assertEqual(body["registry"]["version"], 1)
+        head_hash, sequence = self.d.store().audit_head(task_id)
+        self.assertEqual(body["tasks"][task_id], {"sequence": sequence, "head_hash": head_hash})
+        stdout = io.StringIO()
+        with patch.dict(os.environ, {**self.d.env(), "PORTMARK_AUDIT_FLOOR_PATH": str(self.d.floor_path)}), \
+                patch.object(sys, "argv", argv[:7] + ["demo", "env floor"]), redirect_stdout(stdout), redirect_stderr(io.StringIO()):
+            cli_main()
+        env_task = json.loads(stdout.getvalue())["task_id"]
+        self.assertIn(env_task, LocalFloorWitness(self.d.floor_path, HOST, self.d.signer, self.d.signer).load()["tasks"])
+
     def test_crash_after_the_floor_advance_needs_no_recovery(self):
         host = self.d.host()
         envelope, first = start_task(host)
@@ -696,6 +726,7 @@ class AuditFloorAttackTests(unittest.TestCase):
         host = self.d.host()
         _, kept = start_task(host, "in the backup")
         backup = self.d.snapshot("nightly")
+        epoch_one_floor = self.d.floor_path.read_bytes()
         _, lost = start_task(host, "after the backup")
         self.d.restore(backup)
         self.assertBootRefused("rolled-back")
@@ -719,7 +750,9 @@ class AuditFloorAttackTests(unittest.TestCase):
         self.assertIn(kept.task_id, body["tasks"])
         self.assertNotIn(lost.task_id, body["tasks"])
         self.assertEqual(self.d.verify_cli(kept.task_id)[1]["floor_status"], "anchored")
-        # An OLD floor put back after the reset is refused (epoch mismatch).
+        # The OLD (epoch 1) floor put back after the reset is refused, not trusted.
+        self.d.floor_path.write_bytes(epoch_one_floor)
+        self.assertBootRefused("epoch-mismatch", self.d.registry_host)
 
     # -- configuration guards ---------------------------------------------------------------------
     def test_floor_configuration_guards(self):
