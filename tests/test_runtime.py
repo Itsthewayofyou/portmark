@@ -13,6 +13,7 @@ import logging
 import os
 import platform
 import secrets
+import shutil
 import sqlite3
 import subprocess  # nosec B404
 import sys
@@ -361,7 +362,31 @@ def _respond_json(payload_bytes):
     return behavior
 
 
+def _warm_node_binary() -> None:
+    """Start the node binary once before any Node-path test runs.
+
+    Observed in CI (postgres-store, the one job that had no setup-node step, which runs node itself):
+    the FIRST Node test of the run hit its 2.0 s PRODUCTION deadline (exactly 2.00 s), sometimes the
+    second too, while every later Node test in the same run took about 0.03 s. That pattern is a
+    one-time start-up cost charged to whichever Node test runs first -- most likely the ~100 MiB
+    binary and its libraries being read cold from disk (not reliably reproducible locally). Warming
+    here keeps each deadline assertion about the capsule, not about process start-up; no deadline
+    or check changes.
+    """
+    node = shutil.which("node")
+    if node:
+        subprocess.run(  # nosec B603 - fixed argv (resolved node binary), no shell, no input
+            [node, "--version"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=120, check=False,
+        )
+
+
 class RuntimeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        _warm_node_binary()
+
     def test_demo_completes_with_audited_tool_call(self):
         host = make_host()
         result = host.run(make_demo_envelope(host, "research Telescript"))

@@ -6,6 +6,21 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### CI: fix the recurring Node-deadline flake in postgres-store
+
+- `test_real_wasm_capsule_completes_inside_deadline_limited_sandbox` (and on one run
+  `test_wasm_component_malformed_missing_timeout_and_oversized_outputs_are_rejected`) failed
+  intermittently, only in `postgres-store`, always as the first Node start of the run (exactly
+  2.00 s, the production deadline), while later Node tests in the same run took about 0.03 s.
+  `postgres-store` was the only job without `setup-node`: it ran the Node tests on the runner
+  image's own Node, with the first start paying a one-time start-up cost inside a test deadline.
+- The job now installs the same pinned Node 24 as every other job, and `RuntimeTests` starts
+  `node --version` once in `setUpClass`, so no test pays process start-up inside its deadline.
+  **No deadline, timeout, or assertion changed**, and the production 2.0 s Node deadline is
+  untouched.
+- The earlier hypothesis that Section 8 PR 4's bounded-drain threads caused it was ruled out by
+  measurement: under load, decisions take 126 ms (before PR 4) vs 129 ms (after).
+
 ### Section 9 — native Wasmtime sandbox (PR 3): cross-platform proof (finding #4, CI)
 
 - **The real Wasmtime engine now runs in CI on Linux x86-64, Linux ARM64, Windows, and macOS**
