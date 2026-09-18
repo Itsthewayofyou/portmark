@@ -3879,24 +3879,89 @@ class RuntimeTests(unittest.TestCase):
                     self.assertEqual((wrong_usage.status, wrong_usage.anchor_status), ("invalid", "invalid"))
                     self.assertIn("usage-violation", wrong_usage.reason)
 
-    def test_pre_section_10_migration_anchor_still_verifies_as_legacy(self):
-        # A chain written before Section 10 has the 3-field anchor. It must keep verifying (no
-        # hash-version bump: the recompute uses the stored details), reported as legacy-anchor.
-        source_signer, destination_signer = self._migration_signers("legacy-anchor")
+    @contextmanager
+    def _migrated_chain_with_anchor(self, prefix, rewrite_anchor):
+        # A REAL destination chain (hashed and head-signed by the destination) whose event-0
+        # anchor was written by `rewrite_anchor` -- e.g. a pre-Section-10 host's 3-field anchor.
+        source_signer, destination_signer = self._migration_signers(prefix)
         original_audit_start = AgentHost._audit_start
 
-        def legacy_audit_start(host, envelope, original_task_id):
+        def audit_start(host, envelope, original_task_id):
             previous_hash, start, anchor = original_audit_start(host, envelope, original_task_id)
-            if anchor is not None:
-                anchor = {key: anchor[key] for key in ("previous_audit_hash", "previous_audit_sequence", "previous_audit_host_id")}
-            return previous_hash, start, anchor
+            return previous_hash, start, (rewrite_anchor(anchor) if anchor is not None else None)
 
         with self._sqlite_dual_store_case(source_signer, destination_signer) as (backend, source_store, destination_store):
-            with patch.object(AgentHost, "_audit_start", legacy_audit_start):
+            with patch.object(AgentHost, "_audit_start", audit_start):
                 _, _, second = self._migrate_once(backend, source_store, destination_store, source_signer, destination_signer)
+            yield destination_store, second, source_signer, destination_signer
+
+    @staticmethod
+    def _legacy_anchor(anchor):
+        return {key: anchor[key] for key in ("previous_audit_hash", "previous_audit_sequence", "previous_audit_host_id")}
+
+    def test_legacy_migration_anchor_is_unverifiable_by_default_and_valid_only_with_the_override(self):
+        # A chain written before Section 10 has the 3-field anchor: no source proof to re-check.
+        # Secure default: unverifiable (CLI exit 2). The compatibility override accepts it as valid
+        # but keeps anchor_status legacy-anchor and says the proof was NOT reverified. No hash-format
+        # bump is needed: the recompute uses the stored details.
+        with self._migrated_chain_with_anchor("legacy-anchor", self._legacy_anchor) as (store, second, _, _):
             self.assertNotIn("previous_audit_signature", second.audit[0]["details"]["migration"])
-            legacy = destination_store.verify_audit_chain_status(second.task_id)
-            self.assertEqual((legacy.status, legacy.anchor_status), ("valid", "legacy-anchor"), legacy.reason)
+            refused = store.verify_audit_chain_status(second.task_id)
+            self.assertEqual((refused.status, refused.anchor_status), ("unverifiable", "legacy-anchor"), refused.reason)
+            self.assertIn("cannot be independently reverified", refused.reason)
+            self.assertFalse(store.verify_audit_chain(second.task_id))
+            allowed = store.verify_audit_chain_status(second.task_id, allow_legacy_anchor=True)
+            self.assertEqual((allowed.status, allowed.anchor_status), ("valid", "legacy-anchor"), allowed.reason)
+            self.assertIn("NOT independently reverified", allowed.reason)
+            self.assertNotEqual(allowed.anchor_status, "verified")
+
+    def test_verify_audit_cli_refuses_legacy_anchor_by_default_and_warns_on_the_override(self):
+        with self._migrated_chain_with_anchor("legacy-cli", self._legacy_anchor) as (store, second, source_signer, destination_signer):
+            registry_path = Path(store.path).parent / "trust.json"
+            registry_path.write_text(json.dumps({"identities": [
+                {
+                    "key_id": signer.key_id,
+                    "issuer": signer.issuer,
+                    "public_key_b64": base64.urlsafe_b64encode(signer.public_key_bytes()).decode("ascii").rstrip("="),
+                    "allowed_audiences": ["*"],
+                }
+                for signer in (source_signer, destination_signer)
+            ]}), encoding="utf-8")
+            argv = ["portmark", "--store-path", str(store.path), "--trust-registry-path", str(registry_path), "verify-audit", "--task-id", second.task_id]
+
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with patch.object(sys, "argv", argv), redirect_stdout(stdout), redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as raised:
+                    cli_main()
+            self.assertEqual(raised.exception.code, 2)
+            report = json.loads(stdout.getvalue())
+            self.assertEqual((report["status"], report["anchor_status"]), ("unverifiable", "legacy-anchor"))
+            self.assertEqual(stderr.getvalue(), "")
+
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with patch.object(sys, "argv", argv + ["--allow-legacy-anchor"]), redirect_stdout(stdout), redirect_stderr(stderr):
+                cli_main()  # exit 0: no SystemExit
+            report = json.loads(stdout.getvalue())  # stdout stays ONE valid JSON document
+            self.assertEqual((report["status"], report["anchor_status"]), ("valid", "legacy-anchor"))
+            self.assertIn("NOT independently reverified", report["reason"])
+            self.assertIn("WARNING: --allow-legacy-anchor is a temporary migration-compatibility mode", stderr.getvalue())
+
+    def test_override_never_rescues_a_partial_or_malformed_anchor(self):
+        # Partial modern proofs (a real, destination-signed chain) stay invalid, exit 1, even with
+        # the override: the flag covers only COMPLETE pre-Section-10 anchors.
+        partials = {
+            "missing-signature": lambda anchor: {k: v for k, v in anchor.items() if k != "previous_audit_signature"},
+            "proof-only-key-id": lambda anchor: {**self._legacy_anchor(anchor), "previous_audit_signature_key_id": anchor["previous_audit_signature_key_id"]},
+            "legacy-bad-sequence": lambda anchor: {**self._legacy_anchor(anchor), "previous_audit_sequence": True},
+            "legacy-extra-key": lambda anchor: {**self._legacy_anchor(anchor), "note": "x"},
+            "modern-extra-key": lambda anchor: {**anchor, "note": "unsigned-by-source"},
+        }
+        for label, rewrite in partials.items():
+            with self.subTest(anchor=label):
+                with self._migrated_chain_with_anchor(f"partial-{label}", rewrite) as (store, second, _, _):
+                    for allow in (False, True):
+                        result = store.verify_audit_chain_status(second.task_id, allow_legacy_anchor=allow)
+                        self.assertEqual((result.status, result.anchor_status), ("invalid", "invalid"), result.reason)
 
     def test_stripping_the_anchor_proof_from_a_real_chain_is_tamper_not_legacy(self):
         # Legacy tolerance must not be a downgrade path: removing the proof fields from a real
@@ -3917,9 +3982,10 @@ class RuntimeTests(unittest.TestCase):
                     "UPDATE audit_events SET details_json = ? WHERE task_id = ? AND sequence = 0",
                     (json.dumps(details), second.task_id),
                 )
-            stripped = destination_store.verify_audit_chain_status(second.task_id)
-            self.assertEqual((stripped.status, stripped.reason), ("invalid", "audit event hash is invalid"))
-            self.assertNotEqual(stripped.anchor_status, "legacy-anchor")
+            for allow in (False, True):
+                stripped = destination_store.verify_audit_chain_status(second.task_id, allow_legacy_anchor=allow)
+                self.assertEqual((stripped.status, stripped.reason), ("invalid", "audit event hash is invalid"))
+                self.assertNotEqual(stripped.anchor_status, "legacy-anchor")
 
     def test_in_memory_store_reverifies_the_migration_anchor(self):
         source_signer, destination_signer = self._migration_signers("anchor-memory")
@@ -3959,8 +4025,9 @@ class RuntimeTests(unittest.TestCase):
         for field in ("previous_audit_task_id", "previous_audit_signature_key_id", "previous_audit_signature", "previous_audit_hash"):
             with self.subTest(missing=field):
                 partial = {key: value for key, value in anchor.items() if key != field}
-                result = _check_migration_anchor(registry, head_ok, {"migration": partial})
-                self.assertEqual((result.status, result.anchor_status), ("invalid", "invalid"), result.reason)
+                for allow in (False, True):
+                    result = _check_migration_anchor(registry, head_ok, {"migration": partial}, allow)
+                    self.assertEqual((result.status, result.anchor_status), ("invalid", "invalid"), result.reason)
         for bad_sequence in (True, 0, "3"):
             with self.subTest(sequence=bad_sequence):
                 result = _check_migration_anchor(registry, head_ok, {"migration": {**anchor, "previous_audit_sequence": bad_sequence}})

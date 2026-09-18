@@ -131,7 +131,9 @@ internally consistent histories are not `valid`.
   and signature. Verification re-checks that source signature against the trust registry, so an auditor
   with only the destination database can re-validate the handoff. `anchor_status` reports `none` (not a
   migration), `verified`, `legacy-anchor` (written before this proof was kept; hash, sequence, and host
-  only), or `invalid`. The source signs its handoff head in the v1 format (no signing time), so if the
+  only), or `invalid`. A `legacy-anchor` is `unverifiable` by default (CLI exit 2); the temporary
+  compatibility flag `verify-audit --allow-legacy-anchor` accepts a complete one as `valid` without
+  reverifying the source proof (see SIGNING_KEYS.md). Partial or malformed anchors are always `invalid`. The source signs its handoff head in the v1 format (no signing time), so if the
   source key is revoked later, the anchor reports `invalid`: it cannot be shown to predate the revocation.
 - **What this does not prove.** Verification checks the database against itself and the trust registry.
   It does not know whether a NEWER head once existed: restoring an older, internally consistent database

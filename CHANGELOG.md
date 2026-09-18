@@ -18,7 +18,14 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   the head hash, sequence, and host. `verify-audit` re-verifies that source signature against the
   trust registry (for the `migration` purpose), so an auditor with only the destination database can
   re-validate the handoff. New `anchor_status` in the result and CLI output: `none`, `verified`,
-  `legacy-anchor` (older 3-field anchors keep verifying, no hash-format change), or `invalid`.
+  `legacy-anchor`, or `invalid`. No hash-format change.
+- **Secure default for old anchors (auditor round 2, Low/Policy).** A pre-Section-10 3-field anchor
+  has no source proof, so it is now `status: unverifiable` (CLI exit 2), not `valid`.
+  `verify-audit --allow-legacy-anchor` is a TEMPORARY compatibility override: a complete legacy anchor
+  becomes `valid` (exit 0) but keeps `anchor_status: legacy-anchor`, its `reason` says the source proof
+  was not reverified, and a warning goes to stderr (stdout stays valid JSON). It is never relabelled
+  `verified`, and it never rescues a partial or malformed anchor: an anchor must have exactly the legacy
+  key set or exactly the full key set, with well-formed values, or it is `invalid` (exit 1).
   `evaluate_audit_head` gains `required_usage` (default `audit`). A source key revoked after the handoff
   makes the anchor `invalid`: the v1 handoff head has no signing time to prove it came first.
 - **RUNTIME_STORAGE.md was stale (Low, #5).** It said SQLite schema v3; the code is at SQLite 11 and

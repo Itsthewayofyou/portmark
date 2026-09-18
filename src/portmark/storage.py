@@ -241,7 +241,7 @@ class RuntimeStore(Protocol):
     def audit_head(self, task_id: str) -> tuple[str, int] | None:
         ...
 
-    def verify_audit_chain_status(self, task_id: str) -> AuditVerificationResult:
+    def verify_audit_chain_status(self, task_id: str, allow_legacy_anchor: bool = False) -> AuditVerificationResult:
         ...
 
     def verify_audit_chain(self, task_id: str) -> bool:
@@ -617,7 +617,7 @@ class InMemoryRuntimeStore:
                 return None
             return head["head_hash"], head["sequence"]
 
-    def verify_audit_chain_status(self, task_id: str) -> AuditVerificationResult:
+    def verify_audit_chain_status(self, task_id: str, allow_legacy_anchor: bool = False) -> AuditVerificationResult:
         with self._lock:
             events = self._audit_events.get(task_id, [])
             head = self._audit_heads.get(task_id)
@@ -635,7 +635,7 @@ class InMemoryRuntimeStore:
             if head["head_hash"] != previous or head["sequence"] != len(events):
                 return AuditVerificationResult("invalid", "stored audit head does not match audit events")
             head_result = _verify_head_signature(self._audit_head_verifier, task_id, head)
-            return _check_migration_anchor(self._audit_head_verifier, head_result, events[0]["details"])
+            return _check_migration_anchor(self._audit_head_verifier, head_result, events[0]["details"], allow_legacy_anchor)
 
     def verify_audit_chain(self, task_id: str) -> bool:
         return self.verify_audit_chain_status(task_id).valid
@@ -1311,7 +1311,7 @@ class SQLiteRuntimeStore:
             row = connection.execute("SELECT head_hash, sequence FROM audit_heads WHERE task_id = ?", (task_id,)).fetchone()
             return (row["head_hash"], int(row["sequence"])) if row is not None else None
 
-    def verify_audit_chain_status(self, task_id: str) -> AuditVerificationResult:
+    def verify_audit_chain_status(self, task_id: str, allow_legacy_anchor: bool = False) -> AuditVerificationResult:
         with self._connection() as connection:
             # Section 10 F3: read the events and the head from ONE snapshot. The connection is
             # autocommit (isolation_level=None), so without an explicit transaction each SELECT
@@ -1364,7 +1364,7 @@ class SQLiteRuntimeStore:
                 "signed_at": head["signed_at"],
             },
         )
-        return _check_migration_anchor(self._audit_head_verifier, head_result, first_details)
+        return _check_migration_anchor(self._audit_head_verifier, head_result, first_details, allow_legacy_anchor)
 
     def verify_audit_chain(self, task_id: str) -> bool:
         return self.verify_audit_chain_status(task_id).valid
@@ -1884,7 +1884,7 @@ class PostgresRuntimeStore:
             row = connection.execute("SELECT head_hash, sequence FROM audit_heads WHERE task_id = %s", (task_id,)).fetchone()
             return (row["head_hash"], int(row["sequence"])) if row is not None else None
 
-    def verify_audit_chain_status(self, task_id: str) -> AuditVerificationResult:
+    def verify_audit_chain_status(self, task_id: str, allow_legacy_anchor: bool = False) -> AuditVerificationResult:
         psycopg, _, _, _ = _postgres_modules()
         with self._connect() as connection:
             # Section 10 F3: READ COMMITTED takes a new snapshot per statement, so a writer
@@ -1939,7 +1939,7 @@ class PostgresRuntimeStore:
                 "signed_at": head["signed_at"],
             },
         )
-        return _check_migration_anchor(self._audit_head_verifier, head_result, first_details)
+        return _check_migration_anchor(self._audit_head_verifier, head_result, first_details, allow_legacy_anchor)
 
     def verify_audit_chain(self, task_id: str) -> bool:
         return self.verify_audit_chain_status(task_id).valid
@@ -2374,11 +2374,24 @@ def _verify_head_signature(verifier: AuditHeadVerifier | None, task_id: str, hea
     return AuditVerificationResult(status, evaluation.detail, head_status=evaluation.head_status)
 
 
-# The source proof a Section 10 anchor carries in addition to the pre-Section-10 fields.
+# The anchor a pre-Section-10 host wrote (exactly these keys), and the source proof a Section 10
+# anchor carries in addition. Any other key set is malformed, never "legacy".
+_LEGACY_ANCHOR_FIELDS = ("previous_audit_hash", "previous_audit_sequence", "previous_audit_host_id")
 _ANCHOR_PROOF_FIELDS = ("previous_audit_task_id", "previous_audit_signature_key_id", "previous_audit_signature")
 
+LEGACY_ANCHOR_REFUSED_REASON = (
+    "migration anchor predates the kept source proof (legacy-anchor): the source signature cannot be "
+    "independently reverified; pass --allow-legacy-anchor only to accept it for migration compatibility"
+)
+LEGACY_ANCHOR_ALLOWED_REASON = (
+    "legacy migration anchor accepted by --allow-legacy-anchor: the source proof was NOT independently "
+    "reverified (compatibility mode, not an equivalent security mode)"
+)
 
-def _check_migration_anchor(verifier: AuditHeadVerifier | None, head_result: AuditVerificationResult, first_details: Any) -> AuditVerificationResult:
+
+def _check_migration_anchor(
+    verifier: AuditHeadVerifier | None, head_result: AuditVerificationResult, first_details: Any, allow_legacy_anchor: bool = False
+) -> AuditVerificationResult:
     """Re-verify a migration anchor from this database alone (Section 10 F2).
 
     A migration admission records the source's signed audit head in event 0's details
@@ -2387,19 +2400,24 @@ def _check_migration_anchor(verifier: AuditHeadVerifier | None, head_result: Aud
     that the SOURCE's proof is still authentic under the current trust registry. The source
     signed a v1 head for the "migration" purpose, so it is evaluated under the v1 historical
     policy with that usage: a source key revoked since is reported, not silently accepted.
+
+    A complete pre-Section-10 anchor (exactly the three legacy keys, well formed) carries no
+    proof to re-check. It is `unverifiable` by default; `allow_legacy_anchor` accepts it as
+    `valid` for migration compatibility, but it is never relabelled `verified`. The flag never
+    rescues a partial or malformed anchor: those are `invalid`.
     """
     if not head_result.valid:
         return head_result
     anchor = first_details.get("migration") if isinstance(first_details, dict) else None
     if anchor is None:
         return replace(head_result, anchor_status="none")
-    if not isinstance(anchor, dict):
-        return AuditVerificationResult("invalid", "migration anchor is malformed", head_result.head_status, "invalid")
-    if not any(field in anchor for field in _ANCHOR_PROOF_FIELDS):
-        return replace(head_result, anchor_status="legacy-anchor")
+    if not isinstance(anchor, dict) or set(anchor) not in (set(_LEGACY_ANCHOR_FIELDS), set(_LEGACY_ANCHOR_FIELDS + _ANCHOR_PROOF_FIELDS)):
+        return AuditVerificationResult("invalid", "migration anchor proof is incomplete or malformed", head_result.head_status, "invalid")
+    is_legacy = set(anchor) == set(_LEGACY_ANCHOR_FIELDS)
     head_hash = anchor.get("previous_audit_hash")
     sequence = anchor.get("previous_audit_sequence")
-    strings = (head_hash, anchor.get("previous_audit_host_id"), *(anchor.get(field) for field in _ANCHOR_PROOF_FIELDS))
+    fields = _LEGACY_ANCHOR_FIELDS if is_legacy else _LEGACY_ANCHOR_FIELDS + _ANCHOR_PROOF_FIELDS
+    strings = [anchor.get(field) for field in fields if field != "previous_audit_sequence"]
     if (
         not all(isinstance(value, str) and value for value in strings)
         or not isinstance(sequence, int)
@@ -2407,6 +2425,10 @@ def _check_migration_anchor(verifier: AuditHeadVerifier | None, head_result: Aud
         or sequence <= 0
     ):
         return AuditVerificationResult("invalid", "migration anchor proof is incomplete or malformed", head_result.head_status, "invalid")
+    if is_legacy:
+        if allow_legacy_anchor:
+            return AuditVerificationResult("valid", LEGACY_ANCHOR_ALLOWED_REASON, head_result.head_status, "legacy-anchor")
+        return AuditVerificationResult("unverifiable", LEGACY_ANCHOR_REFUSED_REASON, head_result.head_status, "legacy-anchor")
     if verifier is None:  # unreachable: a valid head_result required a verifier
         return AuditVerificationResult("unverifiable", "trust registry is not configured", head_result.head_status, "unverifiable")
     # debt: v1-only anchor payload (correct because host.py signs the migration handoff head
