@@ -6,6 +6,35 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Section 9 follow-up: malformed-component fuzz campaign
+
+- **New `tests/fuzz_wasmtime_components.py`**, deterministic (seeded), in two parts:
+  - an **in-process part**, thousands of cases per second, through the exact function the worker
+    runs (`_execute`, which the worker's `main()` now calls);
+  - an **end-to-end part**, through `NativeWasmtimeComponentProvider` and the real worker.
+  - Inputs: the real capsule and 11 structured hostile seeds (import, re-exported import, too many
+    memories, wrong `resume` signature, endless start, trapping start, huge memory, huge table, core
+    module, no `resume`, non-JSON outcome), damaged by 10 mutators (bit flips, boundary bytes,
+    truncation, insert, delete, duplicate, LEB128 length bombs, splice, swap, header damage).
+  - Rules checked: only controlled error types; no worker crash signal; no traceback or native
+    panic text reaching the host; inside the deadline; no stdout on failure; no leftover worker;
+    decisions only for offered tools.
+  - A **coverage check** fails a corpus that mostly dies at the header, and every case is reported
+    by the stage where it stopped.
+  - It runs in the `native-wasmtime` CI job on all four platforms (3000 + 30 cases).
+- **Finding, fixed: the native provider accepted WebAssembly TEXT.** `wasmtime.component.Component`
+  also parses the `.wat` text format, so the capsule's source compiled and ran as a provider. The
+  worker now refuses anything that is not a **binary Component Model artifact** (Wasm magic +
+  component layer) before any Wasmtime parser runs. This is not an integrity bypass (the signed
+  digest still pins the exact bytes), but it removed an unneeded untrusted-input parser. Core
+  modules are now refused at the same check, earlier than before.
+- Campaign result after the fix: 3 seeds × 20,000 in-process cases + 140 end-to-end cases, **0
+  findings**, with cases reaching every stage (decode, limits, link, guest run, export, call, outcome,
+  successful run).
+- Test support: the fake-wasmtime tests now prefix their made-up component bytes with a real binary
+  component header, so each one still reaches the check it names (one of them would otherwise have
+  passed for the wrong reason).
+
 ### CI: fix the recurring Node-deadline flake in postgres-store
 
 - `test_real_wasm_capsule_completes_inside_deadline_limited_sandbox` (and on one run

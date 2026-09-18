@@ -39,6 +39,12 @@ example. The default `capsules/research-agent.wasm.b64` file is a core Wasm
 module for the Node runner and native Wasmtime rejects it with a component
 parser error.
 
+The native provider accepts **only a binary Component Model artifact**: the bytes must start with
+the WebAssembly magic (`\0asm`) and carry the component layer marker. The WebAssembly text format
+(`.wat` source) and core modules are refused before any Wasmtime parser runs. Wasmtime itself would
+also accept text, which is extra untrusted-input surface that Portmark does not need; the
+malformed-component fuzz campaign (`tests/fuzz_wasmtime_components.py`) found this.
+
 ### Native Wasmtime resource limits
 
 Wasmtime applies its memory limit to **each linear memory separately**, not to their total. The

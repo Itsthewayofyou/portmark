@@ -87,6 +87,10 @@ WASM_TIMEOUT = "AGFzbQEAAAABCQFgBH9/f38BfgMCAQAFAwEAAQcTAgZtZW1vcnkCAAZyZXN1bWUA
 WASM_FORBIDDEN_IMPORT = "AGFzbQEAAAABDAJgAABgBH9/f38BfgIJAQNlbnYBeAAAAwIBAQUDAQABBxMCBm1lbW9yeQIABnJlc3VtZQABCgYBBABCAAs="
 WASM_MISSING_RESUME = "AGFzbQEAAAAFAwEAAQcKAQZtZW1vcnkCAA=="
 HAS_REAL_WASMTIME = importlib.util.find_spec("wasmtime") is not None
+# The runner refuses anything that is not a BINARY Component Model artifact (fuzz finding), so
+# fake-wasmtime tests put this real header in front of their made-up component bytes; the fake
+# Component strips it again, so each test still reaches the check it is about.
+FAKE_COMPONENT_HEADER = b"\x00asm\x0d\x00\x01\x00"
 
 
 def _requires_enforced_worker_cap(test):
@@ -8004,6 +8008,7 @@ class RuntimeTests(unittest.TestCase):
                     "import time",
                     "class Component:",
                     "    def __init__(self, engine, wasm):",
+                    "        wasm = bytes(wasm)[8:]  # strip the binary component header",
                     "        if wasm == b'import':",
                     "            raise RuntimeError('imports are not linked')",
                     "        self.wasm = wasm",
@@ -8074,7 +8079,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertNotIn("PORTMARK_SIGNING_KEY", env)
 
     def test_native_wasmtime_provider_uses_component_api_in_isolated_worker(self):
-        component = b"native-component"
+        component = FAKE_COMPONENT_HEADER + b"native-component"
         with self._fake_wasmtime_runtime():
             provider = NativeWasmtimeComponentProvider(component)
             decision = provider.decide(provider_view(AgentState("task", "goal")), ("catalog.search",))
@@ -8136,28 +8141,29 @@ class RuntimeTests(unittest.TestCase):
             provider.decide(provider_view(AgentState("task", "goal")), ("catalog.search",))
 
         core_provider = NativeWasmtimeComponentProvider(base64.b64decode(WASM_TOOL_REQUEST))
-        with self.assertRaisesRegex(RuntimeError, "component parser|parse a wasm module"):
+        # A core module is now refused BEFORE any Wasmtime parser runs (binary-component check).
+        with self.assertRaisesRegex(RuntimeError, "not a binary Component Model artifact"):
             core_provider.decide(provider_view(AgentState("task", "goal")), ("catalog.search",))
 
     def test_native_wasmtime_provider_rejects_unlinkable_or_missing_resume_components(self):
         with self._fake_wasmtime_runtime():
-            provider = NativeWasmtimeComponentProvider(b"import")
+            provider = NativeWasmtimeComponentProvider(FAKE_COMPONENT_HEADER + b"import")
             with self.assertRaisesRegex(RuntimeError, "native Wasmtime component rejected"):
                 provider.decide(provider_view(AgentState("task", "goal")), ("catalog.search",))
 
         with self._fake_wasmtime_runtime():
-            provider = NativeWasmtimeComponentProvider(b"missing-resume")
+            provider = NativeWasmtimeComponentProvider(FAKE_COMPONENT_HEADER + b"missing-resume")
             with self.assertRaisesRegex(RuntimeError, "native Wasmtime component rejected"):
                 provider.decide(provider_view(AgentState("task", "goal")), ("catalog.search",))
 
     def test_native_wasmtime_provider_enforces_timeout_and_output_limit(self):
         with self._fake_wasmtime_runtime(sleep_seconds=2):
-            provider = NativeWasmtimeComponentProvider(b"slow", timeout=0.1)
+            provider = NativeWasmtimeComponentProvider(FAKE_COMPONENT_HEADER + b"slow", timeout=0.1)
             with self.assertRaisesRegex(RuntimeError, "execution deadline"):
                 provider.decide(provider_view(AgentState("task", "goal")), ("catalog.search",))
 
         with self._fake_wasmtime_runtime(content="x" * 1024):
-            provider = NativeWasmtimeComponentProvider(b"large", max_output_bytes=128)
+            provider = NativeWasmtimeComponentProvider(FAKE_COMPONENT_HEADER + b"large", max_output_bytes=128)
             with self.assertRaisesRegex(RuntimeError, "output limit|rejected"):
                 provider.decide(provider_view(AgentState("task", "goal")), ("catalog.search",))
 
@@ -8364,7 +8370,7 @@ class RuntimeTests(unittest.TestCase):
 
         real_launch = tools_module._launch_windows_job_tree
         with self._fake_wasmtime_runtime():
-            provider = NativeWasmtimeComponentProvider(b"native-component", timeout=10.0)
+            provider = NativeWasmtimeComponentProvider(FAKE_COMPONENT_HEADER + b"native-component", timeout=10.0)
             with patch.object(tools_module, "_launch_windows_job_tree", wraps=real_launch) as spy:
                 decision = provider.decide(provider_view(AgentState("task", "goal")), ("catalog.search",))
         self.assertEqual(decision.tool, "catalog.search")
@@ -8432,14 +8438,14 @@ class RuntimeTests(unittest.TestCase):
         # run: a saturated host fails closed on time instead of queueing past the timeout.
         slots = threading.BoundedSemaphore(1)
         with self._fake_wasmtime_runtime(), patch("portmark.providers._WASMTIME_WORKER_SLOTS", slots):
-            provider = NativeWasmtimeComponentProvider(b"native-component", timeout=0.3)
+            provider = NativeWasmtimeComponentProvider(FAKE_COMPONENT_HEADER + b"native-component", timeout=0.3)
             self.assertTrue(slots.acquire(blocking=False))  # another decision holds the only slot
             started = time.monotonic()
             with self.assertRaisesRegex(RuntimeError, "capacity exhausted before the execution deadline"):
                 provider.decide(provider_view(AgentState("task", "goal")), ("catalog.search",))
             self.assertLess(time.monotonic() - started, 1.5)
             slots.release()
-            generous = NativeWasmtimeComponentProvider(b"native-component", timeout=10.0)
+            generous = NativeWasmtimeComponentProvider(FAKE_COMPONENT_HEADER + b"native-component", timeout=10.0)
             decision = generous.decide(provider_view(AgentState("task", "goal")), ("catalog.search",))
             self.assertEqual(decision.tool, "catalog.search")
             self.assertTrue(slots.acquire(blocking=False), "a finished decision must release its slot")
@@ -8606,6 +8612,72 @@ class RuntimeTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(json.loads(result.stdout), expected)
 
+    # ---- Section 9 follow-up: malformed-component fuzz campaign (tests/fuzz_wasmtime_components.py) ----
+
+    @unittest.skipUnless(HAS_REAL_WASMTIME, "requires portmark[wasmtime]")
+    @_requires_enforced_worker_cap
+    def test_real_native_wasmtime_refuses_webassembly_text_components(self):
+        # Fuzz finding: wasmtime.component.Component also parses the WebAssembly TEXT format, so the
+        # capsule's .wat SOURCE compiled and ran as a provider. The contract is a binary component;
+        # anything without the binary magic + component layer is refused before any Wasmtime parser.
+        root = Path(__file__).parents[1]
+        text_capsule = (root / "capsules" / "research-agent.component.wat").read_bytes()
+        view = provider_view(AgentState("task", "goal"))
+        for label, component in (("text capsule", text_capsule), ("minimal text", b"(component)")):
+            with self.subTest(case=label):
+                with self.assertRaisesRegex(RuntimeError, "not a binary Component Model artifact"):
+                    NativeWasmtimeComponentProvider(component).decide(view, ("catalog.search",))
+        binary = base64.b64decode((root / "capsules" / "research-agent.component.wasm.b64").read_bytes().strip())
+        self.assertEqual(NativeWasmtimeComponentProvider(binary).decide(view, ("catalog.search",)).tool,
+                         "catalog.search")  # the same capsule in binary form still runs
+
+    @unittest.skipUnless(HAS_REAL_WASMTIME, "requires portmark[wasmtime]")
+    def test_real_native_wasmtime_component_fuzz_smoke_campaign_finds_nothing(self):
+        # A small slice of the campaign (the CI native-wasmtime job runs a larger one per platform).
+        import fuzz_wasmtime_components as fuzz
+
+        inproc = fuzz.run_inproc_arm(400)
+        self.assertEqual(inproc["findings"], [])
+        self.assertEqual(fuzz.coverage_findings(inproc["records"]), [])
+        e2e = fuzz.run_e2e_arm(6)
+        self.assertEqual(e2e["findings"], [])
+
+    def test_component_fuzz_oracles_can_fail(self):
+        # A checker that never fails proves nothing: each oracle must flag its bad input.
+        import fuzz_wasmtime_components as fuzz
+
+        self.assertEqual(fuzz.check_inproc_record({"i": 1, "outcome": "ok", "seconds": 0.01}), [])
+        self.assertTrue(fuzz.check_inproc_record({"i": 1, "outcome": "uncontrolled", "type": "KeyError"}))
+        self.assertTrue(fuzz.check_inproc_record({"i": 1, "outcome": "controlled", "seconds": 9.0}))
+        self.assertEqual(fuzz.check_e2e_result("ok", 0.1, 2.0, RuntimeError("rejected"), None,
+                                               {"returncode": 1, "stdout": b""}), [])
+        cases = {
+            "leaked type": (0.1, KeyError("x"), None, {"returncode": 1, "stdout": b""}),
+            "traceback text": (0.1, RuntimeError("Traceback (most recent call last): ..."), None, None),
+            "native panic": (0.1, RuntimeError("thread 'main' panicked at src/lib.rs"), None, None),
+            "crash signal": (0.1, RuntimeError("rejected"), None, {"returncode": -11, "stdout": b""}),
+            "over deadline": (9.0, RuntimeError("rejected"), None, None),
+            "stdout on failure": (0.1, RuntimeError("rejected"), None, {"returncode": 1, "stdout": b"{}"}),
+            "tool not offered": (0.1, None, ProviderDecision("tool", "payments.reserve", {}), None),
+        }
+        for label, (elapsed, error, decision, run) in cases.items():
+            with self.subTest(case=label):
+                self.assertTrue(fuzz.check_e2e_result(label, elapsed, 2.0, error, decision, run))
+        header_only = [{"stage": "header"}] * 10
+        self.assertTrue(fuzz.coverage_findings(header_only))
+
+    @unittest.skipUnless(HAS_REAL_WASMTIME, "requires portmark[wasmtime]")
+    def test_real_native_wasmtime_component_fuzz_detects_a_crashing_child_and_resumes(self):
+        # Calibration of the crash path: the child aborts (a stand-in for a native crash) at case 20;
+        # the campaign must report exactly that case and still run the cases after it.
+        import fuzz_wasmtime_components as fuzz
+
+        result = fuzz.run_inproc_arm(40, abort_at=20)
+        died = [finding for finding in result["findings"] if "child died" in finding]
+        self.assertEqual(len(died), 1, result["findings"])
+        self.assertIn("case 20", died[0])
+        self.assertEqual(max(record["i"] for record in result["records"]), 39)
+
     @unittest.skipUnless(sys.platform == "win32", "Windows Job Object memory limit")
     def test_windows_job_process_memory_limit_refuses_allocation_past_the_ceiling(self):
         # Section 9 #1 on Windows: the worker's OS ceiling is the Job Object's per-process memory
@@ -8628,7 +8700,7 @@ class RuntimeTests(unittest.TestCase):
         with self._fake_wasmtime_runtime():
             capsule = tempfile.NamedTemporaryFile(delete=False)
             try:
-                capsule.write(b"native-component")
+                capsule.write(FAKE_COMPONENT_HEADER + b"native-component")
                 capsule.close()  # Windows cannot reopen an open NamedTemporaryFile by name
                 host = make_host(
                     wasm_component=capsule.name,
