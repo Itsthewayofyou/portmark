@@ -19,7 +19,11 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
 - **Only real byte buffers are accepted.** The copy uses `memoryview`, not plain `bytes(value)`:
   `bytes(5)` silently yields five zero bytes and `bytes([1, 2])` accepts a list of ints. The buffer
   must also be one-dimensional with one-byte items, so an `array('i', ...)` is not reinterpreted as
-  its raw memory. A non-bytes component (int, bool, str, list, int array) is now refused with `RuntimeError("Wasm component must be
+  its raw memory. The input-size cap is checked on the view **before** the copy (review round 2), so
+  an oversized buffer no longer forces a second full-size allocation before it is rejected; the view
+  is held across check and copy, which locks a `bytearray` against resizing in between. A released
+  `memoryview` gets the same controlled error instead of an incidental `ValueError`. A non-bytes
+  component (int, bool, str, list, int array, released view) is now refused with `RuntimeError("Wasm component must be
   bytes-like")` instead of an incidental `TypeError`. `from_file` paths were never affected
   (`_read_component_file` returns immutable `bytes`).
 - Tests: mutate-after-construction for both providers with `bytearray` and `memoryview` (the bytes

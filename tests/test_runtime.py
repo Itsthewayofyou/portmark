@@ -8174,6 +8174,45 @@ class RuntimeTests(unittest.TestCase):
                         else:
                             NativeWasmtimeComponentProvider(value)
 
+    def test_wasm_providers_reject_oversized_buffer_before_copying_it(self):
+        # PR #78 review: the size cap must apply BEFORE the private copy, or an oversized buffer
+        # forces a second full-size allocation first. Measured, not mocked: peak allocation
+        # during construction must stay far below the buffer size.
+        import tracemalloc
+
+        from portmark.providers import WasmDecisionProvider
+
+        oversized = bytearray(8 * 1024 * 1024)
+        builders = {
+            "node": lambda: WasmDecisionProvider(oversized, max_component_bytes=1),
+            "wasmtime": lambda: NativeWasmtimeComponentProvider(oversized, max_component_bytes=1),
+        }
+        for name, build in builders.items():
+            with self.subTest(provider=name):
+                tracemalloc.start()
+                try:
+                    with patch("portmark.providers.shutil.which", return_value="/usr/bin/node"):
+                        with self.assertRaisesRegex(RuntimeError, "input limit"):
+                            build()
+                    _current, peak = tracemalloc.get_traced_memory()
+                finally:
+                    tracemalloc.stop()
+                self.assertLess(peak, 1024 * 1024)
+
+    def test_wasm_providers_reject_released_memoryview_with_controlled_error(self):
+        from portmark.providers import WasmDecisionProvider
+
+        for name in ("node", "wasmtime"):
+            with self.subTest(provider=name):
+                released = memoryview(bytearray(b"component"))
+                released.release()
+                with self.assertRaisesRegex(RuntimeError, "bytes-like"):
+                    if name == "node":
+                        with patch("portmark.providers.shutil.which", return_value="/usr/bin/node"):
+                            WasmDecisionProvider(released)
+                    else:
+                        NativeWasmtimeComponentProvider(released)
+
     @unittest.skipUnless(HAS_REAL_WASMTIME, "requires portmark[wasmtime]")
     def test_real_native_wasmtime_runs_signed_bytes_after_caller_mutates_buffer(self):
         # End to end through the host's signed-manifest digest check (host.py): mutate the

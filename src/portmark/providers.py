@@ -392,26 +392,34 @@ def _provider_decision(value: Any) -> ProviderDecision:
     raise SecurityError("provider response kind is not supported")
 
 
-def _freeze_component(component: Any) -> bytes:
+def _freeze_component(component: Any, max_component_bytes: int) -> bytes:
     """Take an immutable private copy of the component bytes (Section 9, finding #2).
 
     The provider publishes ``component_digest`` once, and the host checks it against the signed
     manifest (host.py), but the bytes are read again on every ``decide``. Keeping the caller's
     object let a mutable ``bytearray`` change after construction, so the code that ran was not the
-    code the signed digest names. Freeze FIRST, then size-check, hash, and execute that one copy.
+    code the signed digest names. Freeze FIRST, then hash and execute that one copy.
 
     ``memoryview`` accepts only buffer objects. Plain ``bytes(value)`` is NOT a safe freeze:
     ``bytes(5)`` silently yields five zero bytes and ``bytes([1, 2])`` accepts a list of ints.
     The buffer must also be one-dimensional with one-byte items, so an ``array('i', ...)`` or a
-    multi-dimensional buffer is refused instead of being reinterpreted as its raw memory.
+    multi-dimensional buffer is refused instead of being reinterpreted as its raw memory. A
+    released memoryview raises ``ValueError`` and is refused the same way.
+
+    The size limit is checked on the view BEFORE the copy (PR #78 review): copying first let an
+    oversized buffer force a second full-size allocation before the input cap applied. The view is
+    held across the check and the copy, which locks a ``bytearray`` against resizing in between.
     """
     try:
         view = memoryview(component)
-    except TypeError as error:
+    except (TypeError, ValueError) as error:
         raise RuntimeError("Wasm component must be bytes-like") from error
-    if view.ndim != 1 or view.itemsize != 1:
-        raise RuntimeError("Wasm component must be bytes-like")
-    return bytes(view)
+    with view:
+        if view.ndim != 1 or view.itemsize != 1:
+            raise RuntimeError("Wasm component must be bytes-like")
+        if view.nbytes > max_component_bytes:
+            raise RuntimeError("Wasm component exceeds input limit")
+        return bytes(view)
 
 
 def _read_component_file(path: str, max_component_bytes: int) -> bytes:
@@ -588,9 +596,7 @@ class WasmDecisionProvider(ModelProvider):
         node = shutil.which("node")
         if not node:
             raise RuntimeError("Node.js is required to execute WebAssembly capsules")
-        component = _freeze_component(component)
-        if len(component) > max_component_bytes:
-            raise RuntimeError("Wasm component exceeds input limit")
+        component = _freeze_component(component, max_component_bytes)
         self._node = node
         self._component = component
         self._timeout = timeout
@@ -653,9 +659,7 @@ class NativeWasmtimeComponentProvider(ModelProvider):
         max_fuel: int = DEFAULT_WASM_FUEL,
         max_memory_bytes: int = DEFAULT_WASM_MEMORY_BYTES,
     ) -> None:
-        component = _freeze_component(component)
-        if len(component) > max_component_bytes:
-            raise RuntimeError("Wasm component exceeds input limit")
+        component = _freeze_component(component, max_component_bytes)
         if max_fuel < 1:
             raise RuntimeError("max_fuel must be positive")
         if max_memory_bytes < 1:
