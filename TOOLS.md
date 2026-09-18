@@ -158,9 +158,10 @@ the host's error names the key that failed to combine.
 
 Tool return values are stored in the full local checkpoint, but the host applies
 the grant's `output_projection` before the state reaches **any** provider — a
-remote adapter and an in-process provider alike. A provider reading
-`state.memory["tool_results"]` therefore sees only the projected fields, never
-the full stored result:
+remote adapter and an in-process provider alike. Every provider receives a
+canonical `ProviderView` (Section 8 finding #2), not the live state, so a provider
+reading `view.tool_results` therefore sees only the projected fields, never the
+full stored result:
 
 - omit `output_projection`, or set it to `[]`, to share no tool output
 - use field names such as `["id", "title"]` for dict outputs or lists of dicts

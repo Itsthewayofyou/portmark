@@ -1,50 +1,71 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import MappingProxyType
 from typing import Any
 
-from .models import AgentState, ToolGrant
+from .models import AgentState, ProviderView, ToolGrant
 
 
-def project_state_for_provider(state: AgentState, grants: tuple[ToolGrant, ...] = ()) -> AgentState:
-    # Host-enforced projection (finding #4). A grant's output_projection is the ceiling
-    # on what tool output may reach the provider, and it was bypassable: an in-process
-    # provider that reads state.memory["tool_results"] directly saw fields the grant
-    # withheld, because only the adapter path (provider_state / messages) applied it.
-    # Enforce it here too, on the same effective.grants the adapter path uses.
-    # `grant.output_projection or ()` matches project_tool_messages below and fails
-    # closed: an omitted projection is share-nothing, because the host policy is the
-    # ceiling and normalizes its own omitted projection to () before the intersection
-    # (see HostPolicy effective-permit construction, finding #1) -- so an effective
-    # grant here is never None. A tool with no grant is dropped entirely. Each granted
-    # tool's KEY is kept with a reduced value (never dropped), so a provider's
-    # `"tool" not in results` re-proposal guard still fires exactly once. The real state
-    # is untouched: this is a copy, and the host keeps the full tool_results for its own
-    # bookkeeping.
+def _detach(value: Any) -> Any:
+    """Deep-copy into json-safe PLAIN containers so nothing reachable from the view aliases
+    the caller's live objects (Section 8 finding #2). A shallow copy is not enough:
+    `project_tool_output` returns the live object verbatim under a `*` projection, so a
+    top-level copy alone would still leave `view.tool_results[k] is
+    state.memory["tool_results"][k]`. dict/proxy -> new dict, list/tuple -> new list,
+    scalars (immutable) as-is. Values stay PLAIN (not proxies) on purpose: a provider may
+    echo tool output straight into its own decision content, which the host then
+    json-serializes, and json.dumps raises on MappingProxyType. The view's read-only-ness
+    is enforced at the TOP level in `provider_view` (a tuple of messages, a MappingProxyType
+    of tool_results); the deep copy -- not deep immutability -- is what removes every alias
+    to live host state, which is the actual finding."""
+    if isinstance(value, (dict, MappingProxyType)):
+        return {key: _detach(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_detach(item) for item in value]
+    return value
+
+
+def provider_view(state: AgentState, grants: tuple[ToolGrant, ...] = ()) -> ProviderView:
+    """Build the canonical, detached, immutable view every provider receives (finding #2).
+
+    Replaces `project_state_for_provider`, which handed the in-process provider a whole
+    mutable `AgentState` with the host's `memory` bookkeeping still aliased. This projects
+    tool output ONCE per grant (the same reduction the wire path uses) and exposes it in
+    both shapes -- `tool_results` (in-process) and `messages` (remote) -- then recursively
+    detaches both so no reachable object is shared with the live `state`. `memory`,
+    `checkpoint_generation` and `result` are dropped entirely.
+
+    The re-proposal semantic is preserved: a granted tool with a share-nothing projection
+    keeps a PRESENT but falsy `tool_results[name] == {}` (via `project_tool_output(dict, ())`),
+    so a provider's `"tool" not in results` guard still fires exactly once -- identical to the
+    old provider path. A tool with no grant is dropped. Any non-dict `tool_results` shape
+    fails closed to `{}`, never crossing to the provider unprojected."""
     projections = {grant.name: (grant.output_projection or ()) for grant in grants}
-    raw_results = state.memory.get("tool_results")
-    projected_memory = dict(state.memory)
-    # Fail closed, same as project_state_for_migration: tool_results is ALWAYS replaced
-    # when present, never passed through. A well-formed dict is projected per grant; any
-    # other shape (list/string/number/null -- e.g. a captured or crafted wire state) is
-    # dropped to {} rather than reaching the provider unprojected.
-    if "tool_results" in projected_memory:
-        projected_memory["tool_results"] = {
-            name: project_tool_output(result, projections[name])
-            for name, result in raw_results.items()
-            if name in projections
-        } if isinstance(raw_results, dict) else {}
-    return replace(
-        state,
-        memory=projected_memory,
-        messages=project_tool_messages(state.messages, grants),
+    raw_results = state.memory.get("tool_results") if isinstance(state.memory, dict) else None
+    projected_results = {
+        name: project_tool_output(result, projections[name])
+        for name, result in raw_results.items()
+        if name in projections
+    } if isinstance(raw_results, dict) else {}
+    return ProviderView(
+        task_id=state.task_id,
+        goal=state.goal,
+        step=state.step,
+        tool_calls=state.tool_calls,
+        status=state.status,
+        migrated="migration" in state.memory if isinstance(state.memory, dict) else False,
+        # Top-level read-only wrappers over deeply-detached plain data: a tuple of
+        # messages (no .append) and a MappingProxyType of tool_results (no key add/remove).
+        messages=tuple(_detach(message) for message in project_tool_messages(state.messages, grants)),
+        tool_results=MappingProxyType({name: _detach(result) for name, result in projected_results.items()}),
     )
 
 
 def project_state_for_migration(state: AgentState, grants: tuple[ToolGrant, ...] = ()) -> AgentState:
     # Host-enforced payload confidentiality on migration (section 4 #6). A tool's
     # output_projection is the confidentiality ceiling on what that tool's output may
-    # reveal, and the provider path enforces it (project_state_for_provider). But a
+    # reveal, and the provider path enforces it (provider_view). But a
     # migration sealed the FULL raw state, so a tool's withheld fields crossed the trust
     # boundary to the destination HOST inside both memory["tool_results"] and the tool
     # messages -- bypassing the ceiling entirely. Apply the SAME ceiling here, to the
@@ -54,7 +75,7 @@ def project_state_for_migration(state: AgentState, grants: tuple[ToolGrant, ...]
     # per-destination projection: the payload is reduced to that destination's
     # entitlement by construction.
     #
-    # This differs from project_state_for_provider in one deliberate way: NON-tool
+    # This differs from the provider view (provider_view) in one deliberate way: NON-tool
     # messages (user/assistant turns) are kept in full, because the destination RESUMES
     # the task and needs the conversation, whereas the provider projection rebuilds a
     # prompt and drops them. The confidentiality ceiling governs tool OUTPUT, which is
@@ -102,14 +123,22 @@ def project_state_for_migration(state: AgentState, grants: tuple[ToolGrant, ...]
     return replace(state, memory=projected_memory, messages=projected_messages)
 
 
-def provider_state(state: AgentState, grants: tuple[ToolGrant, ...] = ()) -> dict[str, Any]:
+def provider_state(view: ProviderView) -> dict[str, Any]:
+    """Json-serializable wire dict for the remote adapters (HTTP / Wasm) -- a FAITHFUL
+    serialization of every ProviderView field, so an in-process provider and a remote
+    adapter receive the SAME canonical view and cannot make adapter-dependent decisions
+    (Section 8 finding: cross-adapter consistency). `_detach` keeps container values plain,
+    but the view's top-level `tool_results` is a MappingProxyType (json.dumps raises on
+    that), so it is unwrapped with `dict(...)`; `messages` is a tuple of plain dicts."""
     return {
-        "task_id": state.task_id,
-        "goal": state.goal,
-        "step": state.step,
-        "tool_calls": state.tool_calls,
-        "status": state.status,
-        "messages": project_tool_messages(state.messages, grants),
+        "task_id": view.task_id,
+        "goal": view.goal,
+        "step": view.step,
+        "tool_calls": view.tool_calls,
+        "status": view.status,
+        "migrated": view.migrated,
+        "messages": list(view.messages),
+        "tool_results": dict(view.tool_results),
     }
 
 

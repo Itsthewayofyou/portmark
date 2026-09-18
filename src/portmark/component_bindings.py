@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .models import AgentState, ProviderDecision, ToolGrant
-from .projection import provider_state, project_tool_messages
+from .models import ProviderDecision, ProviderView
+from .projection import provider_state
 
 
 WIT_PACKAGE = "portmark:agent@1.0.0"
@@ -12,20 +12,21 @@ WIT_WORLD = "portmark"
 WIT_ABI = "portmark-json-lowered-v1"
 
 
-def component_context(state: AgentState, available_tools: tuple[str, ...], grants: tuple[ToolGrant, ...] = ()) -> dict[str, Any]:
+def component_context(view: ProviderView, available_tools: tuple[str, ...]) -> dict[str, Any]:
     return {
         "wit": {"package": WIT_PACKAGE, "world": WIT_WORLD, "abi": WIT_ABI},
-        "state": provider_state(state, grants),
+        "state": provider_state(view),
         "available_tools": list(available_tools),
     }
 
 
-def component_checkpoint(state: AgentState, grants: tuple[ToolGrant, ...] = ()) -> dict[str, Any]:
+def component_checkpoint(view: ProviderView) -> dict[str, Any]:
+    # `messages` is projected + detached inside the view; `_plain` un-proxies it for json.
     return {
-        "task_id": state.task_id,
-        "step": state.step,
-        "tool_calls": state.tool_calls,
-        "messages": project_tool_messages(state.messages, grants),
+        "task_id": view.task_id,
+        "step": view.step,
+        "tool_calls": view.tool_calls,
+        "messages": list(view.messages),
     }
 
 

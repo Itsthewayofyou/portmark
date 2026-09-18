@@ -6,6 +6,48 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Section 8 — provider boundary (PR 2): canonical detached ProviderView
+
+- **BREAKING API — providers now receive a `ProviderView`, not `AgentState`.** `ModelProvider.decide`
+  changed from `decide(self, state: AgentState, available_tools, grants=())` to
+  `decide(self, view: ProviderView, available_tools)`. `ProviderView` is a frozen dataclass carrying only
+  `task_id, goal, step, tool_calls, status, migrated, messages, tool_results` — third-party in-process
+  providers must update their signature and read `view.tool_results` / `view.goal` instead of
+  `state.memory[...]`.
+- **BREAKING API — `grants` is no longer passed to `decide`.** The host applies every grant's projection
+  when it builds the view; a provider never receives grants, so it cannot widen its own projection.
+  `provider_state(view)` and `component_context(view, available_tools)` / `component_checkpoint(view)`
+  changed signatures accordingly, and `projection.project_state_for_provider` was **removed**.
+- **Fixes finding #2 (High): the in-process provider was over-exposed AND could mutate live host state.**
+  The old path handed the in-process provider a whole mutable `AgentState` (via a shallow-copying
+  `project_state_for_provider`), so it saw host bookkeeping in `memory` — `approvals`,
+  `used_approval_ids`, `migration` — that the remote adapters never got, and could corrupt the host's
+  live state through aliased nested containers (e.g. `state.memory["used_approval_ids"].clear()`,
+  defeating replay prevention). The canonical view **drops `memory` entirely** (closing the
+  over-exposure) and is **deeply detached** into plain, json-safe copies (closing the mutation — no
+  object reachable from the view aliases live state, even under a `*` output projection). Top-level
+  containers are read-only (a `tuple` of messages, a `MappingProxyType` of tool_results) and the
+  dataclass is frozen. `checkpoint_generation` (store-owned) and `result` (host-owned) are dropped too.
+- **`migrated` replaces raw `memory["migration"]` inspection.** A provider that needs to know it resumed
+  after a migration reads the single derived boolean `view.migrated` (present iff the host set
+  `memory["migration"]`), instead of the old leak of the whole `memory` dict.
+- No behavior change to what a well-behaved provider decides: tool-output projection and the
+  share-nothing "present-but-empty" re-proposal semantic are preserved.
+- **Cross-adapter consistency (audit follow-up, Medium).** `provider_state` — the json wire payload for
+  the HTTP/Wasm adapters — now serializes EVERY `ProviderView` field, including `migrated` and
+  `tool_results` (which earlier drafts dropped). Previously the in-process provider read `migrated` /
+  `tool_results` while the wire omitted them and re-derived tool output from `messages`, so a crafted
+  state whose `memory` and `messages` disagreed could make adapters decide differently (re-migration /
+  tool re-proposal). Every adapter now receives a faithful serialization of the same view. `WIT_ABI` is
+  unchanged (`portmark-json-lowered-v1`); the two fields are additive to the component input.
+- **Malformed message list can no longer strand a checkpoint (audit follow-up, Medium).** A validly
+  signed envelope whose `state.messages` contains a non-dict entry (e.g. `[42]`) used to be admitted and
+  then crash view construction with `AttributeError`, leaving the checkpoint `running` (view construction
+  was outside the provider-failure boundary). The host now rejects a non-dict-shaped messages list at
+  admission with `SecurityError` — before the first persist, so nothing is stored — and, defense in depth,
+  builds the view inside the terminalization boundary so any view-construction error closes the task to a
+  durable `failed` checkpoint instead of stranding it.
+
 ### Section 8 — provider boundary (PR 1): HTTP transport safety (SSRF / redirects / DNS-rebinding / total deadline)
 
 - **`GenericHttpProvider` no longer follows redirects and validates the endpoint address.** The provider

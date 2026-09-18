@@ -10,7 +10,7 @@ from typing import Any
 
 from .metrics import RuntimeMetrics
 from .models import AgentEnvelope, ApprovalToken, AttestationEvidence, ProviderDecision, RunResult
-from .projection import project_state_for_migration, project_state_for_provider
+from .projection import project_state_for_migration, provider_view
 from .providers import ModelProvider
 from .security import _MIGRATION_RECEIPT_FIELDS, _OPTIONAL_MIGRATION_RECEIPT_FIELDS, AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, MigrationAttesterProtocol, SecurityError, arguments_hash, audit_head_payload, canonical_json, effect_id, migration_envelope_digest, migration_receipt_payload, verified_approval_token
 from .storage import InMemoryRuntimeStore, RuntimeStore
@@ -379,6 +379,10 @@ class AgentHost:
             raise SecurityError("signed manifest pins a component digest but the provider exposes none to verify")
 
         state = envelope.state
+        # Section 8 (terminalization): reject a malformed messages list BEFORE any persist,
+        # for fresh / resume / migration alike, so a non-dict message entry cannot be
+        # admitted and then crash view construction outside the failure boundary.
+        self._require_wellformed_messages(state)
         # Finding EV-008: fresh-vs-resume and replay protection come from the durable
         # store's checkpoint generation, not from caller-supplied state.status. A task
         # with no stored checkpoint is a fresh run: it must carry generation 0 and it
@@ -480,10 +484,13 @@ class AgentHost:
             # -- in-process or a remote adapter -- can read them. Projection is enforced
             # here, not trusted to the adapter. The provider only reads the state to
             # decide; the host mutates the real state via _apply_decision below.
-            projected_state = project_state_for_provider(state, effective.grants)
             try:
+                # Build the view INSIDE the failure boundary too (defense in depth): even
+                # though admission now rejects a malformed messages list, any exception while
+                # constructing the view must terminalize the task, never strand it as running.
+                view = provider_view(state, effective.grants)
                 try:
-                    decision = provider.decide(projected_state, tool_names, effective.grants)
+                    decision = provider.decide(view, tool_names)
                 finally:
                     self.metrics.observe_duration("provider_decision_duration_seconds", time.monotonic() - decision_started)
             except Exception:
@@ -1185,6 +1192,20 @@ class AgentHost:
         audit.append("content.rejected", details)
         audit.append("agent.failed", state.result)
         return True, None
+
+    @staticmethod
+    def _require_wellformed_messages(state) -> None:
+        # Section 8 (terminalization). provider_view()/project_tool_messages iterate
+        # state.messages and call .get() on each entry, so a caller-supplied message that
+        # is NOT a dict -- e.g. a validly signed envelope carrying messages=[42] -- would
+        # raise AttributeError during view construction, AFTER admission, stranding the
+        # checkpoint as `running` (view construction is outside the provider-failure
+        # boundary). Reject a malformed messages list at the door, before the first
+        # persist, so nothing is stored. Only the SHAPE is checked (a list of dicts);
+        # message CONTENT is untrusted and projected/validated on the provider path.
+        messages = state.messages
+        if not isinstance(messages, list) or not all(isinstance(message, dict) for message in messages):
+            raise SecurityError("state.messages must be a list of message objects")
 
     @staticmethod
     def _require_nonnegative_counters(state) -> None:
