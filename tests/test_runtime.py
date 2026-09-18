@@ -943,7 +943,7 @@ class RuntimeTests(unittest.TestCase):
 
     def test_http_provider_rejects_malformed_response_shapes(self):
         cases = [
-            (b"{", "malformed JSON"),
+            (b"{", "malformed or unsafe JSON"),
             (b"[]", "JSON object"),
             (b"{}", "kind"),
             (b'{"kind":"unknown"}', "kind"),
@@ -3961,6 +3961,112 @@ class RuntimeTests(unittest.TestCase):
             self.assertIsNotNone(checkpoint)
             self.assertEqual(checkpoint["status"], "failed")  # durable terminal, not running
             self.assertTrue(store.verify_audit_chain(envelope.state.task_id))  # closed chain intact
+
+    def test_strict_json_rejects_duplicate_keys(self):
+        # Section 8 finding #4: a JSON object with duplicate keys parses silently last-wins in
+        # stdlib json -- an ambiguity a validator that inspects one copy can be bypassed through.
+        from portmark.json_guard import StrictJSONError, strict_json_loads
+        with self.assertRaisesRegex(StrictJSONError, "duplicate object key"):
+            strict_json_loads('{"a": 1, "a": 2}')
+        with self.assertRaises(StrictJSONError):  # nested duplicate too
+            strict_json_loads('{"outer": {"b": 1, "b": 2}}')
+
+    def test_strict_json_depth_rejected_cleanly(self):
+        # Section 8 finding #4 (unbounded nesting). Adversarial depth must be a clean rejection.
+        # The C json scanner on modern CPython parses deep input iteratively, but (a) a pure-Python
+        # json build recurses and raises RecursionError, and (b) our OWN downstream processing of an
+        # admitted state -- projection._detach, canonical hashing, provider logic -- recurses, so an
+        # admitted 5000-deep document would drive THOSE into RecursionError. The depth pre-scan bounds
+        # nesting up front so the over-deep input never reaches any of them: a clean StrictJSONError,
+        # never a RecursionError leaking past a handler that only catches JSONDecodeError.
+        from portmark.json_guard import StrictJSONError, strict_json_loads
+        deep = "[" * 5000 + "]" * 5000
+        try:
+            strict_json_loads(deep)
+            self.fail("deep nesting was not rejected")
+        except RecursionError:
+            self.fail("depth guard let a RecursionError escape")
+        except StrictJSONError:
+            pass
+
+    def test_strict_json_scanner_string_edges(self):
+        # The string-aware scanner must NOT over-count: braces/brackets and escaped quotes INSIDE
+        # a string value are legitimate content and must parse, or the guard rejects real traffic.
+        from portmark.json_guard import strict_json_loads
+        self.assertEqual(strict_json_loads('{"a": "' + "{" * 200 + '"}'), {"a": "{" * 200})
+        self.assertEqual(strict_json_loads(r'{"a": "\\"}'), {"a": "\\"})
+        self.assertEqual(strict_json_loads(r'{"a": "\""}'), {"a": '"'})
+
+    def test_strict_json_invalid_utf8(self):
+        # An invalid-UTF-8 body must be a clean domain rejection, not a raw UnicodeDecodeError.
+        from portmark.json_guard import StrictJSONError, strict_json_loads
+        with self.assertRaisesRegex(StrictJSONError, "not valid UTF-8"):
+            strict_json_loads(b'\xff\xfe{"a": 1}')
+
+    def test_http_provider_rejects_unsafe_json(self):
+        # The HTTP decision decode goes through strict parsing: a duplicate-key or deeply-nested
+        # (but size-legal) response is a controlled SecurityError, not a silent accept or a crash.
+        from portmark.providers import GenericHttpProvider
+        from portmark.security import SecurityError
+        provider = GenericHttpProvider("https://provider.example/run")
+        for raw in (b'{"kind": "complete", "kind": "tool"}', b"[" * 100 + b"]" * 100):
+            with self.subTest(raw=raw[:16]):
+                with patch.object(provider, "_post", return_value=raw):
+                    with self.assertRaisesRegex(SecurityError, "malformed or unsafe JSON"):
+                        provider.decide(provider_view(AgentState("t", "g")), ())
+
+    def test_wasm_decision_rejects_unsafe_json(self):
+        # The Wasm component decision decode (Python side) goes through strict parsing too.
+        from portmark.component_bindings import decode_component_decision
+        for raw in ('{"outcome": "completed", "outcome": "tool"}', "[" * 100 + "]" * 100):
+            with self.subTest(raw=raw[:16]):
+                with self.assertRaisesRegex(RuntimeError, "malformed or unsafe decision JSON"):
+                    decode_component_decision(raw, ("catalog.search",))
+
+    def test_strict_json_rejects_non_finite_numbers(self):
+        # Section 8 finding #4 follow-up (Medium): stdlib json accepts NaN / Infinity / -Infinity
+        # (parse_constant) and overflows 1e999 to +inf (parse_float). Non-finite floats have no safe
+        # meaning across the boundary -- comparisons, constraints, and hashing disagree on them -- so
+        # the strict decoder must reject them, keyword and overflow forms alike, nested included.
+        from portmark.json_guard import StrictJSONError, strict_json_loads
+        for token in ("NaN", "Infinity", "-Infinity", "1e999", "[NaN]", '{"x": 1e999}', '{"a": [1, -Infinity]}'):
+            with self.subTest(token=token):
+                with self.assertRaises(StrictJSONError):
+                    strict_json_loads(token)
+        # legitimate finite floats still parse
+        self.assertEqual(strict_json_loads('{"a": 3.14, "b": [1, 2.0, -5.0]}'), {"a": 3.14, "b": [1, 2.0, -5.0]})
+
+    def test_strict_json_rejects_oversized_integer_as_domain_error(self):
+        # An integer past Python's int-string digit limit raises a bare ValueError inside json.loads,
+        # NOT a JSONDecodeError -- it must surface as StrictJSONError so a caller catching that one
+        # type is not bypassed by an uncaught ValueError.
+        from portmark.json_guard import StrictJSONError, strict_json_loads
+        with self.assertRaises(StrictJSONError):
+            strict_json_loads("1" + "0" * 5000)
+
+    def test_provider_decision_rejects_contradictory_or_unknown_fields(self):
+        # Section 8 finding #4 follow-up (Low): the auditor's exact payload -- a `complete` decision
+        # also carrying tool/arguments/destination/unknown -- must be rejected, not silently ignored.
+        from portmark.providers import _provider_decision
+        from portmark.security import SecurityError
+        with self.assertRaisesRegex(SecurityError, "unexpected fields"):
+            _provider_decision({"kind": "complete", "tool": "payments.reserve", "arguments": {"amount": 999}, "destination": "host:evil", "unknown": True})
+        # a tool decision may not carry a destination; a migrate may not carry a tool
+        with self.assertRaisesRegex(SecurityError, "unexpected fields"):
+            _provider_decision({"kind": "tool", "tool": "catalog.search", "destination": "host:x"})
+        with self.assertRaisesRegex(SecurityError, "unexpected fields"):
+            _provider_decision({"kind": "migrate", "destination": "host:x", "tool": "payments.reserve"})
+        # valid per-kind decisions still decode
+        self.assertEqual(_provider_decision({"kind": "complete", "content": {"ok": True}}).kind, "complete")
+        self.assertEqual(_provider_decision({"kind": "tool", "tool": "catalog.search", "arguments": {"q": 1}}).tool, "catalog.search")
+
+    def test_wasm_decision_rejects_unknown_fields(self):
+        # Equivalent strict schema on Wasm outcomes AND the nested request object.
+        from portmark.component_bindings import decode_component_decision
+        with self.assertRaisesRegex(RuntimeError, "unexpected fields"):
+            decode_component_decision('{"outcome": "completed", "request": {"name": "x"}, "destination": "host:evil", "unknown": true}', ("catalog.search",))
+        with self.assertRaisesRegex(RuntimeError, "unexpected fields"):
+            decode_component_decision('{"outcome": "tool", "request": {"name": "catalog.search", "arguments_json": "{}", "destination": "evil"}}', ("catalog.search",))
 
     @contextmanager
     def _three_store_context(self, backend):
@@ -7322,6 +7428,10 @@ class RuntimeTests(unittest.TestCase):
         try:
             cases = [
                 (b"{", {"Content-Type": "application/json"}, 400, -32700),
+                # Section 8 finding #4: unsafe-but-valid JSON must reject as a parse error (-32700),
+                # not silently last-wins (dup key) or crash with RecursionError (deep nesting).
+                (b'{"a": 1, "a": 2}', {"Content-Type": "application/json"}, 400, -32700),
+                (b"[" * 100 + b"]" * 100, {"Content-Type": "application/json"}, 400, -32700),
                 (json.dumps({"jsonrpc": "2.0", "id": "bad-method", "method": "tasks/get", "params": {}}).encode(), {"Content-Type": "application/json"}, 400, -32601),
                 (
                     json.dumps({
@@ -7940,7 +8050,7 @@ class RuntimeTests(unittest.TestCase):
     def test_wasm_component_malformed_missing_timeout_and_oversized_outputs_are_rejected(self):
         from portmark.providers import WasmDecisionProvider
         cases = [
-            (WASM_MALFORMED_JSON, {}, "malformed decision JSON"),
+            (WASM_MALFORMED_JSON, {}, "malformed or unsafe decision JSON"),
             (WASM_MISSING_RESUME, {}, "must export resume"),
             (WASM_TIMEOUT, {"timeout": 0.01}, "deadline"),
             (WASM_TOOL_REQUEST, {"max_output_bytes": 8}, "output limit"),
