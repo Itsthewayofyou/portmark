@@ -4080,7 +4080,12 @@ class RuntimeTests(unittest.TestCase):
         # touches PROD_MARKER and exits PROD_EXIT. The marker is the cut-off oracle: if the helper
         # killed it early, the marker never appears.
         script = (
-            "import os, sys\n"
+            "import os, sys, time\n"
+            # Sleep mode: never read stdin, just wait then exit. Used to prove a large stdin write
+            # cannot hold the caller past the deadline (the write must be off the main thread).
+            "if os.environ.get('PROD_SLEEP'):\n"
+            "    time.sleep(float(os.environ['PROD_SLEEP']))\n"
+            "    sys.exit(int(os.environ.get('PROD_EXIT', '0')))\n"
             "chunk = b'x' * 65536\n"
             # Echo mode: read stdin in chunks and write each straight to stdout, INTERLEAVED. This
             # is what makes a large stdin + large stdout deadlock when readers start after the stdin
@@ -4213,6 +4218,25 @@ class RuntimeTests(unittest.TestCase):
                 with patch("portmark.providers._run_bounded", return_value=ret):
                     with self.assertRaisesRegex(RuntimeError, expected):
                         provider.decide(view, ("catalog.search",))
+
+    def test_wasm_bounded_stdin_write_does_not_bypass_deadline(self):
+        # Round-2 finding (Medium): a large stdin write must NOT hold the caller past the deadline
+        # when the child never reads stdin (a wedged / failed-to-start runner). stdin is written on
+        # a supervised writer thread, so process.wait enforces the one absolute deadline even while
+        # the write blocks; the deadline kill closes the child's stdin read end, unblocking the
+        # writer. Neutralizing to a synchronous main-thread stdin write makes this block ~the
+        # child's sleep with timed_out=False (the bite: elapsed >> deadline).
+        from portmark.providers import _run_bounded
+        producer = self._write_producer()
+        request = b"z" * 4_000_000  # >> the OS pipe buffer, so a synchronous write blocks
+        env = dict(os.environ, PROD_SLEEP="5")  # child sleeps 5s WITHOUT reading stdin
+        start = time.monotonic()
+        rc, out, err, timed_out, overflowed = _run_bounded(
+            [sys.executable, producer], request, timeout=0.5, max_output_bytes=65_536, env=env
+        )
+        elapsed = time.monotonic() - start
+        self.assertTrue(timed_out, "deadline not enforced while the stdin write blocked")
+        self.assertLess(elapsed, 3.0, "stdin write bypassed the execution deadline")
 
     @contextmanager
     def _three_store_context(self, backend):

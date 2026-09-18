@@ -436,10 +436,15 @@ def _run_bounded(
     is retained only up to ``stderr_cap`` bytes but kept draining past it, so the pipe never
     blocks the child yet the retained error text cannot itself grow without bound.
 
-    Reader threads start BEFORE stdin is written: the stdin payload (base64 component + context)
-    far exceeds the OS pipe buffer, so writing first would deadlock -- host blocked writing stdin
-    while the child blocks writing stdout. One monotonic deadline bounds the whole call and every
-    wait derives its remaining budget from it, so no phase can re-spend the full timeout.
+    stdin is written on a dedicated WRITER thread, and readers start before it: the stdin payload
+    (base64 component + context) far exceeds the OS pipe buffer, so a synchronous write on the main
+    thread would (a) deadlock against the child's own blocked stdout write, and (b) -- if the child
+    never reads stdin (a wedged or failed-to-start runner) -- block the main thread past the
+    advertised deadline, since ``process.wait(timeout=...)`` is only reached AFTER the write returns.
+    With the write off the main thread, ``process.wait`` supervises the one absolute deadline for the
+    whole call; on expiry the process is killed, which closes the child's stdin read end so the
+    blocked writer unblocks with ``BrokenPipeError``. Every wait derives its budget from that one
+    deadline, so no phase can re-spend the full timeout.
 
     Returns ``(returncode, stdout_bytes, stderr_text, timed_out, overflowed)``.
 
@@ -491,18 +496,25 @@ def _run_bounded(
         except (OSError, ValueError):
             pass
 
+    def write_stdin() -> None:
+        stream = process.stdin
+        if stream is None:
+            return
+        try:
+            stream.write(request)
+            stream.close()
+        except (BrokenPipeError, OSError, ValueError):
+            # Child never read stdin / exited / was killed -> its read end closed; nothing to do.
+            pass
+
     out_reader = threading.Thread(target=drain_stdout, daemon=True)
     err_reader = threading.Thread(target=drain_stderr, daemon=True)
+    writer = threading.Thread(target=write_stdin, daemon=True)
     timed_out = False
     try:
         out_reader.start()
         err_reader.start()
-        if process.stdin is not None:
-            try:
-                process.stdin.write(request)
-                process.stdin.close()
-            except (BrokenPipeError, OSError):
-                pass
+        writer.start()
         try:
             process.wait(timeout=max(0.0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
@@ -513,11 +525,14 @@ def _run_bounded(
             except subprocess.TimeoutExpired:
                 pass
         # Flat grace, NOT deadline-derived: the process has exited (natural EOF, overflow kill, or
-        # confirmed timeout kill) so the readers are draining a closed pipe. A deadline-derived join
-        # could block far past the caller's budget on the overflow path, where the deadline may have
-        # plenty left (cf. the round-1 finding on waits that re-spend the full timeout).
+        # confirmed timeout kill), which closes both pipe ends -- so the readers are draining a
+        # closed pipe and the writer's blocked write has unblocked with BrokenPipeError. A
+        # deadline-derived join could block far past the caller's budget on the overflow path,
+        # where the deadline may have plenty left (cf. the round-1 finding on waits that re-spend
+        # the full timeout).
         out_reader.join(timeout=2.0)
         err_reader.join(timeout=2.0)
+        writer.join(timeout=2.0)
     finally:
         _kill_process(process)
         for stream in (process.stdin, process.stdout, process.stderr):

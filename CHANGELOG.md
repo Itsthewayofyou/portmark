@@ -17,8 +17,12 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   - **stderr is bounded independently** (retained up to 4 KiB but kept draining past it, so the pipe
     never blocks the child) — a multi-megabyte stderr can no longer flow unbounded into the
     "Wasm capsule rejected: …" error string;
-  - **reader threads start before stdin is written**, so a large stdin payload (base64 component +
-    context, well past the OS pipe buffer) concurrent with large stdout cannot deadlock;
+  - **stdin is written on a supervised writer thread** (reader threads start before it), so a large
+    stdin payload (base64 component + context, well past the OS pipe buffer) cannot deadlock against
+    the child's stdout write, and — the round-2 audit fix — a child that never reads stdin (a wedged
+    or failed-to-start runner) can no longer hold the caller past the deadline: `process.wait`
+    supervises the one absolute deadline even while the write blocks, and the deadline kill closes the
+    child's stdin read end so the writer unblocks with `BrokenPipeError`;
   - **one monotonic deadline** bounds the whole call; every wait derives its remaining budget from it,
     so no phase can re-spend the full timeout;
   - **overflow/deadline outcomes take precedence over the non-zero-exit branch** — an overflow kill
