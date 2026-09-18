@@ -6,6 +6,27 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Section 9 — native Wasmtime sandbox (PR 3): cross-platform proof (finding #4, CI)
+
+- **The real Wasmtime engine now runs in CI on Linux x86-64, Linux ARM64, Windows, and macOS**
+  (new `native-wasmtime` job, at the `wasmtime==48.0.0` release pin). Before, only Linux x86-64
+  ran it, and the Windows jobs did not install the extra. The old single-lane step is moved into
+  this job, not duplicated.
+- **Every lane asserts the same hand-derived results**, so the lanes agree with each other:
+  - the real capsule's decision vector at checkpoint lengths 0/119/120/4096, derived from the
+    `i32.lt_u 120` branch in `capsules/research-agent.component.wat`;
+  - canonical NaN `0x7fc00000`;
+  - deterministic relaxed SIMD from the spec (`relaxed_swizzle` out-of-range lane is 0, and
+    `relaxed_trunc` of NaN is 0). On x86-64 the native results are 2 and `0x80000000`.
+- **Each lane proves its platform's worker-cap outcome** and logs it: capped and running, or
+  blocked by default (the provider refuses; the explicit opt-out still runs the real capsule).
+  macOS is decided by the runtime self-check, not assumed. Tests that need a running capped
+  worker skip with a named reason where the engine is blocked by design.
+- **Wasmtime upgrade canary** (`.github/workflows/wasmtime-canary.yml`): weekly and on demand, the
+  same suite runs against the latest Wasmtime on x86-64 and ARM64. It is separate from CI and does
+  not block merges. A red canary means "decide before bumping the pin". A new proposal setter
+  surfaces there through the setter-completeness test.
+
 ### Section 9 — native Wasmtime sandbox (PR 2): real aggregate ceiling, bounded compilation, deterministic engine (findings #1, #3, #4)
 
 - **The native Wasmtime memory limit is no longer only per memory (finding #1, High).** Wasmtime

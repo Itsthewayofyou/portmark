@@ -1,4 +1,5 @@
 import copy
+import functools
 import asyncio
 import base64
 import concurrent.futures
@@ -10,6 +11,7 @@ import io
 import json
 import logging
 import os
+import platform
 import secrets
 import sqlite3
 import subprocess  # nosec B404
@@ -84,6 +86,24 @@ WASM_TIMEOUT = "AGFzbQEAAAABCQFgBH9/f38BfgMCAQAFAwEAAQcTAgZtZW1vcnkCAAZyZXN1bWUA
 WASM_FORBIDDEN_IMPORT = "AGFzbQEAAAABDAJgAABgBH9/f38BfgIJAQNlbnYBeAAAAwIBAQUDAQABBxMCBm1lbW9yeQIABnJlc3VtZQABCgYBBABCAAs="
 WASM_MISSING_RESUME = "AGFzbQEAAAAFAwEAAQcKAQZtZW1vcnkCAA=="
 HAS_REAL_WASMTIME = importlib.util.find_spec("wasmtime") is not None
+
+
+def _requires_enforced_worker_cap(test):
+    """Skip a real native-Wasmtime test where the engine is BLOCKED by design (Section 9 owner
+    decision: no enforceable OS memory ceiling -> the provider refuses to start). The blocked
+    behaviour itself is asserted, on every platform, by
+    test_real_native_wasmtime_platform_outcome_matches_cap_enforcement -- this only stops tests
+    that exercise a RUNNING capped worker from erroring where no such worker can exist."""
+
+    @functools.wraps(test)
+    def wrapper(self, *args, **kwargs):
+        from portmark.providers import _worker_memory_cap_enforceable
+
+        if not _worker_memory_cap_enforceable():
+            self.skipTest("native Wasmtime is blocked here: no enforceable worker memory ceiling")
+        return test(self, *args, **kwargs)
+
+    return wrapper
 HAS_REAL_A2A_SDK = importlib.util.find_spec("a2a") is not None
 
 
@@ -8038,6 +8058,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(decision.arguments, {"query": "from native wasmtime", "limit": 2})
 
     @unittest.skipUnless(HAS_REAL_WASMTIME, "requires portmark[wasmtime]")
+    @_requires_enforced_worker_cap
     def test_real_native_wasmtime_component_runs_and_resumes_from_projected_checkpoint(self):
         capsule = Path(__file__).parents[1] / "capsules" / "research-agent.component.wasm.b64"
         host = make_host(wasm_component=str(capsule), wasm_engine="wasmtime")
@@ -8049,6 +8070,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result.checkpoint["messages"][0]["content"][0]["title"], "Result 1 for from native component checkpoint")
 
     @unittest.skipUnless(HAS_REAL_WASMTIME, "requires portmark[wasmtime]")
+    @_requires_enforced_worker_cap
     def test_real_native_wasmtime_component_traps_on_exhausted_fuel_and_memory(self):
         # Finding #6: a native guest is bounded by fuel (CPU) and a memory limit,
         # not only the wall-clock. Proven with the benign capsule under tiny
@@ -8072,6 +8094,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(bytes(wat2wasm(source)), artifact)
 
     @unittest.skipUnless(HAS_REAL_WASMTIME, "requires portmark[wasmtime]")
+    @_requires_enforced_worker_cap
     def test_real_native_wasmtime_rejects_importing_component_after_component_parse(self):
         from wasmtime import wat2wasm
 
@@ -8214,6 +8237,7 @@ class RuntimeTests(unittest.TestCase):
                         NativeWasmtimeComponentProvider(released)
 
     @unittest.skipUnless(HAS_REAL_WASMTIME, "requires portmark[wasmtime]")
+    @_requires_enforced_worker_cap
     def test_real_native_wasmtime_runs_signed_bytes_after_caller_mutates_buffer(self):
         # End to end through the host's signed-manifest digest check (host.py): mutate the
         # caller's buffer after the provider is built; the ORIGINAL signed component must run.
@@ -8236,6 +8260,7 @@ class RuntimeTests(unittest.TestCase):
         return bytes(wat2wasm(f"(component (core module $m {core_body}) {instantiations})"))
 
     @unittest.skipUnless(HAS_REAL_WASMTIME, "requires portmark[wasmtime]")
+    @_requires_enforced_worker_cap
     def test_real_native_wasmtime_refuses_components_past_store_count_limits(self):
         # Section 9 #1: memory_size is PER MEMORY in Wasmtime, so a component could multiply it by
         # declaring many memories/instances (the auditor's 301-memory, 4 KiB component). The store
@@ -8255,6 +8280,7 @@ class RuntimeTests(unittest.TestCase):
                     provider.decide(provider_view(AgentState("task", "goal")), ("catalog.search",))
 
     @unittest.skipUnless(HAS_REAL_WASMTIME, "requires portmark[wasmtime]")
+    @_requires_enforced_worker_cap
     def test_real_native_wasmtime_admits_two_memories_grown_to_the_per_memory_cap(self):
         # The limits are a ceiling, not a ban: two memories (the default max) each grown to the full
         # 64 MiB per-memory cap still fit inside the 512 MiB worker ceiling. Reaching the export
@@ -8348,6 +8374,7 @@ class RuntimeTests(unittest.TestCase):
             providers_module._worker_memory_cap_enforceable.cache_clear()
 
     @unittest.skipUnless(HAS_REAL_WASMTIME and sys.platform != "win32", "requires portmark[wasmtime] on POSIX")
+    @_requires_enforced_worker_cap
     def test_real_native_wasmtime_worker_runs_under_the_requested_os_address_space_cap(self):
         # The cap is applied INSIDE the worker before the Engine is built, so compilation runs capped.
         # A 32 MiB cap leaves no room for an Engine: the worker must fail and emit no decision. The
@@ -8469,6 +8496,90 @@ class RuntimeTests(unittest.TestCase):
             _engine_config(64 * 1024 * 1024)
         self.assertIn("wasm_tail_call", proposals)  # the enumeration itself is not empty/broken
         self.assertEqual(sorted(proposals - assigned), [])
+
+    # ---- Section 9 PR 3: cross-platform proof (runs in every native-wasmtime CI lane) ----
+
+    @unittest.skipUnless(HAS_REAL_WASMTIME, "requires portmark[wasmtime]")
+    def test_real_native_wasmtime_platform_outcome_matches_cap_enforcement(self):
+        # Owner decision: native Wasmtime runs only under an ENFORCED OS memory ceiling. Each CI lane
+        # (Linux x86-64, Linux ARM64, Windows, macOS) proves whichever branch its platform takes, and
+        # the log line records which one -- so the macOS outcome is observed, not assumed.
+        from portmark import providers as providers_module
+
+        providers_module._worker_memory_cap_enforceable.cache_clear()
+        enforced = providers_module._worker_memory_cap_enforceable()
+        print(f"\n[platform-outcome] {sys.platform}/{platform.machine()}: worker cap enforced={enforced}")
+        capsule = base64.b64decode(
+            (Path(__file__).parents[1] / "capsules" / "research-agent.component.wasm.b64").read_bytes().strip()
+        )
+        if enforced:
+            provider = NativeWasmtimeComponentProvider(capsule)
+        else:
+            with self.assertRaisesRegex(RuntimeError, "enforceable OS memory ceiling"):
+                NativeWasmtimeComponentProvider(capsule)
+            provider = NativeWasmtimeComponentProvider(capsule, allow_uncapped_worker=True)
+        decision = provider.decide(provider_view(AgentState("task", "goal")), ("catalog.search",))
+        self.assertEqual(decision.tool, "catalog.search")
+
+    @unittest.skipUnless(HAS_REAL_WASMTIME, "requires portmark[wasmtime]")
+    def test_real_native_wasmtime_engine_config_makes_relaxed_simd_deterministic(self):
+        # Section 9 #4. Expected values are HAND-DERIVED from the WebAssembly spec's deterministic
+        # relaxed-SIMD semantics, not from running this code: relaxed_swizzle behaves as
+        # i8x16.swizzle (an index >= 16 selects 0), and relaxed_trunc_f32x4_s behaves as
+        # i32x4.trunc_sat_f32x4_s (NaN -> 0). Native x86-64 lowering instead yields 2 (the index is
+        # taken mod 16) and 0x80000000; native AArch64 already yields 0 and 0. Deterministic mode
+        # makes every architecture return the spec values.
+        from wasmtime import Engine, Instance, Module, Store, wat2wasm
+
+        from portmark.wasmtime_component_runner import _engine_config
+
+        engine = Engine(_engine_config(64 * 1024 * 1024))
+        store = Store(engine)
+        store.set_fuel(1_000_000)
+        exports = Instance(store, Module(engine, wat2wasm("""(module
+          (func (export "swizzle_out_of_range") (result i32)
+            (i8x16.extract_lane_u 0 (i8x16.relaxed_swizzle
+              (v128.const i8x16 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16)
+              (v128.const i8x16 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0))))
+          (func (export "trunc_nan") (param f32) (result i32)
+            (i32x4.extract_lane 0 (i32x4.relaxed_trunc_f32x4_s (f32x4.splat (local.get 0))))))""")), []).exports(store)
+        self.assertEqual(exports["swizzle_out_of_range"](store) & 0xFF, 0)
+        self.assertEqual(exports["trunc_nan"](store, float("nan")) & 0xFFFFFFFF, 0)
+
+    @unittest.skipUnless(HAS_REAL_WASMTIME, "requires portmark[wasmtime]")
+    def test_real_native_wasmtime_decision_vector_is_identical_on_every_platform(self):
+        # The same inputs must give the same decisions on every CI lane. The expected vector is
+        # HAND-DERIVED from capsules/research-agent.component.wat: resume() returns the tool-request
+        # data segment when the checkpoint is shorter than 120 bytes (`i32.lt_u` against 120), and
+        # the completed segment otherwise. The boundary lengths 119/120 pin that comparison exactly.
+        # Every lane asserts this one oracle, so passing lanes agree with each other by construction.
+        capsule = (Path(__file__).parents[1] / "capsules" / "research-agent.component.wasm.b64").read_text().strip()
+        tool = {
+            "outcome": "tool",
+            "request": {
+                "name": "catalog.search",
+                "arguments_json": '{"query":"from native component checkpoint","limit":2}',
+            },
+        }
+        completed = {
+            "outcome": "completed",
+            "content_json": '{"summary":"Native Wasmtime component resumed from checkpoint",'
+                            '"evidence":["native-checkpoint-observed"]}',
+        }
+        vector = ((0, tool), (119, tool), (120, completed), (4096, completed))
+        for checkpoint_length, expected in vector:
+            with self.subTest(checkpoint_length=checkpoint_length):
+                request = {
+                    "component": capsule, "context_json": "{}", "checkpoint_json": "x" * checkpoint_length,
+                    "max_output_bytes": 65_536, "max_fuel": 10**9, "max_memory_bytes": 64 * 1024 * 1024,
+                    "instances": 8, "memories": 2, "tables": 4, "table_elements": 10_000, "rlimits": {},
+                }
+                result = subprocess.run(  # nosec B603 - fixed argv, host interpreter, no shell
+                    [sys.executable, "-m", "portmark.wasmtime_component_runner"],
+                    input=json.dumps(request).encode(), capture_output=True, timeout=60, check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout), expected)
 
     @unittest.skipUnless(sys.platform == "win32", "Windows Job Object memory limit")
     def test_windows_job_process_memory_limit_refuses_allocation_past_the_ceiling(self):
