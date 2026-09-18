@@ -107,6 +107,14 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
+      # This job runs the WHOLE suite, including the Node Wasm tests, so it needs the same pinned
+      # Node as every other job. Without it the suite ran on the image's own Node, and the first
+      # Node start of the run paid a cold-start cost inside a 2.0 s test deadline (the recurring
+      # postgres-store flake of test_real_wasm_capsule_completes_inside_deadline_limited_sandbox).
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
       - name: Pin build tooling
         run: python -m pip install pip==26.2.1 setuptools==83.0.0
       - name: Install package with Postgres extra
