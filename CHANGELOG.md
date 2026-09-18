@@ -14,11 +14,20 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   host ID, epoch, trust-registry version + digest, and the highest sequence + head per task, signed by
   the host's audit key (`audit` purpose; a revoked key is refused). Writes: cross-process sidecar lock
   -> read -> verify -> merge -> sign -> temp file -> fsync -> replace -> parent-directory fsync.
-- **Compare-before-use, advance-after-commit.** At start the host compares every witnessed task with the
-  database; inside every save transaction, before signing, it compares the task's chain. Behind =
-  `rolled-back`, different content = `forked`: refused, nothing committed. The floor advances only
-  after the durable commit; a failed advance is retried before the next commit or new work is refused
-  (never more than one commit of lag); a crash in that window is recovered at the next start.
+- **Compare-before-use, advance-before-commit.** At start the host compares every witnessed task with
+  the database; inside every save transaction, before signing, it compares the task's chain. Behind =
+  `rolled-back`, different content = `forked`: refused, nothing committed. The floor is advanced as
+  the LAST step inside the transaction, BEFORE the commit (auditor round 2, High: advancing after the
+  commit let "commit N+1, crash, restore N" boot as anchored). A floor write failure rolls the
+  transaction back. A commit failure after the floor write leaves the floor ahead: refused until
+  `floor-reset`, never lowered automatically, logged CRITICAL.
+- **Adoption at start is verified (auditor round 2, Medium).** Heads new to or ahead of the floor are
+  adopted only if their whole chain verifies and the head is unchanged right before the write; a forged
+  head is skipped and logged, never written into the floor.
+- **`advance_registry` enforces its own contract (auditor round 2, Low):** one version, two digests is
+  refused (`registry-forked`) by the mutator itself.
+- **The floor cannot be switched off silently:** a database that has a floor for a host refuses to
+  start that host without `--audit-floor-path`.
 - **Refusal, not reconstruction.** A database marker (`audit_floor_markers`, SQLite schema 12 /
   PostgreSQL 10) records that a floor exists and its epoch. A missing floor the database recorded is
   refused (`floor-missing`), never rebuilt; a database older than the floor (`db-older-than-floor`)

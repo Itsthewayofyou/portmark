@@ -169,6 +169,10 @@ class AuditFloorMechanismTests(unittest.TestCase):
         witness.advance_registry(4, "d4")
         witness.advance_registry(2, "d2")  # never lowers
         self.assertEqual(witness.load()["registry"], {"version": 4, "digest": "d4"})
+        with self.assertRaises(FloorError) as raised:
+            witness.advance_registry(4, "another-digest")  # one version, two digests
+        self.assertEqual(raised.exception.code, "registry-forked")
+        self.assertEqual(witness.load()["registry"], {"version": 4, "digest": "d4"})
 
     def test_concurrent_processes_merge_under_the_lock_and_never_lose_an_advance(self):
         self.fresh()
@@ -608,59 +612,126 @@ class AuditFloorAttackTests(unittest.TestCase):
         self.assertEqual(len(task_ids), 12)
 
     # -- crashes around the floor advance --------------------------------------------------------
-    def test_crash_between_commit_and_floor_advance_is_benign_lag_and_recovers(self):
+    def test_commit_failure_after_the_floor_advanced_leaves_the_floor_ahead_and_refused(self):
+        # Auditor round 2 (High): the floor now advances BEFORE the commit. If the commit then fails,
+        # the floor is ahead of the database -- indistinguishable from "committed, then rolled back"
+        # -- so it is refused until an operator resets it, never lowered automatically.
+        from portmark.storage import _SQLiteTransaction
+
+        host = self.d.host()
+        envelope, first = start_task(host)
+        head_before = self.d.store().audit_head(first.task_id)
+        original_exit = _SQLiteTransaction.__exit__
+
+        def commit_fails(transaction, exc_type, exc, tb):
+            if exc_type is None:
+                original_exit(transaction, RuntimeError, RuntimeError("simulated"), None)  # roll back
+                raise sqlite3.OperationalError("disk I/O error during commit")
+            return original_exit(transaction, exc_type, exc, tb)
+
+        with patch.object(_SQLiteTransaction, "__exit__", commit_fails):
+            with self.assertLogs("portmark.host", "CRITICAL") as logs:
+                with self.assertRaises(sqlite3.OperationalError):
+                    resume(host, envelope)
+        self.assertIn("floor is ahead of the database", "".join(logs.output))
+        self.assertEqual(self.d.store().audit_head(first.task_id), head_before)  # nothing committed
+        witnessed = LocalFloorWitness(self.d.floor_path, HOST, self.d.signer, self.d.signer).witnessed_head(first.task_id)
+        self.assertGreater(witnessed[1], head_before[1])  # ...but the floor recorded it
+        self.assertBootRefused("rolled-back")
+        code, report = self.d.verify_cli(first.task_id)
+        self.assertEqual((code, report["floor_status"]), (1, "rolled-back"))
+        # Recovery is the explicit operator reset, which accepts the database as it is.
+        store = self.d.store()
+        store.set_audit_head_verifier(self.d.signer)
+        reset_audit_floor(LocalFloorWitness(self.d.floor_path, HOST, self.d.signer, self.d.signer), store, "commit failed after floor write", None, None)
+        self.d.host()
+        self.assertEqual(self.d.verify_cli(first.task_id)[1]["floor_status"], "anchored")
+
+    def test_the_committed_update_can_no_longer_be_rolled_back_undetected(self):
+        # Auditor round 2 reproduction: N -> commit N+1 -> (crash) -> restore N used to boot as
+        # anchored. The floor now records N+1 before the commit, so the restored N is refused.
+        from portmark.storage import _SQLiteTransaction
+
+        host = self.d.host()
+        envelope, first = start_task(host)
+        state_n = self.d.snapshot("state-n")
+        original_exit = _SQLiteTransaction.__exit__
+        crashed = {"once": False}
+
+        def crash_right_after_commit(transaction, exc_type, exc, tb):
+            result = original_exit(transaction, exc_type, exc, tb)
+            if exc_type is None and not crashed["once"]:
+                crashed["once"] = True
+                raise KeyboardInterrupt("process died right after the database commit")
+            return result
+
+        with patch.object(_SQLiteTransaction, "__exit__", crash_right_after_commit):
+            with self.assertRaises(KeyboardInterrupt):
+                resume(host, envelope)  # N+1 is committed; nothing after the commit ran
+        self.assertGreater(self.d.store().audit_head(first.task_id)[1], sqlite_head(state_n, first.task_id)[1])
+        self.d.restore(state_n)  # restore N
+        self.assertBootRefused("rolled-back")  # the floor already recorded N+1 before the commit
+
+    def test_a_floor_write_failure_commits_nothing(self):
+        host = self.d.host()
+        envelope, first = start_task(host)
+        head_before = self.d.store().audit_head(first.task_id)
+        floor_before = self.d.floor_path.read_bytes()
+        with patch.object(LocalFloorWitness, "advance_heads", side_effect=OSError("read-only volume")):
+            with self.assertRaises(OSError):
+                resume(host, envelope)
+        self.assertEqual(self.d.store().audit_head(first.task_id), head_before)  # the transaction rolled back
+        self.assertEqual(self.d.floor_path.read_bytes(), floor_before)
+        resume(host, envelope)  # writable again: works, and stays anchored
+        self.assertEqual(self.d.verify_cli(first.task_id)[1]["floor_status"], "anchored")
+
+    def test_a_floor_behind_the_database_is_adopted_only_after_the_chain_verifies(self):
         host = self.d.host()
         envelope, first = start_task(host)
         floor_before = self.d.floor_path.read_bytes()
         resume(host, envelope)
-        # The crash window: the database commit landed, the process died before the floor write.
-        self.d.floor_path.write_bytes(floor_before)
-        self.assertEqual(self.d.verify_cli(first.task_id)[1]["floor_status"], "anchored")  # lag is not an alarm
-        self.d.host()  # restart: boot recovery adopts the head this host signed
+        self.d.floor_path.write_bytes(floor_before)  # the floor lost its latest write (older copy put back)
+        self.d.host()  # restart: the head is ahead, its chain verifies -> adopted
         witnessed = LocalFloorWitness(self.d.floor_path, HOST, self.d.signer, self.d.signer).witnessed_head(first.task_id)
         self.assertEqual(witnessed, self.d.store().audit_head(first.task_id))
 
-    def test_a_failed_floor_write_is_retried_before_the_next_commit(self):
+    def test_boot_never_adopts_a_forged_head_into_the_floor(self):
+        # Auditor round 2 (Medium) reproduction: a stored head raised to a higher sequence with an
+        # arbitrary hash used to be adopted into the signed floor at restart.
         host = self.d.host()
-        envelope, first = start_task(host)
-        real = LocalFloorWitness.advance_heads
-        calls = {"n": 0}
-
-        def fail_once(witness, heads):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                raise OSError("transient I/O error")
-            return real(witness, heads)
-
-        with patch.object(LocalFloorWitness, "advance_heads", fail_once):
-            with self.assertLogs("portmark.host", "ERROR"):
-                second = resume(host, envelope)  # the committed run still succeeds
-        self.assertEqual(second.status, "awaiting_input")
-        self.assertEqual(host._floor_pending, {})  # caught up at the next persist
-        self.assertEqual(self.d.verify_cli(first.task_id)[1]["floor_status"], "anchored")
-
-    def test_a_floor_that_stays_unwritable_stops_new_work_after_one_commit(self):
-        host = self.d.host()
-        envelope, first = start_task(host)
-        head_before = self.d.store().audit_head(first.task_id)
-        with patch.object(LocalFloorWitness, "advance_heads", side_effect=OSError("read-only volume")):
-            with self.assertLogs("portmark.host", "ERROR"):
-                with self.assertRaisesRegex(SecurityError, "audit floor is behind committed heads"):
-                    resume(host, envelope)  # first commit lands, its advance fails, the NEXT commit refuses
+        _, first = start_task(host)
+        witnessed_before = LocalFloorWitness(self.d.floor_path, HOST, self.d.signer, self.d.signer).witnessed_head(first.task_id)
+        with sqlite3_connection(self.d.store_path) as connection:
+            connection.execute("UPDATE audit_heads SET head_hash = 'evil-head', sequence = sequence + 1 WHERE task_id = ?", (first.task_id,))
+        with self.assertLogs("portmark.witness", "ERROR") as logs:
+            self.d.host()
+        self.assertIn(f"NOT adopting task {first.task_id}", "".join(logs.output))
         witnessed = LocalFloorWitness(self.d.floor_path, HOST, self.d.signer, self.d.signer).witnessed_head(first.task_id)
-        self.assertEqual(witnessed, head_before)  # the floor is behind by exactly the one commit
-        self.assertEqual(self.d.store().audit_head(first.task_id)[1], head_before[1] + 1)
-        self.d.host()  # writable again: a restart recovers the lag
-        self.assertEqual(self.d.verify_cli(first.task_id)[1]["floor_status"], "anchored")
+        self.assertEqual(witnessed, witnessed_before)  # the floor is not contaminated
+        code, report = self.d.verify_cli(first.task_id)
+        self.assertEqual((code, report["status"]), (1, "invalid"))
 
-    def test_a_pending_head_that_forks_the_floor_is_reported_as_a_fork(self):
-        host = self.d.host()
-        envelope, first = start_task(host)
-        head_hash, sequence = self.d.store().audit_head(first.task_id)
-        host._floor_pending[first.task_id] = ("not-the-witnessed-head", sequence)
-        with self.assertRaises(FloorError) as raised:
-            resume(host, envelope)
-        self.assertEqual(raised.exception.code, FORKED)
+    def test_boot_does_not_adopt_a_head_that_changes_during_verification(self):
+        no_floor = make_host(host_id=HOST, signer=self.d.signer, store=self.d.store(), providers={"suspender": SuspendProvider()})
+        _, first = start_task(no_floor)  # written before any floor existed: an adoption candidate
+        original = SQLiteRuntimeStore.verify_audit_chain_status
+
+        def verify_then_move_head(store, task_id, allow_legacy_anchor=False):
+            verdict = original(store, task_id, allow_legacy_anchor=allow_legacy_anchor)
+            with sqlite3_connection(store.path) as connection:
+                connection.execute("UPDATE audit_heads SET sequence = sequence + 1 WHERE task_id = ?", (task_id,))
+            return verdict
+
+        with patch.object(SQLiteRuntimeStore, "verify_audit_chain_status", verify_then_move_head):
+            with self.assertLogs("portmark.witness", "ERROR") as logs:
+                self.d.host()
+        self.assertIn("head changed while it was being verified", "".join(logs.output))
+        self.assertIsNone(LocalFloorWitness(self.d.floor_path, HOST, self.d.signer, self.d.signer).witnessed_head(first.task_id))
+
+    def test_a_database_with_a_floor_cannot_be_started_without_it(self):
+        self.d.host()
+        with self.assertRaisesRegex(ValueError, "has an audit floor"):
+            self.d.host(floor=False)
 
     def test_the_cli_passes_the_floor_path_to_the_host(self):
         # config -> merged_with_args -> make_host(audit_floor_path=...): a CLI-started host must not
@@ -779,6 +850,14 @@ class AuditFloorAttackTests(unittest.TestCase):
             result = apply_floor(dataclasses.replace(before_result(self.d, before.task_id), status="valid"),
                                  LocalFloorWitness(self.d.floor_path, HOST, None, self.d.signer), other, "never-seen", None, None)
         self.assertEqual((result.status, result.floor_status), ("unverifiable", "not-anchored"))
+
+
+def sqlite_head(path, task_id):
+    connection = sqlite3.connect(path)
+    try:
+        return connection.execute("SELECT head_hash, sequence FROM audit_heads WHERE task_id = ?", (task_id,)).fetchone()
+    finally:
+        connection.close()
 
 
 def before_result(deployment, task_id):

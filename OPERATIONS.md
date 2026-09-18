@@ -167,9 +167,19 @@ directory). A durable store without a floor logs a warning at start.
   predates the floor (`db-older-than-floor`), or they come from different reset epochs
   (`epoch-mismatch`).
 - **On every save** the chain is compared with the floor inside the database transaction, before
-  signing; the floor advances only after the commit is durable. If the floor write fails after a
-  commit, the next save must catch it up first or it refuses new work, so the floor is never more
-  than one commit behind. A crash in that window is recovered at the next start.
+  signing, and the floor is advanced as the LAST step inside that transaction, **before** the commit.
+  No commit is ever acknowledged that the floor has not already recorded. If the floor write fails,
+  the transaction rolls back and nothing is committed.
+- **If the commit fails after the floor was written** (a crash in that instant, or a database error),
+  the floor is AHEAD of the database. That is indistinguishable from "committed, then the database was
+  rolled back", so the task is refused (`rolled-back`) and the floor is never lowered automatically.
+  The host logs this as CRITICAL. Recovery is `floor-reset` (below), after confirming the cause.
+- **At start**, heads this host signed that the floor has not seen (tasks from before the floor
+  existed, or a floor restored from an older copy) are adopted only if their WHOLE chain verifies and
+  the head is unchanged right before the write. Anything else is skipped and logged, never written
+  into the floor.
+- **A database with a floor cannot be started without it.** Once a floor exists for a host, starting
+  that host without `--audit-floor-path` is refused, so the floor cannot be switched off silently.
 - **`verify-audit --audit-floor-path FLOOR`** adds `floor_status`: `anchored` (exit 0), `not-anchored`
   (the floor never saw this task; exit 2), or a refusal code (exit 1). Without the flag it reports
   `no-floor` and cannot detect rollback.

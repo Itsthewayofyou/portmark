@@ -372,8 +372,13 @@ verified as `valid`: the signed head lives in the database it authenticates, and
 remembered a newer head. Each host now keeps one signed floor record (`--audit-floor-path`), outside
 the runtime database: per-task highest sequence and head, the trust-registry version and digest, a
 format version, and an epoch. It is compared before use (at start, and inside every save transaction
-before signing) and advanced only after the durable commit. A missing floor that the database recorded
-is refused, never rebuilt; recovery is the explicit `floor-reset` command.
+before signing) and advanced as the last step inside the save transaction, BEFORE the commit, so no
+commit is acknowledged that the floor has not recorded (auditor round 2: advancing after the commit
+left a one-commit window that a crash plus a restore erased without evidence). A commit that fails
+after the floor write leaves the floor ahead: refused until `floor-reset`, never lowered automatically
+-- an availability cost accepted for a fail-closed boundary. Heads adopted at start must fully verify
+first. A missing floor that the database recorded is refused, never rebuilt; a database with a floor
+cannot be started without it; recovery is the explicit `floor-reset` command.
 
 It detects rollback or divergence of the database or trust registry **relative to the surviving
 authoritative floor file**. It does **not** detect:

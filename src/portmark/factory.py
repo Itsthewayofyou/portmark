@@ -244,6 +244,14 @@ def _open_audit_floor(
     neighbouring signing-key checks, never a lazy failure on the first persist."""
     durable = bool(getattr(store, "is_durable", False))
     if not floor_path:
+        marker = store.audit_floor_marker(host_id) if durable and hasattr(store, "audit_floor_marker") else None
+        if marker is not None:
+            # Once a database has a floor, it cannot be silently dropped: a host started without it
+            # would write heads the floor never sees (and could be pointed at a rolled-back copy).
+            raise ValueError(
+                f"this database has an audit floor for {host_id!r} (epoch {marker[0]}); start the host with "
+                "--audit-floor-path / PORTMARK_AUDIT_FLOOR_PATH"
+            )
         if durable:
             logger.warning(
                 "durable store without an audit floor (--audit-floor-path / PORTMARK_AUDIT_FLOOR_PATH): a rollback of "
@@ -270,6 +278,10 @@ def _open_audit_floor(
             )
         registry_version, registry_digest = trust_source.version, trust_source.digest
     witness = LocalFloorWitness(floor_path, host_id, signer, signer)
+    # Boot adoption verifies whole chains, so the store needs its head verifier now (AgentHost sets the
+    # same one again at construction).
+    if hasattr(store, "set_audit_head_verifier"):
+        store.set_audit_head_verifier(signer)  # type: ignore[union-attr]
     try:
         open_audit_floor(witness, store, registry_version, registry_digest)
     except FloorError as error:

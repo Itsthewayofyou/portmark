@@ -89,11 +89,8 @@ class AgentHost:
         self.providers = providers
         self.store = store or InMemoryRuntimeStore()
         # Section 10 PR B: the monotonic witness (local audit floor), set by make_host after its
-        # boot checks pass. None = no floor configured. `_floor_pending` holds heads committed to
-        # the database whose floor advance failed; the next persist must advance them first.
+        # boot checks pass. None = no floor configured.
         self.audit_floor: Any = None
-        self._floor_pending: dict[str, tuple[str, int]] = {}
-        self._floor_lock = threading.Lock()
         # Section 7 PR 2 (round 3): give the tool registry a READ-ONLY view of this host's durable
         # ledger so it can validate a launch-arm request against the real `started` row. `tools` is a
         # plain attribute again (the round-2 auto-binding property setter is gone -- the gate no longer
@@ -1323,124 +1320,107 @@ class AgentHost:
         # to reuse and the audit it tried to append are rolled back with it. The store
         # owns the generation; state.checkpoint_generation is only the CAS assertion.
         floor = self.audit_floor
-        if floor is not None:
-            self._catch_up_audit_floor(floor)
-        with self.store.transaction() as transaction:
-            if floor is not None:
-                # Section 10 PR B, compare-before-use: inside the transaction and BEFORE signing, the
-                # database chain must not be behind or diverged from the floor. A refusal raises here
-                # and rolls back the nonce, events, and checkpoint together; the floor is untouched.
-                floor.check_head(
+        floor_advanced = False
+        try:
+            with self.store.transaction() as transaction:
+                if floor is not None:
+                    # Section 10 PR B, compare-before-use: inside the transaction and BEFORE signing, the
+                    # database chain must not be behind or diverged from the floor. A refusal raises here
+                    # and rolls back the nonce, events, and checkpoint together; the floor is untouched.
+                    floor.check_head(
+                        state.task_id,
+                        transaction.audit_head(state.task_id),
+                        lambda index: transaction.audit_event_hash(state.task_id, index),
+                    )
+                if consume_nonce is not None:
+                    transaction.consume_nonce(consume_nonce, envelope.permit.subject, envelope.permit.audience, state.task_id)
+                # Finding #3 (Option B): sign audit heads as v2 with an attested signed_at so
+                # verification can be judged at signing time. One timestamp per persist; returned
+                # alongside (key_id, signature) so the store persists it for later verification.
+                head_signed_at = int(time.time())
+                # Finding #2 (runtime enforcement): fail closed if the audit-signing key stopped
+                # being usable while the process ran (e.g. it expired past its expires_at, which
+                # no on-disk file change would catch). We are about to sign a new audit head; if
+                # the key can no longer sign one we refuse rather than write evidence that is
+                # invalid from birth. Raising inside the transaction rolls back the nonce, the
+                # audit append, and the checkpoint together -- a closing _persist that trips this
+                # leaves the task in its prior (resumable) state, to be completed after a restart
+                # with a usable key. Legacy HMAC has no key lifecycle and exposes no registry.
+                audit_trust = getattr(self.signer, "registry", None)
+                if audit_trust is not None and hasattr(audit_trust, "audit_signing_reason"):
+                    signing_reason = audit_trust.audit_signing_reason(self.signer.key_id, now=head_signed_at)
+                    if signing_reason is not None:
+                        raise SecurityError(
+                            f"audit-signing key {self.signer.key_id!r} is no longer usable ({signing_reason}); "
+                            "refusing to sign a new audit head"
+                        )
+                transaction.append_audit_events(
                     state.task_id,
-                    transaction.audit_head(state.task_id),
-                    lambda index: transaction.audit_event_hash(state.task_id, index),
+                    self.host_id,
+                    audit.events[persisted_events:],
+                    lambda head_hash, sequence: (
+                        self.signer.key_id,
+                        self.signer.sign_audit_head(state.task_id, self.host_id, head_hash, sequence, signed_at=head_signed_at),
+                        head_signed_at,
+                    ),
                 )
-            if consume_nonce is not None:
-                transaction.consume_nonce(consume_nonce, envelope.permit.subject, envelope.permit.audience, state.task_id)
-            # Finding #3 (Option B): sign audit heads as v2 with an attested signed_at so
-            # verification can be judged at signing time. One timestamp per persist; returned
-            # alongside (key_id, signature) so the store persists it for later verification.
-            head_signed_at = int(time.time())
-            # Finding #2 (runtime enforcement): fail closed if the audit-signing key stopped
-            # being usable while the process ran (e.g. it expired past its expires_at, which
-            # no on-disk file change would catch). We are about to sign a new audit head; if
-            # the key can no longer sign one we refuse rather than write evidence that is
-            # invalid from birth. Raising inside the transaction rolls back the nonce, the
-            # audit append, and the checkpoint together -- a closing _persist that trips this
-            # leaves the task in its prior (resumable) state, to be completed after a restart
-            # with a usable key. Legacy HMAC has no key lifecycle and exposes no registry.
-            audit_trust = getattr(self.signer, "registry", None)
-            if audit_trust is not None and hasattr(audit_trust, "audit_signing_reason"):
-                signing_reason = audit_trust.audit_signing_reason(self.signer.key_id, now=head_signed_at)
-                if signing_reason is not None:
-                    raise SecurityError(
-                        f"audit-signing key {self.signer.key_id!r} is no longer usable ({signing_reason}); "
-                        "refusing to sign a new audit head"
+                new_generation = transaction.save_checkpoint(state.task_id, state, state.checkpoint_generation, closed)
+                # Section 4 #2: the destination issues a signed migration receipt in the SAME
+                # transaction that commits the admission checkpoint, so a crash can never leave a
+                # task admitted without a receipt to prove it. Bound to the just-committed
+                # generation and audit head; keep-first, so a duplicate delivery returns this same
+                # receipt instead of re-executing. accepted_at is destination-set (recorded, not gated).
+                if receipt_binding is not None:
+                    receipt = self.signer.sign_migration_receipt(
+                        migration_receipt_payload(
+                            # Section 4 #7: the receipt payload carries the ORIGINAL task id (the
+                            # source settles against its outbox row keyed on it); the receipt ROW
+                            # below is stored under the source-namespaced state.task_id.
+                            task_id=receipt_binding["original_task_id"],
+                            source_host_id=receipt_binding["source_host_id"],
+                            destination_host_id=self.host_id,
+                            permit_nonce=receipt_binding["permit_nonce"],
+                            envelope_digest=receipt_binding["envelope_digest"],
+                            destination_checkpoint_generation=new_generation,
+                            destination_audit_head=audit.head,
+                            accepted_at=head_signed_at,
+                            # Section 4 #5: present only for a challenge-required migration; part of the
+                            # signed body, so the source can verify the destination's fresh evidence.
+                            destination_attestation=receipt_binding.get("destination_attestation"),
+                        )
                     )
-            transaction.append_audit_events(
-                state.task_id,
-                self.host_id,
-                audit.events[persisted_events:],
-                lambda head_hash, sequence: (
-                    self.signer.key_id,
-                    self.signer.sign_audit_head(state.task_id, self.host_id, head_hash, sequence, signed_at=head_signed_at),
-                    head_signed_at,
-                ),
-            )
-            new_generation = transaction.save_checkpoint(state.task_id, state, state.checkpoint_generation, closed)
-            # Section 4 #2: the destination issues a signed migration receipt in the SAME
-            # transaction that commits the admission checkpoint, so a crash can never leave a
-            # task admitted without a receipt to prove it. Bound to the just-committed
-            # generation and audit head; keep-first, so a duplicate delivery returns this same
-            # receipt instead of re-executing. accepted_at is destination-set (recorded, not gated).
-            if receipt_binding is not None:
-                receipt = self.signer.sign_migration_receipt(
-                    migration_receipt_payload(
-                        # Section 4 #7: the receipt payload carries the ORIGINAL task id (the
-                        # source settles against its outbox row keyed on it); the receipt ROW
-                        # below is stored under the source-namespaced state.task_id.
-                        task_id=receipt_binding["original_task_id"],
-                        source_host_id=receipt_binding["source_host_id"],
-                        destination_host_id=self.host_id,
-                        permit_nonce=receipt_binding["permit_nonce"],
-                        envelope_digest=receipt_binding["envelope_digest"],
-                        destination_checkpoint_generation=new_generation,
-                        destination_audit_head=audit.head,
-                        accepted_at=head_signed_at,
-                        # Section 4 #5: present only for a challenge-required migration; part of the
-                        # signed body, so the source can verify the destination's fresh evidence.
-                        destination_attestation=receipt_binding.get("destination_attestation"),
+                    transaction.store_migration_receipt(state.task_id, canonical_json(receipt).decode("utf-8"))
+                # Section 1, finding #2: a migration's sealed destination envelope is
+                # written to the outbox in the SAME transaction that closes the source
+                # checkpoint. Either both commit or both roll back, so the source can
+                # never be closed (un-resumable) while the migration is lost. The sealed
+                # envelope was snapshotted in _apply_decision, so terminalizing the
+                # source's own checkpoint here does not alter it. A dispatcher delivers it
+                # later; duplicate delivery is safe (destination nonce/CAS reject replays).
+                if migration is not None and closed:
+                    transaction.enqueue_migration(
+                        state.task_id, migration["permit"]["audience"], canonical_json(migration).decode("utf-8")
                     )
+                if floor is not None:
+                    # Section 10 PR B (auditor round 2, High): the witness advances BEFORE the database
+                    # commit, as the LAST step inside the transaction, so no commit is ever acknowledged
+                    # that the floor has not already recorded. Advancing after the commit left a window
+                    # (commit N+1, crash, restore N) that no evidence survived. A floor write failure
+                    # raises here and rolls the whole transaction back -- nothing is committed.
+                    new_head = transaction.audit_head(state.task_id)
+                    if new_head is not None:
+                        floor.advance_head(state.task_id, new_head[1], new_head[0])
+                        floor_advanced = True
+        except BaseException:
+            if floor_advanced:
+                # The floor recorded this head but the commit itself failed. The floor is now AHEAD of
+                # the database: indistinguishable from "committed, then rolled back", so it is NEVER
+                # lowered automatically. This task is refused until an operator runs `floor-reset`.
+                logger.critical(
+                    "audit floor advanced for task %s but the database commit failed: the floor is ahead of the "
+                    "database and the task will be refused until an operator runs `portmark floor-reset`",
+                    state.task_id,
                 )
-                transaction.store_migration_receipt(state.task_id, canonical_json(receipt).decode("utf-8"))
-            # Section 1, finding #2: a migration's sealed destination envelope is
-            # written to the outbox in the SAME transaction that closes the source
-            # checkpoint. Either both commit or both roll back, so the source can
-            # never be closed (un-resumable) while the migration is lost. The sealed
-            # envelope was snapshotted in _apply_decision, so terminalizing the
-            # source's own checkpoint here does not alter it. A dispatcher delivers it
-            # later; duplicate delivery is safe (destination nonce/CAS reject replays).
-            if migration is not None and closed:
-                transaction.enqueue_migration(
-                    state.task_id, migration["permit"]["audience"], canonical_json(migration).decode("utf-8")
-                )
-        state.checkpoint_generation = new_generation
-        if floor is not None:
-            self._advance_audit_floor(floor, state.task_id)
-        return len(audit.events)
-
-    def _advance_audit_floor(self, floor: Any, task_id: str) -> None:
-        # Section 10 PR B, advance-after-durable-commit. The database commit above already
-        # succeeded, so a floor failure here must NOT make the committed run look failed: the
-        # database being AHEAD of the floor is benign lag. Record it; the next persist must
-        # advance it first (_catch_up_audit_floor) or refuse, so lag never exceeds one commit.
-        head = self.store.audit_head(task_id)
-        if head is None:
-            return
-        try:
-            floor.advance_head(task_id, head[1], head[0])
-        except Exception as error:  # noqa: BLE001 -- any failure (I/O, lock, fork) is the same: pending
-            logger.error("audit floor advance failed after commit for task %s (database ahead of floor): %s", task_id, error)
-            with self._floor_lock:
-                self._floor_pending[task_id] = head
-
-    def _catch_up_audit_floor(self, floor: Any) -> None:
-        with self._floor_lock:
-            pending = dict(self._floor_pending)
-        if not pending:
-            return
-        try:
-            floor.advance_heads(pending)
-        except SecurityError:
-            # A floor refusal (e.g. `forked`: the floor already holds a DIFFERENT head for that
-            # sequence) is a divergence, not an I/O problem -- keep its own code and message.
             raise
-        except Exception as error:
-            raise SecurityError(
-                f"audit floor is behind committed heads and cannot be advanced ({error}); refusing new work "
-                "until the floor is writable (or `portmark floor-reset` after investigation)"
-            ) from error
-        with self._floor_lock:
-            for task_id, head in pending.items():
-                if self._floor_pending.get(task_id) == head:
-                    del self._floor_pending[task_id]
+        state.checkpoint_generation = new_generation
+        return len(audit.events)
