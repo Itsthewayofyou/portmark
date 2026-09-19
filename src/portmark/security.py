@@ -2208,6 +2208,26 @@ def _legacy_constrained_arguments(constraints: dict[str, Any]) -> set[str]:
 _ARGUMENT_SPEC_KEYS = frozenset(_SPEC_NARROWERS)
 
 
+def normalize_output_projection(value: Any, where: str) -> tuple[str, ...] | None:
+    """The ONE decoder for an `output_projection`, for every source (policy, spec, A2A).
+
+    PM-002: `None` and `()` are different security values, and only `None` means "no opinion".
+    `_projection_intersection` returns the other side for `None` and deny-all for `()`, so a
+    decoder that collapses an explicit empty list to `None` (a falsy test) turns an explicit
+    "share nothing" into whatever the host allows -- widening at a confidentiality boundary.
+    Absent stays `None`; `[]` stays `()`.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{where} output_projection must be a list")
+    if not all(isinstance(item, str) and item for item in value):
+        raise ValueError(f"{where} output_projection entries must be non-empty strings")
+    if "*" in value and len(value) > 1:
+        raise ValueError(f"{where} output_projection cannot mix '*' with field names")
+    return tuple(value)
+
+
 def validate_constraints(constraints: Any) -> None:
     """Reject structurally malformed constraints at load/decode time.
 

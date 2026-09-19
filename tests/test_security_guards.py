@@ -3,7 +3,7 @@ import json
 import sys
 import tempfile
 import unittest
-from dataclasses import replace
+from dataclasses import asdict as dataclasses_asdict, replace
 from pathlib import Path
 
 from portmark.models import AgentEnvelope, AgentManifest, AgentState, Permit, ResourceBudget, ToolGrant
@@ -506,6 +506,97 @@ class SecurityGuardTests(unittest.TestCase):
         state.messages = [{"role": "tool", "name": "catalog.search", "content": {"id": "1", "confidential": "x"}}]
         projected = provider_state(provider_view(state, effective.grants))
         self.assertEqual(projected["messages"], [{"role": "tool", "name": "catalog.search"}])
+
+    def test_sender_empty_projection_cannot_be_widened_by_the_host(self):
+        # PM-002 (the mirror of the test above): a SENDER who writes output_projection: []
+        # means "share nothing". build_envelope collapsed that empty list to None, which
+        # means "no opinion", so a host policy of ["*"] widened it to full tool output.
+        from portmark.factory import build_envelope
+        from portmark.projection import provider_state, provider_view
+
+        signer = EnvelopeSigner.generate("pm002-key", "user:alice", ("host:local-demo",))
+        spec = {
+            "goal": "g", "audience": "host:local-demo", "agent_id": "agent:demo",
+            "grants": [{"name": "catalog.search", "output_projection": []}],
+        }
+        envelope = build_envelope(spec, signer)
+        self.assertEqual(envelope.permit.grants[0].output_projection, ())  # NOT None
+
+        policy = HostPolicy(
+            "host:local-demo",
+            (ToolGrant("catalog.search", output_projection=("*",)),),  # the host allows everything
+            ResourceBudget(),
+        )
+        effective = policy.effective_permit(envelope.manifest, envelope.permit, now=NOW)
+        self.assertEqual(effective.grants[0].output_projection, ())
+
+        state = AgentState(task_id="t1", goal="g")
+        state.messages = [{"role": "tool", "name": "catalog.search", "content": {"id": "1", "confidential": "x"}}]
+        projected = provider_state(provider_view(state, effective.grants))
+        self.assertEqual(projected["messages"], [{"role": "tool", "name": "catalog.search"}])
+
+    def test_every_projection_decoder_reads_absent_and_empty_differently(self):
+        # PM-002: absent -> None ("no opinion"), [] -> () ("share nothing"). One shared decoder,
+        # so a policy file, an envelope spec and an A2A permit cannot drift apart.
+        from portmark.a2a import envelope_from_dict
+        from portmark.factory import build_envelope
+        from portmark.security import normalize_output_projection
+
+        signer = EnvelopeSigner.generate("pm002-decode", "user:alice", ("host:local-demo",))
+        for raw, expected in ((None, None), ([], ()), (["id"], ("id",)), (["*"], ("*",)), (["id", "title"], ("id", "title"))):
+            with self.subTest(raw=raw):
+                self.assertEqual(normalize_output_projection(raw, "grant 'x'"), expected)
+
+                grant = {"name": "catalog.search"}
+                if raw is not None:
+                    grant["output_projection"] = raw
+                spec = {"goal": "g", "audience": "host:local-demo", "agent_id": "agent:demo", "grants": [grant]}
+                envelope = build_envelope(spec, signer)
+                self.assertEqual(envelope.permit.grants[0].output_projection, expected)
+
+                payload = json.loads(json.dumps(dataclasses_asdict(envelope)))
+                decoded = envelope_from_dict(payload)
+                self.assertEqual(decoded.permit.grants[0].output_projection, expected)
+
+                policy_tool: dict = {}
+                if raw is not None:
+                    policy_tool["output_projection"] = raw
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "policy.json"
+                    path.write_text(
+                        json.dumps({"version": "policy-v1", "tools": {"catalog.search": policy_tool}}), encoding="utf-8"
+                    )
+                    loaded = load_host_policy(str(path), "host:local-demo")
+                self.assertEqual(loaded.grants[0].output_projection, expected)
+
+    def test_a_malformed_projection_fails_closed_in_every_decoder(self):
+        # PM-002: the A2A path validated constraints but not the projection, so a malformed
+        # entry crossed the boundary. Every decoder now refuses the same shapes.
+        from portmark.a2a import envelope_from_dict
+        from portmark.factory import build_envelope
+        from portmark.security import normalize_output_projection
+
+        signer = EnvelopeSigner.generate("pm002-bad", "user:alice", ("host:local-demo",))
+        for bad in ("id", {"id": 1}, [""], [1], ["*", "id"], [None]):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    normalize_output_projection(bad, "grant 'x'")
+                spec = {
+                    "goal": "g", "audience": "host:local-demo", "agent_id": "agent:demo",
+                    "grants": [{"name": "catalog.search", "output_projection": bad}],
+                }
+                with self.assertRaises(ValueError):
+                    build_envelope(spec, signer)
+
+                good = build_envelope({
+                    "goal": "g", "audience": "host:local-demo", "agent_id": "agent:demo",
+                    "grants": [{"name": "catalog.search", "output_projection": ["id"]}],
+                }, signer)
+                payload = json.loads(json.dumps(dataclasses_asdict(good)))
+                payload["permit"]["grants"][0]["output_projection"] = bad
+                with self.assertRaises(Exception) as caught:
+                    envelope_from_dict(payload)
+                self.assertNotIsInstance(caught.exception, AssertionError)
 
     def test_policy_and_trust_registry_loader_validation_guards_are_table_driven(self):
         with tempfile.TemporaryDirectory() as directory:
