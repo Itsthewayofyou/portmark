@@ -1479,6 +1479,8 @@ class AgentHost:
                     # Section 12 #6: mirror the time floor OUTSIDE the database, so restoring an older
                     # database snapshot cannot also restore an older floor. Before the commit and before
                     # the head advance: a failure here rolls the save back with nothing witnessed.
+                    # debt: a second signed floor-file write per advancing save (at most once a minute);
+                    # upgrade to one combined write with advance_head when floor writes show up in save latency.
                     floor.advance_time_floor(advanced_floor)
                 if floor is not None:
                     # Section 10 PR B (auditor round 2, High): the witness advances BEFORE the database

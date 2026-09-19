@@ -154,7 +154,10 @@ class LocalFloorWitness:
 
     File: {"format": "portmark.audit-floor.v1", "body": {...}, "signature_key_id": ..., "signature": ...}
     body: {format_version, host_id, epoch, registry: null | {version, digest}, time_floor (v2),
-           tasks: {task_id: {sequence, head_hash}}, resets: [{at, reason, prior_epoch, prior_floor_sha256}]}
+           tasks: {task_id: {sequence, head_hash}}, resets: [...]}
+    `resets` is append-only and holds two entry shapes: an audit-floor reset
+    {at, reason, prior_epoch, prior_floor_sha256} and (Section 12) a time-floor reset
+    {at, reason, kind: "time-floor", prior_time_floor, new_time_floor}. A reader must check `kind`.
 
     Every read verifies the signature (the host's audit key, `audit` purpose, issuer == host_id);
     every write is lock -> read -> verify -> merge -> sign -> temp -> fsync -> replace -> dir fsync.
