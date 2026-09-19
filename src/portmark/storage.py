@@ -940,7 +940,14 @@ def _prepare_sqlite_database_file(path: Path) -> None:
     _refuse_unsafe_directory_chain(existing, owner_uid, is_store_directory=not missing)
     for name in reversed(missing):
         existing = existing / name
-        os.mkdir(existing, 0o700)
+        try:
+            os.mkdir(existing, 0o700)
+        except FileExistsError:
+            # Section 11 PR B (auditor): hosts cold-starting together all see the same missing
+            # directories; losing that race is not an error. Whatever the winner created -- or
+            # whatever was raced in (a symlink, a file, a wider mode, another owner) -- is judged
+            # by the full re-check below, never trusted because it exists.
+            pass
     if missing:
         _refuse_unsafe_directory_chain(store_directory, owner_uid, is_store_directory=True)
     try:
@@ -951,6 +958,31 @@ def _prepare_sqlite_database_file(path: Path) -> None:
         os.close(fd)
     for candidate in (path, *(Path(f"{path}{suffix}") for suffix in SQLITE_SIDE_FILE_SUFFIXES)):
         _refuse_insecure_sqlite_file(candidate, owner_uid)
+
+
+def _enable_wal(connection: sqlite3.Connection) -> None:
+    """Put the database in WAL mode, tolerating the cold-start race over the switch.
+
+    Switching a new database to WAL needs an exclusive lock, and SQLite may return SQLITE_BUSY at
+    once -- without the busy handler -- to avoid a lock-escalation deadlock. With many hosts
+    cold-starting on one new store, some failed startup with "database is locked" (Section 11 PR B,
+    found by the real 32-process cold-start test). WAL mode persists in the file, so a host that sees
+    it already set skips the switch; a host that loses the race retries SQLITE_BUSY only, bounded by
+    the same busy timeout. Every other error still fails at once.
+    """
+    if str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal":
+        return
+    deadline = time.monotonic() + SQLITE_BUSY_TIMEOUT_MS / 1000
+    delay = 0.005
+    while True:
+        try:
+            connection.execute("PRAGMA journal_mode = WAL")
+            return
+        except sqlite3.OperationalError as error:
+            if getattr(error, "sqlite_errorcode", None) != sqlite3.SQLITE_BUSY or time.monotonic() >= deadline:
+                raise
+        time.sleep(delay)
+        delay = min(delay * 2, 0.1)
 
 
 class SQLiteRuntimeStore:
@@ -972,7 +1004,11 @@ class SQLiteRuntimeStore:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
-        connection.execute("PRAGMA journal_mode = WAL")
+        try:
+            _enable_wal(connection)
+        except BaseException:
+            connection.close()
+            raise
         return connection
 
     @contextmanager
@@ -990,18 +1026,51 @@ class SQLiteRuntimeStore:
 
     def _initialize(self) -> None:
         _prepare_sqlite_database_file(Path(self.path))
-        with self._connection() as connection:
+        connection = self._connect()
+        try:
+            while self._migrate_one_step(connection):
+                pass
+        finally:
+            connection.close()
+
+    def _migrate_one_step(self, connection: sqlite3.Connection) -> bool:
+        """Apply exactly one schema step in one write transaction; return False once current.
+
+        Section 11 #3: executescript() issues a COMMIT first and then runs every statement in
+        autocommit, so a crash in the middle of a migration left a half-applied schema that the next
+        start could not continue ("duplicate column name"). Each step now runs its statements with
+        execute() inside ONE explicit BEGIN IMMEDIATE transaction together with its
+        PRAGMA user_version bump. SQLite DDL and user_version are transactional, so a crash leaves
+        the complete old version or the complete new one, never a mix.
+
+        The version is read INSIDE the write transaction, so two processes opening the same old
+        database serialize on SQLite's write lock and the second sees the first one's result instead
+        of re-running a step. Every step is also restart-idempotent against the half-applied states
+        the old executescript runner could leave behind (see _migrate_to_v2 and _add_column).
+        """
+        connection.execute("BEGIN IMMEDIATE")
+        try:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             if version > SQLITE_SCHEMA_VERSION:
                 raise RuntimeError(f"SQLite store schema version {version} is newer than supported version {SQLITE_SCHEMA_VERSION}")
-            if version == 0:
-                self._migrate_to_v1(connection)
-                version = 1
-            while version < SQLITE_SCHEMA_VERSION:
-                version = self._run_migration(connection, version)
+            if version == SQLITE_SCHEMA_VERSION:
+                connection.execute("COMMIT")
+                return False
+            migration = self._migrations().get(version)
+            if migration is None:
+                raise RuntimeError(f"SQLite store has no migration from schema version {version}")
+            migration(connection)
+            connection.execute(f"PRAGMA user_version = {version + 1:d}")
+            connection.execute("COMMIT")
+            return True
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
 
-    def _run_migration(self, connection: sqlite3.Connection, version: int) -> int:
-        migrations = {
+    def _migrations(self) -> dict[int, Callable[[sqlite3.Connection], None]]:
+        # Keyed by the version a step upgrades FROM. Version 0 is a new or pre-versioning database.
+        return {
             0: self._migrate_to_v1,
             1: self._migrate_to_v2,
             2: self._migrate_to_v3,
@@ -1015,14 +1084,22 @@ class SQLiteRuntimeStore:
             10: self._migrate_to_v11,
             11: self._migrate_to_v12,
         }
-        migration = migrations.get(version)
-        if migration is None:
-            raise RuntimeError(f"SQLite store has no migration from schema version {version}")
-        migration(connection)
-        return int(connection.execute("PRAGMA user_version").fetchone()[0])
+
+    @staticmethod
+    def _table_exists(connection: sqlite3.Connection, table: str) -> bool:
+        return connection.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)).fetchone() is not None
+
+    @staticmethod
+    def _add_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+        # SQLite has no ADD COLUMN IF NOT EXISTS. Checking first makes the step restart-idempotent
+        # against a column that the old autocommit runner added before crashing. `table`, `column`
+        # and `definition` are literals from this module, never external input.
+        existing = {row[1] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in existing:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def _migrate_to_v1(self, connection: sqlite3.Connection) -> None:
-        connection.executescript(
+        connection.execute(
             """
             CREATE TABLE IF NOT EXISTS consumed_nonces (
                 nonce TEXT PRIMARY KEY,
@@ -1030,13 +1107,21 @@ class SQLiteRuntimeStore:
                 audience TEXT NOT NULL,
                 task_id TEXT NOT NULL,
                 consumed_at INTEGER NOT NULL
-            );
+            )
+            """
+        )
+        connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS checkpoints (
                 task_id TEXT PRIMARY KEY,
                 status TEXT NOT NULL,
                 checkpoint_json TEXT NOT NULL,
                 updated_at INTEGER NOT NULL
-            );
+            )
+            """
+        )
+        connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS audit_events (
                 task_id TEXT NOT NULL,
                 sequence INTEGER NOT NULL,
@@ -1048,19 +1133,32 @@ class SQLiteRuntimeStore:
                 created_at INTEGER NOT NULL,
                 PRIMARY KEY (task_id, sequence),
                 UNIQUE (task_id, hash)
-            );
+            )
+            """
+        )
+        connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS audit_heads (
                 task_id TEXT PRIMARY KEY,
                 head_hash TEXT NOT NULL,
                 sequence INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
-            );
-            PRAGMA user_version = 1;
+            )
             """
         )
 
     def _migrate_to_v2(self, connection: sqlite3.Connection) -> None:
-        connection.executescript(
+        # Rebuild audit_events. The old autocommit runner could stop between any two statements:
+        # - audit_events_v2 exists but audit_events is gone: it stopped after DROP, before RENAME, so
+        #   the copy is complete -- finish with the rename;
+        # - both exist: it stopped before DROP, so the original is intact and the copy may be
+        #   partial -- discard the copy and rebuild.
+        if self._table_exists(connection, "audit_events_v2"):
+            if not self._table_exists(connection, "audit_events"):
+                connection.execute("ALTER TABLE audit_events_v2 RENAME TO audit_events")
+                return
+            connection.execute("DROP TABLE audit_events_v2")
+        connection.execute(
             """
             CREATE TABLE audit_events_v2 (
                 task_id TEXT NOT NULL,
@@ -1073,39 +1171,32 @@ class SQLiteRuntimeStore:
                 created_at INTEGER NOT NULL,
                 PRIMARY KEY (task_id, sequence),
                 UNIQUE (task_id, hash)
-            );
+            )
+            """
+        )
+        connection.execute(
+            """
             INSERT INTO audit_events_v2
                 (task_id, sequence, host_id, event, details_json, previous_hash, hash, created_at)
             SELECT task_id, sequence, host_id, event, details_json, previous_hash, hash, created_at
-            FROM audit_events;
-            DROP TABLE audit_events;
-            ALTER TABLE audit_events_v2 RENAME TO audit_events;
-            PRAGMA user_version = 2;
+            FROM audit_events
             """
         )
+        connection.execute("DROP TABLE audit_events")
+        connection.execute("ALTER TABLE audit_events_v2 RENAME TO audit_events")
 
     def _migrate_to_v3(self, connection: sqlite3.Connection) -> None:
-        connection.executescript(
-            """
-            ALTER TABLE audit_heads ADD COLUMN host_id TEXT NOT NULL DEFAULT '';
-            ALTER TABLE audit_heads ADD COLUMN signature_key_id TEXT NOT NULL DEFAULT '';
-            ALTER TABLE audit_heads ADD COLUMN signature TEXT NOT NULL DEFAULT '';
-            PRAGMA user_version = 3;
-            """
-        )
+        self._add_column(connection, "audit_heads", "host_id", "TEXT NOT NULL DEFAULT ''")
+        self._add_column(connection, "audit_heads", "signature_key_id", "TEXT NOT NULL DEFAULT ''")
+        self._add_column(connection, "audit_heads", "signature", "TEXT NOT NULL DEFAULT ''")
 
     def _migrate_to_v4(self, connection: sqlite3.Connection) -> None:
         # Finding EV-008: give every stored checkpoint a store-owned monotonic
         # generation and a terminal `closed` flag, so a resume is a compare-and-swap
         # on the durable row rather than trust in caller-supplied state.
-        connection.executescript(
-            """
-            ALTER TABLE checkpoints ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;
-            ALTER TABLE checkpoints ADD COLUMN closed INTEGER NOT NULL DEFAULT 0;
-            UPDATE checkpoints SET closed = 1 WHERE status IN ('completed', 'failed');
-            PRAGMA user_version = 4;
-            """
-        )
+        self._add_column(connection, "checkpoints", "generation", "INTEGER NOT NULL DEFAULT 0")
+        self._add_column(connection, "checkpoints", "closed", "INTEGER NOT NULL DEFAULT 0")
+        connection.execute("UPDATE checkpoints SET closed = 1 WHERE status IN ('completed', 'failed')")
 
     def _migrate_to_v5(self, connection: sqlite3.Connection) -> None:
         # Section 1, finding #2: durable migration delivery. The sealed destination
@@ -1113,7 +1204,7 @@ class SQLiteRuntimeStore:
         # checkpoint, so a crash after the source closes cannot lose the migration;
         # a dispatcher recovers it from this outbox. Duplicate delivery is safe
         # (destination nonce/CAS reject a replay).
-        connection.executescript(
+        connection.execute(
             """
             CREATE TABLE IF NOT EXISTS migration_outbox (
                 task_id TEXT PRIMARY KEY,
@@ -1122,37 +1213,30 @@ class SQLiteRuntimeStore:
                 status TEXT NOT NULL DEFAULT 'pending',
                 attempt_count INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL
-            );
-            PRAGMA user_version = 5;
+            )
             """
         )
 
     def _migrate_to_v6(self, connection: sqlite3.Connection) -> None:
         # Finding #3 (Option B): audit heads gain a nullable signed_at so verification can be
         # judged at signing time. NULL marks a legacy v1 head (no attested signing time).
-        connection.executescript(
-            """
-            ALTER TABLE audit_heads ADD COLUMN signed_at INTEGER;
-            PRAGMA user_version = 6;
-            """
-        )
+        self._add_column(connection, "audit_heads", "signed_at", "INTEGER")
 
     def _migrate_to_v7(self, connection: sqlite3.Connection) -> None:
         # Section 4 #2: signed destination receipts for migration delivery settlement.
         # migration_receipts holds the receipt this host ISSUED as a destination (so a
         # duplicate delivery returns the same one); migration_outbox.receipt_json holds the
         # receipt this host RECEIVED as a source and verified before settling the row.
-        connection.executescript(
+        connection.execute(
             """
             CREATE TABLE IF NOT EXISTS migration_receipts (
                 task_id TEXT PRIMARY KEY,
                 receipt_json TEXT NOT NULL,
                 created_at INTEGER NOT NULL
-            );
-            ALTER TABLE migration_outbox ADD COLUMN receipt_json TEXT;
-            PRAGMA user_version = 7;
+            )
             """
         )
+        self._add_column(connection, "migration_outbox", "receipt_json", "TEXT")
 
     def _migrate_to_v8(self, connection: sqlite3.Connection) -> None:
         # Section 4 part 3a: outbox reliability. A dispatcher CLAIMS a row under a time-bounded
@@ -1160,14 +1244,9 @@ class SQLiteRuntimeStore:
         # (#3); a row it gives up on moves to a terminal 'dead' state with a dead_reason instead
         # of sitting pending forever (#4). All three columns are nullable -- an unclaimed, live,
         # non-dead row has them NULL, so existing pending rows upgrade untouched.
-        connection.executescript(
-            """
-            ALTER TABLE migration_outbox ADD COLUMN claimed_by TEXT;
-            ALTER TABLE migration_outbox ADD COLUMN lease_expires_at INTEGER;
-            ALTER TABLE migration_outbox ADD COLUMN dead_reason TEXT;
-            PRAGMA user_version = 8;
-            """
-        )
+        self._add_column(connection, "migration_outbox", "claimed_by", "TEXT")
+        self._add_column(connection, "migration_outbox", "lease_expires_at", "INTEGER")
+        self._add_column(connection, "migration_outbox", "dead_reason", "TEXT")
 
     def _migrate_to_v9(self, connection: sqlite3.Connection) -> None:
         # Section 5 #3: durable cancellation. An operator can cancel an admitted task; the
@@ -1175,13 +1254,12 @@ class SQLiteRuntimeStore:
         # approval nonce, so a cancel that lands first atomically prevents redemption, and a
         # cancel that lands after redemption is caught by the pre-launch re-check. One row per
         # cancelled task; presence means cancelled (idempotent).
-        connection.executescript(
+        connection.execute(
             """
             CREATE TABLE IF NOT EXISTS task_cancellations (
                 task_id TEXT PRIMARY KEY,
                 cancelled_at INTEGER NOT NULL
-            );
-            PRAGMA user_version = 9;
+            )
             """
         )
 
@@ -1191,7 +1269,7 @@ class SQLiteRuntimeStore:
         # crash-and-resume can tell "never launched" from "may have landed". State machine:
         # prepared | started | confirmed | unknown | reconciled. arguments_json is kept so the
         # reconcile pass can re-query the external system; result_json holds a confirmed result.
-        connection.executescript(
+        connection.execute(
             """
             CREATE TABLE IF NOT EXISTS tool_effects (
                 effect_id TEXT PRIMARY KEY,
@@ -1203,11 +1281,10 @@ class SQLiteRuntimeStore:
                 reason TEXT,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_tool_effects_task ON tool_effects (task_id);
-            PRAGMA user_version = 10;
+            )
             """
         )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_tool_effects_task ON tool_effects (task_id)")
 
     def _migrate_to_v11(self, connection: sqlite3.Connection) -> None:
         # Section 7 PR 2 (round 3, remediation): give a reconcile claim an OWNER + a lease, mirroring the
@@ -1215,29 +1292,22 @@ class SQLiteRuntimeStore:
         # stale/expired reconciler cannot settle or reset a newer holder's claim; reconcile_lease_expires_at
         # bounds it so a dead reconciler's claim is reclaimable. Both nullable -- an effect not under
         # reconciliation has them NULL, so existing rows upgrade untouched.
-        # SQLite has no ADD COLUMN IF NOT EXISTS, so check first -- idempotent, and parity with the
-        # Postgres side (which uses ADD COLUMN IF NOT EXISTS).
-        existing = {row[1] for row in connection.execute("PRAGMA table_info(tool_effects)").fetchall()}
-        if "reconcile_claim_id" not in existing:
-            connection.execute("ALTER TABLE tool_effects ADD COLUMN reconcile_claim_id TEXT")
-        if "reconcile_lease_expires_at" not in existing:
-            connection.execute("ALTER TABLE tool_effects ADD COLUMN reconcile_lease_expires_at INTEGER")
-        connection.execute("PRAGMA user_version = 11")
+        self._add_column(connection, "tool_effects", "reconcile_claim_id", "TEXT")
+        self._add_column(connection, "tool_effects", "reconcile_lease_expires_at", "INTEGER")
 
     def _migrate_to_v12(self, connection: sqlite3.Connection) -> None:
         # Section 10 PR B: the audit-floor "initialized" marker, one row per host. The floor file
         # lives OUTSIDE this database; this row records that a floor exists (and its epoch), so a
         # floor that later disappears is refused instead of silently rebuilt, and a database from
         # before the floor was created (or before an operator reset) is detected.
-        connection.executescript(
+        connection.execute(
             """
             CREATE TABLE IF NOT EXISTS audit_floor_markers (
                 host_id TEXT PRIMARY KEY,
                 epoch INTEGER NOT NULL,
                 pending INTEGER NOT NULL DEFAULT 0,
                 updated_at INTEGER NOT NULL
-            );
-            PRAGMA user_version = 12;
+            )
             """
         )
 

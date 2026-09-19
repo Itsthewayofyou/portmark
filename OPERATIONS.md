@@ -306,6 +306,28 @@ receipts, and audit details. It must be readable by the host's own user only.
 
 SQLite runtime databases (current version 12) carry their schema version in `PRAGMA user_version`. Hosts migrate version `0` stores to the current baseline on open and refuse to open databases with a newer schema version than the runtime supports. Postgres stores (current version 10) keep their schema version in the `portmark_schema` table in the configured schema. Back up the runtime database before deploying runtime versions that include storage migrations, and validate representative task IDs with `verify-audit` after migration.
 
+**Crash safety.** Each SQLite step is one transaction with its version bump, so a crash or kill during
+an upgrade leaves the complete old version or the complete new one. Just start the host again: it
+continues from the version that was committed. A database that an older runtime left half-migrated (for
+example `duplicate column name: generation` at start) also continues, because every step checks what
+already exists. This does not protect against disk corruption or power loss on storage that ignores
+`fsync`; that is what the backup is for.
+
+**Many hosts starting at once.** Hosts that cold-start together on one new SQLite store (for example a
+scaled-out deployment) are safe: the one that loses the race to create a store directory accepts it after
+the full permission check, and a host that loses the race to switch the new database to WAL mode retries
+within the busy timeout. The upgrade itself is serialized by SQLite's write lock.
+
+**Repair and restore.**
+1. Stop every host that uses the store.
+2. Keep the failed database and its `-wal`/`-shm` files together (copy all three, or none).
+3. Try one start of the current runtime. If it still refuses, check the database with
+   `sqlite3 <path> "PRAGMA integrity_check"`.
+4. If the check fails, restore the last backup, with mode `0600` (see "File Permissions"). A host with
+   an audit floor then refuses with `rolled-back`; run `floor-reset` deliberately, as described in
+   "Audit Floor".
+5. Run `verify-audit` on representative task IDs before you allow new work.
+
 ## Incident Response
 
 For suspected key compromise:

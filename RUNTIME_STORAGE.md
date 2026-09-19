@@ -40,6 +40,13 @@ Each durable store records its schema version and migrates forward on open. A st
 **newer** than the running code fails closed, so an older runtime never writes to an unknown schema.
 
 - **SQLite:** version in `PRAGMA user_version`. Current version: **12** (`SQLITE_SCHEMA_VERSION`).
+  Each step runs in ONE `BEGIN IMMEDIATE` transaction together with its `user_version` bump (never
+  `executescript()`, which commits first and then runs each statement on its own). A crash leaves the
+  complete old version or the complete new one. The version is read inside the write transaction, so
+  concurrent first opens queue on SQLite's write lock. Every step is also restart-idempotent: an
+  `ADD COLUMN` checks `PRAGMA table_info` first, and the v2 `audit_events` rebuild recognises a
+  half-finished copy. So a database left half-migrated by an older runtime also continues.
+  `tests/sqlite_schema_versions.json` is the reference schema of every version.
 - **PostgreSQL:** version in the single-row `portmark_schema` table. Current version: **10**
   (`POSTGRES_SCHEMA_VERSION`). DDL runs behind a session-level advisory lock and uses
   `ADD COLUMN IF NOT EXISTS`, so concurrent first opens are safe. The Postgres version numbers are
