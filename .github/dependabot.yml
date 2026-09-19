@@ -28,9 +28,11 @@ updates:
     labels:
       - dependencies
 
-  # Section 11 #4: the Dockerfile's base image is pinned by digest; this proposes digest bumps.
-  # Workflow service images (postgres in ci.yml) are pinned by digest too, but Dependabot does not
-  # update those -- refresh them by hand (see the comment at the pin).
+  # Section 11 #4: the Dockerfile's base image is pinned by digest. Dependabot proposes a new tag AND
+  # its digest. Only Python patch releases are proposed: a new Python minor (or major) version must first
+  # be added to CI's test matrices and the classifiers, which tests/test_runtime.py enforces, so it is
+  # done by hand, never as a bot bump. Workflow service images (postgres in ci.yml) are pinned by digest
+  # too, but Dependabot does not update those -- refresh them by hand (see the comment at the pin).
   - package-ecosystem: docker
     directory: "/"
     schedule:
@@ -39,3 +41,6 @@ updates:
       prefix: "docker"
     labels:
       - dependencies
+    ignore:
+      - dependency-name: "python"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]

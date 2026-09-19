@@ -6,6 +6,26 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Python 3.14: newly tested and supported (not required)
+
+- **Python 3.14 is now tested and supported.** CI runs the full suite on 3.14 on Linux and Windows,
+  installing from the same hash-locked `requirements/*.txt` sets, with no prerelease interpreter and no
+  relaxed hashes. The classifier `Python :: 3.14` is added.
+- **Nothing is newly required.** `requires-python` stays `>=3.11`, and 3.11, 3.12, and 3.13 stay in the
+  CI matrix.
+- **The container image moves to Python 3.14.6.** The base is `python:3.14.6-slim-bookworm`, still
+  pinned by its full multi-arch digest (checked against Docker Hub on 2026-09-19).
+- **CI now tests the exact shipped image.** A new `container` job builds the image once and checks that
+  its Python is the Dockerfile's pinned version. It then runs the whole suite inside that image, against
+  the Portmark the image installed (the checkout is mounted read-only and its `src/` is hidden), and
+  runs the deployment-profile tests against it. Before, each Linux test job built the image and only
+  ran the profile tests.
+- **The image test pins the base image by shape, not by one version.** It requires exactly one `FROM`,
+  a patch-pinned tag, and a full 64-hex digest. The image's Python minor version must also be in both
+  CI test matrices and the classifiers, so an image on an untested Python cannot merge.
+- **Dependabot proposes Python patch releases only.** A new Python minor or major version is a manual
+  change, because CI must test it first.
+
 ### Section 11 — deployment hardening (PR C): public-mode gate, one proxy authority, locked builds (findings #1, #4 Medium; #6 Low)
 
 - **The container is loopback by default (#1).** The image ran raw uvicorn on `0.0.0.0` with no token,

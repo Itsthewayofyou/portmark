@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import platform
+import re
 import secrets
 import shutil
 import sqlite3
@@ -387,6 +388,44 @@ def _warm_node_binary() -> None:
             [node, "--version"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, timeout=120, check=False,
         )
+
+
+def _skip_if_declared_no_node_environment():
+    """Skip a Node-backed Wasm test ONLY in an environment that declares it has no Node.js.
+
+    CI's `container` job runs the suite inside the shipped image, which has no Node.js (the image does
+    not execute Node-backed Wasm capsules), and sets PORTMARK_TEST_ENV_HAS_NO_NODE=1. Everywhere else
+    nothing changes: a missing Node still fails the test, so a host job that loses Node cannot turn
+    these tests into silent skips.
+    """
+    if shutil.which("node") is None and os.environ.get("PORTMARK_TEST_ENV_HAS_NO_NODE") == "1":
+        raise unittest.SkipTest("declared no-Node environment (the shipped image)")
+
+
+class NoNodeSkipIsDeclaredOnlyTests(unittest.TestCase):
+    @staticmethod
+    def _skips():
+        # Caught here: a SkipTest escaping would skip THIS test instead of failing it.
+        try:
+            _skip_if_declared_no_node_environment()
+        except unittest.SkipTest:
+            return True
+        return False
+
+    def test_missing_node_skips_only_when_the_environment_declares_it(self):
+        with patch.object(shutil, "which", return_value=None):
+            for value in (None, "", "0", "true"):
+                env = {k: v for k, v in os.environ.items() if k != "PORTMARK_TEST_ENV_HAS_NO_NODE"}
+                if value is not None:
+                    env["PORTMARK_TEST_ENV_HAS_NO_NODE"] = value
+                with self.subTest(flag=value), patch.dict(os.environ, env, clear=True):
+                    self.assertFalse(self._skips())  # no skip: the Node test runs and fails loudly
+            with patch.dict(os.environ, {"PORTMARK_TEST_ENV_HAS_NO_NODE": "1"}):
+                self.assertTrue(self._skips())
+        # With Node present the flag changes nothing: the tests run.
+        with patch.object(shutil, "which", return_value="/usr/bin/node"):
+            with patch.dict(os.environ, {"PORTMARK_TEST_ENV_HAS_NO_NODE": "1"}):
+                self.assertFalse(self._skips())
 
 
 class RuntimeTests(unittest.TestCase):
@@ -7851,8 +7890,26 @@ class RuntimeTests(unittest.TestCase):
         dockerfile = (Path(__file__).parents[1] / "Dockerfile").read_text(encoding="utf-8")
         # Section 11 #1/#4: the tool pins moved into the hash-locked requirements/bootstrap.txt, the
         # base image is digest-pinned, and the command is the gated, loopback-default entrypoint.
+        # Exactly one base image: a patch-pinned tag plus the FULL 64-hex digest. A tag alone, a short
+        # digest, `:latest`, or a second FROM all fail here.
+        base_images = re.findall(r"^FROM\s+(\S+)", dockerfile, flags=re.MULTILINE)
+        self.assertEqual(len(base_images), 1, base_images)
+        pinned = re.fullmatch(r"python:3\.(\d+)\.\d+-slim-bookworm@sha256:[0-9a-f]{64}", base_images[0])
+        self.assertIsNotNone(pinned, base_images[0])
+        # The image's Python minor version must already be tested: in the Linux AND Windows test matrices,
+        # and in the classifiers. So a base-image bump to an untested Python cannot merge on its own.
+        image_python = f"3.{pinned.group(1)}"
+        root = Path(__file__).parents[1]
+        ci = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        matrices = re.findall(r'python-version: \[([^\]]*)\]', ci)
+        self.assertEqual(len(matrices), 2, matrices)  # `test` and `windows-tests`
+        for matrix in matrices:
+            self.assertIn(f'"{image_python}"', matrix)
+        self.assertIn(
+            f'"Programming Language :: Python :: {image_python}"',
+            (root / "pyproject.toml").read_text(encoding="utf-8"),
+        )
         required = [
-            "FROM python:3.12.12-slim-bookworm@sha256:",
             "pip install --require-hashes --no-deps -r requirements/bootstrap.txt",
             "pip install --require-hashes --no-deps -r requirements/runtime.txt",
             "pip install --no-deps --no-build-isolation .",
@@ -8350,6 +8407,7 @@ class RuntimeTests(unittest.TestCase):
                 yield
 
     def test_real_wasm_capsule_completes_inside_deadline_limited_sandbox(self):
+        _skip_if_declared_no_node_environment()
         capsule = Path(__file__).parents[1] / "capsules" / "research-agent.wasm.b64"
         host = make_host(wasm_component=str(capsule))
         envelope = make_demo_envelope(host, "portable execution", "wasm")
@@ -9126,6 +9184,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertNotIn("internal_note", json.dumps(checkpoint))
 
     def test_wasm_with_ambient_wasi_import_cannot_instantiate(self):
+        _skip_if_declared_no_node_environment()
         from portmark.providers import WasmDecisionProvider
         hostile = base64.b64decode(WASM_FORBIDDEN_IMPORT)
         provider = WasmDecisionProvider(hostile)
@@ -9157,6 +9216,7 @@ class RuntimeTests(unittest.TestCase):
         )
 
     def test_wasm_component_tool_decision_uses_structured_wit_outcome(self):
+        _skip_if_declared_no_node_environment()
         from portmark.providers import WasmDecisionProvider
         provider = WasmDecisionProvider(base64.b64decode(WASM_TOOL_REQUEST))
         # Carry real tool_results (and a prior tool message) so the wire input includes the
@@ -9176,6 +9236,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(decision.arguments, {"query": "from wasm", "limit": 3})
 
     def test_wasm_component_unavailable_capability_fails_closed(self):
+        _skip_if_declared_no_node_environment()
         from portmark.providers import WasmDecisionProvider
         provider = WasmDecisionProvider(base64.b64decode(WASM_TOOL_REQUEST))
         decision = provider.decide(provider_view(AgentState("task", "goal")), ())
@@ -9183,6 +9244,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(decision.content, {"error": "required capability unavailable"})
 
     def test_wasm_component_malformed_missing_timeout_and_oversized_outputs_are_rejected(self):
+        _skip_if_declared_no_node_environment()
         from portmark.providers import WasmDecisionProvider
         cases = [
             (WASM_MALFORMED_JSON, {}, "malformed or unsafe decision JSON"),

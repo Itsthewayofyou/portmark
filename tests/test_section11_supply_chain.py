@@ -108,6 +108,47 @@ class SupplyChainConfigurationTests(unittest.TestCase):
                     self.assertNotIn("artifact-metadata", job.get("permissions", {}))
         self.assertIn("attest", jobs["publish"]["needs"])  # nothing unattested is published
 
+    @unittest.skipUnless(importlib.util.find_spec("yaml"), "needs PyYAML (from requirements/ci.txt)")
+    def test_ci_runs_the_suite_inside_the_exact_image_it_built(self):
+        import yaml
+
+        jobs = yaml.safe_load((WORKFLOWS / "ci.yml").read_text())["jobs"]
+        runs = [step.get("run", "") for step in jobs["container"]["steps"]]
+        builds = [run for run in runs if "docker build" in run]
+        self.assertEqual(builds, ['docker build -t "$IMAGE" .'])
+        inside = [run for run in runs if "python -m unittest discover -s tests" in run and "docker run" in run]
+        self.assertEqual(len(inside), 1, runs)
+        # The checkout is read-only and its src/ hidden, so the tests can only import the image's Portmark.
+        for part in ['"$GITHUB_WORKSPACE":/repo:ro', "--tmpfs /repo/src", '"$IMAGE" python -m unittest']:
+            self.assertIn(part, inside[0])
+        self.assertTrue(any('test "$GOT" = "$WANT"' in run for run in runs))  # the image's Python is the pinned one
+        self.assertTrue(any('PORTMARK_TEST_IMAGE="$IMAGE"' in run and "DeploymentProfileTests" in run for run in runs))
+        # The no-Node skip is declared by that in-image run and nowhere else in any workflow.
+        declared = [
+            (path.name, line)
+            for path in sorted(WORKFLOWS.glob("*.yml"))
+            for line in path.read_text().splitlines()
+            if "PORTMARK_TEST_ENV_HAS_NO_NODE" in line and not line.lstrip().startswith("#")
+        ]
+        self.assertEqual(len(declared), 1, declared)
+        self.assertIn("PORTMARK_TEST_ENV_HAS_NO_NODE=1", inside[0])
+
+    @unittest.skipUnless(importlib.util.find_spec("yaml"), "needs PyYAML (from requirements/ci.txt)")
+    def test_dependabot_never_proposes_an_untested_python(self):
+        import yaml
+
+        updates = yaml.safe_load((ROOT / ".github" / "dependabot.yml").read_text())["updates"]
+        docker = [update for update in updates if update["package-ecosystem"] == "docker"]
+        self.assertEqual(len(docker), 1)
+        ignored = {
+            kind
+            for rule in docker[0].get("ignore", [])
+            if rule.get("dependency-name") == "python"
+            for kind in rule.get("update-types", [])
+        }
+        self.assertLessEqual({"version-update:semver-major", "version-update:semver-minor"}, ignored)
+        self.assertNotIn("version-update:semver-patch", ignored)  # patch releases still come
+
     def test_bootstrap_setuptools_matches_the_declared_build_requirement(self):
         self.assertIsNone(load_lock_script().build_system_mismatch())
 
