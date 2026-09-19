@@ -6,6 +6,24 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Completeness review — authority during a run (PM-003, PM-004, Medium)
+
+- **A permit's lifetime is re-read while the run is in flight (PM-003).** Expiry was checked once,
+  when the effective permit was built at admission, so an admitted run kept that authority for its
+  whole life: a provider that answered after the permit ended could still launch a tool, redeem an
+  approval, or complete. `security.require_unexpired` now runs after the provider decision, again
+  immediately before a tool launch, and again before an approval is burned durably. It raises
+  `PermitExpiredError` (a `SecurityError`), and the run terminalizes as `permit.expired`.
+- **Every refused decision reaches a durable CLOSED checkpoint (PM-004).** `_apply_decision` ran
+  outside every failure boundary, so a decision that failed host authorization — a tool with no
+  grant, an exhausted tool-call budget, a missing tool name, a migration with no destination or an
+  off-allowlist one, an expired permit, or any unexpected error from a tool — raised straight out of
+  `run()` and left the admitted checkpoint open at `running`: resumable, and claiming the agent was
+  still working. It now records a bounded `decision.refused` (or `permit.expired`) event, persists a
+  closed `failed` checkpoint, and re-raises. The record carries identifiers only, never arguments or
+  state. The **effect ledger** stays the authority on side effects: a tool that had already started
+  keeps its own row for the reconcile pass, and this closure neither settles nor retries it.
+
 ### Completeness review — output projection (PM-002 High, PM-005 Low)
 
 - **An explicit empty `output_projection` is share-nothing again.** `build_envelope` collapsed `[]`

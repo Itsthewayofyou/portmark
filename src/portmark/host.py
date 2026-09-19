@@ -15,7 +15,7 @@ from .metrics import RuntimeMetrics
 from .models import AgentEnvelope, ApprovalToken, AttestationEvidence, ProviderDecision, RunResult
 from .projection import project_state_for_migration, provider_view
 from .providers import ModelProvider
-from .security import _MIGRATION_RECEIPT_FIELDS, _OPTIONAL_MIGRATION_RECEIPT_FIELDS, AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, MigrationAttesterProtocol, SecurityError, arguments_hash, audit_head_payload, canonical_json, effect_id, migration_envelope_digest, migration_receipt_payload, verified_approval_token
+from .security import _MIGRATION_RECEIPT_FIELDS, _OPTIONAL_MIGRATION_RECEIPT_FIELDS, AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, MigrationAttesterProtocol, PermitExpiredError, SecurityError, arguments_hash, audit_head_payload, canonical_json, effect_id, migration_envelope_digest, migration_receipt_payload, require_unexpired, verified_approval_token
 from .storage import InMemoryRuntimeStore, RuntimeStore
 from .tools import ToolExecutionError, ToolKilledError, ToolRegistry
 
@@ -544,7 +544,35 @@ class AgentHost:
             self.metrics.increment("provider.decisions")
             audit.append("provider.proposed", {"kind": decision.kind, "tool": decision.tool})
             tool_calls_before = state.tool_calls
-            finished, migration = self._apply_decision(decision, state, effective, audit, envelope, active_policy, admission_generation)
+            try:
+                finished, migration = self._apply_decision(decision, state, effective, audit, envelope, active_policy, admission_generation)
+            except Exception as error:
+                # PM-004: _apply_decision sat OUTSIDE every failure boundary, so a provider decision
+                # that failed host authorization (a tool with no grant, an exhausted tool-call budget,
+                # a missing tool name, a migration with no destination or an off-allowlist one, an
+                # expired permit, or any unexpected error from a tool) raised straight out of run()
+                # and left the admitted checkpoint open at `running` -- resumable, and claiming the
+                # agent is still working. It is the same class the provider handler above closes, so
+                # it gets the same treatment: a durable CLOSED failure, then re-raise so the caller
+                # still sees the error.
+                #
+                # The EFFECT ledger, not this checkpoint, stays the authority on side effects: a tool
+                # that had already started keeps its own row (`started`/`unknown`) for the reconcile
+                # pass, and closing the task here neither settles nor retries it.
+                expired = isinstance(error, PermitExpiredError)
+                state.status = "failed"
+                state.result = {"error": "permit expired" if expired else "decision refused"}
+                audit.append(
+                    "permit.expired" if expired else "decision.refused",
+                    # Identifiers and shapes only -- never the arguments, the state, or the message of
+                    # a refusal that may quote them.
+                    {"kind": decision.kind, "tool": decision.tool, "error": type(error).__name__},
+                )
+                if self._checkpoint_fits(effective, state):
+                    self._persist(envelope, effective, state, audit, persisted_events, closed=True)
+                else:
+                    self._terminalize_over_budget(envelope, effective, state, audit, persisted_events, decision, state.tool_calls > tool_calls_before)
+                raise
             state.step += 1
             # Close the checkpoint's lineage at this host when the task terminates
             # (completed/failed) or migrates away, so it can never be resumed here
@@ -599,6 +627,10 @@ class AgentHost:
         return result
 
     def _apply_decision(self, decision, state, effective, audit, envelope, active_policy, admission_generation=0):
+        # PM-003: the permit's lifetime is re-read here, on the trusted clock, before ANY action of
+        # this step. Admission checked it once; a provider that answered slowly (or a long previous
+        # step) can have carried the run past the end of its authority.
+        require_unexpired(effective, "after the provider decision")
         if decision.kind == "tool":
             if state.tool_calls >= effective.budget.max_tool_calls:
                 raise SecurityError("tool-call budget exhausted")
@@ -663,6 +695,9 @@ class AgentHost:
                     # Section 12 #1: the same atomic step for a tool without an effect id (a side-effecting
                     # one already began above, before its ledger write).
                     _run_progress.begin("tool")
+                # PM-003: the last check before the tool actually runs. An approval wait, a ledger
+                # write, or a slow pre-launch step can sit between the check above and this launch.
+                require_unexpired(effective, "before the tool launch")
                 launch_cap = self._effect_armer.arm(eid, decision.tool, decision.arguments) if eid is not None else None
                 try:
                     tool_started = time.monotonic()
@@ -766,6 +801,9 @@ class AgentHost:
             audit.append("agent.awaiting_input", {"request": decision.content})
             return True, None
         if decision.kind == "migrate":
+            # PM-003: no separate check here. A migration mints a DELEGATED permit that inherits this
+            # expiry, and the check at the top of this method runs with nothing in between, so a
+            # second one could never observe a different time. (The destination re-checks it too.)
             if not decision.destination:
                 raise SecurityError("migration proposal lacks a destination")
             # Finding EV-009: host policy is a ceiling over movement, not only tools.
@@ -913,6 +951,10 @@ class AgentHost:
         # loses is caught by the pre-launch re-check in _apply_decision.
         # Section 12 #1: redeeming consumes a nonce durably, so it is an operation an abandoned run
         # must not start (atomic check-and-record, like every other write).
+        # PM-003: the approval is about to be burned durably and a side-effecting tool follows, so
+        # the permit's own lifetime is re-read here. The approval token's expiry is checked above and
+        # is a separate, narrower bound; neither one covers the other.
+        require_unexpired(permit, "before the approval redemption")
         _run_progress.begin("approving")
         try:
             with self.store.transaction() as approval_transaction:
