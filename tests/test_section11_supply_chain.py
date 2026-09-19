@@ -149,6 +149,20 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         self.assertLessEqual({"version-update:semver-major", "version-update:semver-minor"}, ignored)
         self.assertNotIn("version-update:semver-patch", ignored)  # patch releases still come
 
+    @unittest.skipUnless(importlib.util.find_spec("yaml"), "needs PyYAML (from requirements/ci.txt)")
+    def test_dependabot_batches_version_updates_but_not_security_fixes(self):
+        # Every pip bump needs a relock + export, so routine bumps come as ONE weekly PR. A security
+        # fix must not wait in that batch: only version updates are grouped.
+        import yaml
+
+        updates = {u["package-ecosystem"]: u for u in yaml.safe_load((ROOT / ".github" / "dependabot.yml").read_text())["updates"]}
+        for ecosystem in ("pip", "github-actions"):
+            with self.subTest(ecosystem=ecosystem):
+                groups = list(updates[ecosystem].get("groups", {}).values())
+                self.assertEqual(len(groups), 1, groups)
+                self.assertEqual(groups[0].get("patterns"), ["*"])
+                self.assertEqual(groups[0].get("applies-to", "version-updates"), "version-updates")
+
     def test_bootstrap_setuptools_matches_the_declared_build_requirement(self):
         self.assertIsNone(load_lock_script().build_system_mismatch())
 
