@@ -6,6 +6,24 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Section 11 — deployment hardening (PR B): crash-safe, restart-idempotent SQLite migrations (finding #3 Medium)
+
+- **Each migration step is one transaction (#3).** Steps ran through `executescript()`, which commits
+  first and then runs each statement in autocommit. A crash after `ALTER TABLE checkpoints ADD COLUMN
+  generation`, before `closed` and the version bump, left a database that every later start refused
+  (`duplicate column name: generation`). Each step now runs its statements with `execute()` inside one
+  `BEGIN IMMEDIATE` transaction together with its `PRAGMA user_version` bump. A crash leaves the
+  complete old or the complete new version.
+- **Concurrent first opens queue.** The version is read inside the write transaction, so two processes
+  opening the same old database no longer run the same step at once.
+- **Restart-idempotent steps.** `ADD COLUMN` checks `PRAGMA table_info` first; the v2 `audit_events`
+  rebuild finishes a copy stranded after `DROP` (rename) and discards one stranded before it. A
+  database already half-migrated by the old runner now continues.
+- **Tests.** A child process is killed with `os._exit` before every statement of the upgrade (from a
+  legacy v0 database and from v3); each reopen must show a complete schema matching
+  `tests/sqlite_schema_versions.json` (generated from the pre-rewrite code) with every seeded row
+  intact, then continue to v12. OPERATIONS.md gains crash-safety and repair/restore steps.
+
 ### Section 11 — deployment hardening (PR A): log redaction and owner-only storage (findings #2, #5 Medium)
 
 - **Plain-text logs are redacted too (#2).** Redaction ran only in the JSON formatter, so the default
