@@ -80,6 +80,7 @@ class SupplyChainConfigurationTests(unittest.TestCase):
                     with self.subTest(file=path.name, line=number):
                         self.assertRegex(line + " ", ACTION_PIN)
 
+    @unittest.skipUnless(importlib.util.find_spec("yaml"), "needs PyYAML (from requirements/ci.txt)")
     def test_release_is_gated_on_main_built_locked_and_attested(self):
         release = (WORKFLOWS / "release.yml").read_text()
         self.assertIn("fetch-depth: 0", release)
@@ -90,10 +91,22 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         self.assertIn("actions/attest-build-provenance@", release)
         self.assertIn("actions/attest-sbom@", release)
         self.assertRegex(release, r"attestations:\s*true")
-        # The attest job, not the build or publish job, holds attestations: write.
-        attest_job = release.split("\n  attest:\n", 1)[1].split("\n  publish:\n", 1)[0]
-        self.assertIn("attestations: write", attest_job)
-        self.assertEqual(release.count("attestations: write"), 1)
+        # The attest job holds exactly the permissions the pinned actions/attest requires -- all three,
+        # or the first real tag release fails in that job (auditor round 2: artifact-metadata was
+        # missing) -- and no other job holds the attestation-only ones.
+        import yaml
+
+        jobs = yaml.safe_load(release)["jobs"]
+        self.assertEqual(
+            jobs["attest"]["permissions"],
+            {"id-token": "write", "attestations": "write", "artifact-metadata": "write"},
+        )
+        for name, job in jobs.items():
+            if name != "attest":
+                with self.subTest(job=name):
+                    self.assertNotIn("attestations", job.get("permissions", {}))
+                    self.assertNotIn("artifact-metadata", job.get("permissions", {}))
+        self.assertIn("attest", jobs["publish"]["needs"])  # nothing unattested is published
 
     def test_bootstrap_setuptools_matches_the_declared_build_requirement(self):
         self.assertIsNone(load_lock_script().build_system_mismatch())
