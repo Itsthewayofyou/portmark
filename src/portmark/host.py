@@ -464,6 +464,11 @@ class AgentHost:
             # awaiting_input resume injects approval input into state.memory before
             # re-running, and that wire state is already treated as untrusted
             # (approvals are consumed via a namespaced store nonce, not memory).
+            # PM-001: the checkpoint's OWNER decides who may resume it -- the envelope signature
+            # proves the sender is *a* trusted identity, and says nothing about this task. The check
+            # itself lives in save_checkpoint, inside the same transaction as the generation CAS, so
+            # a foreign resume is refused with nothing written (the first persist happens before any
+            # provider call, so no tool runs either). A duplicate check here would be unprovable.
             state.step = int(stored["step"])
             state.tool_calls = int(stored["tool_calls"])
             consume_nonce = None
@@ -1480,7 +1485,12 @@ class AgentHost:
                         head_signed_at,
                     ),
                 )
-                new_generation = transaction.save_checkpoint(state.task_id, state, state.checkpoint_generation, closed)
+                new_generation = transaction.save_checkpoint(
+                    state.task_id, state, state.checkpoint_generation, closed,
+                    # PM-001: recorded on the CREATE, compared on every later save, in this same
+                    # transaction as the generation CAS.
+                    owner=(envelope.permit.issuer, envelope.permit.subject),
+                )
                 # Section 4 #2: the destination issues a signed migration receipt in the SAME
                 # transaction that commits the admission checkpoint, so a crash can never leave a
                 # task admitted without a receipt to prove it. Bound to the just-committed

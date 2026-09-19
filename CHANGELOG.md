@@ -6,6 +6,25 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Completeness review — a task belongs to the sender that started it (PM-001, High)
+
+- **Cross-sender task takeover is closed.** The resume path found a checkpoint by caller-supplied
+  task id alone and adopted its counters. An envelope signature proves the sender is *a* trusted
+  identity; it said nothing about this task. So any trusted sender that learned or guessed an open
+  task's id and generation could resume, drive, and close another sender's task.
+- **Owner = `(permit issuer, permit subject)`** of the admission that created the task (owner
+  decision A). It is recorded on the create and compared on every later save, **inside the same
+  transaction as the generation compare-and-swap**, in all three stores. Binding the pair rather
+  than the signing key id lets an issuer rotate its key and still resume its own task. A migrated
+  task is owned by its delegated permit's issuer (the source host) and the agent subject.
+- **Schema SQLite v14 / PostgreSQL v12**: two nullable columns, `owner_issuer` and `owner_subject`.
+- **Upgrades.** Existing rows keep no owner, because it cannot be reconstructed (the audit trail
+  records the agent, never the issuer). An **open** ownerless task refuses to resume — "legacy
+  checkpoint has no stored owner and cannot be resumed safely after upgrade. Submit it as a new
+  task." — rather than letting the first caller claim it, which would preserve the very takeover
+  this closes. A **closed** legacy task is untouched: it is evidence, and stays readable and
+  verifiable. Let open tasks finish before upgrading, or re-submit them afterwards.
+
 ### Completeness review — authority during a run (PM-003, PM-004, Medium)
 
 - **A permit's lifetime is re-read while the run is in flight (PM-003).** Expiry was checked once,
