@@ -71,6 +71,8 @@ def create_app():
         readiness_check=readiness_check,
         public_base_url=public_base_url,
         trusted_proxies=parse_trusted_proxies(config.a2a_trusted_proxies),
+        shutdown_grace_seconds=config.shutdown_grace_seconds,
+        body_read_timeout_seconds=config.a2a_body_read_timeout_seconds,
     )
 
 

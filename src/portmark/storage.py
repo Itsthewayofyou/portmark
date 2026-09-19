@@ -81,6 +81,99 @@ SQLITE_BUSY_TIMEOUT_MS = 30_000
 # (section 2, finding #1 follow-up): a dedicated short connect + busy/statement bound.
 READINESS_CONNECT_TIMEOUT_SECONDS = 2
 SQLITE_READINESS_BUSY_TIMEOUT_MS = 2_000
+
+
+# Section 12 #3: every PostgreSQL connection Portmark opens is time-bounded, whatever the operator's
+# DSN says. Without these, a blackholed database or a blocked row/advisory lock holds an A2A worker
+# (and graceful shutdown) indefinitely. A timeout raises, which fails the transaction and rolls it
+# back exactly as any other database error does.
+_POSTGRES_TIMEOUT_LIMITS = {
+    # name: (default, maximum, unit, environment variable)
+    "connect_seconds": (5, 300, "s", "PORTMARK_POSTGRES_CONNECT_TIMEOUT_SECONDS"),
+    "statement_ms": (30_000, 3_600_000, "ms", "PORTMARK_POSTGRES_STATEMENT_TIMEOUT_MS"),
+    "lock_ms": (10_000, 3_600_000, "ms", "PORTMARK_POSTGRES_LOCK_TIMEOUT_MS"),
+    "idle_in_transaction_ms": (60_000, 3_600_000, "ms", "PORTMARK_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS"),
+}
+
+
+@dataclass(frozen=True)
+class PostgresTimeouts:
+    """Bounds applied to every Portmark PostgreSQL connection (Section 12 #3).
+
+    Every value must be a positive integer no larger than its maximum: zero would DISABLE the
+    PostgreSQL timeout, so it is refused rather than accepted.
+    """
+
+    connect_seconds: int = _POSTGRES_TIMEOUT_LIMITS["connect_seconds"][0]
+    statement_ms: int = _POSTGRES_TIMEOUT_LIMITS["statement_ms"][0]
+    lock_ms: int = _POSTGRES_TIMEOUT_LIMITS["lock_ms"][0]
+    idle_in_transaction_ms: int = _POSTGRES_TIMEOUT_LIMITS["idle_in_transaction_ms"][0]
+
+    def __post_init__(self) -> None:
+        for name, (_default, maximum, unit, _env) in _POSTGRES_TIMEOUT_LIMITS.items():
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= maximum:
+                raise ValueError(f"Postgres timeout {name} must be an integer from 1 to {maximum} {unit}, got {value!r}")
+
+    @classmethod
+    def from_environment(cls, environ: Any = None) -> "PostgresTimeouts":
+        environ = os.environ if environ is None else environ
+        values = {}
+        for name, (default, _maximum, _unit, env) in _POSTGRES_TIMEOUT_LIMITS.items():
+            raw = environ.get(env)
+            if raw is None or not raw.strip():
+                values[name] = default
+                continue
+            try:
+                values[name] = int(raw.strip())
+            except ValueError as error:
+                raise ValueError(f"{env} must be an integer, got {raw!r}") from error
+        return cls(**values)
+
+    def for_schema_migration(self) -> "PostgresTimeouts":
+        # Schema setup may rewrite tables and waits for another process's migration behind the schema
+        # advisory lock, so it gets longer (still finite) statement and lock bounds.
+        return replace(self, statement_ms=max(self.statement_ms, 600_000), lock_ms=max(self.lock_ms, 300_000))
+
+
+def _effective_connect_timeout(dsn: str, timeouts: PostgresTimeouts) -> int:
+    """Portmark's connect bound, or the DSN's own connect_timeout when that one is SMALLER.
+
+    A connect_timeout keyword argument replaces the DSN's value, so a DSN can never disable or widen
+    the bound -- but an operator's tighter value is kept. libpq treats 0 (or a negative) as "wait
+    forever", so such a DSN value is ignored.
+    """
+    from psycopg.conninfo import conninfo_to_dict
+
+    raw = conninfo_to_dict(dsn).get("connect_timeout")
+    try:
+        from_dsn = int(str(raw)) if raw is not None else 0
+    except ValueError:
+        from_dsn = 0
+    return min(timeouts.connect_seconds, from_dsn) if from_dsn > 0 else timeouts.connect_seconds
+
+
+def _bounded_postgres_connect(dsn: str, timeouts: PostgresTimeouts, **kwargs: Any):
+    """psycopg.connect with Portmark's bounds enforced over anything the DSN sets (Section 12 #3).
+
+    The session settings are applied with set_config(..., false) AFTER connecting and then COMMITTED:
+    a session setting made inside a transaction that later rolls back would be undone. They are not
+    passed as the `options` keyword, which would REPLACE the operator's own DSN options (for example
+    a search_path). A later value in the session wins over the DSN's startup options.
+    """
+    psycopg, _rows, _sql, _ = _postgres_modules()
+    connection = psycopg.connect(dsn, connect_timeout=_effective_connect_timeout(dsn, timeouts), **kwargs)
+    try:
+        connection.execute(
+            "SELECT set_config('statement_timeout', %s, false), set_config('lock_timeout', %s, false), "
+            "set_config('idle_in_transaction_session_timeout', %s, false)",
+            (f"{timeouts.statement_ms}ms", f"{timeouts.lock_ms}ms", f"{timeouts.idle_in_transaction_ms}ms"),
+        )
+        connection.commit()
+    except BaseException:
+        connection.close()
+        raise
+    return connection
 # sign_head(head_hash, sequence) -> (signature_key_id, signature, signed_at). signed_at is
 # the epoch seconds embedded in the signed v2 payload (None => a v1 head, no signing time).
 AuditHeadSigner = Callable[[str, int], tuple[str, str, "int | None"]]
@@ -1680,13 +1773,22 @@ class SQLiteRuntimeStore:
 class PostgresRuntimeStore:
     is_durable = True
 
-    def __init__(self, dsn: str, audit_head_verifier: AuditHeadVerifier | None = None, schema: str = "public", clock: Callable[[], int] | None = None) -> None:
+    def __init__(
+        self,
+        dsn: str,
+        audit_head_verifier: AuditHeadVerifier | None = None,
+        schema: str = "public",
+        clock: Callable[[], int] | None = None,
+        timeouts: PostgresTimeouts | None = None,
+    ) -> None:
         if not dsn:
             raise ValueError("Postgres DSN must not be empty")
         if not schema or "\x00" in schema:
             raise ValueError("Postgres schema must not be empty")
         self.dsn = dsn
         self.schema = schema
+        # Section 12 #3: the bounds every connection below gets (see PostgresTimeouts).
+        self.timeouts = timeouts if timeouts is not None else PostgresTimeouts()
         self._audit_head_verifier = audit_head_verifier
         # Section 4 #3: the lease OPERATIONS on Postgres use DATABASE time (clock_timestamp(), see the
         # lease-methods class note), NOT this clock -- so multiple dispatcher hosts with skewed clocks
@@ -1719,7 +1821,9 @@ class PostgresRuntimeStore:
         # would itself raise (InFailedSqlTransaction) and mask the real error.
         psycopg, rows, sql, _ = _postgres_modules()
         lock_key = _advisory_lock_key("portmark-schema:" + self.schema)
-        with psycopg.connect(self.dsn, row_factory=rows.dict_row) as connection:
+        # Section 12 #3: bounded like every connection, with the longer schema-migration bounds, so
+        # a start behind another process's migration waits a finite time for the advisory lock.
+        with _bounded_postgres_connect(self.dsn, self.timeouts.for_schema_migration(), row_factory=rows.dict_row) as connection:
             connection.execute("SELECT pg_advisory_lock(%s)", (lock_key,))
             connection.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(self.schema)))
             connection.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(self.schema)))
@@ -1727,8 +1831,8 @@ class PostgresRuntimeStore:
             connection.commit()
 
     def _connect(self):
-        psycopg, rows, sql, _ = _postgres_modules()
-        connection = psycopg.connect(self.dsn, row_factory=rows.dict_row)
+        _psycopg, rows, sql, _ = _postgres_modules()
+        connection = _bounded_postgres_connect(self.dsn, self.timeouts, row_factory=rows.dict_row)
         connection.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(self.schema)))
         return connection
 
@@ -2497,7 +2601,7 @@ def create_runtime_store(
     if backend == "sqlite":
         return SQLiteRuntimeStore(location, audit_head_verifier)
     if backend == "postgres":
-        return PostgresRuntimeStore(str(location), audit_head_verifier)
+        return PostgresRuntimeStore(str(location), audit_head_verifier, timeouts=PostgresTimeouts.from_environment())
     raise ValueError("store backend must be 'sqlite' or 'postgres'")
 
 

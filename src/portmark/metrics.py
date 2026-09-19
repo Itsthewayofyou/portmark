@@ -17,6 +17,9 @@ _REFUSAL_REASONS = frozenset({
     "security",
     "internal",
     "not_ready",
+    # Section 12: a body not received within the deadline (#2); a request refused while draining (#1).
+    "request_timeout",
+    "shutting_down",
 })
 
 

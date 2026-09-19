@@ -111,15 +111,16 @@ class PublicModeGateTests(unittest.TestCase):
 class EntrypointTests(unittest.TestCase):
     def test_refused_public_bind_never_starts_uvicorn(self):
         environ = {"PORTMARK_BIND_HOST": "0.0.0.0", "PORTMARK_PUBLIC_MODE": PUBLIC_MODE_ACK}  # nosec B104
-        with patch("uvicorn.run") as run, patch("sys.stderr"):
+        with patch("portmark.serve_asgi.run_uvicorn") as run, patch("sys.stderr"):
             self.assertEqual(serve_asgi.main(environ), serve_asgi.REFUSED_EXIT)
         run.assert_not_called()
 
     def test_default_bind_is_loopback_with_portmark_as_the_only_proxy_authority(self):
-        with patch("uvicorn.run") as run:
+        # Section 12 #1: the entrypoint runs uvicorn through run_uvicorn (uvicorn.run plus the drain hook).
+        with patch("portmark.serve_asgi.run_uvicorn") as run:
             self.assertEqual(serve_asgi.main({}), 0)
         run.assert_called_once()
-        app, options = run.call_args.args[0], run.call_args.kwargs
+        app, options = run.call_args.args
         self.assertEqual(app, "portmark.asgi:app")
         self.assertEqual((options["host"], options["port"]), ("127.0.0.1", 8080))
         self.assertIs(options["proxy_headers"], False)
@@ -127,7 +128,7 @@ class EntrypointTests(unittest.TestCase):
 
     def test_bad_port_is_refused(self):
         for port in ("http", "0", "70000"):
-            with self.subTest(port=port), patch("uvicorn.run") as run, patch("sys.stderr"):
+            with self.subTest(port=port), patch("portmark.serve_asgi.run_uvicorn") as run, patch("sys.stderr"):
                 self.assertEqual(serve_asgi.main({"PORTMARK_BIND_PORT": port}), serve_asgi.REFUSED_EXIT)
                 run.assert_not_called()
 
@@ -135,9 +136,9 @@ class EntrypointTests(unittest.TestCase):
         from portmark.a2a import serve
         from portmark.factory import make_host
 
-        with patch("uvicorn.run") as run:
+        with patch("portmark.a2a.run_uvicorn") as run:
             serve(make_host(None), "127.0.0.1", 8080)
-        self.assertIs(run.call_args.kwargs["proxy_headers"], False)
+        self.assertIs(run.call_args.args[1]["proxy_headers"], False)
 
     def test_public_refusal_from_a_real_process_lists_every_requirement(self):
         result = subprocess.run(  # nosec B603 -- this interpreter, fixed module

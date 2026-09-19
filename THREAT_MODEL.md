@@ -296,6 +296,7 @@ flowchart LR
 - A tool failing at call time ends the whole run, so one flaky upstream costs every other reading the agent had collected. Deliberate — see Recorded Decisions below.
 - Audit-history rollback is detected only relative to the surviving local audit floor (Section 10). Whole-machine rollback, copying the database with its floor, forks across hosts, a compromised host's signing, and backdating before compromise are NOT detected -- see Recorded Decisions.
 - Two constraint sets that narrow the same argument in ways Portmark cannot prove are narrower cause the grant to be dropped rather than merged. Availability is traded for the guarantee that merging never creates authority.
+- Shutdown is bounded, not graceful at any cost (Section 12, decision D1): a run still active when the shutdown grace expires is abandoned as in a crash. Portmark stops it from launching another tool or writing another checkpoint, but a tool step already in progress cannot be interrupted, so a side-effecting tool abandoned mid-call has an effect of unknown status until it is reconciled. Portmark reports the shutdown as failed and names the run; the orchestrator, not Portmark, terminates the process.
 
 ## Recorded Decisions
 

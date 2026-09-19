@@ -281,7 +281,14 @@ class GenericHttpProvider(ModelProvider):
                 _TRANSACTION_SLOTS.release()
 
         thread = threading.Thread(target=_run, daemon=True)
-        thread.start()
+        try:
+            thread.start()
+        except RuntimeError as error:
+            # Section 12 #5: the OS refused a new thread, so _run's finally will never release the slot
+            # reserved above. Release it here and fail closed, or each failed start leaks one slot
+            # until the pool is permanently exhausted.
+            _TRANSACTION_SLOTS.release()
+            raise ProviderError("could not start a provider transaction thread") from error
         thread.join(timeout=max(0.0, deadline - time.monotonic()))  # remaining budget, not a fresh timeout
         if thread.is_alive():
             connection = holder.get("connection")

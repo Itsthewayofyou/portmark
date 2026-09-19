@@ -27,7 +27,7 @@ import sys
 from collections.abc import Mapping
 from typing import Any
 
-from .a2a import is_loopback_bind, parse_trusted_proxies, validate_public_base_url
+from .a2a import is_loopback_bind, parse_trusted_proxies, run_uvicorn, validate_public_base_url
 from .config import RuntimeConfig
 from .logging_config import configure_logging
 
@@ -124,9 +124,9 @@ def main(environ: Mapping[str, str] | None = None) -> int:
         for problem in problems:
             print(f"  - {problem}", file=sys.stderr)
         return REFUSED_EXIT
-    import uvicorn
-
-    uvicorn.run("portmark.asgi:app", **uvicorn_options(host, port))
+    # Section 12 #1: run_uvicorn is uvicorn.run() plus the drain hook -- the shutdown signal stops
+    # admission at once, and uvicorn's graceful wait uses the app's own shutdown grace.
+    run_uvicorn("portmark.asgi:app", uvicorn_options(host, port))
     return 0
 
 

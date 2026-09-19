@@ -7209,33 +7209,33 @@ class RuntimeTests(unittest.TestCase):
         self.assertFalse(issubclass(BoundedReferenceHTTPServer, ThreadingHTTPServer))
 
         host = make_host()
-        with patch("uvicorn.run") as run:
+        with patch("portmark.a2a.run_uvicorn") as run:
             with self.assertRaisesRegex(ValueError, "loopback"):
                 serve(host, public_bind, 8080)
         run.assert_not_called()
 
-        with patch("uvicorn.run") as run:
+        with patch("portmark.a2a.run_uvicorn") as run:
             with self.assertRaisesRegex(ValueError, "reverse proxy"):
                 serve(host, public_bind, 8080, allow_direct_a2a=True)
         run.assert_not_called()
 
-        with patch("uvicorn.run") as run:
+        with patch("portmark.a2a.run_uvicorn") as run:
             serve(host, "127.0.0.1", 8080)
         run.assert_called_once()
-        self.assertEqual(run.call_args.kwargs["host"], "127.0.0.1")
-        self.assertEqual(run.call_args.kwargs["limit_concurrency"], DEFAULT_MAX_CONCURRENT_REQUESTS)
+        self.assertEqual(run.call_args.args[1]["host"], "127.0.0.1")
+        self.assertEqual(run.call_args.args[1]["limit_concurrency"], DEFAULT_MAX_CONCURRENT_REQUESTS)
 
     def test_serve_warns_when_tls_not_asserted(self):
         host = make_host()
         # HSTS off => TLS not asserted => a loud startup warning must fire.
-        with patch("uvicorn.run"):
+        with patch("portmark.a2a.run_uvicorn"):
             with self.assertLogs("portmark.a2a", level="WARNING") as captured:
                 serve(host, "127.0.0.1", 8080, enable_hsts=False)
         joined = "\n".join(captured.output)
         self.assertIn("TLS NOT asserted", joined)
         self.assertIn("NOT encrypted in transit", joined)
         # HSTS on => operator asserted HTTPS => no false alarm.
-        with patch("uvicorn.run"):
+        with patch("portmark.a2a.run_uvicorn"):
             with self.assertNoLogs("portmark.a2a", level="WARNING"):
                 serve(host, "127.0.0.1", 8080, enable_hsts=True)
 

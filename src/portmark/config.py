@@ -7,9 +7,11 @@ from dataclasses import dataclass
 from .a2a import (
     DEFAULT_AGENT_CARD_RATE_LIMIT_PER_IP,
     DEFAULT_AGENT_CARD_RATE_LIMIT_WINDOW_SECONDS,
+    DEFAULT_BODY_READ_TIMEOUT_SECONDS,
     DEFAULT_MAX_CONCURRENT_REQUESTS,
     DEFAULT_RATE_LIMIT_PER_IP,
     DEFAULT_RATE_LIMIT_WINDOW_SECONDS,
+    DEFAULT_SHUTDOWN_GRACE_SECONDS,
 )
 
 
@@ -41,6 +43,10 @@ class RuntimeConfig:
     a2a_rate_limit_window_seconds: int = DEFAULT_RATE_LIMIT_WINDOW_SECONDS
     a2a_agent_card_rate_limit_per_ip: int = DEFAULT_AGENT_CARD_RATE_LIMIT_PER_IP
     a2a_agent_card_rate_limit_window_seconds: int = DEFAULT_AGENT_CARD_RATE_LIMIT_WINDOW_SECONDS
+    # Section 12 #2 / #1. Validated (positive, bounded) where the app is built, so a bad value fails
+    # the start instead of disabling the bound.
+    a2a_body_read_timeout_seconds: float = DEFAULT_BODY_READ_TIMEOUT_SECONDS
+    shutdown_grace_seconds: float = DEFAULT_SHUTDOWN_GRACE_SECONDS
 
     @classmethod
     def from_environment(cls) -> "RuntimeConfig":
@@ -77,6 +83,11 @@ class RuntimeConfig:
                 "PORTMARK_A2A_AGENT_CARD_RATE_LIMIT_WINDOW_SECONDS",
                 DEFAULT_AGENT_CARD_RATE_LIMIT_WINDOW_SECONDS,
             )),
+            a2a_body_read_timeout_seconds=float(os.environ.get(
+                "PORTMARK_A2A_BODY_READ_TIMEOUT_SECONDS",
+                DEFAULT_BODY_READ_TIMEOUT_SECONDS,
+            )),
+            shutdown_grace_seconds=float(os.environ.get("PORTMARK_SHUTDOWN_GRACE_SECONDS", DEFAULT_SHUTDOWN_GRACE_SECONDS)),
         )
 
     def merged_with_args(self, args) -> "RuntimeConfig":
@@ -115,6 +126,8 @@ class RuntimeConfig:
                 "a2a_agent_card_rate_limit_window_seconds",
                 None,
             ) or self.a2a_agent_card_rate_limit_window_seconds,
+            a2a_body_read_timeout_seconds=self.a2a_body_read_timeout_seconds,
+            shutdown_grace_seconds=self.shutdown_grace_seconds,
         )
 
 
