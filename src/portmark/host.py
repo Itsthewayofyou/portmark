@@ -10,6 +10,7 @@ import logging
 from typing import Any
 
 from . import _run_progress
+from ._clock import trusted_now
 from .metrics import RuntimeMetrics
 from .models import AgentEnvelope, ApprovalToken, AttestationEvidence, ProviderDecision, RunResult
 from .projection import project_state_for_migration, provider_view
@@ -92,6 +93,8 @@ class AgentHost:
         # Section 10 PR B: the monotonic witness (local audit floor), set by make_host after its
         # boot checks pass. None = no floor configured.
         self.audit_floor: Any = None
+        self._capacity_lock = threading.Lock()
+        self._capacity_next_refresh = 0.0
         # Section 7 PR 2 (round 3): give the tool registry a READ-ONLY view of this host's durable
         # ledger so it can validate a launch-arm request against the real `started` row. `tools` is a
         # plain attribute again (the round-2 auto-binding property setter is gone -- the gate no longer
@@ -137,6 +140,24 @@ class AgentHost:
             raise
         finally:
             self.metrics.observe_duration("run_duration_seconds", time.monotonic() - started)
+
+    # Section 12 #4: capacity gauges for /metrics, refreshed from the store at most once a minute (a report
+    # counts rows, so a scrape storm must not turn into a query storm). A failed report never fails /metrics.
+    CAPACITY_REFRESH_SECONDS = 60.0
+
+    def refresh_capacity_metrics(self) -> None:
+        report_fn = getattr(self.store, "capacity_report", None)
+        if report_fn is None:
+            return
+        with self._capacity_lock:
+            now = time.monotonic()
+            if now < self._capacity_next_refresh:
+                return
+            self._capacity_next_refresh = now + self.CAPACITY_REFRESH_SECONDS
+        try:
+            self.metrics.set_store_capacity(report_fn(), int(time.time()))
+        except Exception:  # noqa: BLE001 -- metrics stay available; the failure is logged
+            logger.warning("store capacity report failed; /metrics keeps the previous values", exc_info=True)
 
     def cancel_task(self, task_id: str) -> None:
         """Durably cancel an admitted task (section 5 #3). Idempotent.
@@ -900,9 +921,17 @@ class AgentHost:
                     permit.subject,
                     permit.audience,
                     state.task_id,
+                    # Section 12 #4 (D2): the approval's own expiry is stored with its nonce, the only
+                    # fact that later justifies pruning it.
+                    expires_at=token.expires_at,
                 )
+                # Section 12 #6: a security-relevant write, so the durable time floor rides it (at most
+                # once per cadence; it never waits for, or fails, this transaction).
+                approval_floor = approval_transaction.advance_time_floor(trusted_now())
                 if approval_transaction.is_task_cancelled(state.task_id):
                     raise _TaskCancelled
+                if approval_floor is not None and self.audit_floor is not None:
+                    self.audit_floor.advance_time_floor(approval_floor)
         except _TaskCancelled:
             return self._approval_failure(state, audit, "approval.denied", "cancelled")
         except SecurityError:
@@ -1370,11 +1399,19 @@ class AgentHost:
                                 f"({verdict.status}: {verdict.reason}); refusing to witness it"
                             )
                 if consume_nonce is not None:
-                    transaction.consume_nonce(consume_nonce, envelope.permit.subject, envelope.permit.audience, state.task_id)
+                    # Section 12 #4 (D2): the permit's expiry is stored with its nonce (never re-derived later).
+                    transaction.consume_nonce(
+                        consume_nonce, envelope.permit.subject, envelope.permit.audience, state.task_id,
+                        expires_at=envelope.permit.expires_at,
+                    )
                 # Finding #3 (Option B): sign audit heads as v2 with an attested signed_at so
                 # verification can be judged at signing time. One timestamp per persist; returned
                 # alongside (key_id, signature) so the store persists it for later verification.
-                head_signed_at = int(time.time())
+                # Section 12 #6: the signing time is a security timestamp -> the trusted clock.
+                head_signed_at = trusted_now()
+                # Section 12 #6: the durable time floor advances with the save (at most once per cadence;
+                # Postgres uses the database clock and never waits on the floor row).
+                advanced_floor = transaction.advance_time_floor(head_signed_at)
                 # Finding #2 (runtime enforcement): fail closed if the audit-signing key stopped
                 # being usable while the process ran (e.g. it expired past its expires_at, which
                 # no on-disk file change would catch). We are about to sign a new audit head; if
@@ -1438,6 +1475,11 @@ class AgentHost:
                     transaction.enqueue_migration(
                         state.task_id, migration["permit"]["audience"], canonical_json(migration).decode("utf-8")
                     )
+                if floor is not None and advanced_floor is not None:
+                    # Section 12 #6: mirror the time floor OUTSIDE the database, so restoring an older
+                    # database snapshot cannot also restore an older floor. Before the commit and before
+                    # the head advance: a failure here rolls the save back with nothing witnessed.
+                    floor.advance_time_floor(advanced_floor)
                 if floor is not None:
                     # Section 10 PR B (auditor round 2, High): the witness advances BEFORE the database
                     # commit, as the LAST step inside the transaction, so no commit is ever acknowledged

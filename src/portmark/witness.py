@@ -53,7 +53,11 @@ from .security import AUDIT_FLOOR_TYPE, SecurityError, canonical_json
 
 logger = logging.getLogger(__name__)
 
-FLOOR_FORMAT_VERSION = 1
+# Section 12 #6: version 2 adds `time_floor` (the durable time floor, mirrored here so it survives a
+# rollback of the database it also lives in). A version-1 file is still read (its time floor is 0)
+# and is rewritten as version 2 on the next write.
+FLOOR_FORMAT_VERSION = 2
+_READABLE_FORMAT_VERSIONS = (1, 2)
 
 # Head comparison outcomes (also the `floor_status` values verify-audit reports).
 ANCHORED = "anchored"
@@ -84,6 +88,14 @@ class MonotonicWitness(Protocol):
         ...
 
     def advance_registry(self, version: int | None, digest: str | None) -> None:
+        ...
+
+    # Section 12 #6: a witness may also remember the durable time floor outside the database.
+    def witnessed_time_floor(self) -> int:
+        ...
+
+    def advance_time_floor(self, floor_at: int) -> None:
+        """Monotonic: a lower value is ignored."""
         ...
 
 
@@ -141,7 +153,7 @@ class LocalFloorWitness:
     """The local audit floor: one signed record per host, outside the runtime database.
 
     File: {"format": "portmark.audit-floor.v1", "body": {...}, "signature_key_id": ..., "signature": ...}
-    body: {format_version, host_id, epoch, registry: null | {version, digest},
+    body: {format_version, host_id, epoch, registry: null | {version, digest}, time_floor (v2),
            tasks: {task_id: {sequence, head_hash}}, resets: [{at, reason, prior_epoch, prior_floor_sha256}]}
 
     Every read verifies the signature (the host's audit key, `audit` purpose, issuer == host_id);
@@ -218,7 +230,8 @@ class LocalFloorWitness:
             self._verifier.verify_audit_floor(key_id, body, signature)
         except SecurityError as error:
             raise FloorError("floor-corrupt", f"audit floor signature check failed: {error}") from error
-        return body
+        # Upgrade only AFTER the signature check: the signature covers the body exactly as stored.
+        return _upgraded(body)
 
     # -- writing ---------------------------------------------------------------------------
     def _write(self, body: dict[str, Any]) -> None:
@@ -233,7 +246,10 @@ class LocalFloorWitness:
         }
         atomic_write_bytes(self.path, canonical_json(document), prefix=".audit-floor-", mode=0o600)
 
-    def create(self, epoch: int, registry: dict[str, Any] | None, tasks: dict[str, dict[str, Any]], resets: list[dict[str, Any]]) -> None:
+    def create(
+        self, epoch: int, registry: dict[str, Any] | None, tasks: dict[str, dict[str, Any]], resets: list[dict[str, Any]],
+        time_floor: int = 0,
+    ) -> None:
         with sidecar_lock(self.path):
             self._write({
                 "format_version": FLOOR_FORMAT_VERSION,
@@ -242,6 +258,7 @@ class LocalFloorWitness:
                 "registry": registry,
                 "tasks": tasks,
                 "resets": resets,
+                "time_floor": time_floor,
             })
 
     def _update(self, mutate: Callable[[dict[str, Any]], bool]) -> None:
@@ -311,6 +328,38 @@ class LocalFloorWitness:
 
         self._update(mutate)
 
+    # -- Section 12 #6: the mirrored durable time floor ---------------------------------------------
+    def witnessed_time_floor(self) -> int:
+        body = self.load()
+        return 0 if body is None else int(body["time_floor"])
+
+    def advance_time_floor(self, floor_at: int) -> None:
+        """Raise the mirrored floor to `floor_at`; never lowers it (a lower value is ignored)."""
+
+        def mutate(body: dict[str, Any]) -> bool:
+            if floor_at > body["time_floor"]:
+                body["time_floor"] = int(floor_at)
+                return True
+            return False
+
+        self._update(mutate)
+
+    def reset_time_floor(self, floor_at: int, reason: str, at: int) -> int:
+        """Operator recovery ONLY (`portmark time-floor reset`): set the mirrored floor, which may lower
+        it, and record the reset in `resets`. Returns the previous value."""
+        if not reason.strip():
+            raise FloorError("reset-refused", "a time-floor reset requires a non-empty reason")
+        prior: dict[str, int] = {}
+
+        def mutate(body: dict[str, Any]) -> bool:
+            prior["value"] = body["time_floor"]
+            body["time_floor"] = int(floor_at)
+            body["resets"].append({"at": at, "reason": reason, "kind": "time-floor", "prior_time_floor": prior["value"], "new_time_floor": int(floor_at)})
+            return True
+
+        self._update(mutate)
+        return prior["value"]
+
 
 _REGISTRY_MESSAGES = {
     "registry-missing": "the audit floor records a trust registry, but none is configured",
@@ -326,10 +375,16 @@ def _validate_body(body: Any) -> None:
     def is_int(value: Any, minimum: int) -> bool:
         return isinstance(value, int) and not isinstance(value, bool) and value >= minimum
 
-    if not isinstance(body, dict) or set(body) != {"format_version", "host_id", "epoch", "registry", "tasks", "resets"}:
+    base_fields = {"format_version", "host_id", "epoch", "registry", "tasks", "resets"}
+    if not isinstance(body, dict) or "format_version" not in body:
         raise bad("unexpected fields")
-    if body["format_version"] != FLOOR_FORMAT_VERSION:
+    if body["format_version"] not in _READABLE_FORMAT_VERSIONS or isinstance(body["format_version"], bool):
         raise bad(f"unsupported format_version {body['format_version']!r}")
+    expected = base_fields if body["format_version"] == 1 else base_fields | {"time_floor"}
+    if set(body) != expected:
+        raise bad("unexpected fields")
+    if body["format_version"] >= 2 and not is_int(body["time_floor"], 0):
+        raise bad("time_floor")
     if not isinstance(body["host_id"], str) or not body["host_id"]:
         raise bad("host_id")
     if not is_int(body["epoch"], 1):
@@ -353,6 +408,15 @@ def _validate_body(body: Any) -> None:
             raise bad(f"task {task_id!r}")
     if not isinstance(body["resets"], list):
         raise bad("resets")
+
+
+
+def _upgraded(body: dict[str, Any]) -> dict[str, Any]:
+    """A validated body in the CURRENT format: a version-1 body gets time_floor 0 (no floor recorded yet).
+    The file on disk is rewritten as version 2 only by the next signed write."""
+    if body["format_version"] == 1:
+        body = {**body, "format_version": FLOOR_FORMAT_VERSION, "time_floor": 0}
+    return body
 
 
 # -- host boot, verification, and operator reset -----------------------------------------------
@@ -464,10 +528,14 @@ def reset_audit_floor(
         raw = witness.read_raw()
     prior_epoch = 0
     prior_resets: list[dict[str, Any]] = []
+    prior_time_floor = 0
     if raw is not None:
         try:
             prior = witness._verified_body(raw)
             prior_epoch, prior_resets = prior["epoch"], list(prior["resets"])
+            # Section 12 #6: an audit-floor reset re-baselines HEADS, not time. The time floor carries
+            # over; only `portmark time-floor reset` may lower it.
+            prior_time_floor = prior["time_floor"]
         except FloorError:
             pass  # a corrupt floor is exactly what a reset replaces; its hash is still recorded
     marker = store.audit_floor_marker(host_id)
@@ -480,7 +548,10 @@ def reset_audit_floor(
         "prior_floor_sha256": None if raw is None else _file_sha256(raw),
     }]
     registry = None if registry_version is None else {"version": registry_version, "digest": registry_digest}
-    witness.create(epoch, registry, {task_id: {"sequence": sequence, "head_hash": head_hash} for task_id, head_hash, sequence in heads}, resets)
+    witness.create(
+        epoch, registry, {task_id: {"sequence": sequence, "head_hash": head_hash} for task_id, head_hash, sequence in heads}, resets,
+        time_floor=max(prior_time_floor, store.time_floor() if hasattr(store, "time_floor") else 0),
+    )
     store.set_audit_floor_marker(host_id, epoch, False)
     return epoch
 

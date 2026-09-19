@@ -126,7 +126,13 @@ def main(environ: Mapping[str, str] | None = None) -> int:
         return REFUSED_EXIT
     # Section 12 #1: run_uvicorn is uvicorn.run() plus the drain hook -- the shutdown signal stops
     # admission at once, and uvicorn's graceful wait uses the app's own shutdown grace.
-    run_uvicorn("portmark.asgi:app", uvicorn_options(host, port))
+    try:
+        run_uvicorn("portmark.asgi:app", uvicorn_options(host, port))
+    except ValueError as error:
+        # Section 12 #6: building the app runs every start-up refusal (time floor, audit floor, signing
+        # key). Report it plainly and exit REFUSED_EXIT, like the public-mode gate, not as a traceback.
+        print(f"portmark: refusing to start: {error}", file=sys.stderr)
+        return REFUSED_EXIT
     return 0
 
 
