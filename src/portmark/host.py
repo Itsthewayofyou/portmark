@@ -488,8 +488,8 @@ class AgentHost:
 
         while state.step < effective.budget.max_steps:
             decision_started = time.monotonic()
-            _run_progress.ensure_live()  # Section 12 #1: no new step after the shutdown deadline
-            _run_progress.note(phase="deciding")
+            # Section 12 #1: atomically refuse (abandoned run) or record the provider call as in flight.
+            _run_progress.begin("deciding")
             # Finding #4: hand the provider a host-projected copy of the state, so tool
             # outputs are reduced to each grant's output_projection before any provider
             # -- in-process or a remote adapter -- can read them. Projection is enforced
@@ -609,12 +609,14 @@ class AgentHost:
             # per-call sequence, records intent BEFORE launch, and settles the outcome after -- so a
             # crash-and-resume REPLAYS a confirmed effect instead of re-running it, and NEVER
             # auto-retries an effect whose status is unknown (Josh's locked decisions).
-            # Section 12 #1: an abandoned run records no effect intent and launches no tool.
-            _run_progress.ensure_live()
             eid = None
             replay_result: Any = _NO_REPLAY
             if self.tools.is_side_effecting(decision.tool) and self.tools.is_isolated(decision.tool):
                 eid = effect_id(state.task_id, state.tool_calls)
+                # Section 12 #1: ONE atomic step, BEFORE the ledger records intent: an abandoned run
+                # stops here with nothing written and nothing launched; otherwise, from this point the
+                # shutdown report names this effect id as in flight (its effect may land).
+                _run_progress.begin("side_effecting_tool", effect_id=eid)
                 mode, payload = self._effect_pre_launch(eid, state.task_id, decision.tool, decision.arguments)
                 if mode == "refuse":
                     return self._effect_refused(state, audit, decision, payload)
@@ -636,9 +638,10 @@ class AgentHost:
                 # before the side-effecting gate, a kill, an exec error) so a capability never outlives
                 # its single intended launch. eid is None for a non-side-effecting or non-isolated tool,
                 # in which case no capability is armed and invoke takes launch_capability=None.
-                # Section 12 #1: from here a side-effecting tool's effect may land, so a run abandoned at
-                # the shutdown deadline in this phase has an effect of unknown status (-> reconcile).
-                _run_progress.note(phase="side_effecting_tool" if eid is not None else "tool", effect_id=eid)
+                if eid is None:
+                    # Section 12 #1: the same atomic step for a tool without an effect id (a side-effecting
+                    # one already began above, before its ledger write).
+                    _run_progress.begin("tool")
                 launch_cap = self._effect_armer.arm(eid, decision.tool, decision.arguments) if eid is not None else None
                 try:
                     tool_started = time.monotonic()
@@ -887,6 +890,9 @@ class AgentHost:
         # Section 5 #3: the cancellation check runs in the SAME transaction, AFTER the consume,
         # so a cancel that wins the race rolls the consume back (nothing is burned) and one that
         # loses is caught by the pre-launch re-check in _apply_decision.
+        # Section 12 #1: redeeming consumes a nonce durably, so it is an operation an abandoned run
+        # must not start (atomic check-and-record, like every other write).
+        _run_progress.begin("approving")
         try:
             with self.store.transaction() as approval_transaction:
                 approval_transaction.consume_nonce(
@@ -1320,8 +1326,8 @@ class AgentHost:
         migration: dict[str, Any] | None = None,
         receipt_binding: dict[str, Any] | None = None,
     ) -> int:
-        _run_progress.ensure_live()  # Section 12 #1: no checkpoint write after the shutdown deadline
-        _run_progress.note(phase="persisting")
+        # Section 12 #1: atomically refuse (abandoned run) or record the checkpoint write as in flight.
+        _run_progress.begin("persisting")
         checkpoint = asdict(state)
         encoded_size = len(canonical_json(checkpoint))
         # The checkpoint is host-owned state, and a migration can transport it to a

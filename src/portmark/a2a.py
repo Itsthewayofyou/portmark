@@ -304,9 +304,9 @@ class _RunTracker:
                     break
                 self._condition.wait(remaining)
             leftovers = list(self._active)
-        for progress in leftovers:
-            progress.abandon()
-        return [progress.snapshot() for progress in leftovers]
+        # abandon() returns the report snapshot under the same lock that begin() takes, so each report
+        # names exactly the operation in flight at the deadline, and nothing can begin afterwards.
+        return [progress.abandon() for progress in leftovers]
 
 
 class BoundedReferenceHTTPServer(ThreadingMixIn, HTTPServer):

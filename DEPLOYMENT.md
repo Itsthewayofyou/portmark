@@ -215,6 +215,20 @@ refused, because it would disable the bound. Schema setup at startup uses longer
 (10 minutes per statement, 5 minutes to wait for another process's migration). A timeout fails the
 operation and rolls its transaction back, as any other database error does.
 
+**When the network goes silent after a query was sent.** The bounds above are enforced by the server. If
+the network between Portmark and PostgreSQL stops delivering packets after a query was sent, the server
+may cancel the statement, but its reply never arrives. For that case every connection also enables TCP
+failure detection, again whatever the DSN says:
+
+- TCP keepalives: a probe after 10 s of silence, then every 5 s; 3 missed probes end the connection
+  (about 25 s).
+- `tcp_user_timeout` of 30 s: a send that stays unacknowledged for 30 s ends the connection.
+
+A live server answers keepalive probes at the TCP level, so a long but healthy statement is not affected.
+These are operating-system mechanisms, not an exact client-side deadline: on a dead network an operation
+fails after roughly the larger of its database bound and about 30 s. `tcp_user_timeout` has no effect
+where the operating system lacks `TCP_USER_TIMEOUT` (for example Windows); keepalives still apply there.
+
 ## Metrics
 
 `GET /metrics` requires the same bearer token as `/message:send`. Without an

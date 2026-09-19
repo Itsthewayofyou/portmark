@@ -21,6 +21,19 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   - Runs execute on daemon threads, so a stuck run no longer holds the process open.
   - A side-effecting tool abandoned mid-call has an effect of unknown status. It is resolved through the
     existing effect ledger (`AgentHost.reconcile_effect`).
+- **No operation can start after the shutdown deadline (auditor, PR #97 round 1).** The first version
+  checked "is the run still live?" and then, in a separate step, recorded the phase and acted. The
+  deadline could land between the two, so a tool could start after the shutdown was reported, and the
+  report could name the previous phase without the effect id. Each operation (provider call, approval
+  redemption, tool launch, checkpoint write) now starts through one atomic `begin()` under the same lock
+  that `abandon()` takes, and `abandon()` takes the report snapshot under that lock. Either the deadline
+  comes first and the operation never starts, or the operation comes first and the report names it as in
+  flight. A side-effecting tool begins before its effect-ledger write, so an abandoned run records no
+  intent and launches nothing. Approval redemption, which consumes a nonce, is fenced too.
+- **PostgreSQL connections detect a silent network (auditor, round 1).** Every connection enables TCP
+  keepalives (10 s idle, 5 s interval, 3 probes) and a 30 s `tcp_user_timeout`, whatever the DSN says.
+  This bounds the wait when the network stops delivering packets after a query was sent. It is an
+  operating-system mechanism, not an exact client-side deadline, and DEPLOYMENT.md says so.
 - **Capacity stays honest when a request task is cancelled (#1).** The admission slot was released
   when the request task ended, even though its run kept executing on a worker thread. The run thread
   now owns the slot until the run ends.

@@ -99,10 +99,11 @@ def _app(**kwargs):
 def _blocking_dispatch(app, *, release: threading.Event, started: threading.Event, note: dict | None = None):
     def dispatch(body: bytes) -> HttpResponse:
         if note:
-            _run_progress.note(**note)
+            _run_progress.note(task_id=note["task_id"], checkpoint_generation=note["checkpoint_generation"])
+            _run_progress.begin(note["phase"], effect_id=note.get("effect_id"))
         started.set()
         release.wait(30)
-        _run_progress.ensure_live()  # what the host does before its next step
+        _run_progress.begin("persisting")  # what the host does before its next write
         return app.a2a_router.response(200, {"ok": True})
 
     app.a2a_router.dispatch_post = dispatch
@@ -489,6 +490,154 @@ class BoundedShutdownTests(unittest.TestCase):
                 host.run(envelope)
         self.assertEqual(invoked, [])
 
+    # --- Auditor round 1 (PR #97): check-then-act races. Each test pauses exactly where the old separate
+    # "is it live?" check and the operation it guarded could be split by the shutdown deadline.
+
+    def _side_effecting_demo_host(self):
+        """The demo host with its tool treated as side-effecting + isolated and the ledger stubbed, so the
+        run walks the side-effecting path (effect id, ledger step, launch) without a subprocess tool."""
+        host = make_host(None, store=InMemoryRuntimeStore())
+        calls = {"pre_launch": 0, "invoke": 0}
+        host.tools.is_side_effecting = lambda name: True
+        host.tools.is_isolated = lambda name: True
+
+        def pre_launch(*args, **kwargs):
+            calls["pre_launch"] += 1
+            return "run", None
+
+        host._effect_pre_launch = pre_launch
+        host._effect_armer = type("Armer", (), {"arm": lambda self, *a: object(), "disarm": lambda self, cap: None})()
+        return host, calls
+
+    def test_abandonment_after_the_decision_stops_the_tool_before_it_launches(self):
+        # The auditor's exact race: the deadline lands after the last liveness check and before the
+        # launch. The atomic begin() at the launch refuses it: no tool call.
+        host = make_host(None, store=InMemoryRuntimeStore())
+        envelope = make_demo_envelope(host, "research Telescript")
+        progress = _run_progress.RunProgress()
+        real_is_side_effecting = host.tools.is_side_effecting
+
+        def deadline_lands_here(name):  # runs between the decision and the tool launch
+            progress.abandon()
+            return real_is_side_effecting(name)
+
+        host.tools.is_side_effecting = deadline_lands_here
+        invoked = []
+        real_invoke = host.tools.invoke
+        with patch.object(host.tools, "invoke", side_effect=lambda *a, **k: (invoked.append(1), real_invoke(*a, **k))[1]):
+            with _run_progress.tracking(progress), self.assertRaises(_run_progress.RunAbandoned):
+                host.run(envelope)
+        self.assertEqual(invoked, [])
+
+    def test_abandonment_before_a_side_effecting_step_writes_no_intent_and_launches_nothing(self):
+        host, calls = self._side_effecting_demo_host()
+        envelope = make_demo_envelope(host, "research Telescript")
+        progress = _run_progress.RunProgress()
+        real_is_isolated = host.tools.is_isolated
+
+        def deadline_lands_here(name):  # after the decision, before the effect id's ledger write
+            progress.abandon()
+            return real_is_isolated(name)
+
+        host.tools.is_isolated = deadline_lands_here
+        with patch.object(host.tools, "invoke", side_effect=lambda *a, **k: calls.__setitem__("invoke", calls["invoke"] + 1)):
+            with _run_progress.tracking(progress), self.assertRaises(_run_progress.RunAbandoned):
+                host.run(envelope)
+        self.assertEqual(calls, {"pre_launch": 0, "invoke": 0})
+
+    def test_a_side_effecting_tool_already_started_is_reported_in_flight_with_its_effect_id(self):
+        # The other order: the step began first, so the deadline report names it -- phase and effect id.
+        host, calls = self._side_effecting_demo_host()
+        envelope = make_demo_envelope(host, "research Telescript")
+        progress = _run_progress.RunProgress()
+        reports = []
+
+        def tool_running_at_the_deadline(*args, **kwargs):
+            calls["invoke"] += 1
+            reports.append(progress.abandon())
+            return {"ok": True}
+
+        with patch.object(host.tools, "invoke", side_effect=tool_running_at_the_deadline):
+            with _run_progress.tracking(progress), self.assertRaises(Exception):
+                host.run(envelope)
+        self.assertEqual(calls["invoke"], 1)
+        self.assertEqual(reports[0]["phase"], "side_effecting_tool")
+        self.assertEqual(len(reports[0]["effect_ids"]), 1)
+        self.assertEqual(reports[0]["task_id"], envelope.state.task_id)
+
+    def test_a_checkpoint_write_already_started_is_reported_in_flight(self):
+        host = make_host(None, store=InMemoryRuntimeStore())
+        envelope = make_demo_envelope(host, "research Telescript")
+        progress = _run_progress.RunProgress()
+        reports = []
+        real_transaction = host.store.transaction
+
+        def write_in_flight_at_the_deadline():
+            if not reports:
+                reports.append(progress.abandon())
+            return real_transaction()
+
+        with patch.object(host.store, "transaction", side_effect=write_in_flight_at_the_deadline):
+            with _run_progress.tracking(progress), self.assertRaises(_run_progress.RunAbandoned):
+                host.run(envelope)
+        self.assertEqual(reports[0]["phase"], "persisting")
+        # The write that had begun completed; nothing after it started.
+        self.assertIsNotNone(host.store.load_checkpoint(envelope.state.task_id))
+
+    def test_an_abandoned_run_does_not_redeem_an_approval(self):
+        import test_runtime as rt
+        from dataclasses import asdict as _asdict
+
+        authority = rt.ApprovalAuthority.generate()
+        grant = rt.ToolGrant("payments.reserve", {"max_amount": 100, "currency": "USD"}, ("reserved",))
+        policy = rt.HostPolicy("host:local-demo", (grant,), rt.ResourceBudget(), "policy-v1", "policy-hash",
+                               {"payments.reserve": "external-payment"}, (authority.trusted_approver(),))
+        host = make_host(attestation_policy=None, store=InMemoryRuntimeStore())
+        host.policy = policy
+        host.providers["payer"] = rt.PaymentProvider()
+        envelope = make_demo_envelope(host, "pay vendor", "payer")
+        object.__setattr__(envelope.permit, "grants", (rt.ToolGrant("payments.reserve", {"max_amount": 100, "currency": "USD"}),))
+        host.signer.seal(envelope)
+        first = host.run(envelope)
+        self.assertEqual(first.status, "awaiting_input")
+        token = authority.issue(
+            "payments.reserve", envelope.permit.subject, envelope.permit.audience, envelope.state.task_id,
+            envelope.permit.nonce, {"amount": 50, "currency": "USD"}, "policy-hash", int(time.time()) + 60,
+            checkpoint_generation=first.checkpoint["checkpoint_generation"],
+        )
+        envelope.state.memory["approvals"] = {"payments.reserve": _asdict(token)}
+        host.signer.seal(envelope)
+        progress = _run_progress.RunProgress()
+        real_decide = host.providers["payer"].decide
+        host.providers["payer"].decide = lambda *a, **k: (progress.abandon(), real_decide(*a, **k))[1]
+        with _run_progress.tracking(progress), self.assertRaises(_run_progress.RunAbandoned):
+            host.run(envelope)
+        # The approval nonce was NOT consumed: consuming it now succeeds (it would raise if burned).
+        with host.store.transaction() as transaction:
+            transaction.consume_nonce(
+                f"approval:{envelope.state.task_id}:{token.approval_id}", envelope.permit.subject,
+                envelope.permit.audience, envelope.state.task_id,
+            )
+
+    def test_begin_and_abandon_are_one_atomic_order(self):
+        progress = _run_progress.RunProgress()
+        progress.note(task_id="t-1", checkpoint_generation=3)
+        progress.begin("side_effecting_tool", effect_id="e-1")
+        report = progress.abandon()
+        self.assertEqual(report, {"task_id": "t-1", "checkpoint_generation": 3, "phase": "side_effecting_tool", "effect_ids": ["e-1"]})
+        with self.assertRaises(_run_progress.RunAbandoned):
+            progress.begin("side_effecting_tool", effect_id="e-2")
+        with self.assertRaises(_run_progress.RunAbandoned):
+            progress.begin("persisting")
+        self.assertEqual(progress.snapshot(), report)  # a refused begin records nothing, not even its phase
+        for operation in _run_progress.OPERATIONS:
+            with self.subTest(operation=operation), self.assertRaises(_run_progress.RunAbandoned):
+                progress.begin(operation)
+        with self.assertRaises(ValueError):
+            progress.note(phase="persisting")  # an operation cannot be recorded without its check
+        with self.assertRaises(ValueError):
+            _run_progress.RunProgress().begin("persisted")
+
     def test_draining_that_begins_during_the_body_read_still_refuses_the_run(self):
         app = _app()
         ran = []
@@ -549,8 +698,8 @@ marker = pathlib.Path(sys.argv[2])
 app = make_asgi_app(make_host(None), None, allow_anonymous=True, shutdown_grace_seconds=5.0)
 
 def dispatch(body):
-    _run_progress.note(task_id="task-sigterm-1", checkpoint_generation=2, phase="side_effecting_tool",
-                       effect_id="effect-sigterm-1")
+    _run_progress.note(task_id="task-sigterm-1", checkpoint_generation=2)
+    _run_progress.begin("side_effecting_tool", effect_id="effect-sigterm-1")
     marker.write_text("running")
     threading.Event().wait()  # never finishes
 
@@ -771,6 +920,19 @@ class PostgresTimeoutEnforcementTests(unittest.TestCase):
             self.assertEqual(again["l"], "10s")
         finally:
             connection.close()
+
+    def test_tcp_failure_detection_is_on_even_if_the_dsn_turns_it_off(self):
+        # Auditor round 1 residual: detect a network that goes silent AFTER a query was sent.
+        hostile = PG_DSN + ("&" if "?" in PG_DSN else "?") + "keepalives=0&keepalives_idle=7200&tcp_user_timeout=0"
+        store = PostgresRuntimeStore(hostile, schema=self.schema)
+        connection = store._connect()
+        try:
+            parameters = connection.info.get_parameters()
+        finally:
+            connection.close()
+        expected = {"keepalives": "1", "keepalives_idle": "10", "keepalives_interval": "5",
+                    "keepalives_count": "3", "tcp_user_timeout": "30000"}
+        self.assertEqual({key: parameters.get(key) for key in expected}, expected)
 
     def test_a_blocked_table_lock_fails_the_operation_and_rolls_it_back(self):
         store = self._store(lock_ms=300)

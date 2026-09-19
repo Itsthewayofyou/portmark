@@ -153,6 +153,22 @@ def _effective_connect_timeout(dsn: str, timeouts: PostgresTimeouts) -> int:
     return min(timeouts.connect_seconds, from_dsn) if from_dsn > 0 else timeouts.connect_seconds
 
 
+# Section 12 #3 (auditor, PR #97 round 1): the server-side bounds cannot help when the NETWORK goes
+# silent after a query was sent -- the server may cancel the statement, but its reply never arrives.
+# TCP keepalives detect a dead peer while the client waits for a reply (probe after 10 s idle, then
+# every 5 s; 3 missed probes = dead, about 25 s), and tcp_user_timeout fails a send that stays
+# unacknowledged for 30 s. A live server acknowledges probes at the TCP level, so a long but healthy
+# statement is not affected. These are OS-level mechanisms, not an exact client deadline: libpq
+# ignores tcp_user_timeout where the OS lacks TCP_USER_TIMEOUT (for example Windows).
+_POSTGRES_TCP_FAILURE_DETECTION = {
+    "keepalives": 1,
+    "keepalives_idle": 10,
+    "keepalives_interval": 5,
+    "keepalives_count": 3,
+    "tcp_user_timeout": 30_000,
+}
+
+
 def _bounded_postgres_connect(dsn: str, timeouts: PostgresTimeouts, **kwargs: Any):
     """psycopg.connect with Portmark's bounds enforced over anything the DSN sets (Section 12 #3).
 
@@ -162,7 +178,9 @@ def _bounded_postgres_connect(dsn: str, timeouts: PostgresTimeouts, **kwargs: An
     a search_path). A later value in the session wins over the DSN's startup options.
     """
     psycopg, _rows, _sql, _ = _postgres_modules()
-    connection = psycopg.connect(dsn, connect_timeout=_effective_connect_timeout(dsn, timeouts), **kwargs)
+    connection = psycopg.connect(
+        dsn, connect_timeout=_effective_connect_timeout(dsn, timeouts), **_POSTGRES_TCP_FAILURE_DETECTION, **kwargs
+    )
     try:
         connection.execute(
             "SELECT set_config('statement_timeout', %s, false), set_config('lock_timeout', %s, false), "
