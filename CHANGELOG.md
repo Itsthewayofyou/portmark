@@ -30,6 +30,12 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
     non-regular files, and files owned by another user are refused.
   - More credential forms are redacted: any-scheme `Authorization` / `Proxy-Authorization`, `Cookie` /
     `Set-Cookie`, `X-API-Key` / `API-Key` / `X-Auth-Token`, and `api_key=` / `access_key=` values.
+- **Auditor round 3.** Every directory from `/` down to the store directory is checked with `lstat`:
+  owned by the host user or root, and not group/other-writable unless sticky (like `/tmp`); the store
+  directory itself gets no sticky exception. A `0700` store directory inside a writable, non-sticky
+  parent could be renamed away and replaced between connections. The existing chain is checked before
+  any missing directory is created (each created `0700`). **Reversed from round 2:** a symlinked store
+  directory is now refused (use a bind mount); a symlink above it is walked to its target.
 - **Operator action:** an existing store created under a `022` umask is refused until you run the printed
   `chmod 600` command (and the same for its `-wal`/`-shm` files, if present).
 

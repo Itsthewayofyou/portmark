@@ -266,15 +266,32 @@ receipts, and audit details. It must be readable by the host's own user only.
   There is no warning-only mode. Fix the mode, then start again.
 - **The store directory is checked too.** A 0600 database in a directory that other users can write is
   not protected: they can delete or rename it and plant its `-wal`/`-shm` files. The host refuses a
-  store directory that is group- or other-writable (fix: `chmod 700 <directory>`), or that is owned by
-  a user other than the host user or root. The directory is checked BEFORE the host creates anything
-  in it. The directory itself may be a symlink (for example to another volume); its target is checked.
+  store directory that is group- or other-writable, even with the sticky bit (fix: `chmod 700 <directory>`),
+  or that is owned by a user other than the host user or root.
+- **Every directory above it is checked, up to `/`.** Renaming a directory needs write access only to
+  ITS parent, so a `0700` store directory inside a directory that other users can write can be renamed
+  away and replaced between connections. Every component from `/` down must be owned by the host user or
+  root, and must not be group- or other-writable (fix: `chmod go-w <directory>`). The one exception is a
+  **sticky** directory such as `/tmp`: there, only an entry's owner, the directory owner, or root can
+  rename or delete the entry, and every entry on the path is itself required to be owned by the host user
+  or root. The existing part of the chain is checked BEFORE the host creates anything; missing directories
+  are then created one by one with mode `0700`.
+- **The store directory must not be a symlink.** A symlink there lets whoever can replace it redirect the
+  store. To put the store on another volume, use a bind mount (or point the store path at the real
+  directory). A symlink ABOVE the store directory (for example macOS `/var` -> `/private/var`) is allowed,
+  because the walk has already shown that only a trusted user can replace it, and its target is walked
+  with the same rules.
+- **Container note.** Do not place the database directly in a shared sticky mount (a tmpfs mounted
+  `1777`): use a `0700` subdirectory owned by the host user.
 - **Store files must be plain files owned by the host user.** The database, `-wal`, and `-shm` are read
   with `lstat`: a symlink, a non-regular file (a FIFO, a device), or a file owned by another user is
   refused. A new database is created with `O_EXCL`, so an existing file or a planted (even dangling)
   symlink at that path is never followed.
-- **The check runs at start only.** Do not widen the mode of a running store. Parent directories above
-  the store directory are not checked: keep them non-writable by other users.
+- **The check runs when the store is opened.** A running host reconnects by pathname and does not
+  re-check the path on every transaction. With the whole chain proven owned by trusted users and not
+  writable by others, only the host user or root can change the path afterwards. Portmark does not pin
+  a directory handle (SQLite opens files by path), so do not widen any directory on the path while a
+  host is running.
 - **Backups.** A backup of the store holds the same data. Keep backup files `0600` (or in a `0700`
   directory), and restore them with mode `0600`; a restored file with a wider mode is refused.
 - **Audit floor.** The floor is rewritten with mode `0600` on every write, even if a restore widened it.

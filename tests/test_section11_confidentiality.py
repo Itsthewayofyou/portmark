@@ -314,15 +314,104 @@ class SQLitePermissionTests(unittest.TestCase):
         self.assertIn("not by the host user", str(raised.exception))
         self.assertEqual(list(directory.iterdir()), [])
 
-    def test_symlinked_store_directory_is_allowed_and_its_target_is_checked(self):
+    # -- auditor round 3: every ancestor, and no symlinked store directory ------------------------
+    def test_symlinked_store_directory_is_refused(self):
+        # Reversed from round 2: a symlink AT the store directory is a pathname-replacement primitive.
         real = self.root / "volume"
         real.mkdir(mode=0o700)
         link = self.root / "state-dir"
         link.symlink_to(real, target_is_directory=True)
-        SQLiteRuntimeStore(link / "state.db")
-        os.chmod(real, 0o777)  # nosec B103 -- the insecure state the refusal must reject, in a private temp dir
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(RuntimeError) as raised:
             SQLiteRuntimeStore(link / "state.db")
+        self.assertIn("is a symbolic link", str(raised.exception))
+        self.assertEqual(list(real.iterdir()), [])
+
+    def test_writable_non_sticky_ancestor_is_refused(self):
+        # The auditor's layout: shared/ 0777 (no sticky bit) > private/ 0700 > state.db 0600.
+        shared = self.root / "shared"
+        private = shared / "private"
+        private.mkdir(parents=True)
+        os.chmod(private, 0o700)
+        os.chmod(shared, 0o777)  # nosec B103 -- the insecure state the refusal must reject, in a private temp dir
+        with self.assertRaises(RuntimeError) as raised:
+            SQLiteRuntimeStore(private / "state.db")
+        self.assertIn(f"{shared} is writable by group or other users", str(raised.exception))
+        self.assertIn(f"chmod go-w {shared}", str(raised.exception))
+        self.assertEqual(list(private.iterdir()), [])  # refused before anything was created
+
+    def test_directory_replaced_through_a_writable_ancestor_is_refused_on_the_next_open(self):
+        # Auditor round 3 regression: a store opens safely, then another user who can write the
+        # ancestor renames the store directory away and plants a replacement between connections.
+        shared = self.root / "shared"
+        private = shared / "private"
+        private.mkdir(parents=True, mode=0o700)
+        os.chmod(shared, 0o755)  # nosec B103 -- a directory; 0755 is the safe, not-writable-by-others baseline
+        store = SQLiteRuntimeStore(private / "state.db")
+        with store.transaction() as transaction:
+            transaction.consume_nonce("genuine", "subject", "audience", "t1")
+        os.chmod(shared, 0o777)  # nosec B103 -- the insecure state the refusal must reject, in a private temp dir
+        private.rename(shared / "private.orig")
+        private.mkdir(mode=0o700)
+        SQLiteRuntimeStore(self.root / "planted.db")  # a well-formed, owner-only database
+        (self.root / "planted.db").rename(private / "state.db")
+        with self.assertRaises(RuntimeError) as raised:
+            SQLiteRuntimeStore(private / "state.db")
+        self.assertIn(f"{shared} is writable by group or other users", str(raised.exception))
+
+    def test_sticky_writable_ancestor_owned_by_a_trusted_user_is_allowed(self):
+        # Like /tmp: sticky means only an entry's owner, the directory owner, or root can rename it.
+        shared = self.root / "sticky"
+        shared.mkdir()
+        os.chmod(shared, 0o1777)  # nosec B103 -- a sticky shared directory, the allowed case
+        SQLiteRuntimeStore(shared / "private" / "state.db")
+        self.assertEqual(self.mode(shared / "private"), 0o700)
+
+    def test_sticky_store_directory_itself_gets_no_exception(self):
+        store_dir = self.root / "sticky-store"
+        store_dir.mkdir()
+        os.chmod(store_dir, 0o1777)  # nosec B103 -- the insecure state the refusal must reject, in a private temp dir
+        with self.assertRaises(RuntimeError) as raised:
+            SQLiteRuntimeStore(store_dir / "state.db")
+        self.assertIn(f"chmod 700 {store_dir}", str(raised.exception))
+
+    def test_ancestor_symlink_is_walked_and_its_target_chain_checked(self):
+        # A symlink ABOVE the store directory (like macOS /var) is allowed when nobody untrusted can
+        # replace it -- and its target is walked with the same rules.
+        exposed = self.root / "exposed"
+        (exposed / "volume").mkdir(parents=True)
+        os.chmod(exposed / "volume", 0o755)  # nosec B103 -- a directory; 0755 is the safe, not-writable-by-others baseline
+        link = self.root / "data"
+        link.symlink_to(exposed / "volume", target_is_directory=True)
+        SQLiteRuntimeStore(link / "portmark" / "state.db")  # safe chain through the link
+        os.chmod(exposed, 0o777)  # nosec B103 -- the insecure state the refusal must reject, in a private temp dir
+        with self.assertRaises(RuntimeError) as raised:
+            SQLiteRuntimeStore(link / "portmark" / "state.db")
+        self.assertIn(f"{exposed} is writable by group or other users", str(raised.exception))
+
+    def test_missing_directories_are_created_owner_only_after_the_existing_chain_is_checked(self):
+        path = self.root / "a" / "b" / "c" / "state.db"
+        SQLiteRuntimeStore(path)
+        for directory in (self.root / "a", self.root / "a" / "b", self.root / "a" / "b" / "c"):
+            self.assertEqual(self.mode(directory), 0o700, directory)
+        shared = self.root / "open"
+        shared.mkdir()
+        os.chmod(shared, 0o777)  # nosec B103 -- the insecure state the refusal must reject, in a private temp dir
+        with self.assertRaises(RuntimeError):
+            SQLiteRuntimeStore(shared / "x" / "y" / "state.db")
+        self.assertEqual(list(shared.iterdir()), [])  # nothing created under the unsafe ancestor
+
+    def test_relative_store_path_with_dotdot_is_walked(self):
+        (self.root / "work").mkdir(mode=0o700)
+        previous = os.getcwd()
+        os.chdir(self.root / "work")
+        try:
+            SQLiteRuntimeStore(Path("..") / "rel" / "state.db")
+            os.chmod(self.root, 0o777)  # nosec B103 -- the insecure state the refusal must reject, in a private temp dir
+            with self.assertRaises(RuntimeError):
+                SQLiteRuntimeStore(Path("..") / "rel" / "state.db")
+        finally:
+            os.chmod(self.root, 0o700)
+            os.chdir(previous)
 
 
 @unittest.skipUnless(POSIX, "POSIX permission bits")
