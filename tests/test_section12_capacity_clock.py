@@ -22,9 +22,9 @@ from unittest.mock import patch
 
 from portmark import _clock, storage
 from portmark._clock import ClockRollbackError, TimeFloorError, TrustedClock, check_time_floor
-from portmark.factory import make_demo_envelope, make_host
+from portmark.factory import build_envelope, make_demo_envelope, make_host
 from portmark.maintenance import parse_cutoff, prune_cutoffs, reset_time_floor, run_prune
-from portmark.security import SecurityError, canonical_json
+from portmark.security import SecurityError, TrustSource, canonical_json
 from portmark.storage import (
     MAX_ADMIN_PAGE_SIZE,
     MAX_CLAIM_LIMIT,
@@ -67,11 +67,11 @@ class FakeTime:
 
 
 def _envelope_at(host, fake: "FakeTime", provider: str = "suspender"):
-    """A demo envelope whose permit is ISSUED at the fake wall time (issuance is agent-side and uses the
-    plain wall clock; the host then judges its expiry with the trusted clock)."""
-    with patch("portmark.factory.time") as factory_time:
-        factory_time.time.return_value = fake.wall
-        return make_demo_envelope(host, "research Telescript", provider)
+    """A demo envelope whose permit is ISSUED at the fake wall time. Issuance uses the trusted clock too,
+    so the caller must already have installed this fake's clock as the default."""
+    if _clock.trusted_now() != int(fake.wall):
+        raise AssertionError("install the fake clock before issuing")
+    return make_demo_envelope(host, "research Telescript", provider)
 
 
 def _sqlite_store(root: Path) -> SQLiteRuntimeStore:
@@ -141,6 +141,60 @@ class TrustedClockTests(unittest.TestCase):
                 _clock.clock_tolerance_from_environment({"PORTMARK_CLOCK_TOLERANCE_SECONDS": bad})
         self.assertEqual(_clock.clock_tolerance_from_environment({}), 300)
         self.assertEqual(_clock.clock_tolerance_from_environment({"PORTMARK_CLOCK_TOLERANCE_SECONDS": "60"}), 60)
+
+    def test_startup_refuses_a_rollback_between_the_configured_tolerance_and_the_default(self):
+        # The process-wide clock starts with the default 300 s tolerance. A 100 s rollback before make_host
+        # is inside 300 but beyond the configured 10: start-up must judge it with 10 and refuse, not let the
+        # audit-key check pass on 300 and then adopt the rolled-back time as a new baseline.
+        fake = FakeTime(time.time())
+        clock = fake.clock()
+        clock.now()
+        fake.jump(-100)
+        with tempfile.TemporaryDirectory() as root, patch.object(_clock, "_default_clock", clock):
+            deployment = Deployment(root)
+            with patch.dict(os.environ, {"PORTMARK_CLOCK_TOLERANCE_SECONDS": "10"}):
+                with self.assertRaisesRegex(ValueError, "trusted clock refused to start"):
+                    deployment.registry_host()
+            with self.assertRaises(ClockRollbackError):  # still failed: the rollback was not adopted
+                _clock.trusted_now()
+
+    def test_configured_tolerance_is_in_force_at_the_first_security_decision(self):
+        seen = []
+        original = TrustSource.audit_signing_reason
+
+        def spy(source, key_id, now=None):
+            seen.append(_clock.default_clock().tolerance_seconds)
+            return original(source, key_id, now)
+
+        with tempfile.TemporaryDirectory() as root, patch.object(_clock, "_default_clock", FakeTime(time.time()).clock()):
+            deployment = Deployment(root)
+            with patch.dict(os.environ, {"PORTMARK_CLOCK_TOLERANCE_SECONDS": "10"}), patch.object(TrustSource, "audit_signing_reason", spy):
+                deployment.registry_host()
+        self.assertTrue(seen)
+        self.assertEqual(seen[0], 10)
+
+    def test_permit_issuance_uses_the_trusted_clock(self):
+        fake = FakeTime(time.time() + 50_000)  # far from the real clock, so a raw wall-clock read shows
+        signer = host_signer()
+        host = make_host(None)
+        with patch.object(_clock, "_default_clock", fake.clock()):
+            demo = make_demo_envelope(host, "research Telescript")
+            built = build_envelope({"goal": "g", "grants": [{"name": "catalog.search"}], "ttl_seconds": 60}, signer)
+        self.assertEqual(demo.permit.expires_at, int(fake.wall) + 3600)
+        self.assertEqual(built.permit.expires_at, int(fake.wall) + 60)
+
+    def test_permit_issuance_refuses_while_the_trusted_clock_is_failed(self):
+        fake = FakeTime(time.time())
+        clock = fake.clock()
+        signer = host_signer()
+        host = make_host(None)
+        with patch.object(_clock, "_default_clock", clock):
+            clock.now()
+            fake.jump(-(TOLERANCE + 1))
+            with self.assertRaises(ClockRollbackError):
+                make_demo_envelope(host, "research Telescript")
+            with self.assertRaises(ClockRollbackError):
+                build_envelope({"goal": "g", "grants": [{"name": "catalog.search"}]}, signer)
 
 
 class TimeFloorStoreTests(unittest.TestCase):
@@ -224,9 +278,9 @@ class ForwardJumpLockoutChainTests(unittest.TestCase):
             with patch.object(_clock, "_default_clock", clock):
                 host = deployment.host()
                 fake.jump(365 * 24 * 3600)  # the wall clock jumps a year ahead
-                envelope = _envelope_at(host, fake)
-                with self.assertLogs("portmark._clock", level="CRITICAL"):
-                    host.run(envelope)
+                with self.assertLogs("portmark._clock", level="CRITICAL"):  # issuance is the first trusted read
+                    envelope = _envelope_at(host, fake)
+                host.run(envelope)
                 jumped_floor = deployment.store().time_floor()
                 self.assertGreaterEqual(jumped_floor, now + 365 * 24 * 3600 - TIME_FLOOR_CADENCE_SECONDS)
                 self.assertEqual(host.audit_floor.witnessed_time_floor(), jumped_floor)  # mirrored outside the DB

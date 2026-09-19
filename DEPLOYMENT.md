@@ -236,7 +236,10 @@ correct time as part of the trusted computing base: run NTP (or your platform's 
 and on the PostgreSQL server.
 
 - **Tolerance.** `PORTMARK_CLOCK_TOLERANCE_SECONDS` (default 300, from 1 to 3600) is the largest clock
-  error Portmark accepts. Expiry decisions can be wrong by at most this much.
+  error Portmark accepts. Expiry decisions can be wrong by at most this much. It is in force from the
+  first start-up check. A rollback larger than it since the process started refuses start-up.
+- **Issuing permits.** `portmark envelope` and the demo set permit expiry with the same clock. While the
+  clock has failed closed, they issue nothing.
 - **While running.** The wall clock is compared with a monotonic clock that never jumps.
   - If the wall clock moves **back** by more than the tolerance, every security decision fails closed
     until the clock is fixed and the host restarts.

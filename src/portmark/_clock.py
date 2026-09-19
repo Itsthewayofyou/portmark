@@ -77,6 +77,12 @@ class TrustedClock:
         self.forward_jumps = 0
         self._forward_jump_listeners: list[Any] = []  # zero-argument references to listeners
 
+    def set_tolerance(self, tolerance_seconds: int) -> None:
+        """Change the tolerance, keeping the baseline: a drift seen since start-up is judged with it."""
+        tolerance = validate_tolerance(tolerance_seconds)
+        with self._lock:
+            self.tolerance_seconds = tolerance
+
     def on_forward_jump(self, listener: Callable[[float], None]) -> None:
         # A bound method is held weakly, so registering a host's metrics does not keep that host alive.
         entry: Any = weakref.WeakMethod(listener) if inspect.ismethod(listener) else (lambda: listener)
@@ -132,11 +138,13 @@ def default_clock() -> TrustedClock:
 
 
 def configure_default_clock(tolerance_seconds: int) -> TrustedClock:
-    """Replace the process-wide trusted clock (a new monotonic baseline) with this tolerance."""
-    global _default_clock
-    clock = TrustedClock(tolerance_seconds)
+    """Set the process-wide trusted clock's tolerance IN PLACE and return that clock.
+
+    Never a new clock: a new one would take a new baseline at the current -- possibly already rolled
+    back -- time, and forget a rollback (or a sticky failure) seen since the process started."""
     with _default_lock:
-        _default_clock = clock
+        clock = _default_clock
+    clock.set_tolerance(tolerance_seconds)
     return clock
 
 

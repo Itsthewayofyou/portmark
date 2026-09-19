@@ -9,8 +9,11 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
 ### Section 12 — capacity and clock (PR B): retention, paging, metrics, clock-rollback protection (findings #4, #6 Medium)
 
 - **Clock rollback can no longer revive expired authorization (#6, owner decision D3).**
-  - All security expiry decisions (permits, approvals, keys, receipts, attestations) and audit-head
-    signing times now use one trusted clock.
+  - All security expiry decisions (permits, approvals, keys, receipts, attestations), permit issuance
+    (`portmark envelope` and the demo), and audit-head signing times now use one trusted clock. While
+    that clock has failed closed, no permit is issued.
+  - The configured tolerance applies from the first start-up check. It changes the running clock in
+    place, so a rollback since the process started is judged with it and refuses start-up.
   - It compares the wall clock with a monotonic baseline. A backward jump beyond
     `PORTMARK_CLOCK_TOLERANCE_SECONDS` (default 300) fails security decisions closed until a restart. A
     forward jump is allowed but reported with a `CRITICAL` line and the `clock.forward_jumps` metric.
