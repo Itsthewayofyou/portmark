@@ -69,7 +69,7 @@ class AuditFloorMechanismTests(unittest.TestCase):
         witness = self.fresh({"t1": {"sequence": 3, "head_hash": "h3"}}, {"version": 2, "digest": "d"})
         body = witness.load()
         self.assertEqual(body["tasks"], {"t1": {"sequence": 3, "head_hash": "h3"}})
-        self.assertEqual((body["host_id"], body["epoch"], body["format_version"]), (HOST, 1, 1))
+        self.assertEqual((body["host_id"], body["epoch"], body["format_version"]), (HOST, 1, 2))  # Section 12: v2 adds time_floor
         self.assertEqual(witness.witnessed_head("t1"), ("h3", 3))
         self.assertIsNone(witness.witnessed_head("t2"))
 
@@ -86,7 +86,7 @@ class AuditFloorMechanismTests(unittest.TestCase):
         cases = {
             "lowered sequence (the rollback-enabling edit)": lambda d: d["body"]["tasks"]["t1"].__setitem__("sequence", 1),
             "other host": lambda d: d["body"].__setitem__("host_id", "host:other"),
-            "unknown format_version": lambda d: d["body"].__setitem__("format_version", 2),
+            "unknown format_version": lambda d: d["body"].__setitem__("format_version", 3),
             "extra body field": lambda d: d["body"].__setitem__("note", "x"),
             "extra document field": lambda d: d.__setitem__("note", "x"),
             "bool sequence": lambda d: d["body"]["tasks"]["t1"].__setitem__("sequence", True),
@@ -229,7 +229,7 @@ class AuditFloorBootAndResetTests(unittest.TestCase):
     def test_schema_has_the_marker_table(self):
         with self.store._connection() as connection:
             self.assertEqual(int(connection.execute("PRAGMA user_version").fetchone()[0]), SQLITE_SCHEMA_VERSION)
-            self.assertEqual(SQLITE_SCHEMA_VERSION, 12)
+            self.assertEqual(SQLITE_SCHEMA_VERSION, 13)  # Section 12 (v13) keeps the Section 10 marker table
             columns = {row[1] for row in connection.execute("PRAGMA table_info(audit_floor_markers)").fetchall()}
         self.assertEqual(columns, {"host_id", "epoch", "pending", "updated_at"})
 
@@ -956,7 +956,7 @@ class AuditFloorPostgresTests(unittest.TestCase):
     def test_postgres_store_anchors_and_refuses_a_rolled_back_chain(self):
         from portmark.storage import POSTGRES_SCHEMA_VERSION
 
-        self.assertEqual(POSTGRES_SCHEMA_VERSION, 10)
+        self.assertEqual(POSTGRES_SCHEMA_VERSION, 11)  # Section 12 (v11) keeps the Section 10 marker table
         host = self.host()
         envelope, first = start_task(host)
         store = self.make_store()

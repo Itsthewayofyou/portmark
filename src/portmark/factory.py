@@ -5,7 +5,6 @@ import logging
 import os
 import shlex
 import secrets
-import time
 from pathlib import Path
 
 from .host import AgentHost
@@ -16,6 +15,7 @@ from .providers import DeterministicProvider, GenericHttpProvider, ModelProvider
 from .security import AttestationPolicy, EnvelopeSigner, EnvelopeSigningIdentity, ExternalAttestationVerifier, HmacEnvelopeSigner, HostPolicy, MigrationAttesterProtocol, TrustRegistry, TrustSource, _b64url_decode, validate_constraints
 from .storage import RuntimeStore, create_runtime_store
 from .tools import ToolRegistry, demo_registry
+from ._clock import ClockRollbackError, TimeFloorError, check_time_floor, clock_tolerance_from_environment, configure_default_clock, trusted_now
 from .witness import FloorError, LocalFloorWitness, floor_path_inside, open_audit_floor
 
 logger = logging.getLogger(__name__)
@@ -89,6 +89,15 @@ def make_host(
     allow_local_provider_endpoint: bool | None = None,
     audit_floor_path: str | None = None,
 ) -> AgentHost:
+    # Section 12 #6 (D3): apply the configured clock tolerance BEFORE the first security decision below
+    # (the audit-key check, the audit floor, trust loading), and judge the clock once with it. The
+    # tolerance is changed in place, keeping the baseline, so a rollback since start-up that the default
+    # tolerance allowed but the configured one does not is refused here -- not adopted as the baseline.
+    clock = configure_default_clock(clock_tolerance_from_environment())
+    try:
+        clock.now()
+    except ClockRollbackError as error:
+        raise ValueError(f"trusted clock refused to start: {error}") from error
     # Note the asymmetry with `tools`, which REPLACES the demo registry.
     # Providers merge over the constructed defaults instead, so passing an
     # in-process provider does not silently remove `deterministic` and break
@@ -218,6 +227,14 @@ def make_host(
     audit_floor = _open_audit_floor(
         audit_floor_path or os.environ.get("PORTMARK_AUDIT_FLOOR_PATH"), host_id, host_signer, configured_store, trust_source
     )
+    # Section 12 #6 (owner decision D3): refuse to start when the clock is behind the durable time floor --
+    # the higher of the database's floor and the audit-floor file's mirror -- by more than the tolerance.
+    # A boot ValueError like every neighbouring start-up check; never lowered automatically.
+    if getattr(configured_store, "is_durable", False):
+        try:
+            check_time_floor(configured_store, audit_floor, clock)
+        except TimeFloorError as error:
+            raise ValueError(f"time floor refused to start ({error.code}): {error}") from error
     host = AgentHost(
         host_id,
         host_signer,
@@ -234,6 +251,8 @@ def make_host(
         metrics=metrics,
     )
     host.audit_floor = audit_floor
+    # Section 12 #6: a forward clock jump beyond the tolerance is also a metric, not only a CRITICAL log.
+    clock.on_forward_jump(host.metrics.note_clock_forward_jump)
     return host
 
 
@@ -362,7 +381,7 @@ def build_envelope(spec: dict, signer: EnvelopeSigningIdentity) -> AgentEnvelope
         issuer=str(spec.get("issuer") or getattr(signer, "issuer", HOST_ID)),
         subject=agent_id,
         audience=str(spec.get("audience", HOST_ID)),
-        expires_at=int(time.time()) + int(spec.get("ttl_seconds", 3600)),
+        expires_at=trusted_now() + int(spec.get("ttl_seconds", 3600)),
         # Always fresh: the host consumes the nonce, so a replayed envelope is refused.
         nonce=secrets.token_hex(16),
         grants=grants,
@@ -377,7 +396,7 @@ def make_demo_envelope(host: AgentHost, goal: str, provider: str = "deterministi
     manifest = AgentManifest("agent:demo", "1.0.0", provider, ("catalog.search", "payments.reserve"), digest)
     permit = Permit(
         issuer=getattr(host.signer, "issuer", host.host_id), subject=manifest.agent_id, audience=host.host_id,
-        expires_at=int(time.time()) + 3600, nonce=secrets.token_hex(16),
+        expires_at=trusted_now() + 3600, nonce=secrets.token_hex(16),
         grants=(ToolGrant("catalog.search", {"max_limit": 3, "arguments": {"query": {"type": "string"}}}, ("id", "title")),),
         budget=ResourceBudget(max_steps=6, max_tool_calls=2, max_output_bytes=32_768),
     )

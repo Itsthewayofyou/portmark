@@ -6,6 +6,51 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Section 12 — capacity and clock (PR B): retention, paging, metrics, clock-rollback protection (findings #4, #6 Medium)
+
+- **Clock rollback can no longer revive expired authorization (#6, owner decision D3).**
+  - All security expiry decisions (permits, approvals, keys, receipts, attestations), permit issuance
+    (`portmark envelope` and the demo), and audit-head signing times now use one trusted clock. While
+    that clock has failed closed, no permit is issued.
+  - The configured tolerance applies from the first start-up check. It changes the running clock in
+    place, so a rollback since the process started is judged with it and refuses start-up.
+  - It compares the wall clock with a monotonic baseline. A backward jump beyond
+    `PORTMARK_CLOCK_TOLERANCE_SECONDS` (default 300) fails security decisions closed until a restart. A
+    forward jump is allowed but reported with a `CRITICAL` line and the `clock.forward_jumps` metric.
+- **A durable time floor.**
+  - It advances with checkpoint saves and approval redemptions, at most once a minute.
+  - Every update is a compare-and-swap that only moves the floor forward.
+  - On PostgreSQL it uses the database clock, and it never waits on or fails the save it rides in
+    (`SKIP LOCKED`).
+  - It is mirrored into the signed audit-floor file (format 2), so restoring an older database snapshot
+    does not restore an older floor.
+- **Start-up refusals.** Start-up refuses when the clock plus the tolerance is behind the floor, and (on
+  PostgreSQL) when the host and database clocks disagree by more than the tolerance. The container
+  entrypoint now exits with code 2 and a plain message for every start-up refusal.
+- **Recovery is manual only:** `portmark time-floor reset --to <epoch> --reason <text> --confirm`,
+  recorded in the maintenance log and in the audit floor. A `floor-reset` of the audit floor keeps the
+  time floor.
+- **Safe pruning, only on request (#4, owner decision D2).** `portmark store prune --before <cutoff>`:
+  - It is a dry run unless `--apply`.
+  - It deletes only nonces whose authorization expiry is stored with them and is older than the cutoff
+    and the clock tolerance.
+  - It also deletes delivered migration rows that carry a verified receipt and were delivered before the
+    cutoff.
+  - It keeps legacy rows without an expiry or delivery time, and all pending and dead migrations.
+  - It selects and deletes in bounded, cursor-ordered batches, re-checking the rule inside the delete.
+  - It writes a maintenance-log record per batch plus a summary.
+  - It refuses a future cutoff, or a clock behind the time floor, and never runs `VACUUM`.
+- **Capacity visibility.**
+  - `portmark store stats`, and `/metrics` gauges refreshed at most once a minute, report row counts per
+    table, the oldest pending migration, database size, free space (SQLite), and the time floor.
+  - `/metrics` now runs off the event loop, like `/readyz`.
+- **Paged admin listings and a claim ceiling.** `list_pending_migrations` and `list_dead_migrations` take
+  `limit` (at most 1000) and an `after` cursor, and return rows in `task_id` order. `claim_migrations`
+  takes at most 100 rows per call.
+- **Schema.** SQLite v13 and Postgres v11. An upgraded database starts its time floor at the newest past
+  timestamp it already holds. The v13 schema reference in `tests/sqlite_schema_versions.json` is
+  hand-derived from v12.
+
 ### Section 12 — runtime limits (PR A): bounded shutdown, body deadline, PostgreSQL timeouts, thread-start permits (findings #1, #2, #3 Medium; #5 Low)
 
 - **Shutdown is bounded (#1, owner decision D1).** Before this change, the ASGI app reported shutdown

@@ -19,6 +19,7 @@ from ._durable_file import (  # noqa: F401 -- re-exported names kept for keygen 
     sidecar_lock as _registry_write_lock,
 )
 from .logging_config import configure_logging
+from .storage import MAX_PRUNE_BATCH
 from .tool_loading import ToolLoaderError, load_tools
 
 
@@ -136,6 +137,77 @@ def _run_floor_reset(parser: argparse.ArgumentParser, args: argparse.Namespace, 
         raise SystemExit(1) from error
     print(f"WARNING: audit floor for {config.host_id} was reset to epoch {epoch}; the current database is now the baseline.", file=sys.stderr)
     print(json.dumps({"host_id": config.host_id, "status": "reset", "epoch": epoch}, indent=2))
+
+
+def _floor_reader(config, audit_verifier):
+    """A read-only audit-floor handle when one is configured (for the mirrored time floor), else None."""
+    from .witness import LocalFloorWitness
+
+    if not config.audit_floor_path:
+        return None
+    if audit_verifier is None:
+        raise SystemExit("reading the audit floor needs --trust-registry-path (its signature is verified)")
+    return LocalFloorWitness(config.audit_floor_path, config.host_id, None, audit_verifier)
+
+
+def _run_store(parser: argparse.ArgumentParser, args: argparse.Namespace, config, store, audit_verifier) -> None:
+    """Section 12 #4: `portmark store stats` and `portmark store prune` (owner decision D2)."""
+    from ._clock import TimeFloorError
+    from .maintenance import parse_cutoff, run_prune
+
+    if store is None:
+        parser.error(f"store {args.store_command} requires --store-path or PORTMARK_STORE_PATH")
+    if args.store_command == "stats":
+        print(json.dumps(store.capacity_report(), indent=2, sort_keys=True))
+        return
+    try:
+        before = parse_cutoff(args.before)
+    except ValueError as error:
+        parser.error(str(error))
+    try:
+        report = run_prune(store, _floor_reader(config, audit_verifier), before, apply=args.apply, batch_size=args.batch_size)
+    except TimeFloorError as error:
+        print(json.dumps({"status": "refused", "time_floor_status": error.code, "reason": str(error)}, indent=2))
+        raise SystemExit(1) from error
+    except ValueError as error:
+        parser.error(str(error))
+    if not args.apply:
+        print("DRY RUN: nothing was deleted. Re-run with --apply to delete the eligible rows.", file=sys.stderr)
+    print(json.dumps(report, indent=2, sort_keys=True))
+
+
+def _run_time_floor(parser: argparse.ArgumentParser, args: argparse.Namespace, config, store, audit_verifier) -> None:
+    """Section 12 #6: `portmark time-floor show` and the explicit operator recovery `time-floor reset`."""
+    import time as _time
+
+    from .maintenance import reset_time_floor, time_floor_status
+    from .witness import FloorError, LocalFloorWitness
+
+    if store is None:
+        parser.error(f"time-floor {args.time_floor_command} requires --store-path or PORTMARK_STORE_PATH")
+    if args.time_floor_command == "show":
+        print(json.dumps(time_floor_status(store, _floor_reader(config, audit_verifier)), indent=2, sort_keys=True))
+        return
+    if not args.confirm:
+        parser.error("time-floor reset changes the durable time floor, which may LOWER it; re-run with --confirm once the clock is known to be right")
+    witness = None
+    if config.audit_floor_path:
+        from .security import TrustSource
+
+        if not config.trust_registry_path:
+            parser.error("time-floor reset with an audit floor needs --trust-registry-path (the mirrored floor is signed)")
+        trust = TrustSource.from_path(config.trust_registry_path)
+        signer = signer_from_environment(config.host_id, config.trust_registry_path, trust=trust)
+        if getattr(signer, "ephemeral", None) is not False:
+            parser.error("time-floor reset must sign the audit floor with the host's stable audit key (PORTMARK_ED25519_PRIVATE_KEY_B64)")
+        witness = LocalFloorWitness(config.audit_floor_path, config.host_id, signer, signer)
+    try:
+        outcome = reset_time_floor(store, witness, args.to, args.reason, int(_time.time()))
+    except (ValueError, FloorError) as error:
+        print(json.dumps({"status": "refused", "reason": str(error)}, indent=2))
+        raise SystemExit(1) from error
+    print(f"WARNING: the durable time floor was set to {args.to} by an operator ({args.reason!r}).", file=sys.stderr)
+    print(json.dumps({"status": "reset", **outcome}, indent=2, sort_keys=True))
 
 
 def _run_keygen(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -278,6 +350,26 @@ def main() -> None:
     floor_reset.add_argument(
         "--allow-legacy-anchor", action="store_true", help="accept complete pre-Section-10 migration anchors while re-verifying chains"
     )
+    store_parser = subparsers.add_parser("store", help="inspect store capacity or prune provably-unneeded rows (Section 12)")
+    store_commands = store_parser.add_subparsers(dest="store_command", required=True)
+    store_commands.add_parser("stats", help="row counts, oldest pending migration, database size, free space, time floor")
+    prune = store_commands.add_parser(
+        "prune",
+        help="delete expired nonces and delivered migrations older than --before (a DRY RUN unless --apply)",
+    )
+    prune.add_argument("--before", required=True, help="retention cutoff: epoch seconds or ISO-8601 (UTC if no offset)")
+    prune.add_argument("--apply", action="store_true", help="actually delete (default: report only)")
+    prune.add_argument("--batch-size", type=int, default=MAX_PRUNE_BATCH, help=f"rows per transaction (1..{MAX_PRUNE_BATCH})")
+    time_floor = subparsers.add_parser("time-floor", help="show the durable time floor, or reset it (OPERATOR RECOVERY)")
+    time_floor_commands = time_floor.add_subparsers(dest="time_floor_command", required=True)
+    time_floor_commands.add_parser("show", help="database floor, mirrored floor, host and database clocks")
+    floor_set = time_floor_commands.add_parser(
+        "reset",
+        help="OPERATOR RECOVERY: set the durable time floor (may lower it) after a wrong clock moved it forward",
+    )
+    floor_set.add_argument("--to", type=int, required=True, help="the new floor, in epoch seconds")
+    floor_set.add_argument("--reason", required=True, help="why (recorded in the maintenance log and the audit floor)")
+    floor_set.add_argument("--confirm", action="store_true", help="required: acknowledge that this may lower the floor")
     verify_audit = subparsers.add_parser("verify-audit")
     verify_audit.add_argument("--task-id", required=True, help="task id whose audit chain should be verified")
     verify_audit.add_argument(
@@ -331,6 +423,12 @@ def main() -> None:
         return
     if args.command == "floor-reset":
         _run_floor_reset(parser, args, config, store)
+        return
+    if args.command == "store":
+        _run_store(parser, args, config, store, audit_verifier)
+        return
+    if args.command == "time-floor":
+        _run_time_floor(parser, args, config, store, audit_verifier)
         return
     if args.tools_loader and not config.policy_path:
         parser.error("--tools requires --policy-path or PORTMARK_POLICY_PATH")

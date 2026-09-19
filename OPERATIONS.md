@@ -260,6 +260,24 @@ database defeats it (non-detection 1 above). After restoring an older database, 
 refuses to start (`rolled-back`); run `floor-reset` deliberately, with the reason, once the restore is
 understood. Restoring an older trust registry is refused the same way (`registry-rolled-back`).
 
+The durable time floor (Section 12) is mirrored in the audit floor too, so a restored older database
+does not bring back an older time floor. If the host then refuses to start with `clock-behind-floor`,
+check the clock first. Lower the floor with `time-floor reset` only when the clock is known to be right.
+
+## Retention And The Time Floor
+
+- **Pruning.** Run `portmark store prune --before <cutoff>` first as a dry run. Read the counts and the
+  kept rows, then repeat with `--apply`. Each run is recorded in the maintenance log. Pick a cutoff that
+  your incident-response process can live with: pruned nonces and delivered outbox rows are gone for
+  good. Take a backup first if you need them as evidence.
+- **Clock rolled back** (the host logs `wall clock moved back` and security decisions fail). Fix the
+  clock and restart. Do not lower the time floor to make a wrong clock work.
+- **Clock jumped forward by mistake** (a `CRITICAL` `jumped FORWARD` line and a rising
+  `clock.forward_jumps`). Correct the clock at once. If the time floor already followed it, start-up
+  refuses with `clock-behind-floor`. Then run
+  `time-floor reset --to <the correct epoch> --reason "<what happened>" --confirm`, with the same
+  `--audit-floor-path` and `--trust-registry-path` the host uses.
+
 ## File Permissions
 
 The SQLite store holds checkpoints, messages, tool arguments and results, migration envelopes and

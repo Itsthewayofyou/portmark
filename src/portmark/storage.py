@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import shutil
 import shlex
 import sqlite3
 import stat
@@ -27,8 +28,8 @@ from .security import (
 )
 
 
-SQLITE_SCHEMA_VERSION = 12
-POSTGRES_SCHEMA_VERSION = 10
+SQLITE_SCHEMA_VERSION = 13
+POSTGRES_SCHEMA_VERSION = 11
 
 # Section 4 #3: a migration lease is bounded. Zero/negative would defeat exclusivity (two workers
 # could claim the same row at the same instant); an unbounded lease would let a dead worker hold a
@@ -54,6 +55,202 @@ def _validate_claim_args(worker_id: str, lease_seconds: int, limit: int) -> None
         raise SecurityError(f"claim_migrations: lease_seconds exceeds the {MAX_MIGRATION_LEASE_SECONDS}s ceiling")
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
         raise SecurityError("claim_migrations: limit must be a positive int")
+    if limit > MAX_CLAIM_LIMIT:
+        raise SecurityError(f"claim_migrations: limit exceeds the ceiling of {MAX_CLAIM_LIMIT} rows per claim")
+
+
+# Section 12 #4: capacity. Administrative listings are paged (a stable cursor on task_id, a capped
+# page), one claim takes at most MAX_CLAIM_LIMIT rows, and a prune deletes in bounded batches.
+DEFAULT_ADMIN_PAGE_SIZE = 500
+MAX_ADMIN_PAGE_SIZE = 1000
+MAX_CLAIM_LIMIT = 100
+MAX_PRUNE_BATCH = 1000
+# Section 12 #6: the durable time floor advances at most once per this many seconds, so it is not
+# written on every save (owner decision D3: 'avoid writing it on every clock read').
+TIME_FLOOR_CADENCE_SECONDS = 60
+# Owner decision D2: only these record classes may ever be pruned. Everything else -- audit events and
+# heads, checkpoints, tool effects, cancellations, receipts, pending/dead migrations, and the
+# maintenance log that records every prune -- is evidence and is never deleted by Portmark.
+PRUNABLE_CLASSES = ("expired_nonces", "delivered_migrations")
+# Timestamp columns that are wall-clock times of past events. The time floor of an upgraded database
+# starts at the newest of them (never at zero), so a clock rolled back before the first start after an
+# upgrade is still caught. Lease expiries are FUTURE times and are deliberately not listed.
+_TIME_FLOOR_SEED_COLUMNS = (
+    ("audit_events", "created_at"),
+    ("audit_heads", "updated_at"),
+    ("audit_heads", "signed_at"),
+    ("audit_floor_markers", "updated_at"),
+    ("checkpoints", "updated_at"),
+    ("consumed_nonces", "consumed_at"),
+    ("migration_outbox", "created_at"),
+    ("migration_receipts", "created_at"),
+    ("task_cancellations", "cancelled_at"),
+    ("tool_effects", "created_at"),
+    ("tool_effects", "updated_at"),
+)
+# Tables a capacity report counts (row counts are bounded labels: fixed table names only).
+_CAPACITY_TABLES = (
+    "audit_events", "audit_heads", "checkpoints", "consumed_nonces", "migration_outbox",
+    "migration_receipts", "task_cancellations", "tool_effects", "maintenance_log",
+)
+
+
+def _validate_page(limit: Any, after: Any) -> None:
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_ADMIN_PAGE_SIZE:
+        raise ValueError(f"page limit must be an integer from 1 to {MAX_ADMIN_PAGE_SIZE}, got {limit!r}")
+    if after is not None and not isinstance(after, str):
+        raise ValueError("page cursor `after` must be a task id string or None")
+
+
+def _validate_prune_args(nonce_cutoff: Any, migration_cutoff: Any, batch_size: Any) -> None:
+    for name, value in (("nonce_cutoff", nonce_cutoff), ("migration_cutoff", migration_cutoff)):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive epoch-seconds integer, got {value!r}")
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or not 1 <= batch_size <= MAX_PRUNE_BATCH:
+        raise ValueError(f"batch_size must be an integer from 1 to {MAX_PRUNE_BATCH}, got {batch_size!r}")
+
+
+def _empty_prune_report(nonce_cutoff: int, migration_cutoff: int, apply: bool) -> dict[str, Any]:
+    return {
+        "applied": apply,
+        "nonce_cutoff": nonce_cutoff,
+        "migration_cutoff": migration_cutoff,
+        "expired_nonces": {"eligible": 0, "deleted": 0, "oldest": None, "newest": None},
+        "delivered_migrations": {"eligible": 0, "deleted": 0, "oldest": None, "newest": None},
+        "kept": {},
+        "batches": 0,
+    }
+
+
+def _checked_expiry(expires_at: Any) -> int | None:
+    if expires_at is None:
+        return None
+    if isinstance(expires_at, bool) or not isinstance(expires_at, int):
+        raise ValueError(f"nonce expires_at must be epoch seconds or None, got {expires_at!r}")
+    return expires_at
+
+
+def _validate_floor_reset(floor_at: Any, reason: Any) -> None:
+    if isinstance(floor_at, bool) or not isinstance(floor_at, int) or floor_at < 0:
+        raise ValueError(f"time floor must be a non-negative epoch-seconds integer, got {floor_at!r}")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("a time-floor reset requires a non-empty reason")
+
+
+def _maintenance_entry(entry_id: int, at: int, action: str, detail: dict[str, Any]) -> dict[str, Any]:
+    return {"id": entry_id, "at": at, "action": action, "detail": detail}
+
+
+def _prune_summary(report: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "nonce_cutoff": report["nonce_cutoff"],
+        "migration_cutoff": report["migration_cutoff"],
+        "deleted": {name: report[name]["deleted"] for name in PRUNABLE_CLASSES},
+        "ranges": {name: [report[name]["oldest"], report[name]["newest"]] for name in PRUNABLE_CLASSES},
+        "kept": report["kept"],
+        "batches": report["batches"],
+    }
+
+
+# Section 12 #4: the two prunable classes as SQL. `{p}` is the backend's placeholder. The DELETE
+# repeats the eligibility predicate, so a row that changed between the SELECT and the DELETE (for
+# example re-delivered) is never removed on stale information.
+_PRUNE_SQL = {
+    "expired_nonces": {
+        "table": "consumed_nonces",
+        "key": "nonce",
+        "stamp": "expires_at",
+        "predicate": "expires_at IS NOT NULL AND expires_at < {p}",
+    },
+    "delivered_migrations": {
+        "table": "migration_outbox",
+        "key": "task_id",
+        "stamp": "delivered_at",
+        "predicate": "status = 'delivered' AND receipt_json IS NOT NULL AND delivered_at IS NOT NULL AND delivered_at < {p}",
+    },
+}
+_PRUNE_KEPT_SQL = {
+    "nonces_without_expiry": "SELECT COUNT(*) AS n FROM consumed_nonces WHERE expires_at IS NULL",
+    "delivered_without_delivery_time": "SELECT COUNT(*) AS n FROM migration_outbox WHERE status = 'delivered' AND delivered_at IS NULL",
+    "delivered_without_receipt": "SELECT COUNT(*) AS n FROM migration_outbox WHERE status = 'delivered' AND receipt_json IS NULL",
+    "pending_migrations": "SELECT COUNT(*) AS n FROM migration_outbox WHERE status = 'pending'",
+    "dead_migrations": "SELECT COUNT(*) AS n FROM migration_outbox WHERE status = 'dead'",
+}
+
+
+def _run_sql_prune(
+    placeholder: str,
+    read: Callable[[str, tuple[Any, ...]], list[dict[str, Any]]],
+    batch_transaction: Callable[[Callable[[Callable[[str, tuple[Any, ...]], Any]], Any]], Any],
+    nonce_cutoff: int,
+    migration_cutoff: int,
+    apply: bool,
+    batch_size: int,
+    now: Callable[[], int],
+) -> dict[str, Any]:
+    """Backend-neutral prune: `read(sql, params)` runs a read; `batch_transaction(work)` runs `work(execute)`
+    in ONE write transaction, where `execute(sql, params)` returns the cursor."""
+    _validate_prune_args(nonce_cutoff, migration_cutoff, batch_size)
+    report = _empty_prune_report(nonce_cutoff, migration_cutoff, apply)
+    cutoffs = {"expired_nonces": nonce_cutoff, "delivered_migrations": migration_cutoff}
+    for name, sql in _PRUNE_SQL.items():
+        predicate = sql["predicate"].format(p=placeholder)
+        row = read(
+            f"SELECT COUNT(*) AS n, MIN({sql['stamp']}) AS oldest, MAX({sql['stamp']}) AS newest "  # nosec B608 -- constant identifiers
+            f"FROM {sql['table']} WHERE {predicate}",
+            (cutoffs[name],),
+        )[0]
+        report[name]["eligible"] = int(row["n"])
+        _merge_range(report[name], row["oldest"], row["newest"])
+    report["kept"] = {name: int(read(query, ())[0]["n"]) for name, query in _PRUNE_KEPT_SQL.items()}
+    if not apply:
+        return report
+    for name, sql in _PRUNE_SQL.items():
+        predicate = sql["predicate"].format(p=placeholder)
+        cursor_key = ""
+        while True:
+            def work(execute, name=name, sql=sql, predicate=predicate, cursor_key=cursor_key):
+                rows = execute(
+                    f"SELECT {sql['key']} AS k, {sql['stamp']} AS s FROM {sql['table']} "  # nosec B608 -- constant identifiers
+                    f"WHERE {predicate} AND {sql['key']} > {placeholder} ORDER BY {sql['key']} LIMIT {placeholder}",
+                    (cutoffs[name], cursor_key, batch_size),
+                ).fetchall()
+                if not rows:
+                    return None
+                keys = [row["k"] for row in rows]
+                marks = ", ".join([placeholder] * len(keys))
+                deleted = execute(
+                    f"DELETE FROM {sql['table']} WHERE {sql['key']} IN ({marks}) AND {predicate}",  # nosec B608 -- constant identifiers
+                    (*keys, cutoffs[name]),
+                ).rowcount
+                stamps = [int(row["s"]) for row in rows]
+                execute(
+                    f"INSERT INTO maintenance_log (at, action, detail_json) VALUES ({placeholder}, {placeholder}, {placeholder})",  # nosec B608 -- placeholders only
+                    (now(), "prune-batch", json.dumps({"class": name, "deleted": deleted, "oldest": min(stamps), "newest": max(stamps), "cutoff": cutoffs[name]}, sort_keys=True)),
+                )
+                return keys[-1], deleted
+            outcome = batch_transaction(work)
+            if outcome is None:
+                break
+            cursor_key, deleted = outcome
+            report[name]["deleted"] += deleted
+            report["batches"] += 1
+    batch_transaction(lambda execute: execute(
+        f"INSERT INTO maintenance_log (at, action, detail_json) VALUES ({placeholder}, {placeholder}, {placeholder})",  # nosec B608 -- placeholders only
+        (now(), "prune", json.dumps(_prune_summary(report), sort_keys=True)),
+    ))
+    return report
+
+
+def _maintenance_rows(rows: list[Any]) -> list[dict[str, Any]]:
+    return [_maintenance_entry(int(row["id"]), int(row["at"]), row["action"], json.loads(row["detail_json"])) for row in rows]
+
+
+def _merge_range(entry: dict[str, Any], oldest: Any, newest: Any) -> None:
+    if oldest is not None:
+        entry["oldest"] = int(oldest) if entry["oldest"] is None else min(entry["oldest"], int(oldest))
+    if newest is not None:
+        entry["newest"] = int(newest) if entry["newest"] is None else max(entry["newest"], int(newest))
 
 
 def _validate_reconcile_claim_args(claim_id: str, lease_seconds: int) -> None:
@@ -220,7 +417,19 @@ class AuditVerificationResult:
 
 
 class RuntimeTransaction(Protocol):
-    def consume_nonce(self, nonce: str, subject: str, audience: str, task_id: str) -> None:
+    def consume_nonce(self, nonce: str, subject: str, audience: str, task_id: str, expires_at: int | None = None) -> None:
+        """Consume a one-time nonce. `expires_at` is the expiry of the authorization it belongs to,
+        stored WITH the nonce (Section 12 #4, owner decision D2): it is the only fact that later
+        justifies deleting the row, never a value re-derived from mutable configuration. None marks a
+        row that can never be pruned."""
+        ...
+
+    def advance_time_floor(self, now: int) -> int | None:
+        """Advance the durable time floor inside this transaction (Section 12 #6), at most once per
+        TIME_FLOOR_CADENCE_SECONDS, never downwards. Postgres ignores `now` and uses the database clock
+        (the shared authority). Never waits for another writer: a row another transaction is already
+        advancing is skipped, so the floor can never fail or stall the save it rides in. Returns the new
+        floor, or None when it did not advance."""
         ...
 
     def is_task_cancelled(self, task_id: str) -> bool:
@@ -371,8 +580,8 @@ class RuntimeStore(Protocol):
     def verify_audit_chain(self, task_id: str) -> bool:
         ...
 
-    def list_pending_migrations(self) -> list[dict[str, Any]]:
-        """All OUTSTANDING outbox rows (status='pending'), oldest first, INCLUDING rows another
+    def list_pending_migrations(self, limit: int = DEFAULT_ADMIN_PAGE_SIZE, after: str | None = None) -> list[dict[str, Any]]:
+        """One PAGE of OUTSTANDING outbox rows (status='pending'), ordered by task_id, INCLUDING rows another
         worker currently holds under a lease. This is a VISIBILITY query, NOT a delivery queue.
 
         Do NOT enumerate this list and ship its rows -- that is exactly the double-dispatch bug
@@ -384,6 +593,9 @@ class RuntimeStore(Protocol):
         the source's `AgentHost.settle_migration` -> `mark_migration_delivered`. Each returned row
         carries `claimed_by`/`lease_expires_at` so a caller can see the claim state. Portmark ships
         the outbox mechanism, not a dispatcher: without one a migration stays durably pending.
+
+        Section 12 #4: paged -- at most `limit` rows (1..MAX_ADMIN_PAGE_SIZE) with task_id > `after`, so
+        a large backlog is never materialized at once. Pass the last row's task_id to get the next page.
         """
         ...
 
@@ -452,8 +664,9 @@ class RuntimeStore(Protocol):
         `find_migration_for_settlement`)."""
         ...
 
-    def list_dead_migrations(self) -> list[dict[str, Any]]:
-        """Dead-lettered rows for operator inspection, oldest first (section 4 #4)."""
+    def list_dead_migrations(self, limit: int = DEFAULT_ADMIN_PAGE_SIZE, after: str | None = None) -> list[dict[str, Any]]:
+        """One page of dead-lettered rows for operator inspection, ordered by task_id (section 4 #4;
+        paged like list_pending_migrations, Section 12 #4)."""
         ...
 
     def requeue_migration(self, task_id: str) -> bool:
@@ -467,6 +680,42 @@ class RuntimeStore(Protocol):
         delivered (section 4 #4). Used by the source's `settle_migration` so a verified destination
         receipt settles a row even after the dispatcher dead-lettered it, keeping #4 from regressing
         the section 4 #2 lost-ack fix."""
+        ...
+
+    # Section 12: time floor (#6) and capacity (#4).
+    def time_floor(self) -> int:
+        """The durable time floor in epoch seconds (0 if none). Only ever raised by advance_time_floor;
+        only an explicit operator reset (reset_time_floor) can lower it."""
+        ...
+
+    def database_now(self) -> int | None:
+        """The database clock (Postgres), or None for the embedded stores (they use the host clock)."""
+        ...
+
+    def reset_time_floor(self, floor_at: int, reason: str) -> int:
+        """Operator recovery: set the floor to `floor_at` (may lower it) and write a maintenance-log
+        record with the reason. Returns the previous floor. Never called automatically."""
+        ...
+
+    def maintenance_log(self, limit: int = 100) -> list[dict[str, Any]]:
+        """The newest maintenance records (prunes, time-floor resets), newest first."""
+        ...
+
+    def prune(self, nonce_cutoff: int, migration_cutoff: int, apply: bool = False, batch_size: int = MAX_PRUNE_BATCH) -> dict[str, Any]:
+        """Delete ONLY provably-unneeded rows (owner decision D2), in bounded batches:
+
+        - consumed nonces whose STORED authorization expiry is < nonce_cutoff (rows without an expiry are
+          kept and counted);
+        - delivered outbox rows with a verified receipt stored on the row and delivered_at < migration_cutoff
+          (pending, dead, and legacy delivered rows without a delivery time are kept and counted).
+
+        Dry run unless `apply`. Each applied batch selects by a stable key cursor, re-checks the predicate
+        in its DELETE, and writes a maintenance_log record in the SAME transaction. Never VACUUMs.
+        Returns counts plus the oldest/newest timestamp of each class."""
+        ...
+
+    def capacity_report(self) -> dict[str, Any]:
+        """Row counts per table, the oldest pending migration, database size, free space, time floor."""
         ...
 
     def check_ready(self) -> None:
@@ -496,6 +745,9 @@ class InMemoryRuntimeStore:
         self._cancelled: set[str] = set()
         self._effects: dict[str, dict[str, Any]] = {}
         self._floor_markers: dict[str, tuple[int, bool]] = {}
+        # Section 12: the durable time floor (#6) and the maintenance log (#4).
+        self._time_floor = 0
+        self._maintenance_log: list[dict[str, Any]] = []
         self._audit_head_verifier: AuditHeadVerifier | None = None
         # Section 4 #3: the lease clock is a CONSTRUCTION dependency, never a per-call parameter --
         # so a caller of claim/release/dead_letter cannot pass a forged "now" to steal a live lease.
@@ -508,11 +760,15 @@ class InMemoryRuntimeStore:
     def transaction(self) -> AbstractContextManager[RuntimeTransaction]:
         return _InMemoryTransaction(self)
 
-    def list_pending_migrations(self) -> list[dict[str, Any]]:
+    def _page(self, status: str, limit: int, after: str | None) -> list[dict[str, Any]]:
+        _validate_page(limit, after)
         with self._lock:
-            rows = [dict(row) for row in self._outbox.values() if row["status"] == "pending"]
-        rows.sort(key=lambda row: (row["created_at"], row["task_id"]))
-        return rows
+            rows = [dict(row) for row in self._outbox.values() if row["status"] == status and (after is None or row["task_id"] > after)]
+        rows.sort(key=lambda row: row["task_id"])
+        return rows[:limit]
+
+    def list_pending_migrations(self, limit: int = DEFAULT_ADMIN_PAGE_SIZE, after: str | None = None) -> list[dict[str, Any]]:
+        return self._page("pending", limit, after)
 
     def get_migration_receipt(self, task_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -627,6 +883,7 @@ class InMemoryRuntimeStore:
             if row is not None:
                 row["status"] = "delivered"
                 row["receipt_json"] = receipt_json
+                row["delivered_at"] = self._clock()  # Section 12 #4: the prune cutoff is measured from here
 
     def record_migration_attempt(self, task_id: str, worker_id: str | None = None) -> None:
         moment = self._clock()
@@ -691,11 +948,8 @@ class InMemoryRuntimeStore:
             row["lease_expires_at"] = None
             return True
 
-    def list_dead_migrations(self) -> list[dict[str, Any]]:
-        with self._lock:
-            rows = [dict(row) for row in self._outbox.values() if row["status"] == "dead"]
-        rows.sort(key=lambda row: (row["created_at"], row["task_id"]))
-        return rows
+    def list_dead_migrations(self, limit: int = DEFAULT_ADMIN_PAGE_SIZE, after: str | None = None) -> list[dict[str, Any]]:
+        return self._page("dead", limit, after)
 
     def requeue_migration(self, task_id: str) -> bool:
         # Operator recovery of a dead-lettered row (NOT lease-scoped -- the operator, not a worker,
@@ -719,6 +973,85 @@ class InMemoryRuntimeStore:
             if row is None or row["status"] not in ("pending", "dead"):
                 return None
             return dict(row)
+
+    def time_floor(self) -> int:
+        with self._lock:
+            return self._time_floor
+
+    def database_now(self) -> int | None:
+        return None
+
+    def reset_time_floor(self, floor_at: int, reason: str) -> int:
+        _validate_floor_reset(floor_at, reason)
+        with self._lock:
+            prior = self._time_floor
+            self._time_floor = floor_at
+            self._maintenance_log.append(_maintenance_entry(len(self._maintenance_log) + 1, _wall_clock(), "time-floor-reset", {"prior": prior, "new": floor_at, "reason": reason}))
+            return prior
+
+    def maintenance_log(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self._lock:
+            return [dict(entry) for entry in reversed(self._maintenance_log[-limit:])]
+
+    def prune(self, nonce_cutoff: int, migration_cutoff: int, apply: bool = False, batch_size: int = MAX_PRUNE_BATCH) -> dict[str, Any]:
+        _validate_prune_args(nonce_cutoff, migration_cutoff, batch_size)
+        report = _empty_prune_report(nonce_cutoff, migration_cutoff, apply)
+        with self._lock:
+            nonces = sorted(
+                (key, row["expires_at"]) for key, row in self._nonces.items()
+                if row.get("expires_at") is not None and row["expires_at"] < nonce_cutoff
+            )
+            delivered = sorted(
+                (key, row["delivered_at"]) for key, row in self._outbox.items()
+                if row["status"] == "delivered" and row.get("receipt_json") is not None
+                and row.get("delivered_at") is not None and row["delivered_at"] < migration_cutoff
+            )
+            report["kept"] = {
+                "nonces_without_expiry": sum(1 for row in self._nonces.values() if row.get("expires_at") is None),
+                "delivered_without_delivery_time": sum(1 for row in self._outbox.values() if row["status"] == "delivered" and row.get("delivered_at") is None),
+                "delivered_without_receipt": sum(1 for row in self._outbox.values() if row["status"] == "delivered" and row.get("receipt_json") is None),
+                "pending_migrations": sum(1 for row in self._outbox.values() if row["status"] == "pending"),
+                "dead_migrations": sum(1 for row in self._outbox.values() if row["status"] == "dead"),
+            }
+            for name, rows, table in (("expired_nonces", nonces, self._nonces), ("delivered_migrations", delivered, self._outbox)):
+                entry = report[name]
+                entry["eligible"] = len(rows)
+                if rows:
+                    _merge_range(entry, min(stamp for _, stamp in rows), max(stamp for _, stamp in rows))
+                if not apply:
+                    continue
+                for offset in range(0, len(rows), batch_size):
+                    batch = rows[offset:offset + batch_size]
+                    for key, _stamp in batch:
+                        del table[key]
+                    entry["deleted"] += len(batch)
+                    report["batches"] += 1
+                    self._maintenance_log.append(_maintenance_entry(
+                        len(self._maintenance_log) + 1, _wall_clock(), "prune-batch",
+                        {"class": name, "deleted": len(batch), "oldest": min(stamp for _, stamp in batch),
+                         "newest": max(stamp for _, stamp in batch), "cutoff": nonce_cutoff if name == "expired_nonces" else migration_cutoff},
+                    ))
+            if apply:
+                self._maintenance_log.append(_maintenance_entry(len(self._maintenance_log) + 1, _wall_clock(), "prune", _prune_summary(report)))
+        return report
+
+    def capacity_report(self) -> dict[str, Any]:
+        with self._lock:
+            pending = [row["created_at"] for row in self._outbox.values() if row["status"] == "pending"]
+            return {
+                "backend": "memory",
+                "rows": {
+                    "audit_events": sum(len(events) for events in self._audit_events.values()),
+                    "audit_heads": len(self._audit_heads), "checkpoints": len(self._checkpoints),
+                    "consumed_nonces": len(self._nonces), "migration_outbox": len(self._outbox),
+                    "migration_receipts": len(self._migration_receipts), "task_cancellations": len(self._cancelled),
+                    "tool_effects": len(self._effects), "maintenance_log": len(self._maintenance_log),
+                },
+                "oldest_pending_migration_at": min(pending) if pending else None,
+                "database_bytes": None,
+                "free_bytes": None,
+                "time_floor": self._time_floor,
+            }
 
     def check_ready(self) -> None:
         # In-memory: no external dependency to probe, always ready.
@@ -791,6 +1124,7 @@ class _InMemoryTransaction:
 
     def __enter__(self) -> "_InMemoryTransaction":
         self._store._lock.acquire()
+        self._time_floor_snapshot = self._store._time_floor
         self._snapshots = (
             dict(self._store._nonces),
             json.loads(json.dumps(self._store._checkpoints)),
@@ -813,9 +1147,10 @@ class _InMemoryTransaction:
                 self._store._outbox,
                 self._store._migration_receipts,
             ) = self._snapshots
+            self._store._time_floor = self._time_floor_snapshot
         self._store._lock.release()
 
-    def consume_nonce(self, nonce: str, subject: str, audience: str, task_id: str) -> None:
+    def consume_nonce(self, nonce: str, subject: str, audience: str, task_id: str, expires_at: int | None = None) -> None:
         if nonce in self._store._nonces:
             raise SecurityError("permit nonce has already been consumed")
         self._store._nonces[nonce] = {
@@ -823,7 +1158,14 @@ class _InMemoryTransaction:
             "audience": audience,
             "task_id": task_id,
             "consumed_at": int(time.time()),
+            "expires_at": _checked_expiry(expires_at),
         }
+
+    def advance_time_floor(self, now: int) -> int | None:
+        if now - TIME_FLOOR_CADENCE_SECONDS < self._store._time_floor:
+            return None
+        self._store._time_floor = int(now)
+        return int(now)
 
     def is_task_cancelled(self, task_id: str) -> bool:
         # Read within the held transaction lock so the redeem-vs-cancel decision is atomic.
@@ -1194,6 +1536,7 @@ class SQLiteRuntimeStore:
             9: self._migrate_to_v10,
             10: self._migrate_to_v11,
             11: self._migrate_to_v12,
+            12: self._migrate_to_v13,
         }
 
     @staticmethod
@@ -1422,16 +1765,53 @@ class SQLiteRuntimeStore:
             """
         )
 
+    def _migrate_to_v13(self, connection: sqlite3.Connection) -> None:
+        # Section 12. #4: a nonce keeps the expiry of the authorization it belongs to (the only fact that
+        # justifies pruning it), a delivered migration keeps when it was delivered, and every prune or
+        # time-floor reset is recorded in maintenance_log. #6: the durable time floor, seeded from the
+        # newest past timestamp already stored, so an upgraded database starts protected, not at zero.
+        self._add_column(connection, "consumed_nonces", "expires_at", "INTEGER")
+        self._add_column(connection, "migration_outbox", "delivered_at", "INTEGER")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS maintenance_log (
+                id INTEGER PRIMARY KEY,
+                at INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                detail_json TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS time_floor (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                floor_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        seed = 0
+        for table, column in _TIME_FLOOR_SEED_COLUMNS:
+            value = connection.execute(f"SELECT MAX({column}) FROM {table}").fetchone()[0]  # nosec B608 -- constant identifiers
+            if value is not None:
+                seed = max(seed, int(value))
+        connection.execute("INSERT OR IGNORE INTO time_floor (singleton, floor_at, updated_at) VALUES (1, ?, ?)", (seed, seed))
+
     def transaction(self) -> AbstractContextManager[RuntimeTransaction]:
         return _SQLiteTransaction(self)
 
-    def list_pending_migrations(self) -> list[dict[str, Any]]:
+    def _page(self, status: str, columns: str, limit: int, after: str | None) -> list[dict[str, Any]]:
+        _validate_page(limit, after)
         with self._connection() as connection:
             rows = connection.execute(
-                "SELECT task_id, destination, sealed_envelope_json, status, attempt_count, created_at, claimed_by, lease_expires_at "
-                "FROM migration_outbox WHERE status = 'pending' ORDER BY created_at, task_id"
+                f"SELECT {columns} FROM migration_outbox WHERE status = ? AND task_id > ? ORDER BY task_id LIMIT ?",  # nosec B608 -- constant columns
+                (status, after or "", limit),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def list_pending_migrations(self, limit: int = DEFAULT_ADMIN_PAGE_SIZE, after: str | None = None) -> list[dict[str, Any]]:
+        return self._page("pending", "task_id, destination, sealed_envelope_json, status, attempt_count, created_at, claimed_by, lease_expires_at", limit, after)
 
     def get_migration_receipt(self, task_id: str) -> dict[str, Any] | None:
         with self._connection() as connection:
@@ -1453,8 +1833,8 @@ class SQLiteRuntimeStore:
     def mark_migration_delivered(self, task_id: str, receipt_json: str) -> None:
         with self._connection() as connection:
             connection.execute(
-                "UPDATE migration_outbox SET status = 'delivered', receipt_json = ? WHERE task_id = ?",
-                (receipt_json, task_id),
+                "UPDATE migration_outbox SET status = 'delivered', receipt_json = ?, delivered_at = ? WHERE task_id = ?",
+                (receipt_json, int(time.time()), task_id),
             )
 
     def cancel_task(self, task_id: str) -> None:
@@ -1640,13 +2020,8 @@ class SQLiteRuntimeStore:
             )
             return cursor.rowcount > 0
 
-    def list_dead_migrations(self) -> list[dict[str, Any]]:
-        with self._connection() as connection:
-            rows = connection.execute(
-                "SELECT task_id, destination, sealed_envelope_json, status, attempt_count, created_at, dead_reason "
-                "FROM migration_outbox WHERE status = 'dead' ORDER BY created_at, task_id"
-            ).fetchall()
-            return [dict(row) for row in rows]
+    def list_dead_migrations(self, limit: int = DEFAULT_ADMIN_PAGE_SIZE, after: str | None = None) -> list[dict[str, Any]]:
+        return self._page("dead", "task_id, destination, sealed_envelope_json, status, attempt_count, created_at, dead_reason", limit, after)
 
     def requeue_migration(self, task_id: str) -> bool:
         # Operator recovery of a dead row (NOT lease-scoped) -- clears dead_reason, returns to queue.
@@ -1668,6 +2043,82 @@ class SQLiteRuntimeStore:
                 (task_id,),
             ).fetchone()
         return None if row is None else dict(row)
+
+    def time_floor(self) -> int:
+        with self._connection() as connection:
+            row = connection.execute("SELECT floor_at FROM time_floor WHERE singleton = 1").fetchone()
+        return 0 if row is None else int(row["floor_at"])
+
+    def database_now(self) -> int | None:
+        return None
+
+    def reset_time_floor(self, floor_at: int, reason: str) -> int:
+        _validate_floor_reset(floor_at, reason)
+        with self._lock, self._connection() as connection:
+            row = connection.execute("SELECT floor_at FROM time_floor WHERE singleton = 1").fetchone()
+            prior = 0 if row is None else int(row["floor_at"])
+            now = int(time.time())
+            connection.execute(
+                "INSERT INTO time_floor (singleton, floor_at, updated_at) VALUES (1, ?, ?) "
+                "ON CONFLICT (singleton) DO UPDATE SET floor_at = excluded.floor_at, updated_at = excluded.updated_at",
+                (floor_at, now),
+            )
+            connection.execute(
+                "INSERT INTO maintenance_log (at, action, detail_json) VALUES (?, 'time-floor-reset', ?)",
+                (now, json.dumps({"prior": prior, "new": floor_at, "reason": reason}, sort_keys=True)),
+            )
+        return prior
+
+    def maintenance_log(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute("SELECT id, at, action, detail_json FROM maintenance_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return _maintenance_rows(rows)
+
+    def prune(self, nonce_cutoff: int, migration_cutoff: int, apply: bool = False, batch_size: int = MAX_PRUNE_BATCH) -> dict[str, Any]:
+        def read(sql: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
+            with self._connection() as connection:
+                return [dict(row) for row in connection.execute(sql, params).fetchall()]
+
+        def batch_transaction(work):
+            with self._lock:
+                connection = self._connect()
+                try:
+                    connection.execute("BEGIN IMMEDIATE")
+                    try:
+                        result = work(connection.execute)
+                        connection.execute("COMMIT")
+                        return result
+                    except BaseException:
+                        connection.execute("ROLLBACK")
+                        raise
+                finally:
+                    connection.close()
+
+        return _run_sql_prune("?", read, batch_transaction, nonce_cutoff, migration_cutoff, apply, batch_size, _wall_clock)
+
+    def capacity_report(self) -> dict[str, Any]:
+        with self._connection() as connection:
+            rows = {table: int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) for table in _CAPACITY_TABLES}  # nosec B608 -- constant table names
+            oldest = connection.execute("SELECT MIN(created_at) FROM migration_outbox WHERE status = 'pending'").fetchone()[0]
+            floor = connection.execute("SELECT floor_at FROM time_floor WHERE singleton = 1").fetchone()
+        size = 0
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                size += os.path.getsize(str(self.path) + suffix)
+            except OSError:
+                pass
+        try:
+            free = shutil.disk_usage(os.path.dirname(os.path.abspath(str(self.path)))).free
+        except OSError:
+            free = None
+        return {
+            "backend": "sqlite",
+            "rows": rows,
+            "oldest_pending_migration_at": None if oldest is None else int(oldest),
+            "database_bytes": size,
+            "free_bytes": free,
+            "time_floor": 0 if floor is None else int(floor[0]),
+        }
 
     def check_ready(self) -> None:
         # Bounded liveness only (section 2, findings #4 + follow-ups). Two hardenings
@@ -2021,6 +2472,35 @@ class PostgresRuntimeStore:
             )
             """
         )
+        # Section 12 (schema v11). #4: nonce authorization expiry, delivery time, maintenance log. #6: the
+        # durable time floor, seeded (once) from the newest past timestamp already stored.
+        connection.execute("ALTER TABLE consumed_nonces ADD COLUMN IF NOT EXISTS expires_at BIGINT")
+        connection.execute("ALTER TABLE migration_outbox ADD COLUMN IF NOT EXISTS delivered_at BIGINT")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS maintenance_log (
+                id BIGSERIAL PRIMARY KEY,
+                at BIGINT NOT NULL,
+                action TEXT NOT NULL,
+                detail_json TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS time_floor (
+                singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+                floor_at BIGINT NOT NULL,
+                updated_at BIGINT NOT NULL
+            )
+            """
+        )
+        seed_terms = ", ".join(f"(SELECT MAX({column}) FROM {table})" for table, column in _TIME_FLOOR_SEED_COLUMNS)  # nosec B608 -- constant identifiers
+        connection.execute(
+            f"INSERT INTO time_floor (singleton, floor_at, updated_at) "  # nosec B608 -- constant identifiers
+            f"SELECT TRUE, COALESCE(GREATEST({seed_terms}), 0), COALESCE(GREATEST({seed_terms}), 0) "
+            f"ON CONFLICT (singleton) DO NOTHING"
+        )
         connection.execute(
             """
             INSERT INTO portmark_schema (singleton, version)
@@ -2033,13 +2513,17 @@ class PostgresRuntimeStore:
     def transaction(self) -> AbstractContextManager[RuntimeTransaction]:
         return _PostgresTransaction(self)
 
-    def list_pending_migrations(self) -> list[dict[str, Any]]:
+    def _page(self, status: str, columns: str, limit: int, after: str | None) -> list[dict[str, Any]]:
+        _validate_page(limit, after)
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT task_id, destination, sealed_envelope_json, status, attempt_count, created_at, claimed_by, lease_expires_at "
-                "FROM migration_outbox WHERE status = 'pending' ORDER BY created_at, task_id"
+                f"SELECT {columns} FROM migration_outbox WHERE status = %s AND task_id > %s ORDER BY task_id LIMIT %s",  # nosec B608 -- constant columns
+                (status, after or "", limit),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def list_pending_migrations(self, limit: int = DEFAULT_ADMIN_PAGE_SIZE, after: str | None = None) -> list[dict[str, Any]]:
+        return self._page("pending", "task_id, destination, sealed_envelope_json, status, attempt_count, created_at, claimed_by, lease_expires_at", limit, after)
 
     def get_migration_receipt(self, task_id: str) -> dict[str, Any] | None:
         with self._connect() as connection:
@@ -2061,7 +2545,7 @@ class PostgresRuntimeStore:
     def mark_migration_delivered(self, task_id: str, receipt_json: str) -> None:
         with self._connect() as connection:
             connection.execute(
-                "UPDATE migration_outbox SET status = 'delivered', receipt_json = %s WHERE task_id = %s",
+                "UPDATE migration_outbox SET status = 'delivered', receipt_json = %s, delivered_at = EXTRACT(EPOCH FROM clock_timestamp())::bigint WHERE task_id = %s",
                 (receipt_json, task_id),
             )
 
@@ -2255,13 +2739,8 @@ class PostgresRuntimeStore:
             )
             return cursor.rowcount > 0
 
-    def list_dead_migrations(self) -> list[dict[str, Any]]:
-        with self._connect() as connection:
-            rows = connection.execute(
-                "SELECT task_id, destination, sealed_envelope_json, status, attempt_count, created_at, dead_reason "
-                "FROM migration_outbox WHERE status = 'dead' ORDER BY created_at, task_id"
-            ).fetchall()
-            return [dict(row) for row in rows]
+    def list_dead_migrations(self, limit: int = DEFAULT_ADMIN_PAGE_SIZE, after: str | None = None) -> list[dict[str, Any]]:
+        return self._page("dead", "task_id, destination, sealed_envelope_json, status, attempt_count, created_at, dead_reason", limit, after)
 
     def requeue_migration(self, task_id: str) -> bool:
         with self._connect() as connection:
@@ -2280,6 +2759,70 @@ class PostgresRuntimeStore:
                 (task_id,),
             ).fetchone()
         return None if row is None else dict(row)
+
+    def time_floor(self) -> int:
+        with self._connect() as connection:
+            row = connection.execute("SELECT floor_at FROM time_floor WHERE singleton").fetchone()
+        return 0 if row is None else int(row["floor_at"])
+
+    def database_now(self) -> int | None:
+        # Section 12 #6: the database clock is the shared authority for the Postgres time floor.
+        with self._connect() as connection:
+            return int(connection.execute("SELECT EXTRACT(EPOCH FROM clock_timestamp())::bigint AS now").fetchone()["now"])
+
+    def reset_time_floor(self, floor_at: int, reason: str) -> int:
+        _validate_floor_reset(floor_at, reason)
+        with self._connect() as connection:
+            row = connection.execute("SELECT floor_at FROM time_floor WHERE singleton FOR UPDATE").fetchone()
+            prior = 0 if row is None else int(row["floor_at"])
+            connection.execute(
+                "INSERT INTO time_floor (singleton, floor_at, updated_at) VALUES (TRUE, %s, EXTRACT(EPOCH FROM clock_timestamp())::bigint) "
+                "ON CONFLICT (singleton) DO UPDATE SET floor_at = EXCLUDED.floor_at, updated_at = EXCLUDED.updated_at",
+                (floor_at,),
+            )
+            connection.execute(
+                "INSERT INTO maintenance_log (at, action, detail_json) VALUES (EXTRACT(EPOCH FROM clock_timestamp())::bigint, 'time-floor-reset', %s)",
+                (json.dumps({"prior": prior, "new": floor_at, "reason": reason}, sort_keys=True),),
+            )
+        return prior
+
+    def maintenance_log(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute("SELECT id, at, action, detail_json FROM maintenance_log ORDER BY id DESC LIMIT %s", (limit,)).fetchall()
+        return _maintenance_rows(rows)
+
+    def prune(self, nonce_cutoff: int, migration_cutoff: int, apply: bool = False, batch_size: int = MAX_PRUNE_BATCH) -> dict[str, Any]:
+        def read(sql: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
+            with self._connect() as connection:
+                return [dict(row) for row in connection.execute(sql, params).fetchall()]
+
+        def batch_transaction(work):
+            # `with connection` commits on success and rolls back on an exception (psycopg 3).
+            with self._connect() as connection:
+                return work(connection.execute)
+
+        return _run_sql_prune("%s", read, batch_transaction, nonce_cutoff, migration_cutoff, apply, batch_size, self.database_now)
+
+    def capacity_report(self) -> dict[str, Any]:
+        with self._connect() as connection:
+            rows = {table: int(connection.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]) for table in _CAPACITY_TABLES}  # nosec B608 -- constant table names
+            oldest = connection.execute("SELECT MIN(created_at) AS oldest FROM migration_outbox WHERE status = 'pending'").fetchone()["oldest"]
+            size = connection.execute(
+                "SELECT COALESCE(SUM(pg_total_relation_size(c.oid)), 0) AS bytes FROM pg_class c "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = %s AND c.relkind IN ('r', 'p')",
+                (self.schema,),
+            ).fetchone()["bytes"]
+            floor = connection.execute("SELECT floor_at FROM time_floor WHERE singleton").fetchone()
+        return {
+            "backend": "postgres",
+            "rows": rows,
+            "oldest_pending_migration_at": None if oldest is None else int(oldest),
+            "database_bytes": int(size),
+            # Free space belongs to the database server's filesystem; Portmark cannot see it. Monitor it
+            # on the server (DEPLOYMENT.md).
+            "free_bytes": None,
+            "time_floor": 0 if floor is None else int(floor["floor_at"]),
+        }
 
     def check_ready(self) -> None:
         # Bounded liveness only (section 2, finding #4 + #1 follow-up). Two separate
@@ -2432,17 +2975,35 @@ class _PostgresTransaction:
         finally:
             self._connection.close()
 
-    def consume_nonce(self, nonce: str, subject: str, audience: str, task_id: str) -> None:
+    def consume_nonce(self, nonce: str, subject: str, audience: str, task_id: str, expires_at: int | None = None) -> None:
         if self._connection is None:
             raise RuntimeError("Postgres transaction was not opened")
         _, _, _, errors = _postgres_modules()
         try:
             self._connection.execute(
-                "INSERT INTO consumed_nonces (nonce, subject, audience, task_id, consumed_at) VALUES (%s, %s, %s, %s, %s)",
-                (nonce, subject, audience, task_id, int(time.time())),
+                "INSERT INTO consumed_nonces (nonce, subject, audience, task_id, consumed_at, expires_at) VALUES (%s, %s, %s, %s, %s, %s)",
+                (nonce, subject, audience, task_id, int(time.time()), _checked_expiry(expires_at)),
             )
         except errors.UniqueViolation as error:
             raise SecurityError("permit nonce has already been consumed") from error
+
+    def advance_time_floor(self, now: int) -> int | None:
+        # Section 12 #6: the DATABASE clock is the shared authority (`now` from the host is ignored).
+        # Every host's checkpoint save rides this in its own transaction, so it must never wait on the
+        # singleton row: SKIP LOCKED makes a save whose floor row another transaction is already
+        # advancing skip the update instead of blocking (and failing under lock_timeout). Monotonic by
+        # the WHERE clause; at most once per cadence.
+        if self._connection is None:
+            raise RuntimeError("Postgres transaction was not opened")
+        cursor = self._connection.execute(
+            "UPDATE time_floor SET floor_at = EXTRACT(EPOCH FROM clock_timestamp())::bigint, updated_at = EXTRACT(EPOCH FROM clock_timestamp())::bigint "
+            "WHERE singleton AND floor_at <= EXTRACT(EPOCH FROM clock_timestamp())::bigint - %s "
+            "AND singleton IN (SELECT singleton FROM time_floor WHERE singleton FOR UPDATE SKIP LOCKED) "
+            "RETURNING floor_at",
+            (TIME_FLOOR_CADENCE_SECONDS,),
+        )
+        row = cursor.fetchone()
+        return None if row is None else int(row["floor_at"])
 
     def is_task_cancelled(self, task_id: str) -> bool:
         # Take the per-task advisory xact lock (same key cancel_task uses) so redeem and cancel
@@ -2655,16 +3216,27 @@ class _SQLiteTransaction:
             self._connection.close()
             self._store._lock.release()
 
-    def consume_nonce(self, nonce: str, subject: str, audience: str, task_id: str) -> None:
+    def consume_nonce(self, nonce: str, subject: str, audience: str, task_id: str, expires_at: int | None = None) -> None:
         if self._connection is None:
             raise RuntimeError("SQLite transaction was not opened")
         try:
             self._connection.execute(
-                "INSERT INTO consumed_nonces (nonce, subject, audience, task_id, consumed_at) VALUES (?, ?, ?, ?, ?)",
-                (nonce, subject, audience, task_id, int(time.time())),
+                "INSERT INTO consumed_nonces (nonce, subject, audience, task_id, consumed_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (nonce, subject, audience, task_id, int(time.time()), _checked_expiry(expires_at)),
             )
         except sqlite3.IntegrityError as error:
             raise SecurityError("permit nonce has already been consumed") from error
+
+    def advance_time_floor(self, now: int) -> int | None:
+        # Inside the open BEGIN IMMEDIATE write transaction, which already serializes writers, so this
+        # UPDATE never waits on another one. Monotonic by the WHERE clause; at most once per cadence.
+        if self._connection is None:
+            raise RuntimeError("SQLite transaction was not opened")
+        cursor = self._connection.execute(
+            "UPDATE time_floor SET floor_at = ?, updated_at = ? WHERE singleton = 1 AND floor_at <= ?",
+            (int(now), int(now), int(now) - TIME_FLOOR_CADENCE_SECONDS),
+        )
+        return int(now) if cursor.rowcount > 0 else None
 
     def is_task_cancelled(self, task_id: str) -> bool:
         # Read within the open BEGIN IMMEDIATE write transaction so the redeem (consume_nonce)

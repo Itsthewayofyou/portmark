@@ -229,6 +229,80 @@ These are operating-system mechanisms, not an exact client-side deadline: on a d
 fails after roughly the larger of its database bound and about 30 s. `tcp_user_timeout` has no effect
 where the operating system lacks `TCP_USER_TIMEOUT` (for example Windows); keepalives still apply there.
 
+## Clock And The Durable Time Floor
+
+Portmark decides permit, approval, key, receipt, and attestation expiry with the host clock. Treat
+correct time as part of the trusted computing base: run NTP (or your platform's time sync) on every host
+and on the PostgreSQL server.
+
+- **Tolerance.** `PORTMARK_CLOCK_TOLERANCE_SECONDS` (default 300, from 1 to 3600) is the largest clock
+  error Portmark accepts. Expiry decisions can be wrong by at most this much. It is in force from the
+  first start-up check. A rollback larger than it since the process started refuses start-up.
+- **Issuing permits.** `portmark envelope` and the demo set permit expiry with the same clock. While the
+  clock has failed closed, they issue nothing.
+- **While running.** The wall clock is compared with a monotonic clock that never jumps.
+  - If the wall clock moves **back** by more than the tolerance, every security decision fails closed
+    until the clock is fixed and the host restarts.
+  - If it moves **forward** by more than the tolerance, Portmark logs one `CRITICAL` line and counts
+    `clock.forward_jumps` in `/metrics`. Correct a wrong forward jump at once (see below).
+- **Across restarts.** A durable time floor records how far time has progressed.
+  - It advances with checkpoint saves and approval redemptions, at most once a minute.
+  - It lives in the database. When an audit floor is configured (`PORTMARK_AUDIT_FLOOR_PATH`), it is also
+    mirrored into that signed file, outside the database.
+  - On PostgreSQL, the floor uses the database clock.
+- **Start-up refusals.** The host refuses to start (the container entrypoint exits with code 2) when:
+  - the host clock plus the tolerance is still behind the floor;
+  - on PostgreSQL, the database clock is behind its own floor;
+  - on PostgreSQL, the host and database clocks differ by more than the tolerance.
+- **Without an audit floor,** restoring an older database snapshot also restores its older time floor. So
+  a restored database, with a clock set back to match it, is **not** detected. Configure the audit floor
+  to close that gap.
+- **After a wrong forward jump.** The floor follows the clock and is never lowered by Portmark. Once the
+  clock is corrected, start-up refuses until an operator runs:
+  ```
+  portmark --store-path <db> [--audit-floor-path <floor> --trust-registry-path <registry>] \
+    time-floor reset --to <epoch-seconds> --reason "<why>" --confirm
+  ```
+  The reset is recorded in the maintenance log and in the audit floor. `portmark ... time-floor show`
+  prints both floors and both clocks.
+
+## Retention And Capacity
+
+Portmark never deletes on its own. `portmark store prune` removes only rows that are provably no longer
+needed, and only when you ask:
+
+- **Expired nonces.** A consumed nonce blocks a replay until its authorization expires. The expiry is
+  stored with the nonce when it is consumed. A nonce is prunable once that expiry is older than your
+  cutoff **and** older than now minus the clock tolerance. Nonces written before this version have no
+  stored expiry and are always kept.
+- **Delivered migrations.** An outbox row is prunable once it is delivered, carries the verified
+  destination receipt, and was delivered before your cutoff. Pending and dead rows are always kept, and
+  so are delivered rows from before this version (no delivery time).
+- **Everything else is evidence and is never pruned:** audit events and heads, checkpoints, tool
+  effects, cancellations, receipts, and the maintenance log itself.
+
+```
+portmark --store-path <db> store prune --before 2026-06-01T00:00:00Z            # dry run: counts only
+portmark --store-path <db> store prune --before 2026-06-01T00:00:00Z --apply    # delete
+```
+
+A prune reports, for each class, how many rows are eligible and deleted, and the oldest and newest
+timestamp. It also counts the rows it kept, by reason. It deletes in batches of at most 1000 rows
+(`--batch-size`), one transaction each. It writes a maintenance-log record per batch plus a summary.
+It refuses a cutoff in the future, and it refuses to run while the clock is behind the time floor. It
+never runs `VACUUM`: run it (SQLite) or let autovacuum work (PostgreSQL) at a time you choose.
+
+**Watching growth.** `portmark --store-path <db> store stats` prints row counts per table, the oldest
+pending migration, the database size, free disk space (SQLite only; watch the PostgreSQL server's disk
+yourself), and the time floor. The same values are gauges on `/metrics` (`portmark_store_rows{table=...}`,
+`portmark_store_database_bytes`, `portmark_store_free_bytes`,
+`portmark_store_oldest_pending_migration_age_seconds`, `portmark_store_time_floor`). They refresh at most
+once a minute. Alert on low free space and on a growing oldest-pending age.
+
+**Administrative listings are paged.** `list_pending_migrations` and `list_dead_migrations` return at most
+`limit` rows (default 500, maximum 1000) in `task_id` order. Pass the last `task_id` as `after` for the
+next page. `claim_migrations` claims at most 100 rows per call.
+
 ## Metrics
 
 `GET /metrics` requires the same bearer token as `/message:send`. Without an
@@ -262,6 +336,7 @@ Dockerfile. Common configuration:
 - `PORTMARK_STORE_BACKEND`: `sqlite` by default, or `postgres` when the image includes `portmark[postgres]`
 - `PORTMARK_STORE_PATH`: SQLite runtime store path or Postgres DSN
 - `PORTMARK_TOOLS`: optional custom tool registry loader, `module:function`
+- `PORTMARK_CLOCK_TOLERANCE_SECONDS`: see "Clock And The Durable Time Floor"
 - `PORTMARK_SHUTDOWN_GRACE_SECONDS`, `PORTMARK_A2A_BODY_READ_TIMEOUT_SECONDS`, and the
   `PORTMARK_POSTGRES_*_TIMEOUT*` bounds: see "Shutdown, Request Deadlines, And Database Timeouts"
 
@@ -309,6 +384,19 @@ Operational notes:
   migrates to a given destination once (identical re-delivery remains idempotent).
 
 ## Upgrading
+
+### Time floor and retention (new schema: SQLite v13, Postgres v11; audit floor format 2)
+
+The upgrade runs automatically at start-up:
+- It adds each nonce's stored expiry, each migration's delivery time, a maintenance log, and the durable
+  time floor.
+- It starts the time floor at the newest past timestamp already in the database, not at zero. So a
+  clock that is wrong at the first start after the upgrade is still caught.
+- Existing nonces and delivered migrations get no expiry or delivery time, so `store prune` keeps them
+  (they cannot be proven safe to delete).
+- An audit-floor file in format 1 is still read (its time floor is 0) and is rewritten in format 2 on the
+  next write. An older Portmark cannot read format 2, so after the upgrade a downgrade needs the backup
+  of the floor file taken before it.
 
 ### Approvals now carry a required checkpoint generation (breaking approval format)
 
