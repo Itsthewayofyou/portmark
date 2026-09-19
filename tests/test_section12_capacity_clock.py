@@ -373,7 +373,8 @@ class NonceExpiryTests(unittest.TestCase):
                 host.providers["payer"].decide = slow_decide
                 self.assertEqual(host.run(envelope).status, "completed")
             store = deployment.store()
-            with sqlite3.connect(deployment.store_path) as connection:
+            # closing(): sqlite3's own `with` commits but never closes, and Windows cannot delete an open file.
+            with contextlib.closing(sqlite3.connect(deployment.store_path)) as connection:
                 stored = connection.execute(
                     "SELECT expires_at FROM consumed_nonces WHERE nonce = ?", (f"approval:{envelope.state.task_id}:{token.approval_id}",)
                 ).fetchone()[0]
@@ -468,8 +469,9 @@ class PruneTests(unittest.TestCase):
         now = int(time.time()) + 1_000  # deliveries (real clock) are safely before the cutoff
         store = _sqlite_store(self.root)
         _seed(store, now)
-        with sqlite3.connect(self.root / "db" / "runtime.sqlite") as connection:
+        with contextlib.closing(sqlite3.connect(self.root / "db" / "runtime.sqlite")) as connection:
             connection.execute("UPDATE migration_outbox SET status = 'delivered', delivered_at = 1 WHERE task_id = 'm-no-receipt'")
+            connection.commit()
         report = run_prune(store, None, now, apply=True, clock=FakeTime(now).clock())
         self.assertEqual(report["delivered_migrations"]["deleted"], 1)  # only m-delivered
         self.assertEqual(report["kept"]["delivered_without_receipt"], 1)
