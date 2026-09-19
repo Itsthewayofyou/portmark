@@ -16,6 +16,7 @@ from .providers import DeterministicProvider, GenericHttpProvider, ModelProvider
 from .security import AttestationPolicy, EnvelopeSigner, EnvelopeSigningIdentity, ExternalAttestationVerifier, HmacEnvelopeSigner, HostPolicy, MigrationAttesterProtocol, TrustRegistry, TrustSource, _b64url_decode, validate_constraints
 from .storage import RuntimeStore, create_runtime_store
 from .tools import ToolRegistry, demo_registry
+from ._clock import TimeFloorError, check_time_floor, clock_tolerance_from_environment, configure_default_clock, default_clock
 from .witness import FloorError, LocalFloorWitness, floor_path_inside, open_audit_floor
 
 logger = logging.getLogger(__name__)
@@ -218,6 +219,18 @@ def make_host(
     audit_floor = _open_audit_floor(
         audit_floor_path or os.environ.get("PORTMARK_AUDIT_FLOOR_PATH"), host_id, host_signer, configured_store, trust_source
     )
+    # Section 12 #6 (owner decision D3): refuse to start when the clock is behind the durable time floor --
+    # the higher of the database's floor and the audit-floor file's mirror -- by more than the tolerance.
+    # A boot ValueError like every neighbouring start-up check; never lowered automatically.
+    clock = default_clock()
+    tolerance = clock_tolerance_from_environment()
+    if tolerance != clock.tolerance_seconds:
+        clock = configure_default_clock(tolerance)
+    if getattr(configured_store, "is_durable", False):
+        try:
+            check_time_floor(configured_store, audit_floor, clock)
+        except TimeFloorError as error:
+            raise ValueError(f"time floor refused to start ({error.code}): {error}") from error
     host = AgentHost(
         host_id,
         host_signer,
@@ -234,6 +247,8 @@ def make_host(
         metrics=metrics,
     )
     host.audit_floor = audit_floor
+    # Section 12 #6: a forward clock jump beyond the tolerance is also a metric, not only a CRITICAL log.
+    clock.on_forward_jump(host.metrics.note_clock_forward_jump)
     return host
 
 

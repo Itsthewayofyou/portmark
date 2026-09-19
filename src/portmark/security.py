@@ -7,7 +7,6 @@ import math
 import secrets
 import subprocess  # nosec B404
 import tempfile
-import time
 import base64
 import binascii
 import string
@@ -25,6 +24,17 @@ from .models import AgentEnvelope, AgentManifest, ApprovalToken, AttestationEvid
 
 class SecurityError(RuntimeError):
     pass
+
+
+def _decision_time(explicit: int | None) -> int:
+    """The time a security expiry decision uses (Section 12 #6): the caller's explicit value, else the
+    trusted clock, which fails closed (ClockRollbackError) if the wall clock moved back beyond the
+    tolerance. Imported lazily: portmark._clock depends on this module for SecurityError."""
+    if explicit is not None:
+        return explicit
+    from ._clock import trusted_now
+
+    return trusted_now()
 
 
 class EnvelopeVerifier(Protocol):
@@ -418,7 +428,7 @@ class TrustRegistry:
         identity = self._identities.get(key_id)
         if identity is None:
             return False
-        current_time = int(time.time()) if now is None else now
+        current_time = _decision_time(now)
         return _identity_unusable_reason(identity, current_time) is None
 
     def audit_signing_reason(self, key_id: str, now: int | None = None) -> str | None:
@@ -432,7 +442,7 @@ class TrustRegistry:
         identity = self._identities.get(key_id)
         if identity is None:
             return "untrusted"
-        current_time = int(time.time()) if now is None else now
+        current_time = _decision_time(now)
         reason = _identity_unusable_reason(identity, current_time)
         if reason is not None:
             return reason
@@ -460,7 +470,7 @@ class TrustRegistry:
         identity = self._identities.get(key_id)
         if identity is None:
             raise SecurityError("audit head signing key is not trusted")
-        current_time = int(time.time()) if now is None else now
+        current_time = _decision_time(now)
         reason = _identity_unusable_reason(identity, current_time)
         if reason == "revoked":
             raise SecurityError("audit head signing key has been revoked")
@@ -510,7 +520,7 @@ class TrustRegistry:
         # a documented legacy policy. Returns a rich status instead of raising, so the audit
         # report can distinguish valid / valid-but-expired / valid-but-later-revoked /
         # signed-after-revocation rather than collapsing them to "invalid".
-        current_time = int(time.time()) if now is None else now
+        current_time = _decision_time(now)
         identity = self._identities.get(key_id)
         if identity is None:
             return AuditHeadEvaluation(False, "untrusted", "audit head signing key is not trusted")
@@ -579,7 +589,7 @@ class TrustRegistry:
         identity = self._identities.get(key_id)
         if identity is None:
             raise SecurityError("migration receipt signing key is not trusted")
-        current_time = int(time.time()) if now is None else now
+        current_time = _decision_time(now)
         reason = _identity_unusable_reason(identity, current_time)
         if reason == "revoked":
             raise SecurityError("migration receipt signing key has been revoked")
@@ -602,7 +612,7 @@ class TrustRegistry:
         identity = self._identities.get(envelope.signature_key_id)
         if identity is None:
             raise SecurityError("agent envelope signature key id is not trusted")
-        current_time = int(time.time()) if now is None else now
+        current_time = _decision_time(now)
         reason = _identity_unusable_reason(identity, current_time)
         if reason == "revoked":
             raise SecurityError("agent envelope signing key has been revoked")
@@ -849,7 +859,7 @@ class AttestationAuthority:
             subject=subject,
             audience=audience,
             measurement=measurement,
-            issued_at=int(time.time()) if issued_at is None else issued_at,
+            issued_at=_decision_time(issued_at),
             expires_at=expires_at,
             nonce=nonce,
             claims=claims or {},
@@ -960,7 +970,7 @@ class AttestationPolicy:
         fail-closed availability guard, not the trust boundary -- the source's `verify_migration_challenge`
         remains the authority and still runs at settlement.
         """
-        current_time = int(time.time()) if now is None else now
+        current_time = _decision_time(now)
         if evidence.subject != subject:
             raise SecurityError("migration challenge evidence subject does not match this host")
         if evidence.audience not in {audience, "*"}:
@@ -1031,7 +1041,7 @@ class AttestationPolicy:
         authority = self._authorities.get(evidence.signature_key_id) if evidence.signature_key_id else None
         if authority is None and self.external_verifier is None:
             raise SecurityError("attestation verifier key is not trusted")
-        current_time = int(time.time()) if now is None else now
+        current_time = _decision_time(now)
         if authority is not None:
             if authority.revoked:
                 raise SecurityError("attestation verifier key has been revoked")
@@ -1204,7 +1214,7 @@ class ApprovalAuthority:
             arguments_hash=arguments_hash(arguments),
             policy_hash=policy_hash,
             approved_by=self.approver,
-            issued_at=int(time.time()) if issued_at is None else issued_at,
+            issued_at=_decision_time(issued_at),
             expires_at=expires_at,
             signature_key_id=self.key_id,
         )
@@ -1899,7 +1909,7 @@ class HostPolicy:
             raise SecurityError(f"host policy does not allow migration to {destination!r}")
 
     def effective_permit(self, manifest: AgentManifest, permit: Permit, now: int | None = None) -> Permit:
-        current_time = int(time.time()) if now is None else now
+        current_time = _decision_time(now)
         if permit.subject != manifest.agent_id:
             raise SecurityError("permit subject does not match agent")
         if permit.audience != self.audience:
@@ -2006,7 +2016,7 @@ class HostPolicy:
         authority = self._approval_authorities.get(token.signature_key_id)
         if authority is None:
             raise SecurityError("approval signer is not trusted")
-        current_time = int(time.time()) if now is None else now
+        current_time = _decision_time(now)
         if authority.revoked:
             raise SecurityError("approval signer has been revoked")
         if authority.not_before > current_time:

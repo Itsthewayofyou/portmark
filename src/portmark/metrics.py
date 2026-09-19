@@ -31,6 +31,9 @@ class RuntimeMetrics:
         self._histogram_counts: dict[str, int] = {}
         self._histogram_sums: dict[str, float] = {}
         self._histogram_buckets: dict[str, Counter[float]] = {}
+        # Section 12 #4: store capacity gauges from the last capacity report (fixed names only).
+        self._store_gauges: dict[str, float] = {}
+        self._store_rows: dict[str, int] = {}
 
     def increment(self, name: str, value: int = 1) -> None:
         if value < 0:
@@ -44,6 +47,23 @@ class RuntimeMetrics:
         reason_code = reason if reason in _REFUSAL_REASONS else "internal"
         with self._lock:
             self._refusals[reason_code] += value
+
+    def set_store_capacity(self, report: dict[str, Any], now: int) -> None:
+        """Record a store capacity report as gauges. Table names come from the store's fixed list."""
+        gauges: dict[str, float] = {}
+        for key in ("database_bytes", "free_bytes", "time_floor"):
+            if report.get(key) is not None:
+                gauges[key] = float(report[key])
+        oldest = report.get("oldest_pending_migration_at")
+        gauges["oldest_pending_migration_age_seconds"] = 0.0 if oldest is None else float(max(0, now - int(oldest)))
+        rows = {str(table): int(count) for table, count in (report.get("rows") or {}).items()}
+        with self._lock:
+            self._store_gauges = gauges
+            self._store_rows = rows
+
+    def note_clock_forward_jump(self, drift_seconds: float) -> None:
+        # Section 12 #6: registered on the trusted clock (held weakly); one count per jump.
+        self.increment("clock.forward_jumps")
 
     def observe_duration(self, name: str, seconds: float) -> None:
         if seconds < 0:
@@ -68,6 +88,8 @@ class RuntimeMetrics:
             histogram_counts = dict(self._histogram_counts)
             histogram_sums = dict(self._histogram_sums)
             histogram_buckets = {name: Counter(buckets) for name, buckets in self._histogram_buckets.items()}
+            store_gauges = dict(sorted(self._store_gauges.items()))
+            store_rows = dict(sorted(self._store_rows.items()))
 
         lines = [
             "# HELP portmark_runtime_counter_total Runtime event counters.",
@@ -95,6 +117,16 @@ class RuntimeMetrics:
             lines.append(f"{metric}_count {count}")
             lines.append(f"{metric}_sum {_float_value(histogram_sums[name])}")
 
+        if store_rows:
+            lines.append("# HELP portmark_store_rows Rows per store table (Section 12 capacity).")
+            lines.append("# TYPE portmark_store_rows gauge")
+            for table, count in store_rows.items():
+                lines.append(f'portmark_store_rows{{table="{_label_value(table)}"}} {count}')
+        for name, value in store_gauges.items():
+            metric = f"portmark_store_{name}"
+            lines.append(f"# HELP {metric} Store capacity gauge (Section 12).")
+            lines.append(f"# TYPE {metric} gauge")
+            lines.append(f"{metric} {_float_value(value)}")
         return "\n".join(lines) + "\n"
 
 

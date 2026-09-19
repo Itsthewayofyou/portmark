@@ -583,6 +583,7 @@ class A2ARouter:
             if not self.auth_config.required or not self.authorized(authorization):
                 self.host.metrics.increment_refusal("unauthorized")
                 return self._unauthorized()
+            self.host.refresh_capacity_metrics()  # Section 12 #4: cached store capacity gauges
             if accepts_plain_text(accept):
                 return self.text_response(
                     200,
@@ -973,8 +974,9 @@ def make_asgi_app(host: AgentHost, auth: A2AAuthConfig | None = None, enable_hst
                 await _send(send, router.response(503, {"status": "not_ready"}))
                 return
             get_args = (path, _header(scope, b"host"), client_ip, _header(scope, b"authorization"), _header(scope, b"accept"))
-            if path == "/readyz":
-                # Readiness can touch the database (finding #4); run it off the event
+            if path in ("/readyz", "/metrics"):
+                # Readiness (and, Section 12 #4, the capacity gauges on /metrics) can touch the database
+                # (finding #4); run it off the event
                 # loop on the DEFAULT pool so it never blocks the loop and never
                 # takes an admission slot. handle_get's own cache bounds DB load.
                 response = await loop.run_in_executor(None, lambda: router.handle_get(*get_args))
