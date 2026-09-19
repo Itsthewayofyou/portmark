@@ -207,6 +207,15 @@ flowchart LR
 - Cannot access the runtime store unless deployment database credentials or filesystem permissions are compromised.
   A local user on the same host is not an exception: the SQLite store and its `-wal`/`-shm` files are created
   owner-only (`0600`), and a store with any group or other permission bit is refused at start (Section 11 #5).
+- Cannot reach a tokenless, plaintext Portmark listener through a published container port: the image
+  binds loopback by default, and a public bind refuses to start unless a TLS-terminating-proxy
+  acknowledgement, a bearer token, trusted-proxy CIDRs, and an `https://` public URL are all set
+  (Section 11 #1). Cannot choose its own client identity with `X-Forwarded-For` unless it connects from a
+  configured trusted proxy: uvicorn's proxy handling is off, so Portmark's policy is the only one (#6).
+- Cannot make two builds of one commit install different dependency bytes or base images, or publish a
+  tag that is not on `main`: installs are hash-locked exports of `uv.lock`, images are digest-pinned,
+  and the release gates on main ancestry and attests provenance and an SBOM (Section 11 #4). Residual:
+  a compromised upstream artifact that was already locked, or a compromised maintainer account.
 - Cannot read credentials from runtime logs in either log format: the rendered output (message, arguments,
   exception text, traceback) is redacted, including URI user-info and credential query parameters (Section 11 #2).
 

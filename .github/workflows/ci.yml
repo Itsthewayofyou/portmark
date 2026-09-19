@@ -32,26 +32,30 @@ jobs:
         with:
           node-version: "24"
           package-manager-cache: false
-      - name: Pin build tooling
-        run: python -m pip install pip==26.2.1 setuptools==83.0.0
+      # Section 11 #4: every install is from the hash-pinned exports of uv.lock (requirements/*.txt).
+      # --require-hashes refuses changed bytes; --no-deps resolves nothing at install time; the
+      # package itself is built with the hash-locked setuptools (--no-build-isolation).
+      - name: Install hash-locked build tooling
+        run: python -m pip install --require-hashes --no-deps -r requirements/bootstrap.txt
+      - name: Install hash-locked dependencies and test tooling
+        run: python -m pip install --require-hashes --no-deps -r requirements/ci.txt
       - name: Install package
-        run: python -m pip install -e .
+        run: python -m pip install --no-deps --no-build-isolation -e . && python -m pip check
       - name: Run regression tests
         run: python -m unittest discover -s tests -v
       - name: Check security.py coverage
         run: |
-          python -m pip install coverage==7.16.0
           coverage run --source=portmark.security -m unittest discover -s tests -q
           coverage report --include='src/portmark/security.py' --fail-under=95
       - name: Run parser fuzz target
         run: python tests/fuzz_a2a_parser.py
       - name: Run security scan
-        run: python -m pip install bandit==1.9.4 && bandit -q -r src tests
+        run: bandit -q -r src tests
       - name: Run dependency vulnerability audit
         # Fails closed on vulnerabilities AND on anything that could not be audited,
         # with one named exemption for portmark's own editable install. See the module
         # docstring for why plain `pip-audit --strict` deadlocks on a version bump.
-        run: python -m pip install pip-audit==2.10.1 && python scripts/audit_dependencies.py
+        run: python scripts/audit_dependencies.py
       - name: Compile Python sources
         run: python -m compileall -q src tests
       - name: Build Docker image
@@ -60,6 +64,7 @@ jobs:
         # Runs the profile probe inside the just-built image with the full hardening flags (every
         # property must hold) and re-runs with each flag removed (that property must flip). Also
         # proves openat2(RESOLVE_BENEATH) is not blocked by the image's seccomp profile.
+        # Section 11 #1: the same image also proves the entrypoint's public-mode gate and loopback default.
         run: PORTMARK_TEST_IMAGE=portmark-ci:${{ matrix.python-version }} python -m unittest discover -s tests -k DeploymentProfileTests -v
 
   native-wasmtime:
@@ -78,10 +83,13 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - name: Pin build tooling
-        run: python -m pip install pip==26.2.1 setuptools==83.0.0
-      - name: Install package with the pinned Wasmtime extra
-        run: python -m pip install -e ".[wasmtime]"
+      - name: Install hash-locked build tooling
+        run: python -m pip install --require-hashes --no-deps -r requirements/bootstrap.txt
+      - name: Install package with the hash-locked Wasmtime extra
+        run: |
+          python -m pip install --require-hashes --no-deps -r requirements/wasmtime.txt
+          python -m pip install --no-deps --no-build-isolation -e .
+          python -m pip check
       - name: Show platform and Wasmtime version
         run: python -c "import platform, sys, importlib.metadata as m; print(sys.platform, platform.machine(), 'wasmtime', m.version('wasmtime'))"
       - name: Run native Wasmtime regression (real engine)
@@ -96,7 +104,9 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:17
+        # Section 11 #4: pinned by digest (multi-arch index, observed 2026-09-19); Dependabot cannot
+        # bump a workflow service image, so refresh it with `docker buildx imagetools inspect postgres:17`.
+        image: postgres:17@sha256:a6ec007920913e8d715a41e68a17b05ddf30e62d69565814988a896767594cc6
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: portmark
@@ -120,10 +130,13 @@ jobs:
         with:
           node-version: "24"
           package-manager-cache: false
-      - name: Pin build tooling
-        run: python -m pip install pip==26.2.1 setuptools==83.0.0
-      - name: Install package with Postgres extra
-        run: python -m pip install -e '.[postgres]'
+      - name: Install hash-locked build tooling
+        run: python -m pip install --require-hashes --no-deps -r requirements/bootstrap.txt
+      - name: Install package with the hash-locked Postgres extra
+        run: |
+          python -m pip install --require-hashes --no-deps -r requirements/postgres.txt
+          python -m pip install --no-deps --no-build-isolation -e .
+          python -m pip check
       - name: Run the full suite with PostgreSQL enabled
         # Run the WHOLE suite against real Postgres, not a -k slice: every Postgres-gated
         # test (the store-contract, migration, CAS/nonce, and section-1 cold-init race +
@@ -151,11 +164,46 @@ jobs:
         with:
           node-version: "24"
           package-manager-cache: false
-      - name: Pin build tooling
-        run: python -m pip install pip==26.2.1 setuptools==83.0.0
-      - name: Install package
-        run: python -m pip install -e .
+      - name: Install hash-locked build tooling
+        run: python -m pip install --require-hashes --no-deps -r requirements/bootstrap.txt
+      - name: Install package with hash-locked dependencies
+        run: |
+          python -m pip install --require-hashes --no-deps -r requirements/runtime.txt
+          python -m pip install --no-deps --no-build-isolation -e .
+          python -m pip check
       - name: Run regression tests
         run: python -m unittest discover -s tests -v
       - name: Compile Python sources
         run: python -m compileall -q src tests
+
+  lockfile:
+    # Section 11 #4: uv.lock must match pyproject.toml, and every requirements/*.txt must be the exact
+    # export of uv.lock, or the hash-locked installs above would install something else than locked.
+    # A Dependabot pin bump fails here until `uv lock` + scripts/lock_requirements.py are committed.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install hash-locked uv
+        run: |
+          python -m pip install --require-hashes --no-deps -r requirements/bootstrap.txt
+          python -m pip install --require-hashes --no-deps -r requirements/release.txt
+      - name: Check uv.lock and the requirements exports are current
+        run: python scripts/lock_requirements.py --check
+      - name: Prove --require-hashes refuses changed bytes
+        # A negative control, so the hash pinning above cannot be decorative. EVERY hash in a copy of the
+        # runtime export is replaced (pip accepts a file matching ANY listed hash, so changing one
+        # platform's hash proves nothing), and --ignore-installed forces a download (an already
+        # installed package is never hash-checked). The install must fail with pip's hash-mismatch
+        # error specifically, not with any other error such as a network failure. The untampered
+        # export must then pass the same command.
+        run: |
+          sed 's/--hash=sha256:[0-9a-f]\{64\}/--hash=sha256:'"$(printf '0%.0s' $(seq 64))"'/g' requirements/runtime.txt > tampered.txt
+          ! cmp -s requirements/runtime.txt tampered.txt
+          if python -m pip install --require-hashes --no-deps --ignore-installed --dry-run -r tampered.txt 2> tampered.err; then
+            echo 'a tampered export was accepted'; exit 1
+          fi
+          grep -q 'DO NOT MATCH THE HASHES' tampered.err || { cat tampered.err; echo 'refused, but not by the hash check'; exit 1; }
+          python -m pip install --require-hashes --no-deps --ignore-installed --dry-run -r requirements/runtime.txt

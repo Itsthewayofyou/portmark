@@ -120,7 +120,14 @@ at `deploy/nginx/portmark.conf` with TLS termination, HTTPS redirect,
 limits for `/.well-known/agent-card.json`, `/message:send`, and `/metrics`.
 
 `portmark serve` refuses non-loopback binds such as `0.0.0.0`; public exposure
-must go through the production proxy boundary. The legacy `--allow-direct-a2a`
+must go through the production proxy boundary. The container entrypoint
+(`python -m portmark.serve_asgi`) is loopback by default too, and binds publicly only
+in public mode: `PORTMARK_PUBLIC_MODE=behind-tls-proxy`, `PORTMARK_A2A_TOKEN`,
+`PORTMARK_A2A_TRUSTED_PROXIES`, and an `https://` `PORTMARK_A2A_PUBLIC_BASE_URL`, all
+together (see DEPLOYMENT.md). Both server paths run uvicorn with `proxy_headers=False`,
+so `PORTMARK_A2A_TRUSTED_PROXIES` is the only setting that decides whose
+`X-Forwarded-For` is believed. If you start uvicorn yourself instead, pass
+`--no-proxy-headers` (uvicorn's default trusts `X-Forwarded-For` from 127.0.0.1). The legacy `--allow-direct-a2a`
 flag and `PORTMARK_ALLOW_DIRECT_A2A=1` environment variable are retained only
 for configuration compatibility and do not bypass the loopback requirement.
 Even when fronted, the reference server still enforces its own
@@ -369,8 +376,34 @@ host IDs, and audit event structure remain visible by design.
 
 CI runs the regression suite across Python 3.11, 3.12, and 3.13, executes the A2A
 parser fuzz target, runs Bandit, and audits installed dependencies with
-`pip-audit --strict`. Runtime package dependencies should stay pinned in
-`pyproject.toml` and refreshed in `uv.lock` together.
+`pip-audit --strict`.
+
+**Locked, reproducible builds.**
+- Every dependency pin lives in `pyproject.toml` (runtime, extras, and the `bootstrap`, `ci`, and
+  `release` tool groups) and is resolved with hashes in `uv.lock`.
+- `requirements/*.txt` are generated, hash-pinned exports of `uv.lock`. Docker, every CI job, and the
+  release job install ONLY from them, with `pip install --require-hashes --no-deps`, then build Portmark
+  itself with `--no-build-isolation` using the locked setuptools. Nothing is resolved at build time.
+- After changing any pin (including a Dependabot PR): run `uv lock`, then
+  `python scripts/lock_requirements.py`, and commit all three. CI's `lockfile` job fails until you do,
+  and it also proves that a tampered hash is refused.
+- The Docker base image and the CI Postgres service image are pinned by `@sha256:` digest. Dependabot
+  proposes Dockerfile digest bumps; refresh the service image by hand (see the comment at its pin).
+- The one deliberate exception is the weekly, non-blocking Wasmtime canary, which floats `wasmtime`
+  itself to warn before the pin is raised. It builds and publishes nothing.
+
+**Releases.** The release workflow refuses a tag whose commit is not on `main`. It builds from the
+locked environment, publishes a CycloneDX SBOM (the `sbom` artifact), and records signed provenance twice:
+PEP 740 attestations on PyPI, and GitHub build-provenance and SBOM attestations. To check a downloaded
+distribution:
+
+```bash
+gh attestation verify portmark-X.Y.Z-py3-none-any.whl --repo Itsthewayofyou/portmark
+```
+
+For a stronger guarantee, also protect `v*` tags on GitHub (a tag ruleset that allows only maintainers
+to create them), and keep the `pypi` environment's required reviewers on. Those are repository settings,
+not files in this repository.
 
 ## Native Wasmtime Components
 

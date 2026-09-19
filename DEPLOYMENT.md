@@ -12,12 +12,33 @@ Build the image:
 docker build -t portmark:local .
 ```
 
+The image's command is `python -m portmark.serve_asgi`. It listens on **loopback only** by default
+(`PORTMARK_BIND_HOST=127.0.0.1`), so a container started without further settings is reachable only from
+inside itself, even if a port is published with `-p`.
+
+### Public mode (a reverse proxy in another container or host)
+
+To accept connections from a reverse proxy, the listener must bind a non-loopback address. The entrypoint
+then refuses to start unless **all four** of these are set; it reports every missing one at once, and the
+acknowledgement alone never lowers any other requirement:
+
+| Setting | Why |
+|---|---|
+| `PORTMARK_PUBLIC_MODE=behind-tls-proxy` | You acknowledge that a trusted reverse proxy terminates TLS in front of this listener. Portmark itself speaks plain HTTP. |
+| `PORTMARK_A2A_TOKEN` | A bearer token for transport authentication (no whitespace). |
+| `PORTMARK_A2A_TRUSTED_PROXIES` | The proxy's CIDRs. Portmark reads `X-Forwarded-For` only from these peers; uvicorn's own proxy-header handling is off, so this setting is the only one that decides. Without it every client would be identified (and rate-limited) as the proxy. |
+| `PORTMARK_A2A_PUBLIC_BASE_URL` | The `https://` URL clients use (no credentials, query, or fragment). |
+
 Run it on a private network behind a reverse proxy:
 
 ```bash
 docker run --rm --name portmark \
   --network portmark-private \
   --env-file ./portmark.env \
+  -e PORTMARK_BIND_HOST=0.0.0.0 \
+  -e PORTMARK_PUBLIC_MODE=behind-tls-proxy \
+  -e PORTMARK_A2A_TRUSTED_PROXIES=172.18.0.0/16 \
+  -e PORTMARK_A2A_PUBLIC_BASE_URL=https://agents.example.com \
   -e PORTMARK_POLICY_PATH=/config/host-policy.json \
   -e PORTMARK_TRUST_REGISTRY_PATH=/config/trust.json \
   -e PORTMARK_STORE_BACKEND=sqlite \
@@ -27,6 +48,10 @@ docker run --rm --name portmark \
   -v portmark-data:/data \
   portmark:local
 ```
+
+Put `PORTMARK_A2A_TOKEN` in `portmark.env` (mode `0600`), not on the command line. Use the proxy
+network's real CIDR for `PORTMARK_A2A_TRUSTED_PROXIES`. Do not publish the container's port to the
+internet with `-p`: only the proxy should reach it.
 
 If you load custom tools, set `PORTMARK_TOOLS=module:function` and provide a
 matching `PORTMARK_POLICY_PATH`. Tool modules must be present in the image or on

@@ -16,12 +16,26 @@ updates:
 
   # Runtime and optional dependencies are exact-pinned in pyproject.toml. The audit
   # gate fails the build on a known vulnerability, but only once one is published --
-  # this raises the PR that fixes it.
+  # this raises the PR that fixes it. Section 11 #4: such a PR fails CI's `lockfile` job until
+  # `uv lock` and `python scripts/lock_requirements.py` are run on it and committed, so the
+  # hash-locked installs always match the pins.
   - package-ecosystem: pip
     directory: "/"
     schedule:
       interval: weekly
     commit-message:
       prefix: "deps"
+    labels:
+      - dependencies
+
+  # Section 11 #4: the Dockerfile's base image is pinned by digest; this proposes digest bumps.
+  # Workflow service images (postgres in ci.yml) are pinned by digest too, but Dependabot does not
+  # update those -- refresh them by hand (see the comment at the pin).
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "docker"
     labels:
       - dependencies

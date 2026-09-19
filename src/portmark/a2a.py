@@ -898,6 +898,9 @@ def serve(
         # default dictConfig AFTER the CLI's configure_logging(), reinstalling non-propagating,
         # unredacted handlers. log_config=None keeps the one redacting root handler in charge.
         log_config=None,
+        # Section 11 #6: uvicorn's default proxy_headers=True rewrites the peer from X-Forwarded-For
+        # (for 127.0.0.1) BEFORE Portmark's trusted-proxy policy runs. Portmark alone decides.
+        proxy_headers=False,
         limit_concurrency=max_concurrent_requests,
         timeout_keep_alive=5,
         access_log=False,

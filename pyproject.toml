@@ -36,6 +36,14 @@ a2a = ["a2a-sdk==1.1.2"]
 postgres = ["psycopg[binary]==3.3.5"]
 wasmtime = ["wasmtime==48.0.0"]
 
+[dependency-groups]
+# Section 11 #4: build and CI tooling is hash-locked in uv.lock like the runtime dependencies.
+# requirements/*.txt are hash-pinned exports of uv.lock (scripts/lock_requirements.py); Docker, CI, and
+# release install them with `pip install --require-hashes --no-deps`. Not part of the package metadata.
+bootstrap = ["pip==26.2.1", "setuptools==84.0.0"]
+ci = ["bandit==1.9.4", "coverage==7.16.0", "pip-audit==2.10.1"]
+release = ["build==1.3.0", "twine==6.2.0", "uv==0.10.11"]
+
 [project.scripts]
 portmark = "portmark.cli:main"
 
