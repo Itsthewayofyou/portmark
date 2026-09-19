@@ -205,6 +205,10 @@ flowchart LR
 - Cannot control the attestation verifier command unless they compromise operator configuration.
 - Cannot read host environment secrets through Wasm capsules under the intended no-import sandbox model.
 - Cannot access the runtime store unless deployment database credentials or filesystem permissions are compromised.
+  A local user on the same host is not an exception: the SQLite store and its `-wal`/`-shm` files are created
+  owner-only (`0600`), and a store with any group or other permission bit is refused at start (Section 11 #5).
+- Cannot read credentials from runtime logs in either log format: the rendered output (message, arguments,
+  exception text, traceback) is redacted, including URI user-info and credential query parameters (Section 11 #2).
 
 ## Entry Points And Attack Surfaces
 

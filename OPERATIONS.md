@@ -253,6 +253,29 @@ database defeats it (non-detection 1 above). After restoring an older database, 
 refuses to start (`rolled-back`); run `floor-reset` deliberately, with the reason, once the restore is
 understood. Restoring an older trust registry is refused the same way (`registry-rolled-back`).
 
+## File Permissions
+
+The SQLite store holds checkpoints, messages, tool arguments and results, migration envelopes and
+receipts, and audit details. It must be readable by the host's own user only.
+
+- **New stores are owner-only.** On POSIX, the host creates a new database file with mode `0600`
+  before SQLite opens it. SQLite then creates the `-wal` and `-shm` side files with the same mode. A
+  store directory that the host creates gets mode `0700`.
+- **Loose stores are refused.** At start, the host refuses a database, `-wal`, or `-shm` file that has
+  any group or other permission bit, and prints the fix, for example `chmod 600 /var/lib/portmark/runtime.sqlite`.
+  There is no warning-only mode. Fix the mode, then start again.
+- **The check runs at start only.** Do not widen the mode of a running store. Keep the store directory
+  `0700` and owned by the host user, so no other user can create or swap files in it.
+- **Backups.** A backup of the store holds the same data. Keep backup files `0600` (or in a `0700`
+  directory), and restore them with mode `0600`; a restored file with a wider mode is refused.
+- **Audit floor.** The floor is rewritten with mode `0600` on every write, even if a restore widened it.
+  Keep the floor directory writable by the host user only: the floor is signed, but a user who can
+  delete it can force the `floor-missing` refusal.
+- **Windows.** There are no mode bits to check. Put the store, its backups, and the floor in a directory
+  whose ACL (access control list) grants access only to the host's account and administrators.
+- **PostgreSQL.** Protect the database with its own roles and network rules; the DSN is a secret (see
+  "Hygiene And Supply Chain").
+
 ## Storage Migrations
 
 SQLite runtime databases (current version 12) carry their schema version in `PRAGMA user_version`. Hosts migrate version `0` stores to the current baseline on open and refuse to open databases with a newer schema version than the runtime supports. Postgres stores (current version 10) keep their schema version in the `portmark_schema` table in the configured schema. Back up the runtime database before deploying runtime versions that include storage migrations, and validate representative task IDs with `verify-audit` after migration.
@@ -278,8 +301,15 @@ For suspected policy bypass:
 
 ## Hygiene And Supply Chain
 
-JSON logs redact bearer credentials, token/secret-like environment values,
-private keys, passwords, and signatures before emission. Still treat runtime
+Both log formats (plain text and `--log-json`) redact the complete rendered output
+before emission: the message and its arguments, exception text, tracebacks, and stack
+information. Redaction covers bearer credentials, token/secret-like environment
+values, private keys, passwords, signatures, the user-info part of a URI
+(`postgres://user:password@db` becomes `postgres://[REDACTED]@db`; also Redis,
+HTTP, and other schemes), and credential query parameters (`token`, `api_key`,
+`password`, `secret`, `signature`, ...). Uvicorn's own loggers are routed through
+the same redacting handler, so a server traceback is redacted too. Redaction is
+pattern-based: do not rely on it for a secret in an unusual format. Still treat runtime
 logs as sensitive operational data because task IDs, key IDs, policy versions,
 host IDs, and audit event structure remain visible by design.
 

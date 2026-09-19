@@ -231,7 +231,7 @@ class LocalFloorWitness:
             "signature_key_id": self._signer.key_id,
             "signature": self._signer.sign_audit_floor(body),
         }
-        atomic_write_bytes(self.path, canonical_json(document), prefix=".audit-floor-")
+        atomic_write_bytes(self.path, canonical_json(document), prefix=".audit-floor-", mode=0o600)
 
     def create(self, epoch: int, registry: dict[str, Any] | None, tasks: dict[str, dict[str, Any]], resets: list[dict[str, Any]]) -> None:
         with sidecar_lock(self.path):

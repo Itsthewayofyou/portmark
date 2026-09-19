@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
+import shlex
 import sqlite3
+import stat
 import threading
 import time
 from collections.abc import Generator
@@ -797,6 +800,47 @@ class _InMemoryTransaction:
         self._store._migration_receipts.setdefault(task_id, receipt_json)
 
 
+# Section 11 #5: the SQLite store holds checkpoints, messages, tool arguments and results,
+# migration envelopes and receipts, and audit details, so it must never be readable by other local
+# users. Group/other permission bits on the database or its WAL/SHM side files are refused.
+SQLITE_INSECURE_MODE_BITS = stat.S_IRWXG | stat.S_IRWXO
+SQLITE_SIDE_FILE_SUFFIXES = ("-wal", "-shm")
+
+
+def _refuse_insecure_sqlite_file(path: Path) -> None:
+    try:
+        mode = os.stat(path).st_mode
+    except FileNotFoundError:
+        return
+    if mode & SQLITE_INSECURE_MODE_BITS:
+        raise RuntimeError(
+            f"SQLite store file {path} is accessible by group or other users "
+            f"(mode {stat.S_IMODE(mode):04o}); it may hold task data and secrets. "
+            f"Fix it with: chmod 600 {shlex.quote(str(path))}"
+        )
+
+
+def _prepare_sqlite_database_file(path: Path) -> None:
+    """Create a new database owner-only; refuse an existing one with group/other access.
+
+    POSIX only: Windows has no mode bits here (its ACLs are documented in OPERATIONS.md).
+    A new database file is pre-created with 0600 BEFORE sqlite3 opens it, because SQLite creates
+    the -wal and -shm side files with the main database file's permissions.
+    """
+    if os.name == "nt":
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        pass
+    else:
+        os.close(fd)
+    for candidate in (path, *(Path(f"{path}{suffix}") for suffix in SQLITE_SIDE_FILE_SUFFIXES)):
+        _refuse_insecure_sqlite_file(candidate)
+
+
 class SQLiteRuntimeStore:
     is_durable = True
 
@@ -833,7 +877,7 @@ class SQLiteRuntimeStore:
             connection.close()
 
     def _initialize(self) -> None:
-        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        _prepare_sqlite_database_file(Path(self.path))
         with self._connection() as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             if version > SQLITE_SCHEMA_VERSION:
