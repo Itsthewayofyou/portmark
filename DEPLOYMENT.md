@@ -158,6 +158,77 @@ or, on failure, a generic:
 The response intentionally omits file paths, exception text, SQL details, and
 secret material.
 
+While the server is shutting down (below), `/readyz` returns `not_ready`, so a
+load balancer stops sending it work. `/healthz` stays `ok`.
+
+## Shutdown, Request Deadlines, And Database Timeouts
+
+**Bounded shutdown.** On `SIGTERM` (or `SIGINT`), Portmark does this:
+
+1. It stops admitting work at once. A new `POST /message:send` gets `503 server shutting down`, and
+   `/readyz` reports `not_ready`.
+2. It waits for the runs already admitted, for at most `PORTMARK_SHUTDOWN_GRACE_SECONDS` (default 25).
+   uvicorn's own graceful-shutdown wait uses the same value and the same start time, so the total is about
+   one grace, not two.
+3. If every run finished, shutdown completes normally.
+4. If any run is still active at the deadline, Portmark logs one `CRITICAL` line per run and reports the
+   shutdown as failed (ASGI `lifespan.shutdown.failed`). Each line names only the task id, the last durable
+   checkpoint generation, the execution phase, and the effect ids. It never logs arguments, state,
+   results, or secrets. The run is then **abandoned, as in a crash**: it launches no further tool and
+   writes no further checkpoint, and the process may exit without waiting for it.
+
+**What to do after an abandoned run.** Treat it like a crash. A run whose phase was `side_effecting_tool`
+may have landed its external effect, so its status is unknown. Resolve it through the effect ledger
+(`AgentHost.reconcile_effect(effect_id, task_id)`, using the logged effect id), never by resending the
+task. A run in any other phase has launched no effect that the
+ledger does not already record.
+
+**Termination is the orchestrator's job.** Portmark can report a failed shutdown. It cannot force the
+process to exit. Set the orchestrator's termination grace slightly **above** Portmark's grace, so the
+report is written before a hard kill:
+
+| Platform | Setting | With the default 25 s grace |
+|---|---|---|
+| Kubernetes | `terminationGracePeriodSeconds` | 30 (the default) or more |
+| Docker | `docker stop --time` / `stop_grace_period` | 30 or more (Docker's default of 10 is too short) |
+| systemd | `TimeoutStopSec` | 30 or more |
+
+**Request-body deadline.** A request body must arrive completely within
+`PORTMARK_A2A_BODY_READ_TIMEOUT_SECONDS` (default 30). This is one absolute deadline for the whole body,
+including the time between chunks, so a client that sends a byte now and then cannot hold an admission
+slot. When it expires, the client gets `408` (the connection is closed) and the slot is released. Keep
+the reverse proxy's own body timeout (nginx `client_body_timeout`) at or below this value.
+
+**PostgreSQL timeouts.** Every connection Portmark opens to PostgreSQL gets these bounds, whatever the DSN
+says. A DSN may set a smaller `connect_timeout`. It cannot disable or raise any bound, because Portmark
+sets them after connecting.
+
+| Bound | Default | Variable |
+|---|---|---|
+| Connect (includes an unreachable or silent host) | 5 s | `PORTMARK_POSTGRES_CONNECT_TIMEOUT_SECONDS` |
+| One statement | 30 000 ms | `PORTMARK_POSTGRES_STATEMENT_TIMEOUT_MS` |
+| Waiting for a row, table, or advisory lock | 10 000 ms | `PORTMARK_POSTGRES_LOCK_TIMEOUT_MS` |
+| Idle inside an open transaction | 60 000 ms | `PORTMARK_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS` |
+
+Each must be a positive integer (maximum 300 s for connect, 3 600 000 ms for the others). Zero is
+refused, because it would disable the bound. Schema setup at startup uses longer, still finite bounds
+(10 minutes per statement, 5 minutes to wait for another process's migration). A timeout fails the
+operation and rolls its transaction back, as any other database error does.
+
+**When the network goes silent after a query was sent.** The bounds above are enforced by the server. If
+the network between Portmark and PostgreSQL stops delivering packets after a query was sent, the server
+may cancel the statement, but its reply never arrives. For that case every connection also enables TCP
+failure detection, again whatever the DSN says:
+
+- TCP keepalives: a probe after 10 s of silence, then every 5 s; 3 missed probes end the connection
+  (about 25 s).
+- `tcp_user_timeout` of 30 s: a send that stays unacknowledged for 30 s ends the connection.
+
+A live server answers keepalive probes at the TCP level, so a long but healthy statement is not affected.
+These are operating-system mechanisms, not an exact client-side deadline: on a dead network an operation
+fails after roughly the larger of its database bound and about 30 s. `tcp_user_timeout` has no effect
+where the operating system lacks `TCP_USER_TIMEOUT` (for example Windows); keepalives still apply there.
+
 ## Metrics
 
 `GET /metrics` requires the same bearer token as `/message:send`. Without an
@@ -191,6 +262,8 @@ Dockerfile. Common configuration:
 - `PORTMARK_STORE_BACKEND`: `sqlite` by default, or `postgres` when the image includes `portmark[postgres]`
 - `PORTMARK_STORE_PATH`: SQLite runtime store path or Postgres DSN
 - `PORTMARK_TOOLS`: optional custom tool registry loader, `module:function`
+- `PORTMARK_SHUTDOWN_GRACE_SECONDS`, `PORTMARK_A2A_BODY_READ_TIMEOUT_SECONDS`, and the
+  `PORTMARK_POSTGRES_*_TIMEOUT*` bounds: see "Shutdown, Request Deadlines, And Database Timeouts"
 
 Do not bake tokens, private keys, policy files containing local secrets, or
 runtime stores into the container image.

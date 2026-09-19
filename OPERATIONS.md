@@ -346,6 +346,16 @@ For suspected key compromise:
 5. Re-run audit-chain verification for impacted task IDs.
 6. Invalidate outstanding approvals from the compromised approver.
 
+After a shutdown that logged `shutdown grace ... expired with a run unfinished` (Section 12):
+
+1. Treat each named run like a crash. Its checkpoint is the last one logged
+   (`checkpoint_generation`); nothing was written for it after the deadline.
+2. For a run in phase `side_effecting_tool`, the external effect may or may not have landed.
+   Reconcile each logged effect id with `AgentHost.reconcile_effect(effect_id, task_id)`. Do not
+   resend the task: the effect ledger refuses to re-run an `unknown` effect, by design.
+3. If this happens often, raise `PORTMARK_SHUTDOWN_GRACE_SECONDS` together with the orchestrator's
+   termination grace (DEPLOYMENT.md, "Shutdown, Request Deadlines, And Database Timeouts").
+
 For suspected policy bypass:
 
 1. Preserve the runtime database and logs.

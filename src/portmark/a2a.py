@@ -7,10 +7,10 @@ import logging
 import os
 import re
 import secrets
+import sys
 import threading
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -19,6 +19,7 @@ from collections.abc import Callable
 from typing import Any, Iterator
 from urllib.parse import urlsplit
 
+from . import _run_progress
 from .json_guard import StrictJSONError, strict_json_loads
 from .a2a_types import A2ARequestError, error_response, make_agent_card, parse_jsonrpc_request, success_response, task_from_run_result
 from .host import AgentHost
@@ -42,6 +43,28 @@ DEFAULT_AGENT_CARD_RATE_LIMIT_PER_IP = 240
 DEFAULT_AGENT_CARD_RATE_LIMIT_WINDOW_SECONDS = 60
 DEFAULT_RATE_LIMIT_TRACKED_CLIENTS = 8192
 DEFAULT_READY_CACHE_SECONDS = 2.0
+# Section 12 #1: how long shutdown waits for admitted runs before reporting the rest as unfinished.
+# Below Kubernetes' default 30 s termination grace, so the report is written before a SIGKILL. The
+# orchestrator's own grace must stay slightly ABOVE this (DEPLOYMENT.md).
+DEFAULT_SHUTDOWN_GRACE_SECONDS = 25.0
+MAX_SHUTDOWN_GRACE_SECONDS = 3600.0
+# Section 12 #2: the ABSOLUTE time allowed to receive a request body, including the time between
+# chunks, so a client that drips a body cannot hold an admission slot indefinitely.
+DEFAULT_BODY_READ_TIMEOUT_SECONDS = 30.0
+MAX_BODY_READ_TIMEOUT_SECONDS = 600.0
+# uvicorn.run()'s exit status when the server never started (uvicorn.main.STARTUP_FAILURE).
+_UVICORN_STARTUP_FAILURE = 3
+
+
+def validate_timeout_seconds(name: str, value: Any, maximum: float) -> float:
+    """A positive, finite number of seconds no larger than `maximum`. Anything else is refused:
+    zero, a negative, NaN, or infinity would disable the bound it configures."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number of seconds, got {value!r}")
+    seconds = float(value)
+    if not 0 < seconds <= maximum:  # also rejects NaN
+        raise ValueError(f"{name} must be greater than 0 and at most {maximum:g} seconds, got {value!r}")
+    return seconds
 
 
 def validate_public_base_url(url: str) -> str:
@@ -225,6 +248,65 @@ class NetworkGuard:
             yield None
         finally:
             self._concurrency.release()
+
+
+class _RunTracker:
+    """The admitted runs of one ASGI app, and its drain state (Section 12 #1, owner decision D1).
+
+    Once draining starts, no new run is admitted. `wait_until_idle` waits for the active runs until the
+    grace deadline (measured from the moment draining started), then marks every run still active as
+    abandoned -- from then on it launches no tool and writes no checkpoint -- and returns their
+    identifier-only progress for the shutdown report.
+    """
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._active: set[_run_progress.RunProgress] = set()
+        self._drain_started: float | None = None
+
+    @property
+    def draining(self) -> bool:
+        with self._condition:
+            return self._drain_started is not None
+
+    def begin_drain(self) -> None:
+        # Idempotent: the server's signal hook and the lifespan shutdown event may both call it; the
+        # grace is measured from the FIRST call.
+        with self._condition:
+            if self._drain_started is None:
+                self._drain_started = time.monotonic()
+
+    def try_start(self) -> _run_progress.RunProgress | None:
+        with self._condition:
+            if self._drain_started is not None:
+                return None
+            progress = _run_progress.RunProgress()
+            self._active.add(progress)
+            return progress
+
+    def finish(self, progress: _run_progress.RunProgress) -> None:
+        with self._condition:
+            self._active.discard(progress)
+            self._condition.notify_all()
+
+    def active_count(self) -> int:
+        with self._condition:
+            return len(self._active)
+
+    def wait_until_idle(self, grace_seconds: float) -> list[dict[str, Any]]:
+        with self._condition:
+            if self._drain_started is None:
+                raise RuntimeError("wait_until_idle requires begin_drain first")
+            deadline = self._drain_started + grace_seconds
+            while self._active:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._condition.wait(remaining)
+            leftovers = list(self._active)
+        # abandon() returns the report snapshot under the same lock that begin() takes, so each report
+        # names exactly the operation in flight at the deadline, and nothing can begin afterwards.
+        return [progress.abandon() for progress in leftovers]
 
 
 class BoundedReferenceHTTPServer(ThreadingMixIn, HTTPServer):
@@ -608,6 +690,11 @@ def make_handler(host: AgentHost, auth: A2AAuthConfig | None = None, enable_hsts
     # reference handler is loopback-dev only and keeps peer-only client identity, so
     # accept-and-ignore the kwarg rather than letting it reach A2ARouter as an error.
     kwargs.pop("trusted_proxies", None)
+    body_timeout = validate_timeout_seconds(
+        "body_read_timeout_seconds",
+        kwargs.pop("body_read_timeout_seconds", DEFAULT_BODY_READ_TIMEOUT_SECONDS),
+        MAX_BODY_READ_TIMEOUT_SECONDS,
+    )
     router = A2ARouter(host, auth, enable_hsts, **kwargs)
 
     class A2AHandler(BaseHTTPRequestHandler):
@@ -625,6 +712,29 @@ def make_handler(host: AgentHost, auth: A2AAuthConfig | None = None, enable_hsts
             if isinstance(self.client_address, tuple) and self.client_address:
                 return str(self.client_address[0])
             return "unknown"
+
+        def _read_body(self, size: int) -> bytes | None:
+            """Read exactly `size` bytes within ONE absolute deadline (Section 12 #2), or None on timeout.
+
+            A per-read socket timeout alone resets on every dribbled byte; setting it to the time LEFT
+            before each read makes the whole body share one deadline. A short body (EOF) is returned
+            as read, and the caller refuses it as a framing error.
+            """
+            deadline = time.monotonic() + body_timeout
+            body = bytearray()
+            try:
+                while len(body) < size:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return None
+                    self.connection.settimeout(remaining)
+                    chunk = self.rfile.read1(min(65_536, size - len(body)))
+                    if not chunk:
+                        break
+                    body.extend(chunk)
+            except TimeoutError:
+                return None
+            return bytes(body)
 
         def do_GET(self) -> None:
             self._send(router.handle_get(
@@ -649,7 +759,18 @@ def make_handler(host: AgentHost, auth: A2AAuthConfig | None = None, enable_hsts
                     if rejection is not None:
                         self._send(rejection)
                         return
-                    self._send(router.dispatch_post(self.rfile.read(size)))
+                    body = self._read_body(size)
+                    if body is None:
+                        router.host.metrics.increment_refusal("request_timeout")
+                        self.close_connection = True
+                        self._send(router.response(408, error_response(None, -32600, "request body timeout"), {"Connection": "close"}))
+                        return
+                    if len(body) != size:
+                        router.host.metrics.increment_refusal("invalid_request")
+                        self.close_connection = True
+                        self._send(router.response(400, error_response(None, -32600, "invalid request")))
+                        return
+                    self._send(router.dispatch_post(body))
             finally:
                 router.host.metrics.observe_duration("a2a_request_duration_seconds", time.monotonic() - started)
 
@@ -714,19 +835,40 @@ def make_asgi_app(host: AgentHost, auth: A2AAuthConfig | None = None, enable_hst
     An oversized request is still rejected without its body being read, which is
     the DoS property. A request within the limit has at most MAX_REQUEST_BYTES
     buffered before per-IP rate limiting applies; uvicorn's own concurrency limit
-    is the outer bound.
+    is the outer bound. The whole body must arrive within `body_read_timeout_seconds`
+    (Section 12 #2), or the request gets 408 and its admission slot is released.
+
+    Shutdown (Section 12 #1, owner decision D1): draining starts at the server's shutdown signal
+    (`app.begin_shutdown`, called by run_uvicorn) or at the lifespan shutdown event, whichever is first.
+    From then on no run is admitted (503) and /readyz reports not ready. The lifespan handler waits for
+    the active runs until `shutdown_grace_seconds` after draining started. If any are still running,
+    it logs their identifiers (task id, checkpoint generation, phase, effect ids -- never arguments,
+    state, or secrets), marks them abandoned so they launch no tool and write no checkpoint, and
+    replies `lifespan.shutdown.failed`. Runs execute on DAEMON threads, so an abandoned run does not
+    hold the process open; the server or orchestrator owns termination. A run abandoned in phase
+    `side_effecting_tool` may have landed its effect: its status is unknown until the effect ledger
+    is reconciled.
     """
     # Transport-level, not a router concern: which peers may speak for a client via
     # X-Forwarded-For (section 2, finding #3). Popped so it does not reach A2ARouter.
     trusted_proxies = kwargs.pop("trusted_proxies", ())
-    max_workers = kwargs.get("max_concurrent_requests", DEFAULT_MAX_CONCURRENT_REQUESTS)
+    shutdown_grace = validate_timeout_seconds(
+        "shutdown_grace_seconds",
+        kwargs.pop("shutdown_grace_seconds", DEFAULT_SHUTDOWN_GRACE_SECONDS),
+        MAX_SHUTDOWN_GRACE_SECONDS,
+    )
+    body_timeout = validate_timeout_seconds(
+        "body_read_timeout_seconds",
+        kwargs.pop("body_read_timeout_seconds", DEFAULT_BODY_READ_TIMEOUT_SECONDS),
+        MAX_BODY_READ_TIMEOUT_SECONDS,
+    )
     router = A2ARouter(host, auth, enable_hsts, **kwargs)
-    # dispatch_post runs host.run() synchronously; execute it OFF the event loop in a
-    # bounded pool sized to the concurrency guard, so one slow agent run cannot block
-    # health probes or any other endpoint (section 2, finding #1). This pool is used
-    # ONLY for dispatch_post -- routing health/readiness through it would reintroduce
-    # the blocking. The permit from admit_post is held across the off-loop run.
-    run_executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="portmark-a2a-run")
+    # dispatch_post runs host.run() synchronously; each admitted run executes OFF the event loop on
+    # its own daemon thread (section 2, finding #1: one slow agent run cannot block health probes).
+    # The number of such threads is bounded by the admission guard, whose permit the thread itself
+    # releases when the run ENDS -- not when the request task ends -- so a cancelled request task
+    # cannot free capacity while its run is still executing (Section 12 #1).
+    tracker = _RunTracker()
 
     def _header(scope: dict[str, Any], name: bytes) -> str:
         for key, value in scope.get("headers", ()):
@@ -751,16 +893,73 @@ def make_asgi_app(host: AgentHost, auth: A2AAuthConfig | None = None, enable_hst
         })
         await send({"type": "http.response.body", "body": response.payload})
 
-    async def app(scope, receive, send) -> None:
-        if scope["type"] == "lifespan":
-            while True:
-                message = await receive()
-                if message["type"] == "lifespan.startup":
-                    await send({"type": "lifespan.startup.complete"})
-                elif message["type"] == "lifespan.shutdown":
-                    run_executor.shutdown(wait=False)
+    def _shutting_down() -> HttpResponse:
+        router.host.metrics.increment_refusal("shutting_down")
+        return router.response(503, error_response(None, -32003, "server shutting down"), {"Retry-After": "1"})
+
+    def _start_run(loop: asyncio.AbstractEventLoop, admission: Any, progress: _run_progress.RunProgress, body: bytes) -> asyncio.Future:
+        """Run dispatch_post on a daemon thread that owns `admission` until the run ends."""
+        future: asyncio.Future = loop.create_future()
+
+        def deliver(outcome: tuple[bool, Any]) -> None:
+            if not future.done():  # the request task may have been cancelled meanwhile
+                future.set_result(outcome)
+
+        def worker() -> None:
+            try:
+                with _run_progress.tracking(progress):
+                    outcome: tuple[bool, Any] = (True, router.dispatch_post(body))
+            except Exception as error:  # noqa: BLE001 -- handed back to the request task below
+                outcome = (False, error)
+            finally:
+                tracker.finish(progress)
+                admission.__exit__(None, None, None)
+            try:
+                loop.call_soon_threadsafe(deliver, outcome)
+            except RuntimeError:
+                pass  # the event loop has closed (shutdown): nobody is waiting for this response
+
+        thread = threading.Thread(target=worker, daemon=True, name="portmark-a2a-run")
+        thread.start()  # a RuntimeError here is handled by the caller, which still owns admission
+        return future
+
+    async def _lifespan(receive, send) -> None:
+        loop = asyncio.get_running_loop()
+        while True:
+            message = await receive()
+            if message["type"] == "lifespan.startup":
+                await send({"type": "lifespan.startup.complete"})
+            elif message["type"] == "lifespan.shutdown":
+                tracker.begin_drain()
+                unfinished = await loop.run_in_executor(None, tracker.wait_until_idle, shutdown_grace)
+                if not unfinished:
                     await send({"type": "lifespan.shutdown.complete"})
                     return
+                for run in unfinished:
+                    logger.critical(
+                        "shutdown grace of %gs expired with a run unfinished: task_id=%r checkpoint_generation=%s "
+                        "phase=%s effect_ids=%s",
+                        shutdown_grace,
+                        run["task_id"],
+                        run["checkpoint_generation"],
+                        run["phase"],
+                        run["effect_ids"],
+                    )
+                logger.critical(
+                    "%d run(s) abandoned at the shutdown deadline, as in a crash: they launch no further tool and "
+                    "write no further checkpoint. A run abandoned in phase side_effecting_tool may have landed its "
+                    "effect; resolve it through the effect ledger (reconcile), never by retrying.",
+                    len(unfinished),
+                )
+                await send({
+                    "type": "lifespan.shutdown.failed",
+                    "message": f"{len(unfinished)} run(s) still active when the {shutdown_grace:g}s shutdown grace expired",
+                })
+                return
+
+    async def app(scope, receive, send) -> None:
+        if scope["type"] == "lifespan":
+            await _lifespan(receive, send)
             return
         if scope["type"] != "http":
             return
@@ -768,69 +967,154 @@ def make_asgi_app(host: AgentHost, auth: A2AAuthConfig | None = None, enable_hst
         path, method = scope.get("path", ""), scope.get("method", "GET").upper()
         client_ip = _client_ip(scope)
         if method == "GET":
+            if path == "/readyz" and tracker.draining:
+                # Section 12 #1: a draining server is not ready, so a load balancer stops routing to it.
+                router.host.metrics.increment_refusal("not_ready")
+                await _send(send, router.response(503, {"status": "not_ready"}))
+                return
             get_args = (path, _header(scope, b"host"), client_ip, _header(scope, b"authorization"), _header(scope, b"accept"))
             if path == "/readyz":
                 # Readiness can touch the database (finding #4); run it off the event
                 # loop on the DEFAULT pool so it never blocks the loop and never
-                # borrows a dispatch worker. handle_get's own cache bounds DB load.
+                # takes an admission slot. handle_get's own cache bounds DB load.
                 response = await loop.run_in_executor(None, lambda: router.handle_get(*get_args))
             else:
                 # healthz, agent card, metrics are cheap and must NOT queue behind
-                # agent work, so they stay on the loop and off the dispatch pool.
+                # agent work, so they stay on the loop and off the run threads.
                 response = router.handle_get(*get_args)
             await _send(send, response)
             return
         if method != "POST":
             await _send(send, router.response(404, {"error": "not found"}))
             return
+        if tracker.draining:
+            await _send(send, _shutting_down())
+            return
 
         router.note_forwarded_proto(_header(scope, b"x-forwarded-proto"))
         started = time.monotonic()
+        # The admission context is entered here and exited EXACTLY once: by this function if no run
+        # thread took it over, otherwise by that thread when the run ends (Section 12 #1).
+        admission = router.admit_post(
+            path, _header(scope, b"content-type"), _header(scope, b"content-length"), _header(scope, b"authorization"), client_ip
+        )
+        handed_to_run = False
         try:
-            raw_length = _header(scope, b"content-length")
-            content_type = _header(scope, b"content-type")
-            with router.admit_post(path, content_type, raw_length, _header(scope, b"authorization"), client_ip) as (
-                rejection,
-                size,
-            ):
-                if rejection is not None:
-                    await _send(send, rejection)
+            rejection, size = admission.__enter__()
+            if rejection is not None:
+                await _send(send, rejection)
+                return
+            body = bytearray()
+            framing_error = False
+            timed_out = False
+            deadline = loop.time() + body_timeout
+            while len(body) < size:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                try:
+                    # Section 12 #2: ONE absolute deadline for the whole body, including the gaps
+                    # between chunks, so a dripping client cannot hold this admission slot forever.
+                    message = await asyncio.wait_for(receive(), remaining)
+                except asyncio.TimeoutError:
+                    timed_out = True
+                    break
+                if message["type"] == "http.disconnect":
                     return
-                body = bytearray()
-                framing_error = False
-                while len(body) < size:
-                    message = await receive()
-                    if message["type"] == "http.disconnect":
-                        return
-                    body.extend(message.get("body", b""))
-                    if len(body) > MAX_REQUEST_BYTES:
-                        router.host.metrics.increment_refusal("invalid_request")
-                        await _send(send, router.response(413, error_response(None, -32600, "invalid request")))
-                        return
-                    if len(body) > size:
-                        # Body crosses the declared Content-Length (finding #5): the
-                        # declared frame is a lie, so reject rather than trust either
-                        # length. Do not run an agent on an unframed body.
-                        framing_error = True
-                        break
-                    if not message.get("more_body", False):
-                        break
-                if framing_error or len(body) != size:
-                    # Crossed the declared length, or early EOF (fewer bytes than
-                    # declared) -- the ASGI body did not match its Content-Length.
+                body.extend(message.get("body", b""))
+                if len(body) > MAX_REQUEST_BYTES:
                     router.host.metrics.increment_refusal("invalid_request")
-                    await _send(send, router.response(400, error_response(None, -32600, "invalid request")))
+                    await _send(send, router.response(413, error_response(None, -32600, "invalid request")))
                     return
-                # host.run() is synchronous and can be slow; run it OFF the loop while
-                # the admission permit is still held (finding #1), so /healthz and
-                # every other endpoint stay responsive during a long agent run.
-                response = await loop.run_in_executor(run_executor, router.dispatch_post, bytes(body))
-            await _send(send, response)
+                if len(body) > size:
+                    # Body crosses the declared Content-Length (finding #5): the
+                    # declared frame is a lie, so reject rather than trust either
+                    # length. Do not run an agent on an unframed body.
+                    framing_error = True
+                    break
+                if not message.get("more_body", False):
+                    break
+            if timed_out:
+                router.host.metrics.increment_refusal("request_timeout")
+                await _send(send, router.response(408, error_response(None, -32600, "request body timeout"), {"Connection": "close"}))
+                return
+            if framing_error or len(body) != size:
+                # Crossed the declared length, or early EOF (fewer bytes than
+                # declared) -- the ASGI body did not match its Content-Length.
+                router.host.metrics.increment_refusal("invalid_request")
+                await _send(send, router.response(400, error_response(None, -32600, "invalid request")))
+                return
+            progress = tracker.try_start()
+            if progress is None:  # draining began while the body was being read
+                await _send(send, _shutting_down())
+                return
+            try:
+                future = _start_run(loop, admission, progress, bytes(body))
+            except RuntimeError:
+                # Section 12 #5 (same class): the OS refused a thread. The run never started, so this
+                # function still owns the admission and releases it below; fail closed with 503.
+                tracker.finish(progress)
+                router.host.metrics.increment_refusal("server_busy")
+                await _send(send, router.response(503, error_response(None, -32003, "server busy"), {"Retry-After": "1"}))
+                return
+            handed_to_run = True
+            succeeded, value = await future
+            if not succeeded:
+                raise value
+            response = value
         finally:
+            if not handed_to_run:
+                admission.__exit__(None, None, None)
             router.host.metrics.observe_duration("a2a_request_duration_seconds", time.monotonic() - started)
+        await _send(send, response)
 
     app.a2a_router = router  # type: ignore[attr-defined]
+    # Section 12 #1: run_uvicorn calls this from the server's signal handler, so admission stops the
+    # moment shutdown begins; and it reads the grace from here, so uvicorn and the app share one value.
+    app.begin_shutdown = tracker.begin_drain  # type: ignore[attr-defined]
+    app.shutdown_grace_seconds = shutdown_grace  # type: ignore[attr-defined]
+    app.run_tracker = tracker  # type: ignore[attr-defined]
     return app
+
+
+def _shutdown_hook(app: Any) -> Any:
+    """Find the Portmark app inside uvicorn's middleware wrappers (each keeps the next as `.app`)."""
+    current = app
+    for _ in range(8):
+        if callable(getattr(current, "begin_shutdown", None)):
+            return current
+        current = getattr(current, "app", None)
+        if current is None:
+            break
+    raise RuntimeError("the ASGI application has no Portmark shutdown hook (make_asgi_app)")
+
+
+def run_uvicorn(app: Any, options: dict[str, Any]) -> None:
+    """Run uvicorn as uvicorn.run() does for one worker without reload, plus Section 12 #1.
+
+    - The server's shutdown signal first calls the app's `begin_shutdown`, so admission stops at once.
+    - uvicorn's own graceful-shutdown wait (`timeout_graceful_shutdown`) is set to the app's grace, and
+      the app measures its grace from the same moment, so the total shutdown time is about ONE grace,
+      not two. After uvicorn's wait, the lifespan handler reports the runs still unfinished.
+    """
+    import uvicorn
+
+    config = uvicorn.Config(app, **options)
+    # As uvicorn.run() does: import the app now (an import string is imported once and cached, so the
+    # server's later config.load() gets this same object). load_app() returns it unwrapped.
+    portmark_app = _shutdown_hook(config.load_app())
+    config.timeout_graceful_shutdown = portmark_app.shutdown_grace_seconds
+
+    class _DrainingServer(uvicorn.Server):
+        def handle_exit(self, sig, frame) -> None:
+            portmark_app.begin_shutdown()
+            super().handle_exit(sig, frame)
+
+    server = _DrainingServer(config=config)
+    server.run()
+    if not server.started:
+        sys.exit(_UVICORN_STARTUP_FAILURE)
 
 
 def serve(
@@ -848,6 +1132,8 @@ def serve(
     a2a_adapter: str = "local",
     public_base_url: str | None = None,
     trusted_proxies: str | None = None,
+    shutdown_grace_seconds: float = DEFAULT_SHUTDOWN_GRACE_SECONDS,
+    body_read_timeout_seconds: float = DEFAULT_BODY_READ_TIMEOUT_SECONDS,
 ) -> None:
     """Serve the A2A boundary on uvicorn.
 
@@ -869,7 +1155,7 @@ def serve(
             "--enable-hsts before public exposure. See THREAT_MODEL.md."
         )
     try:
-        import uvicorn
+        import uvicorn  # noqa: F401 -- fail fast with a clear message; run_uvicorn uses it below
     except ImportError as exc:  # pragma: no cover - exercised by packaging, not unit tests
         raise RuntimeError("serving the A2A boundary requires uvicorn; install portmark with its default dependencies") from exc
 
@@ -885,23 +1171,27 @@ def serve(
         a2a_adapter=a2a_adapter,
         public_base_url=validate_public_base_url(public_base_url) if public_base_url else None,
         trusted_proxies=parse_trusted_proxies(trusted_proxies),
+        shutdown_grace_seconds=shutdown_grace_seconds,
+        body_read_timeout_seconds=body_read_timeout_seconds,
         # The loopback bind enforced above is the compensating control, so a
         # tokenless loopback server is an acknowledged configuration here.
         allow_anonymous=True,
     )
-    uvicorn.run(
+    run_uvicorn(
         app,
-        host=bind,
-        port=port,
-        log_level="warning",
-        # Section 11 #2 (auditor round 2): uvicorn.run() builds a Config that re-applies uvicorn's
-        # default dictConfig AFTER the CLI's configure_logging(), reinstalling non-propagating,
-        # unredacted handlers. log_config=None keeps the one redacting root handler in charge.
-        log_config=None,
-        # Section 11 #6: uvicorn's default proxy_headers=True rewrites the peer from X-Forwarded-For
-        # (for 127.0.0.1) BEFORE Portmark's trusted-proxy policy runs. Portmark alone decides.
-        proxy_headers=False,
-        limit_concurrency=max_concurrent_requests,
-        timeout_keep_alive=5,
-        access_log=False,
+        {
+            "host": bind,
+            "port": port,
+            "log_level": "warning",
+            # Section 11 #2 (auditor round 2): a uvicorn Config re-applies uvicorn's default
+            # dictConfig AFTER the CLI's configure_logging(), reinstalling non-propagating, unredacted
+            # handlers. log_config=None keeps the one redacting root handler in charge.
+            "log_config": None,
+            # Section 11 #6: uvicorn's default proxy_headers=True rewrites the peer from
+            # X-Forwarded-For (for 127.0.0.1) BEFORE Portmark's trusted-proxy policy runs.
+            "proxy_headers": False,
+            "limit_concurrency": max_concurrent_requests,
+            "timeout_keep_alive": 5,
+            "access_log": False,
+        },
     )

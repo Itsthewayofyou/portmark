@@ -6,6 +6,65 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Section 12 — runtime limits (PR A): bounded shutdown, body deadline, PostgreSQL timeouts, thread-start permits (findings #1, #2, #3 Medium; #5 Low)
+
+- **Shutdown is bounded (#1, owner decision D1).** Before this change, the ASGI app reported shutdown
+  complete while admitted runs were still executing. uvicorn waited for them with no time limit.
+  Shutdown now works like this:
+  - Admission stops at once. A new submission gets `503`, and `/readyz` reports `not_ready`.
+  - The app waits for the admitted runs, for at most `PORTMARK_SHUTDOWN_GRACE_SECONDS` (default 25).
+    uvicorn's own wait shares the same grace and start time.
+  - When the grace expires, the app logs each unfinished run by task id, checkpoint generation, phase and
+    effect ids only. It then replies `lifespan.shutdown.failed`.
+  - The unfinished run is abandoned, as in a crash. It launches no further tool and writes no further
+    checkpoint.
+  - Runs execute on daemon threads, so a stuck run no longer holds the process open.
+  - A side-effecting tool abandoned mid-call has an effect of unknown status. It is resolved through the
+    existing effect ledger (`AgentHost.reconcile_effect`).
+- **No operation can start after the shutdown deadline (auditor, PR #97 round 1).** The first version
+  checked "is the run still live?" and then, in a separate step, recorded the phase and acted. The
+  deadline could land between the two, so a tool could start after the shutdown was reported, and the
+  report could name the previous phase without the effect id. Each operation (provider call, approval
+  redemption, tool launch, checkpoint write) now starts through one atomic `begin()` under the same lock
+  that `abandon()` takes, and `abandon()` takes the report snapshot under that lock. Either the deadline
+  comes first and the operation never starts, or the operation comes first and the report names it as in
+  flight. A side-effecting tool begins before its effect-ledger write, so an abandoned run records no
+  intent and launches nothing. Approval redemption, which consumes a nonce, is fenced too.
+- **PostgreSQL connections detect a silent network (auditor, round 1).** Every connection enables TCP
+  keepalives (10 s idle, 5 s interval, 3 probes) and a 30 s `tcp_user_timeout`, whatever the DSN says.
+  This bounds the wait when the network stops delivering packets after a query was sent. It is an
+  operating-system mechanism, not an exact client-side deadline, and DEPLOYMENT.md says so.
+- **Capacity stays honest when a request task is cancelled (#1).** The admission slot was released
+  when the request task ended, even though its run kept executing on a worker thread. The run thread
+  now owns the slot until the run ends.
+- **One absolute request-body deadline (#2).** A body must arrive completely within
+  `PORTMARK_A2A_BODY_READ_TIMEOUT_SECONDS` (default 30), including the time between chunks. When it
+  expires, the client gets `408`, the connection closes, and the admission slot is released. The auditor's
+  repro no longer starves the server: two stalled requests against a limit of two used to force a `503`
+  on a valid third one. The same deadline applies to the loopback reference `http.server`, which read the
+  body with no time limit.
+- **Every PostgreSQL connection is time-bounded (#3).** Before this change, only readiness was bounded.
+  Every connection now has these limits, including the schema-setup connection, which waited on a
+  blocking advisory lock:
+
+  | Limit | Default |
+  |---|---|
+  | Connect | 5 s |
+  | Statement | 30 s |
+  | Lock wait (row, table or advisory) | 10 s |
+  | Idle in an open transaction | 60 s |
+
+  - Each limit can be changed with a `PORTMARK_POSTGRES_*` variable. Zero is refused, because it would
+    turn the limit off.
+  - The limits are set after connecting, so a DSN cannot disable or raise them. A DSN may only lower
+    `connect_timeout`.
+  - Schema setup uses longer limits that are still finite.
+  - A timeout fails the transaction and rolls it back, like any other database error.
+- **A thread that fails to start no longer leaks capacity (#5).** The HTTP provider's transaction slot
+  and the migration attester's slot are released, and the call fails closed, when `Thread.start()`
+  raises. The new ASGI run thread follows the same rule. I checked every other thread-start site: none
+  of them reserves a slot.
+
 ### Tooling and dependency updates (Dependabot #89-#93, one PR)
 
 - **Tool pins:** coverage 7.16.0 → 7.16.1 (`ci`), twine 6.2.0 → 7.0.0 and uv 0.10.11 → 0.12.15

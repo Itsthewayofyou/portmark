@@ -374,6 +374,8 @@ def main() -> None:
                 a2a_adapter=config.a2a_adapter,
                 public_base_url=config.a2a_public_base_url,
                 trusted_proxies=config.a2a_trusted_proxies,
+                shutdown_grace_seconds=config.shutdown_grace_seconds,
+                body_read_timeout_seconds=config.a2a_body_read_timeout_seconds,
             )
         except ValueError as exc:
             parser.error(str(exc))

@@ -9,6 +9,7 @@ from collections.abc import Callable
 import logging
 from typing import Any
 
+from . import _run_progress
 from .metrics import RuntimeMetrics
 from .models import AgentEnvelope, ApprovalToken, AttestationEvidence, ProviderDecision, RunResult
 from .projection import project_state_for_migration, provider_view
@@ -293,6 +294,8 @@ class AgentHost:
         return current["state"] if current is not None else "unknown"
 
     def _run(self, envelope: AgentEnvelope) -> RunResult:
+        # Section 12 #1: identifiers only, for the bounded-shutdown report of unfinished work.
+        _run_progress.note(task_id=envelope.state.task_id, phase="admitting")
         active_policy = self._active_policy()
         self.signer.verify(envelope)
         # Section 4 #2: digest the sealed migration envelope NOW, while it is pristine -- admission
@@ -485,6 +488,8 @@ class AgentHost:
 
         while state.step < effective.budget.max_steps:
             decision_started = time.monotonic()
+            # Section 12 #1: atomically refuse (abandoned run) or record the provider call as in flight.
+            _run_progress.begin("deciding")
             # Finding #4: hand the provider a host-projected copy of the state, so tool
             # outputs are reduced to each grant's output_projection before any provider
             # -- in-process or a remote adapter -- can read them. Projection is enforced
@@ -608,6 +613,10 @@ class AgentHost:
             replay_result: Any = _NO_REPLAY
             if self.tools.is_side_effecting(decision.tool) and self.tools.is_isolated(decision.tool):
                 eid = effect_id(state.task_id, state.tool_calls)
+                # Section 12 #1: ONE atomic step, BEFORE the ledger records intent: an abandoned run
+                # stops here with nothing written and nothing launched; otherwise, from this point the
+                # shutdown report names this effect id as in flight (its effect may land).
+                _run_progress.begin("side_effecting_tool", effect_id=eid)
                 mode, payload = self._effect_pre_launch(eid, state.task_id, decision.tool, decision.arguments)
                 if mode == "refuse":
                     return self._effect_refused(state, audit, decision, payload)
@@ -629,6 +638,10 @@ class AgentHost:
                 # before the side-effecting gate, a kill, an exec error) so a capability never outlives
                 # its single intended launch. eid is None for a non-side-effecting or non-isolated tool,
                 # in which case no capability is armed and invoke takes launch_capability=None.
+                if eid is None:
+                    # Section 12 #1: the same atomic step for a tool without an effect id (a side-effecting
+                    # one already began above, before its ledger write).
+                    _run_progress.begin("tool")
                 launch_cap = self._effect_armer.arm(eid, decision.tool, decision.arguments) if eid is not None else None
                 try:
                     tool_started = time.monotonic()
@@ -637,6 +650,7 @@ class AgentHost:
                             effective, decision.tool, decision.arguments, effective.budget.max_output_bytes, launch_capability=launch_cap
                         )
                     finally:
+                        _run_progress.note(phase="tool_returned")
                         self.metrics.observe_duration("tool_invocation_duration_seconds", time.monotonic() - tool_started)
                         self._effect_armer.disarm(launch_cap)
                 except ToolKilledError as error:
@@ -876,6 +890,9 @@ class AgentHost:
         # Section 5 #3: the cancellation check runs in the SAME transaction, AFTER the consume,
         # so a cancel that wins the race rolls the consume back (nothing is burned) and one that
         # loses is caught by the pre-launch re-check in _apply_decision.
+        # Section 12 #1: redeeming consumes a nonce durably, so it is an operation an abandoned run
+        # must not start (atomic check-and-record, like every other write).
+        _run_progress.begin("approving")
         try:
             with self.store.transaction() as approval_transaction:
                 approval_transaction.consume_nonce(
@@ -1042,7 +1059,13 @@ class AgentHost:
                 self._attester_slots.release()
 
         worker = threading.Thread(target=_invoke, daemon=True)
-        worker.start()
+        try:
+            worker.start()
+        except RuntimeError as error:
+            # Section 12 #5: _invoke never ran, so its finally will never release the permit reserved
+            # above. Release it here and fail closed (no attestation, nothing persisted).
+            self._attester_slots.release()
+            raise SecurityError("could not start the migration challenge attester") from error
         worker.join(timeout)
         if worker.is_alive():
             raise SecurityError("migration challenge attestation timed out")
@@ -1303,6 +1326,8 @@ class AgentHost:
         migration: dict[str, Any] | None = None,
         receipt_binding: dict[str, Any] | None = None,
     ) -> int:
+        # Section 12 #1: atomically refuse (abandoned run) or record the checkpoint write as in flight.
+        _run_progress.begin("persisting")
         checkpoint = asdict(state)
         encoded_size = len(canonical_json(checkpoint))
         # The checkpoint is host-owned state, and a migration can transport it to a
@@ -1435,4 +1460,5 @@ class AgentHost:
                 )
             raise
         state.checkpoint_generation = new_generation
+        _run_progress.note(checkpoint_generation=new_generation, phase="persisted")
         return len(audit.events)
