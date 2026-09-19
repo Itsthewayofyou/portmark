@@ -13,6 +13,10 @@ updates:
       prefix: "ci"
     labels:
       - dependencies
+    # One weekly PR for all action pins instead of one PR per action.
+    groups:
+      github-actions:
+        patterns: ["*"]
 
   # Runtime and optional dependencies are exact-pinned in pyproject.toml. The audit
   # gate fails the build on a known vulnerability, but only once one is published --
@@ -27,6 +31,13 @@ updates:
       prefix: "deps"
     labels:
       - dependencies
+    # One weekly PR for all version updates, so the relock + export above is done once per week, not
+    # once per package. Security updates are not grouped (`applies-to` defaults to version-updates):
+    # a fix for a published vulnerability still arrives as its own PR, straight away.
+    groups:
+      python-dependencies:
+        applies-to: version-updates
+        patterns: ["*"]
 
   # Section 11 #4: the Dockerfile's base image is pinned by digest. Dependabot proposes a new tag AND
   # its digest. Only Python patch releases are proposed: a new Python minor (or major) version must first

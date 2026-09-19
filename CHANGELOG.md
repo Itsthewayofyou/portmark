@@ -6,6 +6,20 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Tooling and dependency updates (Dependabot #89-#93, one PR)
+
+- **Tool pins:** coverage 7.16.0 → 7.16.1 (`ci`), twine 6.2.0 → 7.0.0 and uv 0.10.11 → 0.12.15
+  (`release`). **Transitive:** urllib3 2.7.0 → 2.8.0, tzdata 2026.3 → 2026.4 (Windows only). No runtime
+  dependency changes.
+- Relocked for these five packages only (`uv lock --upgrade-package`), then the hash-pinned exports were
+  regenerated. uv 0.12 also drops lock markers that repeat a parent's marker (for example `wrapt` under
+  `aiologic`, which is itself only used below Python 3.14). The exports are unchanged apart from the five
+  versions and their hashes.
+- Checked with the new tools: twine 7 still has `check --strict`, and uv 0.12.15 still exports the
+  CycloneDX 1.5 SBOM the release workflow attests.
+- **Dependabot now groups routine bumps:** one weekly PR for pip and one for GitHub Actions, so the relock
+  is done once per week. Security updates are not grouped and still arrive at once.
+
 ### Python 3.14: newly tested and supported (not required)
 
 - **Python 3.14 is now tested and supported.** CI runs the full suite on 3.14 on Linux and Windows,
