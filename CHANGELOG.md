@@ -33,6 +33,13 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   approval, or complete. `security.require_unexpired` now runs after the provider decision, again
   immediately before a tool launch, and again before an approval is burned durably. It raises
   `PermitExpiredError` (a `SecurityError`), and the run terminalizes as `permit.expired`.
+- **Reading the provider's result is inside that boundary too.** A provider that returns something
+  that is not a `ProviderDecision` raised on attribute access, outside every handler, and left the
+  checkpoint at `running` — the same class PM-004 closes.
+- **The last authority check runs BEFORE the effect ledger records intent.** Checking after it left a
+  `started` row for an effect that never launched; a later attempt would read `started`, settle it
+  `unknown` and refuse, so a phantom effect had to be reconciled by hand. Nothing is now written to
+  the ledger under expired authority.
 - **Every refused decision reaches a durable CLOSED checkpoint (PM-004).** `_apply_decision` ran
   outside every failure boundary, so a decision that failed host authorization — a tool with no
   grant, an exhausted tool-call budget, a missing tool name, a migration with no destination or an

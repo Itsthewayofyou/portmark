@@ -547,9 +547,13 @@ class AgentHost:
                     self._terminalize_over_budget(envelope, effective, state, audit, persisted_events, None, False)
                 raise
             self.metrics.increment("provider.decisions")
-            audit.append("provider.proposed", {"kind": decision.kind, "tool": decision.tool})
             tool_calls_before = state.tool_calls
             try:
+                # Auditor round 1: READING the decision is inside the boundary too. A provider that
+                # returns something that is not a ProviderDecision raises on attribute access, and
+                # that raise used to happen here, outside every handler -- stranding the checkpoint at
+                # `running`, the very class PM-004 closes.
+                audit.append("provider.proposed", {"kind": decision.kind, "tool": decision.tool})
                 finished, migration = self._apply_decision(decision, state, effective, audit, envelope, active_policy, admission_generation)
             except Exception as error:
                 # PM-004: _apply_decision sat OUTSIDE every failure boundary, so a provider decision
@@ -570,8 +574,13 @@ class AgentHost:
                 audit.append(
                     "permit.expired" if expired else "decision.refused",
                     # Identifiers and shapes only -- never the arguments, the state, or the message of
-                    # a refusal that may quote them.
-                    {"kind": decision.kind, "tool": decision.tool, "error": type(error).__name__},
+                    # a refusal that may quote them. Read defensively: the decision itself may be the
+                    # malformed thing that brought us here.
+                    {
+                        "kind": getattr(decision, "kind", None),
+                        "tool": getattr(decision, "tool", None),
+                        "error": type(error).__name__,
+                    },
                 )
                 if self._checkpoint_fits(effective, state):
                     self._persist(envelope, effective, state, audit, persisted_events, closed=True)
@@ -667,6 +676,13 @@ class AgentHost:
             # per-call sequence, records intent BEFORE launch, and settles the outcome after -- so a
             # crash-and-resume REPLAYS a confirmed effect instead of re-running it, and NEVER
             # auto-retries an effect whose status is unknown (Josh's locked decisions).
+            # PM-003 (auditor round 1): the LAST authority check, and it sits BEFORE the ledger
+            # records intent, not after. An approval wait or a cancellation read can sit between the
+            # check at the top of this method and here. Checking after the ledger write would leave a
+            # `started` row for an effect that never launched: a later attempt reads `started`,
+            # settles it `unknown` and refuses, so a phantom effect would have to be reconciled by
+            # hand. The ledger stays truthful because nothing is written under expired authority.
+            require_unexpired(effective, "before the tool launch")
             eid = None
             replay_result: Any = _NO_REPLAY
             if self.tools.is_side_effecting(decision.tool) and self.tools.is_isolated(decision.tool):
@@ -700,9 +716,6 @@ class AgentHost:
                     # Section 12 #1: the same atomic step for a tool without an effect id (a side-effecting
                     # one already began above, before its ledger write).
                     _run_progress.begin("tool")
-                # PM-003: the last check before the tool actually runs. An approval wait, a ledger
-                # write, or a slow pre-launch step can sit between the check above and this launch.
-                require_unexpired(effective, "before the tool launch")
                 launch_cap = self._effect_armer.arm(eid, decision.tool, decision.arguments) if eid is not None else None
                 try:
                     tool_started = time.monotonic()

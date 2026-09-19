@@ -131,24 +131,52 @@ class ReviewLifecycleTests(unittest.TestCase):
             self._closed_failed(store, host, probe, "permit.expired")
             self.assertNotEqual(store.load_checkpoint(probe.state.task_id)["status"], "completed")
 
-    def test_a_permit_that_expires_before_the_launch_stops_the_launch(self):
-        # The second boundary: the check at the top of _apply_decision passed, and time then ran out
-        # during the pre-launch ledger step. The tool must still not run.
+    def test_a_permit_that_expires_before_the_launch_records_no_effect_and_no_launch(self):
+        # The second boundary, isolated: the check at the top of _apply_decision passed, the approval
+        # gate returned, and time ran out during the pre-launch cancellation read. The tool must not
+        # run AND -- auditor round 1 -- the effect ledger must record NOTHING: a `started` row for an
+        # effect that never launched would later settle `unknown` and need reconciling by hand.
         fake = FakeTime(2_000_000_000)
         store = self._store()
+        authority = ApprovalAuthority.generate()
         launched = []
         with patch.object(_clock, "_default_clock", fake.clock()):
-            provider = ScriptedProvider(ProviderDecision("tool", "catalog.search", {"query": "t"}))
-            host = self._host(provider, store)
-            envelope, probe = self._envelope(host, "expiry before launch")
+            host = self._host(PayingProvider(), store)
+            host.policy = HostPolicy(
+                "host:local-demo",
+                (ToolGrant("payments.reserve", {"max_amount": 100, "currency": "USD"}, ("reserved",)),),
+                ResourceBudget(), "policy-v1", "policy-hash", {"payments.reserve": "external-payment"},
+                (authority.trusted_approver(),),
+            )
             host.tools.is_side_effecting = lambda name: True
             host.tools.is_isolated = lambda name: True
-            host._effect_pre_launch = lambda *args, **kwargs: (fake.advance(3_601), ("launch", None))[1]
-            with patch.object(host.tools, "invoke", side_effect=lambda *a, **k: launched.append(1)):
-                with self.assertRaises(PermitExpiredError):
-                    host.run(envelope)
+            envelope, probe = self._envelope(host, "expiry before the ledger")
+            object.__setattr__(
+                envelope.permit, "grants", (ToolGrant("payments.reserve", {"max_amount": 100, "currency": "USD"}),)
+            )
+            host.signer.seal(envelope)
+            first = host.run(envelope)
+            self.assertEqual(first.status, "awaiting_input")
+            token = authority.issue(
+                "payments.reserve", envelope.permit.subject, envelope.permit.audience, envelope.state.task_id,
+                envelope.permit.nonce, {"amount": 50, "currency": "USD"}, "policy-hash",
+                int(fake.wall) + 3_600, checkpoint_generation=first.checkpoint["checkpoint_generation"],
+            )
+            envelope.state.memory["approvals"] = {"payments.reserve": asdict(token)}
+            host.signer.seal(envelope)
+
+            def slow_cancellation_read(task_id):
+                fake.advance(3_601)  # the permit ends after the approval, before the ledger write
+                return False
+
+            with patch.object(host.store, "is_task_cancelled", side_effect=slow_cancellation_read):
+                with patch.object(host.tools, "invoke", side_effect=lambda *a, **k: launched.append(1)):
+                    with self.assertRaises(PermitExpiredError):
+                        host.run(envelope)
             self.assertEqual(launched, [])
-            self._closed_failed(store, host, probe, "permit.expired")
+            with contextlib.closing(sqlite3.connect(str(self.root / "runtime.sqlite"))) as connection:
+                effects = connection.execute("SELECT COUNT(*) FROM tool_effects").fetchone()[0]
+            self.assertEqual(effects, 0)  # nothing was written under expired authority
 
     def test_an_expired_permit_emits_no_migration(self):
         fake = FakeTime(2_000_000_000)
@@ -233,6 +261,22 @@ class ReviewLifecycleTests(unittest.TestCase):
                 self.assertIn(where, source)
 
     # ---- PM-004: a refused decision ends the task durably -----------------------------------
+
+    def test_an_invalid_provider_result_closes_the_task(self):
+        # Auditor round 1: READING the decision was outside every boundary, so a provider that
+        # returns something that is not a ProviderDecision raised on attribute access and left the
+        # checkpoint at `running` -- the same class PM-004 closes.
+        store = self._store()
+
+        class BrokenProvider(ModelProvider):
+            def decide(self, state, available_tools, grants=()):
+                return "not a decision"
+
+        host = self._host(BrokenProvider(), store)
+        envelope, probe = self._envelope(host, "invalid provider result")
+        with self.assertRaises(Exception):
+            host.run(envelope)
+        self._closed_failed(store, host, probe, "decision.refused")
 
     def test_a_tool_with_no_grant_closes_the_task_instead_of_stranding_it(self):
         store = self._store()
