@@ -1,6 +1,9 @@
 # Section 11 #4: the base image is pinned by digest (the multi-arch index, observed 2026-09-19), so two
-# builds of one commit start from the same bytes. Dependabot's docker ecosystem proposes digest bumps.
-FROM python:3.12.12-slim-bookworm@sha256:593bd06efe90efa80dc4eee3948be7c0fde4134606dd40d8dd8dbcade98e669c
+# builds of one commit start from the same bytes. Dependabot's docker ecosystem proposes new tags AND
+# their digests; .github/dependabot.yml limits it to 3.14.x patch releases, because a new Python
+# minor version must first be added to CI. CI's `container` job builds this image and runs the suite
+# inside it.
+FROM python:3.14.6-slim-bookworm@sha256:4c92ffcde4dd6f1ff72a24518f49fd4990b27134987dfa31a733badde66df9f8
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

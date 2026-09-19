@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -58,14 +58,52 @@ jobs:
         run: python scripts/audit_dependencies.py
       - name: Compile Python sources
         run: python -m compileall -q src tests
-      - name: Build Docker image
-        run: docker build -t portmark-ci:${{ matrix.python-version }} .
+
+  container:
+    # The shipped image, built ONCE from the Dockerfile (its Python is the Dockerfile's pinned base, not a
+    # matrix value), then tested as built: the whole suite runs INSIDE that exact image against the
+    # Portmark it installed from the hash-locked runtime set, and the deployment-profile tests run the
+    # image from the host.
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: portmark-ci:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Build the image
+        run: docker build -t "$IMAGE" .
+      - name: Check the image runs the Dockerfile's Python and its own installed Portmark
+        run: |
+          WANT=$(sed -n 's/^FROM python:\([0-9][0-9.]*\)-slim-bookworm@sha256:[0-9a-f]\{64\}$/\1/p' Dockerfile)
+          test -n "$WANT"
+          GOT=$(docker run --rm "$IMAGE" python -c "import platform; print(platform.python_version())")
+          echo "Dockerfile=$WANT image=$GOT"
+          test "$GOT" = "$WANT"
+          docker run --rm "$IMAGE" python -m pip check
+          docker run --rm "$IMAGE" python -c "import portmark, sysconfig; assert portmark.__file__.startswith(sysconfig.get_paths()['purelib']), portmark.__file__"
+      - name: Run the regression suite inside the image
+        # The checkout is mounted read-only and its src/ is hidden behind an empty tmpfs, so every test
+        # imports the Portmark INSTALLED in the image. The image has no Node.js; the five Node-backed
+        # Wasm tests skip only because this run declares it (PORTMARK_TEST_ENV_HAS_NO_NODE=1). Tests
+        # that need docker or PostgreSQL skip here and run in the steps and jobs that provide them.
+        run: >-
+          docker run --rm -v "$GITHUB_WORKSPACE":/repo:ro --tmpfs /repo/src -w /repo
+          -e PYTHONDONTWRITEBYTECODE=1 -e PORTMARK_TEST_ENV_HAS_NO_NODE=1
+          "$IMAGE" python -m unittest discover -s tests -v
+      - name: Install the host test runner (hash-locked)
+        run: |
+          python -m pip install --require-hashes --no-deps -r requirements/bootstrap.txt
+          python -m pip install --require-hashes --no-deps -r requirements/runtime.txt
+          python -m pip install --no-deps --no-build-isolation -e .
+          python -m pip check
       - name: Verify hardened deployment profile (Section 7 PR 3)
         # Runs the profile probe inside the just-built image with the full hardening flags (every
         # property must hold) and re-runs with each flag removed (that property must flip). Also
         # proves openat2(RESOLVE_BENEATH) is not blocked by the image's seccomp profile.
         # Section 11 #1: the same image also proves the entrypoint's public-mode gate and loopback default.
-        run: PORTMARK_TEST_IMAGE=portmark-ci:${{ matrix.python-version }} python -m unittest discover -s tests -k DeploymentProfileTests -v
+        run: PORTMARK_TEST_IMAGE="$IMAGE" python -m unittest discover -s tests -k DeploymentProfileTests -v
 
   native-wasmtime:
     # Section 9 (#4): the REAL native Wasmtime engine on every architecture and OS it ships for,
@@ -154,7 +192,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
