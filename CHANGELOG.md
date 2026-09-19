@@ -6,6 +6,33 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Section 11 — deployment hardening (PR C): public-mode gate, one proxy authority, locked builds (findings #1, #4 Medium; #6 Low)
+
+- **The container is loopback by default (#1).** The image ran raw uvicorn on `0.0.0.0` with no token,
+  no TLS assertion, and uvicorn's proxy handling. Its command is now `python -m portmark.serve_asgi`,
+  which binds `127.0.0.1` unless told otherwise. A public bind refuses to start unless ALL of
+  `PORTMARK_PUBLIC_MODE=behind-tls-proxy`, `PORTMARK_A2A_TOKEN`, `PORTMARK_A2A_TRUSTED_PROXIES`, and an
+  `https://` `PORTMARK_A2A_PUBLIC_BASE_URL` are set; every missing one is reported at once, and the
+  acknowledgement alone never lowers another requirement. **Operator action:** a container that must
+  accept connections from another container or host needs these settings (DEPLOYMENT.md).
+- **Portmark is the only proxy authority (#6).** Both the container entrypoint and `portmark serve` run
+  uvicorn with `proxy_headers=False` (uvicorn's default trusted `X-Forwarded-For` from 127.0.0.1 and
+  rewrote the peer before Portmark's policy ran).
+- **Locked builds (#4).** Tool pins moved into `pyproject.toml` dependency groups; `uv.lock` was
+  refreshed (it was stale: `psycopg` / `psycopg-binary` 3.3.4 -> 3.3.5, which `pyproject.toml` already
+  pinned). `requirements/*.txt` are hash-pinned exports (`scripts/lock_requirements.py`); Docker, every
+  CI job, and the release install only from them with `--require-hashes --no-deps` and build Portmark
+  with `--no-build-isolation`. A new CI `lockfile` job fails on a stale lock or export and proves a
+  tampered hash is refused. The Docker base image and the CI Postgres image are pinned by digest;
+  Dependabot now covers the Dockerfile.
+- **Found on the way:** CI and Docker pinned `setuptools==83.0.0` while `[build-system]` required
+  84.0.0 (a Dependabot bump); the isolated build silently fetched 84.0.0 unhashed. The bootstrap group
+  now matches, and `lock_requirements.py --check` fails if they diverge again.
+- **Releases (#4).** The tag's commit must be on `main` (and be the checked-out commit); the build runs
+  in the locked environment; a CycloneDX SBOM is published as an artifact; a separate `attest` job
+  records GitHub build-provenance and SBOM attestations; PyPI PEP 740 attestations (already on by
+  default) are now set explicitly.
+
 ### Section 11 — deployment hardening (PR B): crash-safe, restart-idempotent SQLite migrations (finding #3 Medium)
 
 - **Each migration step is one transaction (#3).** Steps ran through `executescript()`, which commits

@@ -7849,15 +7849,17 @@ class RuntimeTests(unittest.TestCase):
 
     def test_dockerfile_uses_non_root_runtime_and_does_not_bake_secrets(self):
         dockerfile = (Path(__file__).parents[1] / "Dockerfile").read_text(encoding="utf-8")
+        # Section 11 #1/#4: the tool pins moved into the hash-locked requirements/bootstrap.txt, the
+        # base image is digest-pinned, and the command is the gated, loopback-default entrypoint.
         required = [
-            "FROM python:3.12.12-slim-bookworm",
-            "pip==26.2.1",
-            "setuptools==83.0.0",
-            "pip install --no-cache-dir .",
+            "FROM python:3.12.12-slim-bookworm@sha256:",
+            "pip install --require-hashes --no-deps -r requirements/bootstrap.txt",
+            "pip install --require-hashes --no-deps -r requirements/runtime.txt",
+            "pip install --no-deps --no-build-isolation .",
             "useradd",
             "USER portmark",
-            "uvicorn",
-            "portmark.asgi:app",
+            "PORTMARK_BIND_HOST=127.0.0.1",
+            'CMD ["python", "-m", "portmark.serve_asgi"]',
         ]
         for item in required:
             with self.subTest(required=item):
@@ -7871,6 +7873,10 @@ class RuntimeTests(unittest.TestCase):
             "apt-get",
             "build-essential",
             " gcc",
+            # Section 11 #1/#6: no raw uvicorn public bind, no uvicorn proxy-header trust.
+            "0.0.0.0",  # nosec B104 -- a string that must NOT appear in the Dockerfile
+            "--proxy-headers",
+            "--forwarded-allow-ips",
         ]
         for item in forbidden:
             with self.subTest(forbidden=item):

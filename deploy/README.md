@@ -98,6 +98,14 @@ volumes:
 # NetworkPolicy: default-deny egress, allowlist only what the tool needs.
 ```
 
+**Serving A2A from the pod.** The image's command (`python -m portmark.serve_asgi`) binds `127.0.0.1:8080`
+by default. The simplest safe layout is a TLS-terminating proxy **sidecar in the same pod**: containers
+in one pod share the network namespace, so the proxy reaches Portmark on loopback and nothing else can.
+Point a Service at the proxy, never at port 8080. If the proxy must run elsewhere, Portmark needs public
+mode, which refuses to start unless `PORTMARK_PUBLIC_MODE=behind-tls-proxy`, `PORTMARK_A2A_TOKEN`,
+`PORTMARK_A2A_TRUSTED_PROXIES`, and an `https://` `PORTMARK_A2A_PUBLIC_BASE_URL` are all set
+(see `DEPLOYMENT.md`).
+
 ## Interaction with the safe-path capability (important)
 
 The capability-based safe-path helper (`portmark.safe_paths.SafeRoot`) resolves paths with
