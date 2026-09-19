@@ -13,13 +13,31 @@ import json
 import os
 import shutil
 import sqlite3
+import stat
+import subprocess  # nosec B404 -- runs this test's own interpreter on a fixed inline script
+import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import portmark.storage as storage
 from portmark.storage import SQLITE_SCHEMA_VERSION, SQLiteRuntimeStore
+
+SRC = str(Path(__file__).resolve().parent.parent / "src")
+# One cold-starting host. The import happens BEFORE the wait, so every process is ready and they all
+# reach the missing directories together (importing after the signal staggers them and hides the race).
+COLD_START_SCRIPT = """
+import os, sys, time
+from portmark.storage import SQLiteRuntimeStore
+gate, path, ready = sys.argv[1], sys.argv[2], sys.argv[3]
+open(ready, "w").close()
+while not os.path.exists(gate):
+    pass
+SQLiteRuntimeStore(path)
+"""
 
 REFERENCE = {int(version): schema for version, schema in json.loads((Path(__file__).parent / "sqlite_schema_versions.json").read_text()).items()}
 CAN_FORK = hasattr(os, "fork")
@@ -335,6 +353,171 @@ class MigrationCrashInjectionTests(unittest.TestCase):
         build_at_version(fixture, 3)
         _, seen = self.crash_everywhere(fixture, 3)
         self.assertEqual(seen, set(range(3, SQLITE_SCHEMA_VERSION + 1)))
+
+
+class _Rows:
+    def __init__(self, row):
+        self._row = row
+
+    def fetchone(self):
+        return self._row
+
+
+class ColdStartDirectoryRaceTests(unittest.TestCase):
+    """Auditor round 2 on #86: hosts cold-starting together on a store whose directories do not exist
+    yet all try to create the same components; the losers failed with FileExistsError."""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.root = Path(self._dir.name)
+
+    def tearDown(self):
+        self._dir.cleanup()
+
+    def test_many_processes_cold_start_one_new_nested_store(self):
+        path = self.root / "new" / "nested" / "deeper" / "state.db"
+        gate = self.root / "go"
+        env = {**os.environ, "PYTHONPATH": SRC, "PYTHONDONTWRITEBYTECODE": "1"}
+        ready_dir = self.root / "ready"
+        ready_dir.mkdir()
+        hosts = [
+            subprocess.Popen(  # nosec B603 -- this interpreter, fixed inline script
+                [sys.executable, "-c", COLD_START_SCRIPT, str(gate), str(path), str(ready_dir / str(index))],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+            )
+            for index in range(32)
+        ]
+        deadline = time.monotonic() + 120
+        while len(list(ready_dir.iterdir())) < len(hosts):  # every host imported and is spinning
+            self.assertLess(time.monotonic(), deadline, "cold-start hosts never became ready")
+            time.sleep(0.01)
+        gate.touch()
+        failures = []
+        for host in hosts:
+            _, stderr = host.communicate(timeout=180)
+            if host.returncode != 0:
+                failures.append(stderr.strip().splitlines()[-1] if stderr.strip() else f"exit {host.returncode}")
+        self.assertEqual(failures, [])
+        connection = sqlite3.connect(path)
+        try:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SQLITE_SCHEMA_VERSION)
+            self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+        finally:
+            connection.close()
+        if os.name != "nt":
+            for directory in (self.root / "new", self.root / "new" / "nested", path.parent):
+                self.assertEqual(stat.S_IMODE(os.stat(directory).st_mode), 0o700, directory)
+
+    # The same cold start exposed a second race: switching a NEW database to WAL needs an exclusive
+    # lock, and SQLite may answer SQLITE_BUSY at once (no busy handler) to avoid a deadlock. The
+    # 32-process test above hits it only sometimes, so the retry is pinned deterministically here.
+    class _FakeWalConnection:
+        def __init__(self, mode, failures):
+            self.mode, self.failures, self.switches = mode, list(failures), 0
+
+        def execute(self, sql):
+            if sql == "PRAGMA journal_mode":
+                return _Rows((self.mode,))
+            self.switches += 1
+            if self.failures:
+                raise self.failures.pop(0)
+            self.mode = "wal"
+            return _Rows(("wal",))
+
+    @staticmethod
+    def sqlite_error(code, message):
+        error = sqlite3.OperationalError(message)
+        error.sqlite_errorcode = code
+        return error
+
+    def test_wal_switch_retries_sqlite_busy_until_it_succeeds(self):
+        busy = self.sqlite_error(sqlite3.SQLITE_BUSY, "database is locked")
+        connection = self._FakeWalConnection("delete", [busy, busy, busy])
+        storage._enable_wal(connection)
+        self.assertEqual((connection.switches, connection.mode), (4, "wal"))
+
+    def test_wal_switch_fails_at_once_on_any_other_error(self):
+        other = self.sqlite_error(sqlite3.SQLITE_IOERR, "disk I/O error")
+        connection = self._FakeWalConnection("delete", [other])
+        with self.assertRaises(sqlite3.OperationalError):
+            storage._enable_wal(connection)
+        self.assertEqual(connection.switches, 1)
+
+    def test_wal_switch_gives_up_at_the_busy_timeout(self):
+        busy = self.sqlite_error(sqlite3.SQLITE_BUSY, "database is locked")
+        connection = self._FakeWalConnection("delete", [busy] * 200)
+        with patch("portmark.storage.SQLITE_BUSY_TIMEOUT_MS", 50), self.assertRaises(sqlite3.OperationalError):
+            storage._enable_wal(connection)
+        self.assertLess(connection.switches, 200)
+
+    def test_wal_switch_is_skipped_when_the_database_is_already_wal(self):
+        connection = self._FakeWalConnection("wal", [])
+        storage._enable_wal(connection)
+        self.assertEqual(connection.switches, 0)
+
+    # Deterministic forms of the same race: "another process" creates the component just before this
+    # one's mkdir. A benign winner is accepted; anything hostile it could have raced in is refused.
+    def race_mkdir(self, plant):
+        real_mkdir = os.mkdir
+
+        def racing_mkdir(target, mode=0o777, *args, **kwargs):
+            if not os.path.lexists(target):
+                plant(Path(target), real_mkdir)
+            return real_mkdir(target, mode, *args, **kwargs)
+
+        return patch("portmark.storage.os.mkdir", racing_mkdir)
+
+    @unittest.skipIf(os.name == "nt", "POSIX directory chain")
+    def test_losing_the_mkdir_race_to_a_benign_winner_is_not_an_error(self):
+        path = self.root / "a" / "b" / "state.db"
+        with self.race_mkdir(lambda target, mkdir: mkdir(target, 0o700)):
+            SQLiteRuntimeStore(path)
+        self.assertTrue(path.exists())
+
+    @unittest.skipIf(os.name == "nt", "POSIX directory chain")
+    def test_a_symlink_raced_in_as_the_store_directory_is_refused(self):
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir(mode=0o700)
+        path = self.root / "a" / "store" / "state.db"
+
+        def plant(target, mkdir):
+            if target.name == "store":
+                target.symlink_to(elsewhere, target_is_directory=True)
+            else:
+                mkdir(target, 0o700)
+
+        with self.race_mkdir(plant), self.assertRaises(RuntimeError) as raised:
+            SQLiteRuntimeStore(path)
+        self.assertIn("symbolic link", str(raised.exception))
+        self.assertEqual(list(elsewhere.iterdir()), [])
+
+    @unittest.skipIf(os.name == "nt", "POSIX directory chain")
+    def test_a_world_writable_directory_raced_in_is_refused(self):
+        path = self.root / "a" / "store" / "state.db"
+
+        def plant(target, mkdir):
+            mkdir(target, 0o700)
+            if target.name == "a":
+                os.chmod(target, 0o777)  # nosec B103 -- the insecure state the refusal must reject, in a private temp dir
+
+        with self.race_mkdir(plant), self.assertRaises(RuntimeError) as raised:
+            SQLiteRuntimeStore(path)
+        self.assertIn("is writable by group or other users", str(raised.exception))
+        self.assertFalse(path.exists())
+
+    @unittest.skipIf(os.name == "nt", "POSIX directory chain")
+    def test_a_file_raced_in_as_the_store_directory_is_refused(self):
+        path = self.root / "a" / "store" / "state.db"
+
+        def plant(target, mkdir):
+            if target.name == "store":
+                target.write_text("not a directory")
+            else:
+                mkdir(target, 0o700)
+
+        with self.race_mkdir(plant), self.assertRaises(RuntimeError) as raised:
+            SQLiteRuntimeStore(path)
+        self.assertIn("is not a directory", str(raised.exception))
 
 
 if __name__ == "__main__":

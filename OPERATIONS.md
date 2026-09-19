@@ -313,6 +313,11 @@ example `duplicate column name: generation` at start) also continues, because ev
 already exists. This does not protect against disk corruption or power loss on storage that ignores
 `fsync`; that is what the backup is for.
 
+**Many hosts starting at once.** Hosts that cold-start together on one new SQLite store (for example a
+scaled-out deployment) are safe: the one that loses the race to create a store directory accepts it after
+the full permission check, and a host that loses the race to switch the new database to WAL mode retries
+within the busy timeout. The upgrade itself is serialized by SQLite's write lock.
+
 **Repair and restore.**
 1. Stop every host that uses the store.
 2. Keep the failed database and its `-wal`/`-shm` files together (copy all three, or none).

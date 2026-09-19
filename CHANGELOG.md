@@ -23,6 +23,14 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   legacy v0 database and from v3); each reopen must show a complete schema matching
   `tests/sqlite_schema_versions.json` (generated from the pre-rewrite code) with every seeded row
   intact, then continue to v12. OPERATIONS.md gains crash-safety and repair/restore steps.
+- **Cold start of many hosts on one new store (auditor round 2, availability).** Hosts that start
+  together on a store whose directories do not exist yet all created the same components; the losers
+  failed with `FileExistsError`. Losing the `mkdir` race is now accepted, and the full directory-chain
+  check that follows judges whatever exists (a raced-in symlink, file, wider mode, or other owner is
+  still refused). The real 32-process cold-start test then exposed a second race: switching a new
+  database to WAL can return `SQLITE_BUSY` at once (no busy handler, to avoid a lock-escalation
+  deadlock), so some hosts failed with `database is locked`. The switch is skipped when the file is
+  already WAL, and `SQLITE_BUSY` alone is retried within the existing busy timeout.
 
 ### Section 11 — deployment hardening (PR A): log redaction and owner-only storage (findings #2, #5 Medium)
 

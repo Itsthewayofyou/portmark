@@ -940,7 +940,14 @@ def _prepare_sqlite_database_file(path: Path) -> None:
     _refuse_unsafe_directory_chain(existing, owner_uid, is_store_directory=not missing)
     for name in reversed(missing):
         existing = existing / name
-        os.mkdir(existing, 0o700)
+        try:
+            os.mkdir(existing, 0o700)
+        except FileExistsError:
+            # Section 11 PR B (auditor): hosts cold-starting together all see the same missing
+            # directories; losing that race is not an error. Whatever the winner created -- or
+            # whatever was raced in (a symlink, a file, a wider mode, another owner) -- is judged
+            # by the full re-check below, never trusted because it exists.
+            pass
     if missing:
         _refuse_unsafe_directory_chain(store_directory, owner_uid, is_store_directory=True)
     try:
@@ -951,6 +958,31 @@ def _prepare_sqlite_database_file(path: Path) -> None:
         os.close(fd)
     for candidate in (path, *(Path(f"{path}{suffix}") for suffix in SQLITE_SIDE_FILE_SUFFIXES)):
         _refuse_insecure_sqlite_file(candidate, owner_uid)
+
+
+def _enable_wal(connection: sqlite3.Connection) -> None:
+    """Put the database in WAL mode, tolerating the cold-start race over the switch.
+
+    Switching a new database to WAL needs an exclusive lock, and SQLite may return SQLITE_BUSY at
+    once -- without the busy handler -- to avoid a lock-escalation deadlock. With many hosts
+    cold-starting on one new store, some failed startup with "database is locked" (Section 11 PR B,
+    found by the real 32-process cold-start test). WAL mode persists in the file, so a host that sees
+    it already set skips the switch; a host that loses the race retries SQLITE_BUSY only, bounded by
+    the same busy timeout. Every other error still fails at once.
+    """
+    if str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal":
+        return
+    deadline = time.monotonic() + SQLITE_BUSY_TIMEOUT_MS / 1000
+    delay = 0.005
+    while True:
+        try:
+            connection.execute("PRAGMA journal_mode = WAL")
+            return
+        except sqlite3.OperationalError as error:
+            if getattr(error, "sqlite_errorcode", None) != sqlite3.SQLITE_BUSY or time.monotonic() >= deadline:
+                raise
+        time.sleep(delay)
+        delay = min(delay * 2, 0.1)
 
 
 class SQLiteRuntimeStore:
@@ -972,7 +1004,11 @@ class SQLiteRuntimeStore:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
-        connection.execute("PRAGMA journal_mode = WAL")
+        try:
+            _enable_wal(connection)
+        except BaseException:
+            connection.close()
+            raise
         return connection
 
     @contextmanager
