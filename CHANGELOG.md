@@ -6,6 +6,21 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Completeness review — output projection (PM-002 High, PM-005 Low)
+
+- **An explicit empty `output_projection` is share-nothing again.** `build_envelope` collapsed `[]`
+  to `None` with a falsy test. `None` means "no opinion" in the projection intersection, so a sender
+  that explicitly asked to share no fields was widened to whatever the host policy allowed (`["*"]`
+  meant full tool output reached the model provider). Absent stays `None`; `[]` stays `()`.
+- **One decoder for every source.** `security.normalize_output_projection` is now used by the policy
+  loader, `build_envelope` and the A2A permit decoder, so they cannot drift apart. The A2A path did
+  not have the widening bug (`ToolGrant.__post_init__` keeps `[]` as `()`), but it had no projection
+  validation at all; it now rejects a non-list, an empty or non-string entry, and `*` mixed with
+  field names, like the other two. The policy loader keeps its behaviour and its error type.
+- **EV-002 Windows text corrected (PM-005).** `EXTERNAL_VALIDATION.md` still said Windows refuses
+  side-effecting isolated tools. Windows has used a kill-on-close Job Object since 0.9.0, and the
+  refusal now applies only to a platform with no tree-termination primitive at all.
+
 ### Section 12 — capacity and clock (PR B): retention, paging, metrics, clock-rollback protection (findings #4, #6 Medium)
 
 - **Clock rollback can no longer revive expired authorization (#6, owner decision D3).**

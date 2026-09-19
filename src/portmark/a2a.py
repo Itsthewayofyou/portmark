@@ -24,7 +24,7 @@ from .json_guard import StrictJSONError, strict_json_loads
 from .a2a_types import A2ARequestError, error_response, make_agent_card, parse_jsonrpc_request, success_response, task_from_run_result
 from .host import AgentHost
 from .models import AgentEnvelope, AgentManifest, AgentState, AttestationEvidence, Permit, ResourceBudget, ToolGrant
-from .security import SecurityError, validate_constraints
+from .security import SecurityError, normalize_output_projection, validate_constraints
 from .official_a2a import make_sdk_agent_card, validate_sdk_message_send_params
 
 
@@ -156,6 +156,14 @@ def envelope_from_dict(value: dict[str, Any]) -> AgentEnvelope:
         for grant in permit_value["grants"]:
             if isinstance(grant, dict):
                 validate_constraints(grant.get("constraints") or {})
+                # PM-002: the same projection rule as policy and envelope specs. This path never had
+                # the widening bug (ToolGrant.__post_init__ keeps an explicit [] as ()), but it had no
+                # projection VALIDATION at all, so a malformed entry crossed the boundary and failed
+                # (or silently did nothing) later. It now fails closed at decode, like the other two.
+                if "output_projection" in grant:
+                    grant["output_projection"] = normalize_output_projection(
+                        grant["output_projection"], f"grant {grant.get('name')!r}"
+                    )
         permit = Permit(
             issuer=permit_value["issuer"], subject=permit_value["subject"], audience=permit_value["audience"],
             expires_at=permit_value["expires_at"], nonce=permit_value["nonce"],

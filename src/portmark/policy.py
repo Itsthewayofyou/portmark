@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .models import ResourceBudget, ToolGrant
-from .security import HostPolicy, MigrationPolicy, TrustedApprover, _b64url_decode as _strict_b64url_decode, canonical_json, validate_constraints
+from .security import HostPolicy, MigrationPolicy, TrustedApprover, _b64url_decode as _strict_b64url_decode, canonical_json, normalize_output_projection, validate_constraints
 
 
 VALID_IMPACTS = {"low", "medium", "high", "destructive", "external-payment", "credentialed", "data-exfiltration"}
@@ -131,15 +131,8 @@ def _approval_required_impacts(value: Any) -> tuple[str, ...]:
 
 
 def _output_projection(value: Any, tool: str) -> tuple[str, ...] | None:
-    if value is None:
-        return None
-    if not isinstance(value, list):
-        raise ValueError(f"policy tool {tool!r} output_projection must be a list")
-    if not all(isinstance(item, str) and item for item in value):
-        raise ValueError(f"policy tool {tool!r} output_projection entries must be non-empty strings")
-    if "*" in value and len(value) > 1:
-        raise ValueError(f"policy tool {tool!r} output_projection cannot mix '*' with field names")
-    return tuple(value)
+    # PM-002: the shared decoder, so policy, envelope specs and A2A cannot drift apart.
+    return normalize_output_projection(value, f"policy tool {tool!r}")
 
 
 def _required_string(value: dict[str, Any], name: str) -> str:

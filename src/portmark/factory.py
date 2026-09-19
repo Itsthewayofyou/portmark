@@ -12,7 +12,7 @@ from .metrics import RuntimeMetrics
 from .models import AgentEnvelope, AgentManifest, AgentState, Permit, ResourceBudget, ToolGrant
 from .policy import load_host_policy
 from .providers import DeterministicProvider, GenericHttpProvider, ModelProvider, NativeWasmtimeComponentProvider, WasmDecisionProvider
-from .security import AttestationPolicy, EnvelopeSigner, EnvelopeSigningIdentity, ExternalAttestationVerifier, HmacEnvelopeSigner, HostPolicy, MigrationAttesterProtocol, TrustRegistry, TrustSource, _b64url_decode, validate_constraints
+from .security import AttestationPolicy, EnvelopeSigner, EnvelopeSigningIdentity, ExternalAttestationVerifier, HmacEnvelopeSigner, HostPolicy, MigrationAttesterProtocol, TrustRegistry, TrustSource, _b64url_decode, normalize_output_projection, validate_constraints
 from .storage import RuntimeStore, create_runtime_store
 from .tools import ToolRegistry, demo_registry
 from ._clock import ClockRollbackError, TimeFloorError, check_time_floor, clock_tolerance_from_environment, configure_default_clock, trusted_now
@@ -333,10 +333,10 @@ def _grant_from_spec(value: object) -> ToolGrant:
         raise ValueError(f"grant {name!r} constraints must be an object")
     # Finding #5: reject unknown argument-spec keys (typos) at decode, not silently at runtime.
     validate_constraints(constraints)
-    projection = value.get("output_projection")
-    if projection is not None and not isinstance(projection, list):
-        raise ValueError(f"grant {name!r} output_projection must be a list")
-    return ToolGrant(name, dict(constraints), tuple(projection) if projection else None)
+    # PM-002: one shared decoder. An explicit [] is share-nothing and must NOT become None
+    # (which defers to the host's projection, and can widen to everything).
+    projection = normalize_output_projection(value.get("output_projection"), f"grant {name!r}")
+    return ToolGrant(name, dict(constraints), projection)
 
 
 def build_envelope(spec: dict, signer: EnvelopeSigningIdentity) -> AgentEnvelope:
