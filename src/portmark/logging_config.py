@@ -10,11 +10,25 @@ from datetime import datetime, timezone
 SENSITIVE_LOG_PATTERNS = (
     (re.compile(r"(?i)(authorization\s*:\s*bearer\s+)[^\s,'\"}]+"), r"\1[REDACTED]"),
     (re.compile(r"(?i)(bearer\s+)[^\s,'\"}]+"), r"\1[REDACTED]"),
-    (re.compile(r"(?i)(\b[A-Z0-9_]*(?:TOKEN|SECRET|PRIVATE_KEY|PASSWORD|SIGNATURE)[A-Z0-9_]*\s*=\s*)[^\s,'\"}]+"), r"\1[REDACTED]"),
     (
-        re.compile(r"(?i)((?:\"|')?(?:authorization|bearer_token|a2a_token|token|secret|private_key|raw_private_key|password|signature)(?:\"|')?\s*[:=]\s*([\"']))([^\"']+)([\"'])"),
+        re.compile(
+            r"(?i)(\b[A-Z0-9_\-]*(?:TOKEN|SECRET|PRIVATE_KEY|PASSWORD|SIGNATURE|API[_\-]?KEY|ACCESS[_\-]?KEY|CREDENTIALS?)[A-Z0-9_\-]*\s*=\s*)[^\s,'\"}]+"
+        ),
+        r"\1[REDACTED]",
+    ),
+    (
+        re.compile(
+            r"(?i)((?:\"|')?(?:proxy-authorization|authorization|bearer_token|a2a_token|token|secret|private_key|raw_private_key|password|signature|x-api-key|api[_\-]?key|access[_\-]?key|set-cookie|cookie)(?:\"|')?\s*[:=]\s*([\"']))([^\"']+)([\"'])"
+        ),
         r"\1[REDACTED]\4",
     ),
+    # Section 11 #2 (auditor round 2): credential-bearing HTTP headers written as `Name: value`.
+    # A non-Bearer Authorization (Basic, Digest, a raw key) and a Cookie can hold spaces, commas,
+    # and quotes, so their value is redacted to the end of the line; a Bearer value was already
+    # reduced to `Bearer [REDACTED]` above and keeps its scheme. Key headers carry one token.
+    (re.compile(r"(?im)(\b(?:proxy-)?authorization\s*:\s*)(?!\s*bearer\s+\[REDACTED\])(?=\S)[^\r\n]+"), r"\1[REDACTED]"),
+    (re.compile(r"(?im)(\b(?:set-)?cookie\s*:\s*)[^\r\n]+"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)(\b(?:x-)?(?:api|access|auth)[_\-]?(?:key|token)\s*:\s*)[^\s,;'\"}]+"), r"\1[REDACTED]"),
     # Section 11 #2: credentials embedded in a URI's user-info (postgres://user:pass@db,
     # redis://:pass@cache, https://token@host). The whole user-info is dropped, not just the
     # password span, because a bare token often sits in the user position. Greedy up to the

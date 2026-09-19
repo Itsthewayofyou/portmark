@@ -264,8 +264,17 @@ receipts, and audit details. It must be readable by the host's own user only.
 - **Loose stores are refused.** At start, the host refuses a database, `-wal`, or `-shm` file that has
   any group or other permission bit, and prints the fix, for example `chmod 600 /var/lib/portmark/runtime.sqlite`.
   There is no warning-only mode. Fix the mode, then start again.
-- **The check runs at start only.** Do not widen the mode of a running store. Keep the store directory
-  `0700` and owned by the host user, so no other user can create or swap files in it.
+- **The store directory is checked too.** A 0600 database in a directory that other users can write is
+  not protected: they can delete or rename it and plant its `-wal`/`-shm` files. The host refuses a
+  store directory that is group- or other-writable (fix: `chmod 700 <directory>`), or that is owned by
+  a user other than the host user or root. The directory is checked BEFORE the host creates anything
+  in it. The directory itself may be a symlink (for example to another volume); its target is checked.
+- **Store files must be plain files owned by the host user.** The database, `-wal`, and `-shm` are read
+  with `lstat`: a symlink, a non-regular file (a FIFO, a device), or a file owned by another user is
+  refused. A new database is created with `O_EXCL`, so an existing file or a planted (even dangling)
+  symlink at that path is never followed.
+- **The check runs at start only.** Do not widen the mode of a running store. Parent directories above
+  the store directory are not checked: keep them non-writable by other users.
 - **Backups.** A backup of the store holds the same data. Keep backup files `0600` (or in a `0700`
   directory), and restore them with mode `0600`; a restored file with a wider mode is refused.
 - **Audit floor.** The floor is rewritten with mode `0600` on every write, even if a restore widened it.
@@ -306,10 +315,16 @@ before emission: the message and its arguments, exception text, tracebacks, and 
 information. Redaction covers bearer credentials, token/secret-like environment
 values, private keys, passwords, signatures, the user-info part of a URI
 (`postgres://user:password@db` becomes `postgres://[REDACTED]@db`; also Redis,
-HTTP, and other schemes), and credential query parameters (`token`, `api_key`,
-`password`, `secret`, `signature`, ...). Uvicorn's own loggers are routed through
-the same redacting handler, so a server traceback is redacted too. Redaction is
-pattern-based: do not rely on it for a secret in an unusual format. Still treat runtime
+HTTP, and other schemes), credential query parameters (`token`, `api_key`,
+`password`, `secret`, `signature`, `sig`, ...), `api_key=` / `access_key=` style
+values, and credential headers: the whole value of `Authorization` and
+`Proxy-Authorization` (any scheme; `Bearer` keeps its scheme word), `Cookie` and
+`Set-Cookie` (to the end of the line), and `X-API-Key` / `API-Key` / `X-Auth-Token`.
+Uvicorn's own loggers are routed through the same redacting handler, both when
+Uvicorn configures logging before the app loads and under `portmark serve`, where
+`uvicorn.run(log_config=None)` keeps it from reinstalling its own handlers.
+Redaction is pattern-based: do not rely on it for a secret in an unusual format
+(for example a raw header tuple `(b"cookie", b"...")`). Still treat runtime
 logs as sensitive operational data because task IDs, key IDs, policy versions,
 host IDs, and audit event structure remain visible by design.
 

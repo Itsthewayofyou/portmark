@@ -807,30 +807,70 @@ SQLITE_INSECURE_MODE_BITS = stat.S_IRWXG | stat.S_IRWXO
 SQLITE_SIDE_FILE_SUFFIXES = ("-wal", "-shm")
 
 
-def _refuse_insecure_sqlite_file(path: Path) -> None:
+def _refuse_insecure_sqlite_file(path: Path, owner_uid: int) -> None:
+    """Refuse a store file that another local user could read, swap, or redirect.
+
+    lstat, never stat: a symlink at the database, -wal, or -shm path would let whoever controls
+    its target decide where task data is written (auditor round 2).
+    """
     try:
-        mode = os.stat(path).st_mode
+        info = os.lstat(path)
     except FileNotFoundError:
         return
-    if mode & SQLITE_INSECURE_MODE_BITS:
+    if stat.S_ISLNK(info.st_mode):
+        raise RuntimeError(f"SQLite store file {path} is a symbolic link; the store and its -wal/-shm files must be regular files")
+    if not stat.S_ISREG(info.st_mode):
+        raise RuntimeError(f"SQLite store file {path} is not a regular file")
+    if info.st_uid != owner_uid:
+        raise RuntimeError(
+            f"SQLite store file {path} is owned by uid {info.st_uid}, not by the host user (uid {owner_uid}). "
+            f"Fix it with: chown {owner_uid} {shlex.quote(str(path))}"
+        )
+    if info.st_mode & SQLITE_INSECURE_MODE_BITS:
         raise RuntimeError(
             f"SQLite store file {path} is accessible by group or other users "
-            f"(mode {stat.S_IMODE(mode):04o}); it may hold task data and secrets. "
+            f"(mode {stat.S_IMODE(info.st_mode):04o}); it may hold task data and secrets. "
             f"Fix it with: chmod 600 {shlex.quote(str(path))}"
         )
 
 
+def _refuse_insecure_sqlite_directory(directory: Path, owner_uid: int) -> None:
+    """Refuse a store directory in which another local user can create, replace, or delete files.
+
+    A 0600 database in a writable directory is not protected: whoever can write the directory can
+    delete or rename the database and plant its -wal/-shm files (auditor round 2). The directory
+    may be a symlink (a common way to place state on another volume); its target is checked.
+    """
+    info = os.stat(directory)
+    if not stat.S_ISDIR(info.st_mode):
+        raise RuntimeError(f"SQLite store directory {directory} is not a directory")
+    if info.st_uid not in (owner_uid, 0):
+        raise RuntimeError(
+            f"SQLite store directory {directory} is owned by uid {info.st_uid}, not by the host user "
+            f"(uid {owner_uid}) or root. Fix it with: chown {owner_uid} {shlex.quote(str(directory))}"
+        )
+    if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise RuntimeError(
+            f"SQLite store directory {directory} is writable by group or other users "
+            f"(mode {stat.S_IMODE(info.st_mode):04o}); they could replace or delete the store. "
+            f"Fix it with: chmod 700 {shlex.quote(str(directory))}"
+        )
+
+
 def _prepare_sqlite_database_file(path: Path) -> None:
-    """Create a new database owner-only; refuse an existing one with group/other access.
+    """Create a new database owner-only; refuse an unsafe directory or an unsafe existing file.
 
     POSIX only: Windows has no mode bits here (its ACLs are documented in OPERATIONS.md).
-    A new database file is pre-created with 0600 BEFORE sqlite3 opens it, because SQLite creates
-    the -wal and -shm side files with the main database file's permissions.
+    Order matters: the directory is checked BEFORE anything is created in it. A new database file
+    is then pre-created 0600 (O_EXCL, so an existing file or symlink is never followed) BEFORE
+    sqlite3 opens it, because SQLite creates the -wal and -shm files with the database's mode.
     """
     if os.name == "nt":
         path.parent.mkdir(parents=True, exist_ok=True)
         return
+    owner_uid = os.geteuid()
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _refuse_insecure_sqlite_directory(path.parent, owner_uid)
     try:
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError:
@@ -838,7 +878,7 @@ def _prepare_sqlite_database_file(path: Path) -> None:
     else:
         os.close(fd)
     for candidate in (path, *(Path(f"{path}{suffix}") for suffix in SQLITE_SIDE_FILE_SUFFIXES)):
-        _refuse_insecure_sqlite_file(candidate)
+        _refuse_insecure_sqlite_file(candidate, owner_uid)
 
 
 class SQLiteRuntimeStore:

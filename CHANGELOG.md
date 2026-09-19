@@ -21,6 +21,15 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   `-wal`, or `-shm` file with any group or other permission bit is refused at start, with the exact
   `chmod 600 <path>` fix. POSIX only; Windows ACL guidance is in OPERATIONS.md.
 - **The audit floor is rewritten `0600` on every write**, even if a restore widened its mode.
+- **Auditor round 2.**
+  - `portmark serve` leaked through Uvicorn: `uvicorn.run()` re-applied Uvicorn's default logging
+    after `configure_logging()`. It now passes `log_config=None`; an integration test drives the real
+    CLI startup order.
+  - The store directory is refused if group/other-writable (`chmod 700 <dir>`) or owned by another
+    user (checked before anything is created in it). Store files are checked with `lstat`: symlinks,
+    non-regular files, and files owned by another user are refused.
+  - More credential forms are redacted: any-scheme `Authorization` / `Proxy-Authorization`, `Cookie` /
+    `Set-Cookie`, `X-API-Key` / `API-Key` / `X-Auth-Token`, and `api_key=` / `access_key=` values.
 - **Operator action:** an existing store created under a `022` umask is refused until you run the printed
   `chmod 600` command (and the same for its `-wal`/`-shm` files, if present).
 
