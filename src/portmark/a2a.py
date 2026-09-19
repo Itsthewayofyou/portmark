@@ -894,6 +894,10 @@ def serve(
         host=bind,
         port=port,
         log_level="warning",
+        # Section 11 #2 (auditor round 2): uvicorn.run() builds a Config that re-applies uvicorn's
+        # default dictConfig AFTER the CLI's configure_logging(), reinstalling non-propagating,
+        # unredacted handlers. log_config=None keeps the one redacting root handler in charge.
+        log_config=None,
         limit_concurrency=max_concurrent_requests,
         timeout_keep_alive=5,
         access_log=False,

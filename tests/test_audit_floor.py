@@ -450,6 +450,8 @@ class Deployment:
         for suffix in ("", "-wal", "-shm"):
             Path(str(self.store_path) + suffix).unlink(missing_ok=True)
         shutil.copyfile(snapshot, self.store_path)
+        # A faithful restore keeps the store owner-only (Section 11 #5 refuses a looser file).
+        os.chmod(self.store_path, 0o600)
 
     def verify_cli(self, task_id, floor=True):
         argv = ["portmark", "--host-id", HOST, "--store-path", str(self.store_path), "--trust-registry-path", str(self.registry_path)]

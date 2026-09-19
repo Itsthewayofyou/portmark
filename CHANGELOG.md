@@ -6,6 +6,39 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Section 11 — deployment hardening (PR A): log redaction and owner-only storage (findings #2, #5 Medium)
+
+- **Plain-text logs are redacted too (#2).** Redaction ran only in the JSON formatter, so the default
+  text format wrote bearer tokens, passwords, and DSNs verbatim. Both formats now redact the fully
+  rendered output (message, arguments, exception text, traceback, stack information).
+- **URI credentials and query credentials are redacted (#2).** No pattern matched URI user-info, so
+  `postgres://alice:password@db` leaked even in JSON mode. User-info is now replaced with `[REDACTED]`
+  for any scheme, and so are credential query parameters (`token`, `api_key`, `password`, `secret`, ...).
+- **Uvicorn's loggers go through the redacting handler (#2).** Uvicorn installs its own non-propagating
+  handlers, so its "Exception in ASGI application" traceback bypassed redaction.
+- **SQLite stores are owner-only (#5).** A new database is created `0600` before SQLite opens it (so
+  `-wal`/`-shm` are `0600` too), in a `0700` directory when the host creates it. An existing database,
+  `-wal`, or `-shm` file with any group or other permission bit is refused at start, with the exact
+  `chmod 600 <path>` fix. POSIX only; Windows ACL guidance is in OPERATIONS.md.
+- **The audit floor is rewritten `0600` on every write**, even if a restore widened its mode.
+- **Auditor round 2.**
+  - `portmark serve` leaked through Uvicorn: `uvicorn.run()` re-applied Uvicorn's default logging
+    after `configure_logging()`. It now passes `log_config=None`; an integration test drives the real
+    CLI startup order.
+  - The store directory is refused if group/other-writable (`chmod 700 <dir>`) or owned by another
+    user (checked before anything is created in it). Store files are checked with `lstat`: symlinks,
+    non-regular files, and files owned by another user are refused.
+  - More credential forms are redacted: any-scheme `Authorization` / `Proxy-Authorization`, `Cookie` /
+    `Set-Cookie`, `X-API-Key` / `API-Key` / `X-Auth-Token`, and `api_key=` / `access_key=` values.
+- **Auditor round 3.** Every directory from `/` down to the store directory is checked with `lstat`:
+  owned by the host user or root, and not group/other-writable unless sticky (like `/tmp`); the store
+  directory itself gets no sticky exception. A `0700` store directory inside a writable, non-sticky
+  parent could be renamed away and replaced between connections. The existing chain is checked before
+  any missing directory is created (each created `0700`). **Reversed from round 2:** a symlinked store
+  directory is now refused (use a bind mount); a symlink above it is walked to its target.
+- **Operator action:** an existing store created under a `022` umask is refused until you run the printed
+  `chmod 600` command (and the same for its `-wal`/`-shm` files, if present).
+
 ### Section 10 — audit chain (PR B): local audit floor behind a monotonic-witness contract (findings #1 High, #4 Medium)
 
 - **Rollback is detected relative to a signed floor outside the database (High, #1).** A restored older,

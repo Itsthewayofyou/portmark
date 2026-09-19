@@ -253,6 +253,55 @@ database defeats it (non-detection 1 above). After restoring an older database, 
 refuses to start (`rolled-back`); run `floor-reset` deliberately, with the reason, once the restore is
 understood. Restoring an older trust registry is refused the same way (`registry-rolled-back`).
 
+## File Permissions
+
+The SQLite store holds checkpoints, messages, tool arguments and results, migration envelopes and
+receipts, and audit details. It must be readable by the host's own user only.
+
+- **New stores are owner-only.** On POSIX, the host creates a new database file with mode `0600`
+  before SQLite opens it. SQLite then creates the `-wal` and `-shm` side files with the same mode. A
+  store directory that the host creates gets mode `0700`.
+- **Loose stores are refused.** At start, the host refuses a database, `-wal`, or `-shm` file that has
+  any group or other permission bit, and prints the fix, for example `chmod 600 /var/lib/portmark/runtime.sqlite`.
+  There is no warning-only mode. Fix the mode, then start again.
+- **The store directory is checked too.** A 0600 database in a directory that other users can write is
+  not protected: they can delete or rename it and plant its `-wal`/`-shm` files. The host refuses a
+  store directory that is group- or other-writable, even with the sticky bit (fix: `chmod 700 <directory>`),
+  or that is owned by a user other than the host user or root.
+- **Every directory above it is checked, up to `/`.** Renaming a directory needs write access only to
+  ITS parent, so a `0700` store directory inside a directory that other users can write can be renamed
+  away and replaced between connections. Every component from `/` down must be owned by the host user or
+  root, and must not be group- or other-writable (fix: `chmod go-w <directory>`). The one exception is a
+  **sticky** directory such as `/tmp`: there, only an entry's owner, the directory owner, or root can
+  rename or delete the entry, and every entry on the path is itself required to be owned by the host user
+  or root. The existing part of the chain is checked BEFORE the host creates anything; missing directories
+  are then created one by one with mode `0700`.
+- **The store directory must not be a symlink.** A symlink there lets whoever can replace it redirect the
+  store. To put the store on another volume, use a bind mount (or point the store path at the real
+  directory). A symlink ABOVE the store directory (for example macOS `/var` -> `/private/var`) is allowed,
+  because the walk has already shown that only a trusted user can replace it, and its target is walked
+  with the same rules.
+- **Container note.** Do not place the database directly in a shared sticky mount (a tmpfs mounted
+  `1777`): use a `0700` subdirectory owned by the host user.
+- **Store files must be plain files owned by the host user.** The database, `-wal`, and `-shm` are read
+  with `lstat`: a symlink, a non-regular file (a FIFO, a device), or a file owned by another user is
+  refused. A new database is created with `O_EXCL`, so an existing file or a planted (even dangling)
+  symlink at that path is never followed.
+- **The check runs when the store is opened.** A running host reconnects by pathname and does not
+  re-check the path on every transaction. With the whole chain proven owned by trusted users and not
+  writable by others, only the host user or root can change the path afterwards. Portmark does not pin
+  a directory handle (SQLite opens files by path), so do not widen any directory on the path while a
+  host is running.
+- **Backups.** A backup of the store holds the same data. Keep backup files `0600` (or in a `0700`
+  directory), and restore them with mode `0600`; a restored file with a wider mode is refused.
+- **Audit floor.** The floor is rewritten with mode `0600` on every write, even if a restore widened it.
+  Keep the floor directory writable by the host user only: the floor is signed, but a user who can
+  delete it can force the `floor-missing` refusal.
+- **Windows.** There are no mode bits to check. Put the store, its backups, and the floor in a directory
+  whose ACL (access control list) grants access only to the host's account and administrators.
+- **PostgreSQL.** Protect the database with its own roles and network rules; the DSN is a secret (see
+  "Hygiene And Supply Chain").
+
 ## Storage Migrations
 
 SQLite runtime databases (current version 12) carry their schema version in `PRAGMA user_version`. Hosts migrate version `0` stores to the current baseline on open and refuse to open databases with a newer schema version than the runtime supports. Postgres stores (current version 10) keep their schema version in the `portmark_schema` table in the configured schema. Back up the runtime database before deploying runtime versions that include storage migrations, and validate representative task IDs with `verify-audit` after migration.
@@ -278,8 +327,21 @@ For suspected policy bypass:
 
 ## Hygiene And Supply Chain
 
-JSON logs redact bearer credentials, token/secret-like environment values,
-private keys, passwords, and signatures before emission. Still treat runtime
+Both log formats (plain text and `--log-json`) redact the complete rendered output
+before emission: the message and its arguments, exception text, tracebacks, and stack
+information. Redaction covers bearer credentials, token/secret-like environment
+values, private keys, passwords, signatures, the user-info part of a URI
+(`postgres://user:password@db` becomes `postgres://[REDACTED]@db`; also Redis,
+HTTP, and other schemes), credential query parameters (`token`, `api_key`,
+`password`, `secret`, `signature`, `sig`, ...), `api_key=` / `access_key=` style
+values, and credential headers: the whole value of `Authorization` and
+`Proxy-Authorization` (any scheme; `Bearer` keeps its scheme word), `Cookie` and
+`Set-Cookie` (to the end of the line), and `X-API-Key` / `API-Key` / `X-Auth-Token`.
+Uvicorn's own loggers are routed through the same redacting handler, both when
+Uvicorn configures logging before the app loads and under `portmark serve`, where
+`uvicorn.run(log_config=None)` keeps it from reinstalling its own handlers.
+Redaction is pattern-based: do not rely on it for a secret in an unusual format
+(for example a raw header tuple `(b"cookie", b"...")`). Still treat runtime
 logs as sensitive operational data because task IDs, key IDs, policy versions,
 host IDs, and audit event structure remain visible by design.
 

@@ -3504,7 +3504,12 @@ class RuntimeTests(unittest.TestCase):
         # Tests that open a raw connection to inspect or tamper with the store must
         # close it, or Windows keeps the database file open and its temp dir cannot
         # be deleted. sqlite3's own `with connection` commits but never closes.
+        created = not os.path.exists(path)
         connection = sqlite3.connect(path)
+        if created:
+            # A legacy database built here stands in for an operator's file, which the store
+            # requires to be owner-only (Section 11 #5).
+            os.chmod(path, 0o600)
         try:
             with connection:
                 yield connection

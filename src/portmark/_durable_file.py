@@ -15,12 +15,19 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 
 
-def atomic_write_bytes(path: str, data: bytes, prefix: str = ".portmark-") -> None:
+def atomic_write_bytes(path: str, data: bytes, prefix: str = ".portmark-", mode: int | None = None) -> None:
+    """Atomically replace ``path`` with ``data``.
+
+    ``mode`` forces the file mode. When it is None the existing file's mode is kept, and a new
+    file keeps mkstemp's owner-only 0600 (Section 11 #5: a caller that must never widen access
+    passes ``mode=0o600`` so a file that was once 0644 is tightened on the next write).
+    """
     directory = os.path.dirname(os.path.abspath(path)) or "."
-    try:
-        mode: int | None = os.stat(path).st_mode & 0o777
-    except OSError:
-        mode = None
+    if mode is None:
+        try:
+            mode = os.stat(path).st_mode & 0o777
+        except OSError:
+            mode = None
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=prefix, suffix=".tmp")
     try:
         with os.fdopen(fd, "wb") as handle:

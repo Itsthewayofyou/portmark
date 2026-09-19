@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
+import shlex
 import sqlite3
+import stat
 import threading
 import time
 from collections.abc import Generator
@@ -797,6 +800,159 @@ class _InMemoryTransaction:
         self._store._migration_receipts.setdefault(task_id, receipt_json)
 
 
+# Section 11 #5: the SQLite store holds checkpoints, messages, tool arguments and results,
+# migration envelopes and receipts, and audit details, so it must never be readable by other local
+# users. Group/other permission bits on the database or its WAL/SHM side files are refused.
+SQLITE_INSECURE_MODE_BITS = stat.S_IRWXG | stat.S_IRWXO
+SQLITE_SIDE_FILE_SUFFIXES = ("-wal", "-shm")
+
+
+def _refuse_insecure_sqlite_file(path: Path, owner_uid: int) -> None:
+    """Refuse a store file that another local user could read, swap, or redirect.
+
+    lstat, never stat: a symlink at the database, -wal, or -shm path would let whoever controls
+    its target decide where task data is written (auditor round 2).
+    """
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(info.st_mode):
+        raise RuntimeError(f"SQLite store file {path} is a symbolic link; the store and its -wal/-shm files must be regular files")
+    if not stat.S_ISREG(info.st_mode):
+        raise RuntimeError(f"SQLite store file {path} is not a regular file")
+    if info.st_uid != owner_uid:
+        raise RuntimeError(
+            f"SQLite store file {path} is owned by uid {info.st_uid}, not by the host user (uid {owner_uid}). "
+            f"Fix it with: chown {owner_uid} {shlex.quote(str(path))}"
+        )
+    if info.st_mode & SQLITE_INSECURE_MODE_BITS:
+        raise RuntimeError(
+            f"SQLite store file {path} is accessible by group or other users "
+            f"(mode {stat.S_IMODE(info.st_mode):04o}); it may hold task data and secrets. "
+            f"Fix it with: chmod 600 {shlex.quote(str(path))}"
+        )
+
+
+SQLITE_MAX_SYMLINK_HOPS = 40
+_GROUP_OR_OTHER_WRITE = stat.S_IWGRP | stat.S_IWOTH
+
+
+def _refuse_untrusted_owner(kind: str, path: str, info: os.stat_result, owner_uid: int) -> None:
+    if info.st_uid not in (owner_uid, 0):
+        raise RuntimeError(
+            f"SQLite store {kind} {path} is owned by uid {info.st_uid}, not by the host user "
+            f"(uid {owner_uid}) or root. Fix it with: chown {owner_uid} {shlex.quote(path)}"
+        )
+
+
+def _refuse_unsafe_directory_chain(directory: Path, owner_uid: int, *, is_store_directory: bool) -> None:
+    """Refuse a path that any untrusted local user could redirect, from / down to ``directory``.
+
+    Section 11 #5 (auditor round 3): a 0700 store directory is not protected if ANY ancestor is
+    writable by another user, because renaming a directory needs write access only to ITS parent.
+    The store reconnects by pathname, so that user could swap in a replacement between connections.
+    Every component is read with lstat and must be owned by the host user or root. An ancestor
+    directory may be group/other-writable only when it is sticky (like /tmp): then only the owner
+    of an entry, the directory owner, or root can rename or delete that entry, and every entry on
+    the path is itself required to be owned by the host user or root.
+
+    Symlinks: the store directory itself must not be a symlink (a symlink there is a
+    pathname-replacement primitive). A symlink ABOVE it (macOS /var -> /private/var) is allowed only
+    where the walk has already shown that no untrusted user can replace it, and its target is walked
+    with the same rules. The walk runs to /, never stopping early: a root-owned directory inside a
+    writable directory can still be renamed away.
+    """
+    lexical = directory if directory.is_absolute() else Path(os.getcwd()) / directory
+    if is_store_directory and stat.S_ISLNK(os.lstat(lexical).st_mode):
+        raise RuntimeError(
+            f"SQLite store directory {lexical} is a symbolic link; point the store path at the real "
+            f"directory (use a bind mount to place it on another volume)"
+        )
+    root_info = os.lstat("/")
+    _refuse_untrusted_owner("directory", "/", root_info, owner_uid)
+    if root_info.st_mode & _GROUP_OR_OTHER_WRITE and not root_info.st_mode & stat.S_ISVTX:
+        raise RuntimeError("SQLite store path is unsafe: / is writable by group or other users")
+    current = "/"
+    pending = list(reversed(lexical.parts[1:]))
+    hops = 0
+    while pending:
+        name = pending.pop()
+        if name in ("", "."):
+            continue
+        if name == "..":
+            current = os.path.dirname(current)
+            continue
+        candidate = os.path.join(current, name)
+        info = os.lstat(candidate)
+        _refuse_untrusted_owner("path component", candidate, info, owner_uid)
+        if stat.S_ISLNK(info.st_mode):
+            hops += 1
+            if hops > SQLITE_MAX_SYMLINK_HOPS:
+                raise RuntimeError(f"SQLite store path {lexical} has too many symbolic links")
+            target = os.readlink(candidate)
+            if os.path.isabs(target):
+                current = "/"
+            pending.extend(reversed(Path(target).parts[1:] if os.path.isabs(target) else Path(target).parts))
+            continue
+        if not stat.S_ISDIR(info.st_mode):
+            raise RuntimeError(f"SQLite store path component {candidate} is not a directory")
+        if is_store_directory and not pending:
+            current = candidate  # the store directory itself: the stricter check below applies
+            break
+        if info.st_mode & _GROUP_OR_OTHER_WRITE and not info.st_mode & stat.S_ISVTX:
+            raise RuntimeError(
+                f"SQLite store path component {candidate} is writable by group or other users "
+                f"(mode {stat.S_IMODE(info.st_mode):04o}) and not sticky; they could rename or replace "
+                f"the store directory. Fix it with: chmod go-w {shlex.quote(candidate)}"
+            )
+        current = candidate
+    if is_store_directory:
+        # The store directory gets no sticky exception: nobody but its owner may write it.
+        info = os.lstat(current)
+        if info.st_mode & _GROUP_OR_OTHER_WRITE:
+            raise RuntimeError(
+                f"SQLite store directory {current} is writable by group or other users "
+                f"(mode {stat.S_IMODE(info.st_mode):04o}); they could replace or delete the store. "
+                f"Fix it with: chmod 700 {shlex.quote(current)}"
+            )
+
+
+def _prepare_sqlite_database_file(path: Path) -> None:
+    """Create a new database owner-only; refuse an unsafe directory or an unsafe existing file.
+
+    POSIX only: Windows has no mode bits here (its ACLs are documented in OPERATIONS.md).
+    Order matters: the existing part of the directory chain is checked BEFORE anything is created
+    in it; missing directories are then created one by one with 0700, and the whole chain is checked
+    again. A new database file is then pre-created 0600 (O_EXCL, so an existing file or symlink is
+    never followed) BEFORE sqlite3 opens it, because SQLite creates the -wal and -shm files with the
+    database's mode.
+    """
+    if os.name == "nt":
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return
+    owner_uid = os.geteuid()
+    store_directory = path.parent if path.parent.is_absolute() else Path(os.getcwd()) / path.parent
+    existing, missing = store_directory, []
+    while not os.path.lexists(existing):
+        missing.append(existing.name)
+        existing = existing.parent
+    _refuse_unsafe_directory_chain(existing, owner_uid, is_store_directory=not missing)
+    for name in reversed(missing):
+        existing = existing / name
+        os.mkdir(existing, 0o700)
+    if missing:
+        _refuse_unsafe_directory_chain(store_directory, owner_uid, is_store_directory=True)
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        pass
+    else:
+        os.close(fd)
+    for candidate in (path, *(Path(f"{path}{suffix}") for suffix in SQLITE_SIDE_FILE_SUFFIXES)):
+        _refuse_insecure_sqlite_file(candidate, owner_uid)
+
+
 class SQLiteRuntimeStore:
     is_durable = True
 
@@ -833,7 +989,7 @@ class SQLiteRuntimeStore:
             connection.close()
 
     def _initialize(self) -> None:
-        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        _prepare_sqlite_database_file(Path(self.path))
         with self._connection() as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             if version > SQLITE_SCHEMA_VERSION:
