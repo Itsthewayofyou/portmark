@@ -151,18 +151,30 @@ class EntrypointTests(unittest.TestCase):
 
 ENTRYPOINT_LOG_SCRIPT = """
 import logging, sys
+import uvicorn.config
 import uvicorn.server
 
 SECRET = sys.argv[1]
+real_load_app = uvicorn.config.Config.load_app
+
+def observed_load_app(self):
+    # Layer 1, observed directly, in the window where it is load-bearing: uvicorn's Config has applied
+    # (or skipped) its log config, and uvicorn.run() is about to import the app -- whose own
+    # configure_logging (layer 2) would take the loggers over again. Uvicorn's own startup messages,
+    # such as "Error loading ASGI app", are written in this window.
+    server_logger = logging.getLogger("uvicorn")
+    print(f"UVICORN_HANDLERS_BEFORE_APP={len(server_logger.handlers)} PROPAGATE={server_logger.propagate}", flush=True)
+    return real_load_app(self)
 
 def fake_run(self, sockets=None):
-    self.config.load()  # imports portmark.asgi:app, exactly as a real start does
+    # uvicorn.run() has already imported the app (Config.load_app) before calling this.
     self.started = True
     try:
         raise RuntimeError(f"db down postgres://u:{SECRET}@db/x")
     except RuntimeError:
         logging.getLogger("uvicorn.error").exception("Exception in ASGI application Authorization: Bearer %s", SECRET)
 
+uvicorn.config.Config.load_app = observed_load_app
 uvicorn.server.Server.run = fake_run
 from portmark.serve_asgi import main
 sys.exit(main())
@@ -179,6 +191,11 @@ class EntrypointLogRedactionTests(unittest.TestCase):
             env=child_env(),
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+        # Layer 1 (uvicorn.run(log_config=None)): uvicorn installed no handler of its own. Two layers
+        # each keep the output redacted, so the secret check below alone could not see this one go.
+        markers = [line for line in result.stdout.splitlines() if line.startswith("UVICORN_HANDLERS_BEFORE_APP=")]
+        self.assertEqual(markers, ["UVICORN_HANDLERS_BEFORE_APP=0 PROPAGATE=True"])
+        # Both layers together: the real output carries no secret.
         output = result.stdout + result.stderr
         self.assertIn("Exception in ASGI application", output)
         self.assertIn("Traceback", output)
