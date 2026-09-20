@@ -65,6 +65,63 @@ def _namespaced_migration_task_id(source_host_id: str, task_id: str) -> str:
     return f"{_MIGRATION_TASK_NAMESPACE}{len(source_host_id)}::{source_host_id}::{task_id}"
 
 
+def _require_wellformed_decision(decision: Any) -> None:
+    """A provider decision is UNTRUSTED input, so check its shape once, up front (auditor round 2).
+
+    The loop used to trust the shape and only meet a bad value where it happened to be hashed,
+    compared or written. That let a hostile decision escape the failure boundary by a side door: a
+    `tool` that is not a string but compares equal to a granted name passes the grant check and then
+    becomes a KEY in `state.memory["tool_results"]`, and the mixed-type key set makes the canonical
+    encoding of the checkpoint raise later -- in `_persist`, outside every handler, stranding the
+    task at `running`. Arguments that cannot be encoded have the same shape: their first encoding is
+    conditional, so which line raises depends on the path taken.
+
+    Checking here, inside the decision boundary, turns all of that into one refusal that terminalizes
+    the task. It is a SHAPE check only: what a decision may ASK for is still the policy's business.
+    """
+    try:
+        kind = decision.kind
+        tool = decision.tool
+        arguments = decision.arguments
+        destination = decision.destination
+    except BaseException as error:  # a missing field, or a property that raises on access
+        raise SecurityError("provider decision fields could not be read") from error
+    if not isinstance(kind, str):
+        raise SecurityError("provider decision kind must be a string")
+    if tool is not None and not isinstance(tool, str):
+        raise SecurityError("provider decision tool must be a string")
+    if destination is not None and not isinstance(destination, str):
+        raise SecurityError("provider decision destination must be a string")
+    if arguments is not None and not isinstance(arguments, dict):
+        raise SecurityError("provider decision arguments must be an object")
+    # Encodability of the ARGUMENTS, once and here -- not at whichever later line happens to hash
+    # them first, which differs per path. `content` is deliberately NOT checked here: it already has
+    # a gentler, tested treatment further down (`_is_encodable` -> a `content.rejected` terminal
+    # result that does not raise), and duplicating it here would turn that clean failure into a raise.
+    if arguments is not None:
+        try:
+            canonical_json(arguments)
+        except BaseException as error:
+            raise SecurityError("provider decision arguments cannot be recorded") from error
+
+
+def _recordable_label(source: Any, name: str) -> str | None:
+    """A provider-supplied field, reduced to something the audit chain can definitely record.
+
+    Auditor round 2: the refusal handler is the last thing standing between a malformed decision and
+    a stranded task, so it must not read that decision naively. A field can RAISE on access (a
+    property), or be a value `canonical_json` cannot encode -- and `AuditLog.append` hashes the record
+    before storing it, so either one raises INSIDE the handler and strands the very task it exists to
+    close. Anything that is not a short plain string becomes None: the event name and the error class
+    already say what happened, and a refusal record is evidence, not a debugging dump.
+    """
+    try:
+        value = getattr(source, name, None)
+    except BaseException:  # a property that raises is exactly the case this exists for
+        return None
+    return value if isinstance(value, str) and len(value) <= 128 else None
+
+
 class AgentHost:
     def __init__(
         self,
@@ -552,7 +609,9 @@ class AgentHost:
                 # Auditor round 1: READING the decision is inside the boundary too. A provider that
                 # returns something that is not a ProviderDecision raises on attribute access, and
                 # that raise used to happen here, outside every handler -- stranding the checkpoint at
-                # `running`, the very class PM-004 closes.
+                # `running`, the very class PM-004 closes. Round 2: check the SHAPE before reading
+                # it anywhere, so a malformed field cannot escape by a later side door instead.
+                _require_wellformed_decision(decision)
                 audit.append("provider.proposed", {"kind": decision.kind, "tool": decision.tool})
                 finished, migration = self._apply_decision(decision, state, effective, audit, envelope, active_policy, admission_generation)
             except Exception as error:
@@ -577,8 +636,8 @@ class AgentHost:
                     # a refusal that may quote them. Read defensively: the decision itself may be the
                     # malformed thing that brought us here.
                     {
-                        "kind": getattr(decision, "kind", None),
-                        "tool": getattr(decision, "tool", None),
+                        "kind": _recordable_label(decision, "kind"),
+                        "tool": _recordable_label(decision, "tool"),
                         "error": type(error).__name__,
                     },
                 )
@@ -682,7 +741,7 @@ class AgentHost:
             # `started` row for an effect that never launched: a later attempt reads `started`,
             # settles it `unknown` and refuses, so a phantom effect would have to be reconciled by
             # hand. The ledger stays truthful because nothing is written under expired authority.
-            require_unexpired(effective, "before the tool launch")
+            require_unexpired(effective, "before the ledger write")
             eid = None
             replay_result: Any = _NO_REPLAY
             if self.tools.is_side_effecting(decision.tool) and self.tools.is_isolated(decision.tool):
@@ -691,7 +750,16 @@ class AgentHost:
                 # stops here with nothing written and nothing launched; otherwise, from this point the
                 # shutdown report names this effect id as in flight (its effect may land).
                 _run_progress.begin("side_effecting_tool", effect_id=eid)
-                mode, payload = self._effect_pre_launch(eid, state.task_id, decision.tool, decision.arguments)
+                mode, payload = self._effect_pre_launch(
+                    eid, state.task_id, decision.tool, decision.arguments,
+                    # PM-003 (auditor round 2): the ledger write can block on a database lock, so the
+                    # check above can go stale before the launch. This gate runs INSIDE the ledger
+                    # step, after `prepared` and immediately before `started`, so an expiry leaves the
+                    # row at `prepared` -- "intent recorded, never launched", which a later run may
+                    # simply re-run -- instead of `started`, which means "this may have landed" and
+                    # would force an operator to reconcile an effect that never happened.
+                    final_gate=lambda: require_unexpired(effective, "before the tool launch"),
+                )
                 if mode == "refuse":
                     return self._effect_refused(state, audit, decision, payload)
                 if mode == "replay":
@@ -716,6 +784,9 @@ class AgentHost:
                     # Section 12 #1: the same atomic step for a tool without an effect id (a side-effecting
                     # one already began above, before its ledger write).
                     _run_progress.begin("tool")
+                    # PM-003: no ledger row on this path, so the last check can sit right here, with
+                    # nothing but the launch after it.
+                    require_unexpired(effective, "before the tool launch")
                 launch_cap = self._effect_armer.arm(eid, decision.tool, decision.arguments) if eid is not None else None
                 try:
                     tool_started = time.monotonic()
@@ -1026,7 +1097,9 @@ class AgentHost:
         profile = self.tools.isolation_profile
         return profile.audit_summary() if profile is not None else None
 
-    def _effect_pre_launch(self, eid: str, task_id: str, tool: str, arguments: dict[str, Any]) -> tuple[str, Any]:
+    def _effect_pre_launch(
+        self, eid: str, task_id: str, tool: str, arguments: dict[str, Any], final_gate: Callable[[], None] | None = None
+    ) -> tuple[str, Any]:
         """Effect-ledger state machine for a side-effecting tool BEFORE it launches (Section 7 PR 2).
 
         Returns one of: ("replay", stored_result) -- a prior identical call already CONFIRMED, so
@@ -1081,6 +1154,11 @@ class AgentHost:
             self.store.record_effect_prepared(
                 eid, task_id, tool, canonical_json(arguments).decode("utf-8")
             )
+        # PM-003: the LAST authority check, immediately before the row says "this may have landed".
+        # Everything after it is the launch itself. A check placed any later could only settle a
+        # `started` row back down, which is exactly the phantom effect this ordering avoids.
+        if final_gate is not None:
+            final_gate()
         self.store.mark_effect_started(eid)
         return "run", None
 
@@ -1234,7 +1312,7 @@ class AgentHost:
             audit.append(
                 "output.refused",
                 {
-                    "tool": decision.tool if decision is not None else None,
+                    "tool": _recordable_label(decision, "tool") if decision is not None else None,
                     "encoded_size": oversized,
                     "max_output_bytes": ceiling,
                     "effect_status": "unknown",
