@@ -1914,8 +1914,7 @@ class HostPolicy:
             raise SecurityError("permit subject does not match agent")
         if permit.audience != self.audience:
             raise SecurityError("permit is not intended for this host")
-        if permit.expires_at <= current_time:
-            raise SecurityError("permit has expired")
+        require_unexpired(permit, "at admission", now=current_time)
         # The manifest is a pure name filter, not a set of empty-constraint grants.
         # A bare ToolGrant(name) reads as an argument passthrough (its empty
         # constraints declare no argument policy), so folding it into the merge
@@ -2206,6 +2205,25 @@ def _legacy_constrained_arguments(constraints: dict[str, Any]) -> set[str]:
 # already says an unknown key must be refused, not merged); derive from it so this
 # validator and the merge planner can never drift apart.
 _ARGUMENT_SPEC_KEYS = frozenset(_SPEC_NARROWERS)
+
+
+class PermitExpiredError(SecurityError):
+    """The permit's lifetime ended. Its own class so the host can terminalize it as `permit.expired`."""
+
+
+def require_unexpired(permit: Permit, where: str, now: int | None = None) -> int:
+    """Refuse an expired permit at a security boundary, and return the time the check used.
+
+    PM-003: expiry was read ONCE, when the effective permit was built at admission. An admitted run
+    then kept that authority for its whole life, so a provider that answered after the permit ended
+    could still launch a tool, redeem an approval, or emit a migration. Short-lived authority must
+    be short-lived in fact, so every boundary that ACTS re-reads the trusted clock. `where` names the
+    boundary for the audit trail; it carries no arguments, state, or secrets.
+    """
+    current_time = _decision_time(now)
+    if permit.expires_at <= current_time:
+        raise PermitExpiredError(f"permit has expired ({where})")
+    return current_time
 
 
 def normalize_output_projection(value: Any, where: str) -> tuple[str, ...] | None:

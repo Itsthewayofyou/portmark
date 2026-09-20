@@ -15,7 +15,7 @@ from .metrics import RuntimeMetrics
 from .models import AgentEnvelope, ApprovalToken, AttestationEvidence, ProviderDecision, RunResult
 from .projection import project_state_for_migration, provider_view
 from .providers import ModelProvider
-from .security import _MIGRATION_RECEIPT_FIELDS, _OPTIONAL_MIGRATION_RECEIPT_FIELDS, AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, MigrationAttesterProtocol, SecurityError, arguments_hash, audit_head_payload, canonical_json, effect_id, migration_envelope_digest, migration_receipt_payload, verified_approval_token
+from .security import _MIGRATION_RECEIPT_FIELDS, _OPTIONAL_MIGRATION_RECEIPT_FIELDS, AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, MigrationAttesterProtocol, PermitExpiredError, SecurityError, arguments_hash, audit_head_payload, canonical_json, effect_id, migration_envelope_digest, migration_receipt_payload, require_unexpired, verified_approval_token
 from .storage import InMemoryRuntimeStore, RuntimeStore
 from .tools import ToolExecutionError, ToolKilledError, ToolRegistry
 
@@ -63,6 +63,63 @@ def _namespaced_migration_task_id(source_host_id: str, task_id: str) -> str:
     # source settles delivery by the ORIGINAL task_id carried in the receipt payload, so a
     # constructor is all that is needed (a parser would be a second place to get it wrong).
     return f"{_MIGRATION_TASK_NAMESPACE}{len(source_host_id)}::{source_host_id}::{task_id}"
+
+
+def _require_wellformed_decision(decision: Any) -> None:
+    """A provider decision is UNTRUSTED input, so check its shape once, up front (auditor round 2).
+
+    The loop used to trust the shape and only meet a bad value where it happened to be hashed,
+    compared or written. That let a hostile decision escape the failure boundary by a side door: a
+    `tool` that is not a string but compares equal to a granted name passes the grant check and then
+    becomes a KEY in `state.memory["tool_results"]`, and the mixed-type key set makes the canonical
+    encoding of the checkpoint raise later -- in `_persist`, outside every handler, stranding the
+    task at `running`. Arguments that cannot be encoded have the same shape: their first encoding is
+    conditional, so which line raises depends on the path taken.
+
+    Checking here, inside the decision boundary, turns all of that into one refusal that terminalizes
+    the task. It is a SHAPE check only: what a decision may ASK for is still the policy's business.
+    """
+    try:
+        kind = decision.kind
+        tool = decision.tool
+        arguments = decision.arguments
+        destination = decision.destination
+    except BaseException as error:  # a missing field, or a property that raises on access
+        raise SecurityError("provider decision fields could not be read") from error
+    if not isinstance(kind, str):
+        raise SecurityError("provider decision kind must be a string")
+    if tool is not None and not isinstance(tool, str):
+        raise SecurityError("provider decision tool must be a string")
+    if destination is not None and not isinstance(destination, str):
+        raise SecurityError("provider decision destination must be a string")
+    if arguments is not None and not isinstance(arguments, dict):
+        raise SecurityError("provider decision arguments must be an object")
+    # Encodability of the ARGUMENTS, once and here -- not at whichever later line happens to hash
+    # them first, which differs per path. `content` is deliberately NOT checked here: it already has
+    # a gentler, tested treatment further down (`_is_encodable` -> a `content.rejected` terminal
+    # result that does not raise), and duplicating it here would turn that clean failure into a raise.
+    if arguments is not None:
+        try:
+            canonical_json(arguments)
+        except BaseException as error:
+            raise SecurityError("provider decision arguments cannot be recorded") from error
+
+
+def _recordable_label(source: Any, name: str) -> str | None:
+    """A provider-supplied field, reduced to something the audit chain can definitely record.
+
+    Auditor round 2: the refusal handler is the last thing standing between a malformed decision and
+    a stranded task, so it must not read that decision naively. A field can RAISE on access (a
+    property), or be a value `canonical_json` cannot encode -- and `AuditLog.append` hashes the record
+    before storing it, so either one raises INSIDE the handler and strands the very task it exists to
+    close. Anything that is not a short plain string becomes None: the event name and the error class
+    already say what happened, and a refusal record is evidence, not a debugging dump.
+    """
+    try:
+        value = getattr(source, name, None)
+    except BaseException:  # a property that raises is exactly the case this exists for
+        return None
+    return value if isinstance(value, str) and len(value) <= 128 else None
 
 
 class AgentHost:
@@ -542,9 +599,48 @@ class AgentHost:
                     self._terminalize_over_budget(envelope, effective, state, audit, persisted_events, None, False)
                 raise
             self.metrics.increment("provider.decisions")
-            audit.append("provider.proposed", {"kind": decision.kind, "tool": decision.tool})
             tool_calls_before = state.tool_calls
-            finished, migration = self._apply_decision(decision, state, effective, audit, envelope, active_policy, admission_generation)
+            try:
+                # Auditor round 1: READING the decision is inside the boundary too. A provider that
+                # returns something that is not a ProviderDecision raises on attribute access, and
+                # that raise used to happen here, outside every handler -- stranding the checkpoint at
+                # `running`, the very class PM-004 closes. Round 2: check the SHAPE before reading
+                # it anywhere, so a malformed field cannot escape by a later side door instead.
+                _require_wellformed_decision(decision)
+                audit.append("provider.proposed", {"kind": decision.kind, "tool": decision.tool})
+                finished, migration = self._apply_decision(decision, state, effective, audit, envelope, active_policy, admission_generation)
+            except Exception as error:
+                # PM-004: _apply_decision sat OUTSIDE every failure boundary, so a provider decision
+                # that failed host authorization (a tool with no grant, an exhausted tool-call budget,
+                # a missing tool name, a migration with no destination or an off-allowlist one, an
+                # expired permit, or any unexpected error from a tool) raised straight out of run()
+                # and left the admitted checkpoint open at `running` -- resumable, and claiming the
+                # agent is still working. It is the same class the provider handler above closes, so
+                # it gets the same treatment: a durable CLOSED failure, then re-raise so the caller
+                # still sees the error.
+                #
+                # The EFFECT ledger, not this checkpoint, stays the authority on side effects: a tool
+                # that had already started keeps its own row (`started`/`unknown`) for the reconcile
+                # pass, and closing the task here neither settles nor retries it.
+                expired = isinstance(error, PermitExpiredError)
+                state.status = "failed"
+                state.result = {"error": "permit expired" if expired else "decision refused"}
+                audit.append(
+                    "permit.expired" if expired else "decision.refused",
+                    # Identifiers and shapes only -- never the arguments, the state, or the message of
+                    # a refusal that may quote them. Read defensively: the decision itself may be the
+                    # malformed thing that brought us here.
+                    {
+                        "kind": _recordable_label(decision, "kind"),
+                        "tool": _recordable_label(decision, "tool"),
+                        "error": type(error).__name__,
+                    },
+                )
+                if self._checkpoint_fits(effective, state):
+                    self._persist(envelope, effective, state, audit, persisted_events, closed=True)
+                else:
+                    self._terminalize_over_budget(envelope, effective, state, audit, persisted_events, decision, state.tool_calls > tool_calls_before)
+                raise
             state.step += 1
             # Close the checkpoint's lineage at this host when the task terminates
             # (completed/failed) or migrates away, so it can never be resumed here
@@ -599,6 +695,10 @@ class AgentHost:
         return result
 
     def _apply_decision(self, decision, state, effective, audit, envelope, active_policy, admission_generation=0):
+        # PM-003: the permit's lifetime is re-read here, on the trusted clock, before ANY action of
+        # this step. Admission checked it once; a provider that answered slowly (or a long previous
+        # step) can have carried the run past the end of its authority.
+        require_unexpired(effective, "after the provider decision")
         if decision.kind == "tool":
             if state.tool_calls >= effective.budget.max_tool_calls:
                 raise SecurityError("tool-call budget exhausted")
@@ -630,6 +730,13 @@ class AgentHost:
             # per-call sequence, records intent BEFORE launch, and settles the outcome after -- so a
             # crash-and-resume REPLAYS a confirmed effect instead of re-running it, and NEVER
             # auto-retries an effect whose status is unknown (Josh's locked decisions).
+            # PM-003 (auditor round 1): the LAST authority check, and it sits BEFORE the ledger
+            # records intent, not after. An approval wait or a cancellation read can sit between the
+            # check at the top of this method and here. Checking after the ledger write would leave a
+            # `started` row for an effect that never launched: a later attempt reads `started`,
+            # settles it `unknown` and refuses, so a phantom effect would have to be reconciled by
+            # hand. The ledger stays truthful because nothing is written under expired authority.
+            require_unexpired(effective, "before the ledger write")
             eid = None
             replay_result: Any = _NO_REPLAY
             if self.tools.is_side_effecting(decision.tool) and self.tools.is_isolated(decision.tool):
@@ -667,6 +774,25 @@ class AgentHost:
                 try:
                     tool_started = time.monotonic()
                     try:
+                        # PM-003 (auditor round 3): the LAST authority check, with nothing after it
+                        # but the call itself. The `prepared` -> `started` transition and arm() are
+                        # both store round trips, so a check placed before them can go stale here.
+                        #
+                        # Here -- and only here -- the host KNOWS the tool has not run: invoke has
+                        # not been called and its one-use launch capability is still armed. So an
+                        # expiry settles the row back to `prepared` ("intent recorded, never
+                        # launched"), which a later run may simply re-run. That is truthful, and it
+                        # avoids the `started` phantom that would otherwise need an operator's
+                        # reconcile for an effect that never happened. The `finally` below disarms
+                        # the capability on this exit exactly as on any other.
+                        try:
+                            require_unexpired(effective, "before the tool launch")
+                        except PermitExpiredError:
+                            if eid is not None:
+                                self.store.settle_effect(
+                                    eid, "prepared", None, "permit expired before the launch; nothing ran"
+                                )
+                            raise
                         result = self.tools.invoke(
                             effective, decision.tool, decision.arguments, effective.budget.max_output_bytes, launch_capability=launch_cap
                         )
@@ -766,6 +892,9 @@ class AgentHost:
             audit.append("agent.awaiting_input", {"request": decision.content})
             return True, None
         if decision.kind == "migrate":
+            # PM-003: no separate check here. A migration mints a DELEGATED permit that inherits this
+            # expiry, and the check at the top of this method runs with nothing in between, so a
+            # second one could never observe a different time. (The destination re-checks it too.)
             if not decision.destination:
                 raise SecurityError("migration proposal lacks a destination")
             # Finding EV-009: host policy is a ceiling over movement, not only tools.
@@ -913,6 +1042,10 @@ class AgentHost:
         # loses is caught by the pre-launch re-check in _apply_decision.
         # Section 12 #1: redeeming consumes a nonce durably, so it is an operation an abandoned run
         # must not start (atomic check-and-record, like every other write).
+        # PM-003: the approval is about to be burned durably and a side-effecting tool follows, so
+        # the permit's own lifetime is re-read here. The approval token's expiry is checked above and
+        # is a separate, narrower bound; neither one covers the other.
+        require_unexpired(permit, "before the approval redemption")
         _run_progress.begin("approving")
         try:
             with self.store.transaction() as approval_transaction:
@@ -1174,7 +1307,7 @@ class AgentHost:
             audit.append(
                 "output.refused",
                 {
-                    "tool": decision.tool if decision is not None else None,
+                    "tool": _recordable_label(decision, "tool") if decision is not None else None,
                     "encoded_size": oversized,
                     "max_output_bytes": ceiling,
                     "effect_status": "unknown",
