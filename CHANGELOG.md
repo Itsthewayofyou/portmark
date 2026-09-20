@@ -23,10 +23,14 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
 - **Reading the provider's result is inside that boundary too.** A provider that returns something
   that is not a `ProviderDecision` raised on attribute access, outside every handler, and left the
   checkpoint at `running` — the same class PM-004 closes.
-- **The last authority check runs BEFORE the effect ledger records intent.** Checking after it left a
-  `started` row for an effect that never launched; a later attempt would read `started`, settle it
-  `unknown` and refuse, so a phantom effect had to be reconciled by hand. Nothing is now written to
-  the ledger under expired authority.
+- **The last authority check sits immediately before the call, and a late expiry tells the truth.**
+  Every earlier position can go stale: the ledger's `prepared` -> `started` transition and the
+  launch-capability check are both store round trips that can block. At the final position the host
+  KNOWS the tool has not run — `invoke` has not been called and its one-use capability is still
+  armed — so an expiry settles the row back to `prepared` ("intent recorded, never launched"), which
+  a later run may simply re-run. It is never left at `started` ("may have landed"), which would make
+  an operator reconcile an effect that never happened. A separate check before the ledger keeps an
+  already-expired decision from writing anything at all.
 - **Every refused decision reaches a durable CLOSED checkpoint (PM-004).** `_apply_decision` ran
   outside every failure boundary, so a decision that failed host authorization — a tool with no
   grant, an exhausted tool-call budget, a missing tool name, a migration with no destination or an
