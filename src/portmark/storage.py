@@ -28,13 +28,34 @@ from .security import (
 )
 
 
-SQLITE_SCHEMA_VERSION = 13
-POSTGRES_SCHEMA_VERSION = 11
+SQLITE_SCHEMA_VERSION = 14
+POSTGRES_SCHEMA_VERSION = 12
 
 # Section 4 #3: a migration lease is bounded. Zero/negative would defeat exclusivity (two workers
 # could claim the same row at the same instant); an unbounded lease would let a dead worker hold a
 # row effectively forever. Callers that need longer must renew, not lease past this ceiling.
 MAX_MIGRATION_LEASE_SECONDS = 7 * 24 * 60 * 60  # 7 days
+
+
+_LEGACY_OWNER_REFUSAL = (
+    "legacy checkpoint has no stored owner and cannot be resumed safely after upgrade. "
+    "Submit it as a new task."
+)
+
+
+def _check_owner(stored: tuple[str | None, str | None], asserted: tuple[str, str] | None) -> None:
+    """PM-001: the stored owner must be exactly the one the caller asserts.
+
+    `(None, None)` means the row predates the owner column. It is not a wildcard: a caller that
+    asserts an owner is refused, because the row's real owner cannot be reconstructed and letting
+    the first caller claim it would preserve the takeover this check closes.
+    """
+    expected: tuple[str | None, str | None] = asserted if asserted is not None else (None, None)
+    if stored == expected:
+        return
+    if stored == (None, None):
+        raise SecurityError(_LEGACY_OWNER_REFUSAL)
+    raise SecurityError("checkpoint belongs to a different owner")
 
 
 def _wall_clock() -> int:
@@ -451,7 +472,7 @@ class RuntimeTransaction(Protocol):
     def append_audit_events(self, task_id: str, host_id: str, events: tuple[dict[str, Any], ...], sign_head: AuditHeadSigner | None = None) -> None:
         ...
 
-    def save_checkpoint(self, task_id: str, state: AgentState, expected_generation: int, closed: bool = False) -> int:
+    def save_checkpoint(self, task_id: str, state: AgentState, expected_generation: int, closed: bool = False, owner: tuple[str, str] | None = None) -> int:
         """Atomically admit and persist a checkpoint, returning its new generation.
 
         Compare-and-swap on the store-owned generation (finding EV-008). The store
@@ -467,6 +488,15 @@ class RuntimeTransaction(Protocol):
         `closed=True` marks the checkpoint terminal (completed, failed, or migrated
         away); a closed checkpoint can never be reopened by a later resume. The
         comparison and the advance happen in the same store transaction.
+
+        PM-001: `owner` is `(permit issuer, permit subject)`. It is recorded on the
+        CREATE and compared -- in this same transaction as the generation CAS -- on
+        every later save. A different owner raises `SecurityError`, so a trusted
+        sender cannot resume, drive, or close another trusted sender's open task by
+        knowing its id and generation. A stored row with NO owner (written before
+        this schema) refuses too: its owner cannot be reconstructed, and letting the
+        first caller claim it would preserve the very takeover this closes. `owner=None`
+        makes no assertion and is for store-contract tests, never the host path.
         """
         ...
 
@@ -569,6 +599,15 @@ class RuntimeStore(Protocol):
         ...
 
     def load_checkpoint(self, task_id: str) -> dict[str, Any] | None:
+        ...
+
+    def checkpoint_owner(self, task_id: str) -> tuple[str | None, str | None] | None:
+        """PM-001: the stored `(issuer, subject)` of this task, or None when there is no checkpoint.
+
+        `(None, None)` means the row predates the owner column. The host reads this to refuse a
+        foreign resume BEFORE anything is written; `save_checkpoint` re-checks it durably, inside
+        the transaction that does the generation CAS, so this read is a courtesy, not the gate.
+        """
         ...
 
     def audit_head(self, task_id: str) -> tuple[str, int] | None:
@@ -1067,6 +1106,11 @@ class InMemoryRuntimeStore:
             # Stored rows are {generation, closed, state}; callers see the state blob.
             return json.loads(json.dumps(row["state"])) if row is not None else None
 
+    def checkpoint_owner(self, task_id: str) -> tuple[str | None, str | None] | None:
+        with self._lock:
+            row = self._checkpoints.get(task_id)
+            return None if row is None else (row.get("owner_issuer"), row.get("owner_subject"))
+
     def audit_head(self, task_id: str) -> tuple[str, int] | None:
         with self._lock:
             events = self._audit_events.get(task_id)
@@ -1203,7 +1247,7 @@ class _InMemoryTransaction:
                 "signed_at": signed_at,
             }
 
-    def save_checkpoint(self, task_id: str, state: AgentState, expected_generation: int, closed: bool = False) -> int:
+    def save_checkpoint(self, task_id: str, state: AgentState, expected_generation: int, closed: bool = False, owner: tuple[str, str] | None = None) -> int:
         row = self._store._checkpoints.get(task_id)
         if row is None:
             if expected_generation != 0:
@@ -1214,6 +1258,8 @@ class _InMemoryTransaction:
                 raise SecurityError("task checkpoint is closed")
             if row["generation"] != expected_generation:
                 raise SecurityError("stale checkpoint generation")
+            # PM-001: ownership is compared in the same step as the generation CAS.
+            _check_owner((row.get("owner_issuer"), row.get("owner_subject")), owner)
             new_generation = expected_generation + 1
         blob = asdict(state)
         blob["checkpoint_generation"] = new_generation
@@ -1221,6 +1267,9 @@ class _InMemoryTransaction:
             "generation": new_generation,
             "closed": bool(closed),
             "state": blob,
+            # Recorded on the CREATE and never rewritten afterwards.
+            "owner_issuer": row["owner_issuer"] if row is not None else (owner[0] if owner else None),
+            "owner_subject": row["owner_subject"] if row is not None else (owner[1] if owner else None),
         }
         return new_generation
 
@@ -1537,6 +1586,7 @@ class SQLiteRuntimeStore:
             10: self._migrate_to_v11,
             11: self._migrate_to_v12,
             12: self._migrate_to_v13,
+            13: self._migrate_to_v14,
         }
 
     @staticmethod
@@ -1764,6 +1814,16 @@ class SQLiteRuntimeStore:
             )
             """
         )
+
+    def _migrate_to_v14(self, connection: sqlite3.Connection) -> None:
+        # PM-001: the owner of a task -- the permit issuer and subject of its FIRST admission. A
+        # checkpoint was found by caller-supplied task id alone, so any trusted sender that learned
+        # or guessed an open task's id and generation could resume, drive, and close another
+        # sender's task. Existing rows stay NULL: their owner cannot be reconstructed (the audit
+        # trail records the agent, never the issuer), so an OPEN legacy task refuses to resume
+        # rather than let the first caller claim it. A closed one is unaffected -- it is evidence.
+        self._add_column(connection, "checkpoints", "owner_issuer", "TEXT")
+        self._add_column(connection, "checkpoints", "owner_subject", "TEXT")
 
     def _migrate_to_v13(self, connection: sqlite3.Connection) -> None:
         # Section 12. #4: a nonce keeps the expiry of the authorization it belongs to (the only fact that
@@ -2149,6 +2209,13 @@ class SQLiteRuntimeStore:
             row = connection.execute("SELECT checkpoint_json FROM checkpoints WHERE task_id = ?", (task_id,)).fetchone()
             return json.loads(row["checkpoint_json"]) if row is not None else None
 
+    def checkpoint_owner(self, task_id: str) -> tuple[str | None, str | None] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT owner_issuer, owner_subject FROM checkpoints WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            return None if row is None else (row["owner_issuer"], row["owner_subject"])
+
     def audit_head(self, task_id: str) -> tuple[str, int] | None:
         with self._connection() as connection:
             row = connection.execute("SELECT head_hash, sequence FROM audit_heads WHERE task_id = ?", (task_id,)).fetchone()
@@ -2355,6 +2422,12 @@ class PostgresRuntimeStore:
         # not add them, so ALTER them in idempotently. No-op on a fresh table.
         connection.execute("ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS generation BIGINT NOT NULL DEFAULT 0")
         connection.execute("ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS closed BOOLEAN NOT NULL DEFAULT FALSE")
+        # PM-001 (schema v12): the owner of a task -- the permit issuer and subject of its FIRST
+        # admission. Existing rows stay NULL, and an OPEN row with no owner refuses to resume: the
+        # owner cannot be reconstructed (the audit trail records the agent, never the issuer), so
+        # letting the first caller claim it would preserve the very takeover this closes.
+        connection.execute("ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS owner_issuer TEXT")
+        connection.execute("ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS owner_subject TEXT")
         # An already-terminal checkpoint from before this column existed must be
         # closed so a pre-EV-008 envelope (default generation 0) cannot re-run it.
         connection.execute("UPDATE checkpoints SET closed = TRUE WHERE closed = FALSE AND status IN ('completed', 'failed')")
@@ -2862,6 +2935,13 @@ class PostgresRuntimeStore:
             row = connection.execute("SELECT checkpoint_json FROM checkpoints WHERE task_id = %s", (task_id,)).fetchone()
             return json.loads(row["checkpoint_json"]) if row is not None else None
 
+    def checkpoint_owner(self, task_id: str) -> tuple[str | None, str | None] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT owner_issuer, owner_subject FROM checkpoints WHERE task_id = %s", (task_id,)
+            ).fetchone()
+            return None if row is None else (row["owner_issuer"], row["owner_subject"])
+
     def audit_head(self, task_id: str) -> tuple[str, int] | None:
         with self._connect() as connection:
             row = connection.execute("SELECT head_hash, sequence FROM audit_heads WHERE task_id = %s", (task_id,)).fetchone()
@@ -3089,11 +3169,11 @@ class _PostgresTransaction:
                 (task_id, event["hash"], sequence, host_id, signature_key_id, signature, signed_at, int(time.time())),
             )
 
-    def save_checkpoint(self, task_id: str, state: AgentState, expected_generation: int, closed: bool = False) -> int:
+    def save_checkpoint(self, task_id: str, state: AgentState, expected_generation: int, closed: bool = False, owner: tuple[str, str] | None = None) -> int:
         if self._connection is None:
             raise RuntimeError("Postgres transaction was not opened")
         row = self._connection.execute(
-            "SELECT generation, closed FROM checkpoints WHERE task_id = %s", (task_id,)
+            "SELECT generation, closed, owner_issuer, owner_subject FROM checkpoints WHERE task_id = %s", (task_id,)
         ).fetchone()
         if row is None:
             if expected_generation != 0:
@@ -3101,18 +3181,26 @@ class _PostgresTransaction:
             new_generation = 1
             result = self._connection.execute(
                 """
-                INSERT INTO checkpoints (task_id, status, checkpoint_json, generation, closed, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                INSERT INTO checkpoints (task_id, status, checkpoint_json, generation, closed, updated_at, owner_issuer, owner_subject)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (task_id) DO NOTHING
                 RETURNING generation
                 """,
-                (task_id, state.status, self._checkpoint_json(state, new_generation), new_generation, bool(closed), int(time.time())),
+                (
+                    task_id, state.status, self._checkpoint_json(state, new_generation), new_generation,
+                    bool(closed), int(time.time()),
+                    # PM-001: the owner is recorded on the CREATE, inside the admission transaction.
+                    owner[0] if owner else None, owner[1] if owner else None,
+                ),
             ).fetchone()
             if result is None:
                 raise SecurityError("stale checkpoint generation")
             return new_generation
         if row["closed"]:
             raise SecurityError("task checkpoint is closed")
+        # PM-001: ownership is compared in the same transaction as the generation CAS, and the
+        # UPDATE below never rewrites the owner columns.
+        _check_owner((row["owner_issuer"], row["owner_subject"]), owner)
         new_generation = expected_generation + 1
         result = self._connection.execute(
             """
@@ -3316,11 +3404,11 @@ class _SQLiteTransaction:
                 (task_id, event["hash"], sequence, host_id, signature_key_id, signature, signed_at, int(time.time())),
             )
 
-    def save_checkpoint(self, task_id: str, state: AgentState, expected_generation: int, closed: bool = False) -> int:
+    def save_checkpoint(self, task_id: str, state: AgentState, expected_generation: int, closed: bool = False, owner: tuple[str, str] | None = None) -> int:
         if self._connection is None:
             raise RuntimeError("SQLite transaction was not opened")
         row = self._connection.execute(
-            "SELECT generation, closed FROM checkpoints WHERE task_id = ?", (task_id,)
+            "SELECT generation, closed, owner_issuer, owner_subject FROM checkpoints WHERE task_id = ?", (task_id,)
         ).fetchone()
         if row is None:
             if expected_generation != 0:
@@ -3328,17 +3416,25 @@ class _SQLiteTransaction:
             new_generation = 1
             cursor = self._connection.execute(
                 """
-                INSERT INTO checkpoints (task_id, status, checkpoint_json, generation, closed, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO checkpoints (task_id, status, checkpoint_json, generation, closed, updated_at, owner_issuer, owner_subject)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(task_id) DO NOTHING
                 """,
-                (task_id, state.status, self._checkpoint_json(state, new_generation), new_generation, 1 if closed else 0, int(time.time())),
+                (
+                    task_id, state.status, self._checkpoint_json(state, new_generation), new_generation,
+                    1 if closed else 0, int(time.time()),
+                    # PM-001: the owner is recorded on the CREATE, inside the admission transaction.
+                    owner[0] if owner else None, owner[1] if owner else None,
+                ),
             )
             if cursor.rowcount != 1:
                 raise SecurityError("stale checkpoint generation")
             return new_generation
         if row["closed"]:
             raise SecurityError("task checkpoint is closed")
+        # PM-001: ownership is compared in the same transaction as the generation CAS, and the
+        # UPDATE below never rewrites the owner columns.
+        _check_owner((row["owner_issuer"], row["owner_subject"]), owner)
         new_generation = expected_generation + 1
         cursor = self._connection.execute(
             """
