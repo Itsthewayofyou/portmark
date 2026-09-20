@@ -14,6 +14,12 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   approval, or complete. `security.require_unexpired` now runs after the provider decision, again
   immediately before a tool launch, and again before an approval is burned durably. It raises
   `PermitExpiredError` (a `SecurityError`), and the run terminalizes as `permit.expired`.
+- **A provider decision is checked for SHAPE before it is read anywhere.** `kind`, `tool` and
+  `destination` must be strings, `arguments` an object that can be recorded. Without this, a `tool`
+  that is not a string but compares equal to a granted name passed the grant check and became a KEY
+  in the saved state; encoding that checkpoint then raised in `_persist`, outside every handler, and
+  stranded the task at `running`. `content` keeps its existing, gentler treatment (a clean
+  `content.rejected` result that does not raise).
 - **Reading the provider's result is inside that boundary too.** A provider that returns something
   that is not a `ProviderDecision` raised on attribute access, outside every handler, and left the
   checkpoint at `running` — the same class PM-004 closes.

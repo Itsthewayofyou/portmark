@@ -245,6 +245,31 @@ class ReviewLifecycleTests(unittest.TestCase):
                 ).fetchone()[0]
             self.assertEqual(burned, 0)  # the one-use approval survives for a properly timed run
 
+    def test_a_permit_that_expires_before_a_plain_tool_launch_stops_it(self):
+        # The path with NO ledger row (a tool that is not side-effecting): its last check sits
+        # immediately before the launch, with nothing after it. Time passes here while the registry
+        # is asked whether the tool is side-effecting.
+        fake = FakeTime(2_000_000_000)
+        store = self._store()
+        launched = []
+        with patch.object(_clock, "_default_clock", fake.clock()):
+            host = self._host(ScriptedProvider(ProviderDecision("tool", "catalog.search", {"query": "t"})), store)
+            envelope, probe = self._envelope(host, "expiry before a plain launch")
+
+            def slow_lookup(name):
+                fake.advance(3_601)  # the permit ends after the ledger-write check, before the launch
+                return False
+
+            host.tools.is_side_effecting = slow_lookup
+            with patch.object(host.tools, "invoke", side_effect=lambda *a, **k: launched.append(1)):
+                with self.assertRaises(PermitExpiredError):
+                    host.run(envelope)
+            self.assertEqual(launched, [])
+            with contextlib.closing(sqlite3.connect(str(self.root / "runtime.sqlite"))) as connection:
+                effects = connection.execute("SELECT COUNT(*) FROM tool_effects").fetchone()[0]
+            self.assertEqual(effects, 0)
+            self._closed_failed(store, host, probe, "permit.expired")
+
     def test_the_boundaries_that_re_read_the_clock_are_named(self):
         # The guard is one call; this pins WHERE it is called, so removing a call site is visible.
         import inspect
@@ -254,6 +279,7 @@ class ReviewLifecycleTests(unittest.TestCase):
         source = inspect.getsource(host_module)
         for where in (
             '"after the provider decision"',
+            '"before the ledger write"',
             '"before the tool launch"',
             '"before the approval redemption"',
         ):
@@ -276,6 +302,157 @@ class ReviewLifecycleTests(unittest.TestCase):
         envelope, probe = self._envelope(host, "invalid provider result")
         with self.assertRaises(Exception):
             host.run(envelope)
+        self._closed_failed(store, host, probe, "decision.refused")
+
+    def test_a_decision_whose_fields_explode_closes_the_task(self):
+        # Auditor round 2: a field that RAISES on access breaks a handler that reads it with a plain
+        # getattr, so the refusal record itself would strand the task it exists to close.
+        store = self._store()
+
+        class Exploding:
+            kind = "tool"
+
+            @property
+            def tool(self):
+                raise RuntimeError("boom on read")
+
+            arguments: dict = {}
+            content = None
+            destination = None
+
+        class BoobyTrappedProvider(ModelProvider):
+            def decide(self, state, available_tools, grants=()):
+                return Exploding()
+
+        host = self._host(BoobyTrappedProvider(), store)
+        envelope, probe = self._envelope(host, "exploding decision field")
+        with self.assertRaises(Exception):
+            host.run(envelope)
+        self._closed_failed(store, host, probe, "decision.refused")
+
+    def test_a_decision_with_unrecordable_fields_closes_the_task(self):
+        # Auditor round 2: a field that is not JSON-encodable makes audit.append raise while it
+        # hashes the record. Inside the refusal handler that would strand the task, so the handler
+        # records only values it can prove are recordable.
+        store = self._store()
+
+        class Weird:
+            kind = object()
+            tool = {"not": "a string"}
+            arguments: dict = {}
+            content = None
+            destination = None
+
+        class WeirdProvider(ModelProvider):
+            def decide(self, state, available_tools, grants=()):
+                return Weird()
+
+        host = self._host(WeirdProvider(), store)
+        envelope, probe = self._envelope(host, "unrecordable decision field")
+        with self.assertRaises(Exception):
+            host.run(envelope)
+        self._closed_failed(store, host, probe, "decision.refused")
+        # And the record that was written is plain, readable evidence.
+        refusal = [entry for entry in self._events(probe.state.task_id) if entry["event"] == "decision.refused"][0]
+        self.assertIsNone(refusal["details"]["kind"])
+        self.assertIsNone(refusal["details"]["tool"])
+
+    def test_a_permit_that_expires_during_the_ledger_write_leaves_the_effect_prepared(self):
+        # Auditor round 2: the ledger write sits between the last check and the launch, and it can
+        # block on a database lock. The tool must not run, and the ledger row must stay `prepared`
+        # ("intent recorded, never launched") -- not `started`, which means "this may have landed"
+        # and forces a reconcile of an effect that never happened.
+        fake = FakeTime(2_000_000_000)
+        store = self._store()
+        launched = []
+        with patch.object(_clock, "_default_clock", fake.clock()):
+            host = self._host(ScriptedProvider(ProviderDecision("tool", "catalog.search", {"query": "t"})), store)
+            host.tools.is_side_effecting = lambda name: True
+            host.tools.is_isolated = lambda name: True
+            envelope, probe = self._envelope(host, "expiry during the ledger write")
+            real_prepared = host.store.record_effect_prepared
+
+            def slow_prepared(*args, **kwargs):
+                real_prepared(*args, **kwargs)
+                fake.advance(3_601)  # the permit ends while the ledger row is being written
+
+            with patch.object(host.store, "record_effect_prepared", side_effect=slow_prepared):
+                with patch.object(host.tools, "invoke", side_effect=lambda *a, **k: launched.append(1)):
+                    with self.assertRaises(PermitExpiredError):
+                        host.run(envelope)
+            self.assertEqual(launched, [])
+            with contextlib.closing(sqlite3.connect(str(self.root / "runtime.sqlite"))) as connection:
+                states = [row[0] for row in connection.execute("SELECT state FROM tool_effects").fetchall()]
+            self.assertEqual(states, ["prepared"])  # truthful: recorded, never launched
+
+    def test_a_tool_name_that_is_not_a_string_is_refused_before_it_reaches_the_state(self):
+        # Auditor round 2, the side door: a tool that is NOT a string but compares equal to a granted
+        # name passes the grant check, and then becomes a KEY in state.memory["tool_results"]. The
+        # checkpoint's canonical encoding then raises in _persist -- outside every handler -- and
+        # strands the task at `running`. The shape check refuses it before any of that.
+        store = self._store()
+
+        class SneakyName:
+            """Equal to a granted tool name, hashable, and not a string."""
+
+            def __eq__(self, other):
+                return other == "catalog.search"
+
+            def __hash__(self):
+                return hash("catalog.search")
+
+        class SneakyProvider(ModelProvider):
+            def decide(self, state, available_tools, grants=()):
+                return ProviderDecision("tool", SneakyName(), {"query": "t"})
+
+        host = self._host(SneakyProvider(), store)
+        envelope, probe = self._envelope(host, "sneaky tool name")
+        with self.assertRaisesRegex(SecurityError, "tool must be a string"):
+            host.run(envelope)
+        self._closed_failed(store, host, probe, "decision.refused")
+
+    def test_arguments_that_cannot_be_recorded_are_refused(self):
+        # The same shape: the first attempt to encode the arguments depends on which path the run
+        # takes, so the raise could land in a place that strands the task. Refuse once, up front.
+        store = self._store()
+
+        class UnrecordableProvider(ModelProvider):
+            def decide(self, state, available_tools, grants=()):
+                # A float NaN passes a type constraint (it IS a number) but canonical_json refuses
+                # it (allow_nan=False), so without this check the raise lands wherever that value is
+                # first encoded -- which depends on the path, and can be outside the boundary.
+                return ProviderDecision("tool", "catalog.search", {"query": float("nan")})
+
+        host = self._host(UnrecordableProvider(), store)
+        # A grant with NO argument constraints, so the constraint check cannot catch this first and
+        # the encodability rule is the only thing standing in the way.
+        host.policy = HostPolicy("host:local-demo", (ToolGrant("catalog.search"),), ResourceBudget())
+        envelope, probe = self._envelope(host, "unrecordable arguments")
+        object.__setattr__(envelope.permit, "grants", (ToolGrant("catalog.search"),))
+        host.signer.seal(envelope)
+        with self.assertRaisesRegex(SecurityError, "arguments cannot be recorded"):
+            host.run(envelope)
+        self._closed_failed(store, host, probe, "decision.refused")
+
+    def test_a_decision_shape_refusal_never_reaches_the_tool_or_the_ledger(self):
+        # A refused shape must not run anything or write an effect row.
+        store = self._store()
+        launched = []
+
+        class BadKindProvider(ModelProvider):
+            def decide(self, state, available_tools, grants=()):
+                return ProviderDecision(42, "catalog.search", {"query": "t"})
+
+        host = self._host(BadKindProvider(), store)
+        host.tools.is_side_effecting = lambda name: True
+        host.tools.is_isolated = lambda name: True
+        envelope, probe = self._envelope(host, "bad decision kind")
+        with patch.object(host.tools, "invoke", side_effect=lambda *a, **k: launched.append(1)):
+            with self.assertRaisesRegex(SecurityError, "kind must be a string"):
+                host.run(envelope)
+        self.assertEqual(launched, [])
+        with contextlib.closing(sqlite3.connect(str(self.root / "runtime.sqlite"))) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM tool_effects").fetchone()[0], 0)
         self._closed_failed(store, host, probe, "decision.refused")
 
     def test_a_tool_with_no_grant_closes_the_task_instead_of_stranding_it(self):
