@@ -385,6 +385,23 @@ Operational notes:
 
 ## Upgrading
 
+### Task ownership (new schema: SQLite v14, Postgres v12)
+
+A task now belongs to the sender that started it: the **issuer and subject of the permit that first
+admitted it**. Every later save of that task must present the same pair, checked in the same
+transaction as the checkpoint compare-and-swap. A sender may rotate its signing key and still resume
+its own task, because the key id is not what binds.
+
+**Before you upgrade, let open tasks finish.** Rows written by an older Portmark carry no owner, and
+it cannot be reconstructed (the audit trail records the agent, never the issuer). So:
+
+- an **open** task with no stored owner refuses to resume, with: `legacy checkpoint has no stored
+  owner and cannot be resumed safely after upgrade. Submit it as a new task.` Adopting the first
+  caller as the owner instead would keep exactly the takeover this closes;
+- a **closed** task is untouched. It stays readable and its audit chain still verifies.
+
+Anything still suspended (`awaiting_input`) at upgrade time must be re-submitted as a new task.
+
 ### Time floor and retention (new schema: SQLite v13, Postgres v11; audit floor format 2)
 
 The upgrade runs automatically at start-up:
