@@ -178,6 +178,35 @@ class ReviewLifecycleTests(unittest.TestCase):
                 effects = connection.execute("SELECT COUNT(*) FROM tool_effects").fetchone()[0]
             self.assertEqual(effects, 0)  # nothing was written under expired authority
 
+    def test_a_permit_that_expires_during_the_started_transition_reverts_the_row(self):
+        # Auditor round 3: `prepared` -> `started` is itself a store round trip that can block, so a
+        # check placed before it can go stale. The last check sits immediately before the call, where
+        # the host KNOWS nothing ran, and settles the row back to `prepared` -- truthful, and
+        # re-runnable without an operator reconcile.
+        fake = FakeTime(2_000_000_000)
+        store = self._store()
+        launched = []
+        with patch.object(_clock, "_default_clock", fake.clock()):
+            host = self._host(ScriptedProvider(ProviderDecision("tool", "catalog.search", {"query": "t"})), store)
+            host.tools.is_side_effecting = lambda name: True
+            host.tools.is_isolated = lambda name: True
+            envelope, probe = self._envelope(host, "expiry during the started transition")
+            real_started = host.store.mark_effect_started
+
+            def slow_started(*args, **kwargs):
+                real_started(*args, **kwargs)
+                fake.advance(3_601)  # the permit ends while the row is being advanced
+
+            with patch.object(host.store, "mark_effect_started", side_effect=slow_started):
+                with patch.object(host.tools, "invoke", side_effect=lambda *a, **k: launched.append(1)):
+                    with self.assertRaises(PermitExpiredError):
+                        host.run(envelope)
+            self.assertEqual(launched, [])
+            with contextlib.closing(sqlite3.connect(str(self.root / "runtime.sqlite"))) as connection:
+                rows = connection.execute("SELECT state, reason FROM tool_effects").fetchall()
+            self.assertEqual([row[0] for row in rows], ["prepared"])  # not `started`: nothing ran
+            self.assertIn("nothing ran", rows[0][1])
+
     def test_an_expired_permit_emits_no_migration(self):
         fake = FakeTime(2_000_000_000)
         store = self._store()

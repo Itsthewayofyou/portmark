@@ -750,16 +750,7 @@ class AgentHost:
                 # stops here with nothing written and nothing launched; otherwise, from this point the
                 # shutdown report names this effect id as in flight (its effect may land).
                 _run_progress.begin("side_effecting_tool", effect_id=eid)
-                mode, payload = self._effect_pre_launch(
-                    eid, state.task_id, decision.tool, decision.arguments,
-                    # PM-003 (auditor round 2): the ledger write can block on a database lock, so the
-                    # check above can go stale before the launch. This gate runs INSIDE the ledger
-                    # step, after `prepared` and immediately before `started`, so an expiry leaves the
-                    # row at `prepared` -- "intent recorded, never launched", which a later run may
-                    # simply re-run -- instead of `started`, which means "this may have landed" and
-                    # would force an operator to reconcile an effect that never happened.
-                    final_gate=lambda: require_unexpired(effective, "before the tool launch"),
-                )
+                mode, payload = self._effect_pre_launch(eid, state.task_id, decision.tool, decision.arguments)
                 if mode == "refuse":
                     return self._effect_refused(state, audit, decision, payload)
                 if mode == "replay":
@@ -784,13 +775,29 @@ class AgentHost:
                     # Section 12 #1: the same atomic step for a tool without an effect id (a side-effecting
                     # one already began above, before its ledger write).
                     _run_progress.begin("tool")
-                    # PM-003: no ledger row on this path, so the last check can sit right here, with
-                    # nothing but the launch after it.
-                    require_unexpired(effective, "before the tool launch")
                 launch_cap = self._effect_armer.arm(eid, decision.tool, decision.arguments) if eid is not None else None
                 try:
                     tool_started = time.monotonic()
                     try:
+                        # PM-003 (auditor round 3): the LAST authority check, with nothing after it
+                        # but the call itself. The `prepared` -> `started` transition and arm() are
+                        # both store round trips, so a check placed before them can go stale here.
+                        #
+                        # Here -- and only here -- the host KNOWS the tool has not run: invoke has
+                        # not been called and its one-use launch capability is still armed. So an
+                        # expiry settles the row back to `prepared` ("intent recorded, never
+                        # launched"), which a later run may simply re-run. That is truthful, and it
+                        # avoids the `started` phantom that would otherwise need an operator's
+                        # reconcile for an effect that never happened. The `finally` below disarms
+                        # the capability on this exit exactly as on any other.
+                        try:
+                            require_unexpired(effective, "before the tool launch")
+                        except PermitExpiredError:
+                            if eid is not None:
+                                self.store.settle_effect(
+                                    eid, "prepared", None, "permit expired before the launch; nothing ran"
+                                )
+                            raise
                         result = self.tools.invoke(
                             effective, decision.tool, decision.arguments, effective.budget.max_output_bytes, launch_capability=launch_cap
                         )
@@ -1097,9 +1104,7 @@ class AgentHost:
         profile = self.tools.isolation_profile
         return profile.audit_summary() if profile is not None else None
 
-    def _effect_pre_launch(
-        self, eid: str, task_id: str, tool: str, arguments: dict[str, Any], final_gate: Callable[[], None] | None = None
-    ) -> tuple[str, Any]:
+    def _effect_pre_launch(self, eid: str, task_id: str, tool: str, arguments: dict[str, Any]) -> tuple[str, Any]:
         """Effect-ledger state machine for a side-effecting tool BEFORE it launches (Section 7 PR 2).
 
         Returns one of: ("replay", stored_result) -- a prior identical call already CONFIRMED, so
@@ -1154,11 +1159,6 @@ class AgentHost:
             self.store.record_effect_prepared(
                 eid, task_id, tool, canonical_json(arguments).decode("utf-8")
             )
-        # PM-003: the LAST authority check, immediately before the row says "this may have landed".
-        # Everything after it is the launch itself. A check placed any later could only settle a
-        # `started` row back down, which is exactly the phantom effect this ordering avoids.
-        if final_gate is not None:
-            final_gate()
         self.store.mark_effect_started(eid)
         return "run", None
 
