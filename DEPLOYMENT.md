@@ -166,6 +166,25 @@ The proxy must provide:
 - routing only for `/.well-known/agent-card.json`, `/message:send`, `/metrics`,
   `/healthz`, and `/readyz`
 
+### Multiple Replicas
+
+**Requirement: with more than one Portmark replica, the rate limit must be enforced at a shared edge.**
+Portmark's own limits (`PORTMARK_A2A_RATE_LIMIT_PER_IP`, default 120 requests per 60 s, and the Agent Card
+and concurrency limits) are kept in each process's memory. They are not shared. With N replicas behind a
+load balancer, one client can get up to N times the limit, and a restart resets the count. They stay on as
+a second layer, but they are not the control for a scaled deployment.
+
+- Put every replica behind one edge that limits per client: the reference nginx file
+  (`deploy/nginx/portmark.conf`) limits every route it forwards (`limit_req`, plus `limit_conn` on
+  `/message:send`).
+- An nginx `limit_req` zone is shared only inside one nginx instance. If the edge itself runs as several
+  instances, use a limiter with shared state (for example a cloud load balancer or API-gateway rate
+  limit, or Envoy's global rate-limit service), or divide each instance's rate by the number of
+  instances.
+- Key the limit on the real client address, and set `PORTMARK_A2A_TRUSTED_PROXIES` to the edge's
+  addresses so each replica also sees the real client.
+- Alert on `portmark_refusals_total{reason="rate_limited"}` summed across all replicas.
+
 The included reference CLI server keeps its loopback-only bind rule:
 
 ```bash

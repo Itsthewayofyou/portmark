@@ -6,6 +6,16 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### External validation — EV-001 and EV-007 resolved
+
+- **EV-001:** DEPLOYMENT.md "Multiple Replicas" states that a multi-replica deployment must enforce the
+  rate limit at a shared edge (Portmark's own limits are per process), including the caveat that an nginx
+  zone is shared only inside one nginx instance. A test asserts the text, and a route-coverage test
+  requires every route the reference nginx front forwards to carry a per-client `limit_req` on a
+  defined zone.
+- **EV-007:** mutation tests pin the rest of both decision schemas: wrong types, missing required keys,
+  and an unsupported kind or outcome (HTTP provider and Wasm component decoders). No code changed.
+
 ### Boundary audit — release gates (RC-03, RC-02)
 
 - **The SafeRoot tests can no longer skip silently on Linux (RC-03).** The `openat2` (SafeRoot) tests skip
