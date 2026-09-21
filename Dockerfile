@@ -12,7 +12,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 RUN groupadd --system portmark \
-    && useradd --system --gid portmark --home-dir /home/portmark --create-home portmark
+    && useradd --system --gid portmark --home-dir /home/portmark --create-home portmark \
+    && install -d -o portmark -g portmark -m 0700 /data /floor
+# /data (runtime store) and /floor (audit floor, kept on its own volume) are owned by the runtime user,
+# so a named volume mounted there starts writable by it: Docker copies the directory's owner and mode
+# into a new named volume. Without this the documented run failed with Permission denied on /data.
 
 # Section 11 #4: dependencies come ONLY from the hash-pinned exports of uv.lock. --require-hashes
 # refuses any file whose bytes differ; --no-deps means nothing is resolved at build time.

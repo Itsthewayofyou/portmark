@@ -298,11 +298,24 @@ class DeploymentProfileTestsPublicMode(unittest.TestCase):
     def test_the_default_image_refuses_to_start_without_production_controls(self):
         # Boundary audit NET-02 (owner decision 1A): the image is production by default. With no
         # configuration it refuses to start and names every missing control, even on loopback.
-        result = self.docker("run", "--rm", _IMAGE, check=False)
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("production profile", result.stderr)
-        for name in ("PORTMARK_PUBLIC_MODE", "PORTMARK_A2A_TOKEN", "PORTMARK_A2A_TRUSTED_PROXIES", "PORTMARK_A2A_PUBLIC_BASE_URL"):
-            self.assertIn(name, result.stderr)
+        # Detached, then wait for the exit: an image that STARTS (the pre-fix behavior) keeps running,
+        # which this reports as such, instead of a harness timeout that a slow daemon could also cause.
+        name = f"portmark-s11c-{os.getpid()}-{time.monotonic_ns()}"
+        self.docker("run", "-d", "--name", name, _IMAGE)
+        self.addCleanup(self.docker, "rm", "-f", name, check=False)
+        deadline = time.monotonic() + 60
+        state = ""
+        while time.monotonic() < deadline:
+            state = self.docker("inspect", "-f", "{{.State.Status}} {{.State.ExitCode}}", name).stdout.split()
+            if state[0] == "exited":
+                break
+            time.sleep(0.5)
+        self.assertEqual(state[0], "exited", "the image kept running with no production controls: it started")
+        self.assertEqual(state[1], "2")
+        logs = self.docker("logs", name).stderr
+        self.assertIn("production profile", logs)
+        for variable in ("PORTMARK_PUBLIC_MODE", "PORTMARK_A2A_TOKEN", "PORTMARK_A2A_TRUSTED_PROXIES", "PORTMARK_A2A_PUBLIC_BASE_URL"):
+            self.assertIn(variable, logs)
 
     def test_the_default_image_listens_on_loopback_only(self):
         # Development profile: this test is about the loopback bind, not the production controls.

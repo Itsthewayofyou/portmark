@@ -25,6 +25,11 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   migration challenge. The check runs on the boot policy load and on every policy reload.
   `required_for_migration` is deliberately not set: with the challenge on, it would demand pre-collected
   provider evidence, which the challenge replaces.
+- **The documented container run works with named volumes.** The image ran as `portmark` but `/data`
+  did not exist, so a named volume mounted there was owned by root and the store failed with
+  `Permission denied` (also on main). The image now creates `/data` and `/floor` owned by `portmark`,
+  mode `0700`; a new named volume copies that owner. The DEPLOYMENT.md example was run end to end:
+  ready, `portmark_audit_witness_active 1`, and refused (exit 2) without the floor.
 - **Not changed (recorded):** hostile-tool containment stays a deployment control (RC-01, see the new
   DEPLOYMENT.md "Production Profile" section); the remote witness is open as EV-013 (DB-02).
 
