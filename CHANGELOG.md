@@ -6,6 +6,21 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### External validation — EV-006 resolved: optional checkpoint encryption
+
+- **Checkpoints can be sealed at the storage boundary** (new module `portmark.checkpoint_crypto`). Set
+  `PORTMARK_CHECKPOINT_KEYS` (`key-id:base64-key[,...]`) or `PORTMARK_CHECKPOINT_KEYS_FILE` (mode 600).
+  The SQLite and Postgres stores then seal each checkpoint with AES-256-GCM, bound to the task id,
+  generation and key id. A changed byte, a wrong key, or a row moved to another task or generation is
+  refused. No schema change.
+- **Optional (owner decision D1).** New gauge `portmark_checkpoint_encryption_active` on the authenticated
+  `/metrics`. Disk or volume encryption remains a valid deployment-level control.
+- **Strict reads and a one-time migration (owner decision D2).** With a keyring a plaintext row is refused;
+  without one a sealed row is refused. `portmark store encrypt-checkpoints [--apply]` seals every
+  plaintext row in one transaction (and re-seals rows under an older key, for rotation). A row that
+  cannot be read aborts the whole run. **Upgrade note:** setting a keyring on a store with existing
+  checkpoints makes those tasks fail until the migration has run.
+
 ### External validation — EV-004 resolved: verifier conformance kit
 
 - **New command `portmark attest-conformance --evidence <file>`** (library: `portmark.verifier_conformance`).
