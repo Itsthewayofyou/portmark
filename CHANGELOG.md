@@ -13,8 +13,8 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   (wrong subject, audience, measurement and nonce; stale; corrupted, truncated and garbage quote),
   straight to `PORTMARK_ATTESTATION_VERIFIER_COMMAND`, then the known-good request again. In each
   negative case the claims and the request agree, so only the verifier's quote binding can refuse it.
-  The final repeat fails a verifier with a replay cache, which would otherwise refuse every negative
-  case as a replay. Exit 0 = pass, 1 = a case failed,
+  One lie goes first, while the quote is new: a verifier that remembers the quote instead of comparing
+  fields fails (a first-use association cache accepts that lie; a replay cache refuses the repeats). Exit 0 = pass, 1 = a case failed,
   2 = bad input. It needs no store and no policy.
 - DEPLOYMENT.md and ATTESTATION.md now require a pass before production use.
 

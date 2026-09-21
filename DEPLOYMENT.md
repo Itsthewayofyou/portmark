@@ -417,7 +417,7 @@ challenge, and revocation and freshness data.
 
 **Requirement: run the verifier conformance kit before production use.** Portmark checks the claimed
 evidence fields itself, but only the verifier can prove that the quote binds the same values. Capture one
-real, fresh verifier request on the target platform, then run:
+real, fresh verifier request on the target platform (a quote the verifier has never seen), then run:
 
 ```bash
 PORTMARK_ATTESTATION_VERIFIER_COMMAND='...' portmark attest-conformance --evidence known-good-request.json

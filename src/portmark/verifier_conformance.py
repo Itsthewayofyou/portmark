@@ -10,10 +10,14 @@ before the verifier runs, and a rubber-stamp verifier would pass. It drives the 
 directly, through the same shell-free `ExternalAttestationVerifier` adapter the runtime uses.
 
 The operator supplies one real, known-good verifier request (a fresh quote captured on the target
-platform). The kit asserts that the verifier accepts it (at the start and again at the end, so a
-verifier with a replay cache cannot pass by refusing every reuse of the quote), then builds each
-negative case from it by changing ONE dimension: the claims and the request agree with each other (so Portmark's own checks
-would pass), but the quote was issued for the original values. Only the verifier can refuse these.
+platform, never sent to the verifier before). Each negative case changes ONE dimension of it: the
+claims and the request agree with each other (so Portmark's own checks would pass), but the quote
+was issued for the original values. Only the verifier can refuse these.
+
+The order defeats verifiers that remember a quote. One lie goes first, while the quote is new, so a
+verifier that trusts the fields it first sees with a quote accepts it and fails. The base comes next
+(expect accept), then the other negative cases, then the base again, so a verifier that refuses any
+quote it has seen before fails too. A correct verifier answers from the request alone.
 The kit cannot cover the evidence `signature`: the adapter never sends it to the verifier.
 """
 
@@ -167,6 +171,9 @@ def _garbage_quote(request: dict[str, Any]) -> None:
     request["evidence"]["quote"] = _GARBAGE if request["evidence"]["quote"] != _GARBAGE else _GARBAGE + "-x"
 
 
+# The negative case sent first, before the verifier has seen the base quote (see run_conformance).
+LEADING_CASE = "wrong-subject-first"
+
 # Every negative case, in report order. Each changes one dimension of the known-good base.
 NEGATIVE_CASES: tuple[tuple[str, Callable[[dict[str, Any]], None]], ...] = (
     ("wrong-subject", _wrong_subject),
@@ -194,6 +201,15 @@ def _run_case(verifier: ExternalAttestationVerifierProtocol, name: str, expect: 
     return ConformanceCase(name, expect, "accepted", "")
 
 
+def _mutated(plain: dict[str, Any], name: str, mutate: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
+    request = copy.deepcopy(plain)
+    mutate(request)
+    if request == plain:
+        # A case that changes nothing sends the known-good request and "fails" a correct verifier.
+        raise RuntimeError(f"conformance case {name} does not change the base request")
+    return request
+
+
 def run_conformance(verifier: ExternalAttestationVerifierProtocol, base: dict[str, Any]) -> ConformanceReport:
     """Send the known-good base and every negative case to `verifier`; report accept or reject per case.
 
@@ -201,14 +217,18 @@ def run_conformance(verifier: ExternalAttestationVerifierProtocol, base: dict[st
     kit asserts accept or reject only.
     """
     plain = dict(base, evidence=base["evidence"].unsigned_dict())
-    cases = [_run_case(verifier, "valid", "accept", copy.deepcopy(plain))]
-    for name, mutate in NEGATIVE_CASES:
-        request = copy.deepcopy(plain)
-        mutate(request)
-        if request == plain:
-            # A case that changes nothing sends the known-good request and "fails" a correct verifier.
-            raise RuntimeError(f"conformance case {name} does not change the base request")
-        cases.append(_run_case(verifier, name, "reject", request))
+    cases = []
+    # A LIE comes first, while the base quote is still new to the verifier. A verifier that trusts the
+    # fields it first sees with a quote (a first-use association cache) and then refuses any other
+    # fields would otherwise learn the truth from `valid` and refuse every later lie without comparing
+    # a field with the quote. Sent first, the lie is what it learns, so it accepts it and fails here.
+    # A correct verifier answers from the request alone, so the order does not change its answers.
+    for name, mutate in ((LEADING_CASE, _wrong_subject), *NEGATIVE_CASES):
+        if name == LEADING_CASE:
+            cases.append(_run_case(verifier, name, "reject", _mutated(plain, name, mutate)))
+            cases.append(_run_case(verifier, "valid", "accept", copy.deepcopy(plain)))
+        else:
+            cases.append(_run_case(verifier, name, "reject", _mutated(plain, name, mutate)))
     # Every negative case reuses the base quote. A verifier that refuses a quote it has seen before
     # (a replay cache) refuses them all as replays, whatever they claim, and would pass while it
     # compares no field. So the base must be accepted again at the end: the same request must get the

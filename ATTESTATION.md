@@ -109,13 +109,15 @@ PORTMARK_ATTESTATION_VERIFIER_COMMAND='...' portmark attest-conformance --eviden
 ```
 
 `--evidence` is one real, known-good request in the stdin shape above, with a fresh quote captured on
-the target platform. The kit refuses a base whose claims disagree with its own request (exit 2). It
+the target platform. **The verifier must never have seen that quote before** (capture a new one for
+each run). The kit refuses a base whose claims disagree with its own request (exit 2). It
 sends the requests to the command directly, through the same shell-free adapter the runtime uses
 (empty environment, 2 s timeout, 4 KiB output limit). It does not go through Portmark's own checks,
 because they would refuse each bad case before the verifier runs.
 
 | Case | Expect | What changes from the known-good base |
 |---|---|---|
+| `wrong-subject-first` | reject | claimed subject and `expected_subject`, sent first, while the quote is new |
 | `valid` | accept | nothing |
 | `wrong-subject` | reject | claimed subject and `expected_subject` |
 | `wrong-audience` | reject | claimed audience and `relying_party` (a concrete value, not `*`) |
@@ -133,15 +135,22 @@ report data carries a hash of the subject, audience, nonce and validity window, 
 compared with the measured value in the quote. Each replacement value differs from the base value, so
 no case can send the known-good request by accident.
 
-**The verifier must give the same answer to the same request.** Every negative case reuses the base
-quote. A verifier that refuses a quote it has seen before (a replay cache) would refuse them all as
-replays and pass while it compares no field. `valid-repeat` catches this: such a verifier fails it.
+**The verifier must answer from the request alone.** Every case reuses the base quote, so a verifier
+that remembers a quote could pass while it compares no field. The order catches the two forms:
+
+- A verifier that trusts the fields it first sees with a quote, and then refuses other fields with it
+  (a first-use association cache), learns the lie in `wrong-subject-first` and accepts it.
+- A verifier that refuses a quote it has seen before (a replay cache) refuses `valid` and
+  `valid-repeat`.
+
 Replay protection is Portmark's job (permit and challenge nonces), not the verifier's.
 
 The kit also refuses a base with a field of the wrong type (exit 2). The output is one JSON document
 with a result per case. Exit 0 means every case passed, and exit 1 means at least one failed.
 
-Limits: the contract has no reason channel, so the kit checks accept or reject only. The kit cannot
+Limits: the contract has no reason channel, so the kit checks accept or reject only. The order checks
+catch memory only when the base quote is new to the verifier: a verifier that learned the true fields
+from an earlier request is not caught, so always use a newly captured quote. The kit cannot
 forge a quote that the platform signed, so it cannot catch a verifier that skips the quote signature
 check but compares the fields. Review that check in the verifier code. The evidence `signature` field
 is not sent to the verifier, so the kit does not cover it.

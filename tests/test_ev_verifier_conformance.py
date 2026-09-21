@@ -23,7 +23,7 @@ from unittest.mock import patch
 
 from portmark.cli import main as cli_main
 from portmark.security import ExternalAttestationVerifier
-from portmark.verifier_conformance import NEGATIVE_CASES, load_base_request, run_conformance
+from portmark.verifier_conformance import LEADING_CASE, NEGATIVE_CASES, load_base_request, run_conformance
 
 _KEY = b"portmark-conformance-test-key"
 _NOW = 1_800_000_030
@@ -50,6 +50,24 @@ if blind == "replay-cache":
     if evidence["quote"] in seen:
         sys.exit(1)
     open(sys.argv[2], "a").write(evidence["quote"] + "\n")
+
+
+def associate():
+    # First-use association cache: trusts the fields it first sees with a quote, then refuses any
+    # other fields with that quote. It never compares a field with the quote (cache file in argv[2]).
+    import os
+    key = json.dumps([evidence[k] for k in BOUND] + [request["expected_subject"], request["relying_party"], request["expected_nonce"], request["now"]])
+    db = json.load(open(sys.argv[2])) if os.path.exists(sys.argv[2]) else {}
+    if evidence["quote"] in db and db[evidence["quote"]] != key:
+        sys.exit(1)
+    db[evidence["quote"]] = key
+    json.dump(db, open(sys.argv[2], "w"))
+    print(json.dumps({"valid": True}))
+    sys.exit(0)
+
+
+if blind == "tofu-nomac":
+    associate()
 try:
     payload, mac = evidence["quote"].split(".")
     body = base64.urlsafe_b64decode(payload.encode() + b"=" * (-len(payload) %% 4))
@@ -61,6 +79,8 @@ except Exception:
         print(json.dumps({"valid": True}))
         sys.exit(0)
     sys.exit(1)
+if blind == "tofu":
+    associate()
 skip = {"subject": ("subject",), "audience": ("audience",), "measurement": ("measurement",),
         "nonce": ("nonce",), "window": ("issued_at", "expires_at"), "replay-cache": BOUND}.get(blind, ())
 for name in BOUND:
@@ -78,16 +98,20 @@ print(json.dumps({"valid": True}))
 ''' % (_KEY,)
 
 # Each broken variant, and the ONLY cases the kit may fail it on.
+_MEMORY = {LEADING_CASE, "valid", "valid-repeat"}
 _BLIND = {
-    "subject": {"wrong-subject"},
+    "subject": {LEADING_CASE, "wrong-subject"},
     "audience": {"wrong-audience"},
     "measurement": {"wrong-measurement"},
     "nonce": {"wrong-nonce"},
     "window": {"stale"},
     "quote-fail-open": {"malformed-quote-corrupted", "malformed-quote-truncated", "malformed-quote-garbage"},
-    "rubber-stamp": {name for name, _ in NEGATIVE_CASES},
+    "rubber-stamp": {LEADING_CASE, *(name for name, _ in NEGATIVE_CASES)},
     "reject-all": {"valid", "valid-repeat"},
-    "replay-cache": {"valid-repeat"},
+    "replay-cache": _MEMORY,
+    # It learns the leading lie, so it also accepts the same lie again as wrong-subject.
+    "tofu": _MEMORY | {"wrong-subject"},
+    "tofu-nomac": _MEMORY | {"wrong-subject", "malformed-quote-corrupted", "malformed-quote-truncated", "malformed-quote-garbage"},
 }
 
 
@@ -137,7 +161,7 @@ class VerifierConformanceKitTests(unittest.TestCase):
         self.assertTrue(report.passed, report.to_dict())
         self.assertEqual(
             [case.name for case in report.cases],
-            ["valid", "wrong-subject", "wrong-audience", "wrong-measurement", "wrong-nonce", "stale",
+            ["wrong-subject-first", "valid", "wrong-subject", "wrong-audience", "wrong-measurement", "wrong-nonce", "stale",
              "malformed-quote-corrupted", "malformed-quote-truncated", "malformed-quote-garbage", "valid-repeat"],
         )
         self.assertEqual(report.to_dict()["status"], "pass")
@@ -174,7 +198,7 @@ class VerifierConformanceKitTests(unittest.TestCase):
 
                 base = _base_request()
                 run_conformance(Recorder(), load_base_request(dict(base, evidence=dict(base["evidence"], quote=quote))))
-                valid, negatives, repeat = captured[0], captured[1:-1], captured[-1]
+                valid, negatives, repeat = captured[1], [captured[0], *captured[2:-1]], captured[-1]
                 self.assertEqual(valid, repeat)
                 for case in negatives:
                     self.assertNotEqual(case, valid)
@@ -200,7 +224,7 @@ class VerifierConformanceKitTests(unittest.TestCase):
                 pass
 
         run_conformance(Recorder(), load_base_request(_base_request()))
-        self.assertEqual(len(captured), 2 + len(NEGATIVE_CASES))
+        self.assertEqual(len(captured), 3 + len(NEGATIVE_CASES))
         policy = AttestationPolicy(allowed_measurements=(), external_verifier=Accept())
         for evidence, subject, relying_party, nonce, now in captured:
             with self.subTest(case=evidence):
@@ -300,7 +324,8 @@ class VerifierConformanceDocsTests(unittest.TestCase):
     def test_attestation_lists_every_case_the_kit_runs(self):
         text = (self.ROOT / "ATTESTATION.md").read_text(encoding="utf-8")
         self.assertIn("### Verifier Conformance Kit", text)
-        for name in ["valid", *(name for name, _ in NEGATIVE_CASES), "valid-repeat"]:
+        self.assertIn("**The verifier must never have seen that quote before**", text)
+        for name in [LEADING_CASE, "valid", *(name for name, _ in NEGATIVE_CASES), "valid-repeat"]:
             with self.subTest(case=name):
                 self.assertIn(f"| `{name}` |", text)
 
