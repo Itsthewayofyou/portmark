@@ -15,7 +15,7 @@ from .metrics import RuntimeMetrics
 from .models import AgentEnvelope, ApprovalToken, AttestationEvidence, ProviderDecision, RunResult
 from .projection import project_state_for_migration, provider_view
 from .providers import ModelProvider
-from .security import _MIGRATION_RECEIPT_FIELDS, _OPTIONAL_MIGRATION_RECEIPT_FIELDS, AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, MigrationAttesterProtocol, PermitExpiredError, SecurityError, arguments_hash, audit_head_payload, canonical_json, effect_id, migration_envelope_digest, migration_receipt_payload, require_unexpired, verified_approval_token
+from .security import _MIGRATION_RECEIPT_FIELDS, _OPTIONAL_MIGRATION_RECEIPT_FIELDS, AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, MigrationAttesterProtocol, MigrationPreflightProtocol, PermitExpiredError, SecurityError, arguments_hash, audit_head_payload, canonical_json, effect_id, migration_envelope_digest, migration_receipt_payload, require_unexpired, verified_approval_token
 from .storage import InMemoryRuntimeStore, RuntimeStore
 from .tools import ToolExecutionError, ToolKilledError, ToolRegistry
 
@@ -135,6 +135,7 @@ class AgentHost:
         migration_attester: MigrationAttesterProtocol | None = None,
         migration_attester_timeout: float | None = 5.0,
         migration_attester_max_inflight: int = 8,
+        migration_preflight: MigrationPreflightProtocol | None = None,
         policy_loader: Callable[[], HostPolicy] | None = None,
         reload_policy: bool = False,
         metrics: RuntimeMetrics | None = None,
@@ -178,6 +179,10 @@ class AgentHost:
         # most this many hang before further calls are refused fail-closed); a call that returns -- even
         # after its timeout -- releases its permit, so transient slowness self-heals.
         self._attester_slots = threading.BoundedSemaphore(max(1, migration_attester_max_inflight))
+        # Boundary audit ATT-01 (auditor round 1 on #104): SOURCE-side pre-release attestation. When set,
+        # every migration first obtains the destination's attestation over a fresh challenge and verifies
+        # it, before any state is sealed or released. None = no pre-release attestation.
+        self.migration_preflight = migration_preflight
         self._policy_loader = policy_loader
         self._reload_policy = reload_policy
         self.metrics = metrics or RuntimeMetrics()
@@ -918,10 +923,26 @@ class AgentHost:
             self.attestation_policy.verify_migration(
                 destination_attestation, decision.destination, self.host_id, expected_nonce=effective.nonce
             )
+            # Boundary audit ATT-01 (auditor round 1 on #104): verify the destination BEFORE any state is
+            # released. The settle-time challenge alone ran after the signed (not encrypted) envelope had
+            # already left. One fresh challenge serves both checks: the destination attests over it here,
+            # and, in challenge mode, again at admission for the receipt. A refusal raises before the
+            # envelope is built, so nothing is sealed, returned, or written to the outbox; the run-loop
+            # handler (PM-004) then closes the task as refused.
+            challenge = secrets.token_urlsafe(32)
+            preflight_measurement = None
+            if self.migration_preflight is not None:
+                preflight_evidence = self.migration_preflight.attest(decision.destination, self.host_id, challenge)
+                self.attestation_policy.verify_migration_challenge(
+                    preflight_evidence, challenge, decision.destination, self.host_id
+                )
+                preflight_measurement = preflight_evidence.get("measurement")
             state.status = "ready"
             state.memory["migration"] = {"from": self.host_id, "to": decision.destination}
             if destination_attestation is not None:
                 state.memory["migration"]["attested_measurement"] = destination_attestation.measurement
+            if self.migration_preflight is not None:
+                state.memory["migration"]["preflight_measurement"] = preflight_measurement
             # Section 4 #5 (challenge-passing protocol): when the source requires a challenge, mint a
             # FRESH, source-chosen challenge and carry it as the delegated permit nonce (so it inherits
             # the sealed-envelope digest and the receipt permit_nonce binding for free). The destination
@@ -934,7 +955,7 @@ class AgentHost:
             # attestation, because that attestation (bound to the incoming nonce) would make the
             # destination's verify_execution raise against the fresh challenge nonce.
             if self.attestation_policy.require_migration_challenge:
-                delegated_nonce = secrets.token_urlsafe(32)
+                delegated_nonce = challenge
                 delegated_attestation = None
                 state.memory["migration"]["challenge_required"] = True
             else:

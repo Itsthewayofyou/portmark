@@ -7,12 +7,13 @@ import shlex
 import secrets
 from pathlib import Path
 
+from .config import ALLOWED_MEASUREMENTS_ENV, DEVELOPMENT_PROFILE, PREFLIGHT_COMMAND_ENV, PROFILE_ENV, parse_allowed_measurements
 from .host import AgentHost
 from .metrics import RuntimeMetrics
 from .models import AgentEnvelope, AgentManifest, AgentState, Permit, ResourceBudget, ToolGrant
 from .policy import load_host_policy
 from .providers import DeterministicProvider, GenericHttpProvider, ModelProvider, NativeWasmtimeComponentProvider, WasmDecisionProvider
-from .security import AttestationPolicy, EnvelopeSigner, EnvelopeSigningIdentity, ExternalAttestationVerifier, HmacEnvelopeSigner, HostPolicy, MigrationAttesterProtocol, TrustRegistry, TrustSource, _b64url_decode, normalize_output_projection, validate_constraints
+from .security import AttestationPolicy, EnvelopeSigner, EnvelopeSigningIdentity, ExternalAttestationVerifier, ExternalMigrationPreflight, HmacEnvelopeSigner, HostPolicy, MigrationAttesterProtocol, MigrationPreflightProtocol, TrustRegistry, TrustSource, _b64url_decode, normalize_output_projection, validate_constraints
 from .storage import RuntimeStore, create_runtime_store
 from .tools import ToolRegistry, demo_registry
 from ._clock import ClockRollbackError, TimeFloorError, check_time_floor, clock_tolerance_from_environment, configure_default_clock, trusted_now
@@ -88,6 +89,10 @@ def make_host(
     allow_ephemeral_signing_key: bool = False,
     allow_local_provider_endpoint: bool | None = None,
     audit_floor_path: str | None = None,
+    attestation_allowed_measurements: tuple[str, ...] | None = None,
+    migration_preflight_command: str | tuple[str, ...] | None = None,
+    migration_preflight: MigrationPreflightProtocol | None = None,
+    production: bool = False,
 ) -> AgentHost:
     # Section 12 #6 (D3): apply the configured clock tolerance BEFORE the first security decision below
     # (the audit-key check, the audit floor, trust loading), and judge the clock once with it. The
@@ -125,6 +130,32 @@ def make_host(
             raise ValueError("wasm_engine must be 'node' or 'wasmtime'")
     if providers:
         configured_providers.update(providers)
+    configured_attestation_policy = attestation_policy
+    if configured_attestation_policy is None:
+        command = attestation_verifier_command or os.environ.get("PORTMARK_ATTESTATION_VERIFIER_COMMAND")
+        required = (os.environ.get("PORTMARK_REQUIRE_ATTESTATION") == "1") if require_attestation is None else require_attestation
+        measurements = (
+            parse_allowed_measurements(os.environ.get(ALLOWED_MEASUREMENTS_ENV))
+            if attestation_allowed_measurements is None else tuple(attestation_allowed_measurements)
+        )
+        if command or required or measurements:
+            argv = tuple(shlex.split(command)) if isinstance(command, str) else command
+            verifier = ExternalAttestationVerifier(argv) if argv else None
+            configured_attestation_policy = AttestationPolicy(
+                allowed_measurements=measurements,
+                required_for_execution=required,
+                required_for_migration=required,
+                external_verifier=verifier,
+                # Boundary audit ATT-02: in production a migration must settle on the destination's
+                # FRESH attestation over a challenge this host mints, never on replayable evidence.
+                require_migration_challenge=production,
+            )
+    configured_preflight = migration_preflight
+    if configured_preflight is None:
+        preflight_command = migration_preflight_command or os.environ.get(PREFLIGHT_COMMAND_ENV)
+        preflight_argv = tuple(shlex.split(preflight_command)) if isinstance(preflight_command, str) else preflight_command
+        if preflight_argv:
+            configured_preflight = ExternalMigrationPreflight(preflight_argv)
     configured_policy_path = policy_path or os.environ.get("PORTMARK_POLICY_PATH")
     configured_trust_registry_path = trust_registry_path or os.environ.get("PORTMARK_TRUST_REGISTRY_PATH")
     # One fail-closed trust source shared by the signer AND the store's audit verifier
@@ -132,6 +163,11 @@ def make_host(
     # other has stopped trusting, and would not fail closed together on an on-disk change.
     trust_source = TrustSource.from_path(configured_trust_registry_path) if configured_trust_registry_path else None
     policy_loader = (lambda: load_host_policy(configured_policy_path, host_id)) if configured_policy_path else None
+    if production and policy_loader is not None:
+        # Boundary audit ATT-01/ATT-02: wrap the loader, so the check runs on the boot load AND on every
+        # reload (reload_policy). A reloaded policy that turns migration on without the attestation
+        # configuration raises, exactly like any other invalid policy file.
+        policy_loader = _production_policy_loader(policy_loader, configured_attestation_policy, configured_preflight)
     policy = policy_loader() if policy_loader else HostPolicy(
         host_id,
         # Finding #1: host policy is the projection ceiling, and an omitted
@@ -153,18 +189,6 @@ def make_host(
             os.environ["PORTMARK_STORE_PATH"],
             audit_verifier,
         )
-    configured_attestation_policy = attestation_policy
-    if configured_attestation_policy is None:
-        command = attestation_verifier_command or os.environ.get("PORTMARK_ATTESTATION_VERIFIER_COMMAND")
-        required = (os.environ.get("PORTMARK_REQUIRE_ATTESTATION") == "1") if require_attestation is None else require_attestation
-        if command or required:
-            argv = tuple(shlex.split(command)) if isinstance(command, str) else command
-            verifier = ExternalAttestationVerifier(argv) if argv else None
-            configured_attestation_policy = AttestationPolicy(
-                required_for_execution=required,
-                required_for_migration=required,
-                external_verifier=verifier,
-            )
     # A caller-supplied signer keeps its OWN trust registry, so a file-backed TrustSource
     # built from trust_registry_path would be constructed and then orphaned -- admission
     # and audit verification would keep using the signer's stale in-memory registry, and a
@@ -225,7 +249,8 @@ def make_host(
                 "the trust registry that verifies audit heads. Rotate to a usable key before starting the host."
             )
     audit_floor = _open_audit_floor(
-        audit_floor_path or os.environ.get("PORTMARK_AUDIT_FLOOR_PATH"), host_id, host_signer, configured_store, trust_source
+        audit_floor_path or os.environ.get("PORTMARK_AUDIT_FLOOR_PATH"), host_id, host_signer, configured_store, trust_source,
+        production=production,
     )
     # Section 12 #6 (owner decision D3): refuse to start when the clock is behind the durable time floor --
     # the higher of the database's floor and the audit-floor file's mirror -- by more than the tolerance.
@@ -246,18 +271,60 @@ def make_host(
         migration_attester=migration_attester,
         migration_attester_timeout=migration_attester_timeout,
         migration_attester_max_inflight=migration_attester_max_inflight,
+        migration_preflight=configured_preflight,
         policy_loader=policy_loader,
         reload_policy=reload_policy,
         metrics=metrics,
     )
     host.audit_floor = audit_floor
+    # Boundary audit DB-01: whether rollback detection is on, on the authenticated /metrics (not /readyz).
+    host.metrics.set_gauge("audit_witness_active", 1 if audit_floor is not None else 0)
     # Section 12 #6: a forward clock jump beyond the tolerance is also a metric, not only a CRITICAL log.
     clock.on_forward_jump(host.metrics.note_clock_forward_jump)
     return host
 
 
+def _production_policy_loader(loader, attestation_policy: AttestationPolicy | None, preflight: MigrationPreflightProtocol | None):
+    def load() -> HostPolicy:
+        loaded = loader()
+        if loaded.migration.allowed:
+            problems = production_migration_problems(attestation_policy, preflight)
+            if problems:
+                raise ValueError(
+                    "host policy allows migration, and the production profile then needs every requirement "
+                    f"below (set {PROFILE_ENV}={DEVELOPMENT_PROFILE} to run without them): " + "; ".join(problems)
+                )
+        return loaded
+
+    return load
+
+
+def production_migration_problems(policy: AttestationPolicy | None, preflight: MigrationPreflightProtocol | None = None) -> list[str]:
+    """Boundary audit ATT-01/ATT-02: what a production host that may migrate is missing. Empty means none.
+
+    Portmark's own Ed25519 attestation proves possession of a key, not hardware state, so production
+    needs the deployment's platform verifier; an empty measurement list skips the allowlist; without the
+    challenge a valid unexpired attestation can be replayed for another migration; and without the
+    preflight the destination is verified only after the signed (not encrypted) state has left.
+    """
+    problems = []
+    if preflight is None:
+        problems.append(
+            f"{PREFLIGHT_COMMAND_ENV} is required: the destination must attest over a fresh challenge "
+            "BEFORE migration state is released"
+        )
+    if policy is None or policy.external_verifier is None:
+        problems.append("PORTMARK_ATTESTATION_VERIFIER_COMMAND is required: the platform (hardware) quote verifier")
+    if policy is None or not policy.allowed_measurements:
+        problems.append(f"{ALLOWED_MEASUREMENTS_ENV} is required: the approved workload measurements")
+    if policy is None or not policy.require_migration_challenge:
+        problems.append("the migration challenge must be on (fresh destination attestation at settlement)")
+    return problems
+
+
 def _open_audit_floor(
-    floor_path: str | None, host_id: str, signer: EnvelopeSigningIdentity, store: RuntimeStore | None, trust_source: TrustSource | None
+    floor_path: str | None, host_id: str, signer: EnvelopeSigningIdentity, store: RuntimeStore | None, trust_source: TrustSource | None,
+    production: bool = False,
 ) -> LocalFloorWitness | None:
     """Section 10 PR B: boot-time audit-floor checks. Every refusal is a boot ValueError, like the
     neighbouring signing-key checks, never a lazy failure on the first persist."""
@@ -270,6 +337,14 @@ def _open_audit_floor(
             raise ValueError(
                 f"this database has an audit floor for {host_id!r} (epoch {marker[0]}); start the host with "
                 "--audit-floor-path / PORTMARK_AUDIT_FLOOR_PATH"
+            )
+        if durable and production:
+            # Boundary audit DB-01: a new production database must not start without rollback
+            # detection; development keeps the warning below.
+            raise ValueError(
+                "the production profile needs an audit floor for a durable store (--audit-floor-path / "
+                "PORTMARK_AUDIT_FLOOR_PATH), or a rollback of the database or trust registry will not be "
+                f"detected; set {PROFILE_ENV}={DEVELOPMENT_PROFILE} to run without one"
             )
         if durable:
             logger.warning(

@@ -7940,7 +7940,9 @@ class RuntimeTests(unittest.TestCase):
                 self.assertNotIn(item, dockerfile)
 
     def test_container_asgi_entrypoint_builds_app_from_environment(self):
-        with patch.dict(os.environ, {}, clear=True):
+        # Development profile: an empty environment has none of the production requirements (boundary
+        # audit NET-02), which test_boundary_production_profile covers. This test is the /healthz shape.
+        with patch.dict(os.environ, {"PORTMARK_PROFILE": "development"}, clear=True):
             from portmark.asgi import create_app
 
             app = create_app()

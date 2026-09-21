@@ -9,10 +9,11 @@ from .a2a import (
     parse_trusted_proxies,
     validate_public_base_url,
 )
-from .config import RuntimeConfig
+from .config import PRODUCTION_PROFILE, RuntimeConfig
 from .factory import HOST_ID, make_host
 from .logging_config import configure_logging
 from .policy import load_host_policy
+from .serve_asgi import PUBLIC_MODE_ENV, network_problems
 from .security import load_trust_registry
 from .storage import create_runtime_store
 from .tool_loading import ToolLoaderError, load_tools
@@ -21,6 +22,19 @@ from .tool_loading import ToolLoaderError, load_tools
 def create_app():
     config = RuntimeConfig.from_environment()
     configure_logging(config.log_level, config.log_json)
+    production = config.profile == PRODUCTION_PROFILE
+    if production:
+        # Boundary audit NET-02 (owner decision 1A): the public-exposure requirements are enforced HERE,
+        # where the app is built, not only by the serve_asgi launcher. `uvicorn portmark.asgi:app` or an
+        # embedding server imports this module and never passes through the launcher's bind check, and
+        # the app cannot see which address it will be bound to -- so production requires all four
+        # whatever the bind. PORTMARK_PROFILE=development is the explicit opt-out.
+        problems = network_problems(config, os.environ.get(PUBLIC_MODE_ENV))
+        if problems:
+            raise ValueError(
+                "the production profile needs every requirement below (set PORTMARK_PROFILE=development "
+                "to run without them): " + "; ".join(problems)
+            )
     tools_path = os.environ.get("PORTMARK_TOOLS")
     if tools_path and not config.policy_path:
         raise RuntimeError("PORTMARK_TOOLS requires PORTMARK_POLICY_PATH")
@@ -42,7 +56,10 @@ def create_app():
         reload_policy=config.reload_policy,
         attestation_verifier_command=config.attestation_verifier_command,
         require_attestation=config.require_attestation,
+        attestation_allowed_measurements=config.attestation_allowed_measurements,
+        migration_preflight_command=config.migration_preflight_command,
         tools=tools,
+        production=production,
     )
 
     def readiness_check() -> None:
