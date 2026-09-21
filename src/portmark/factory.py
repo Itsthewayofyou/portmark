@@ -7,13 +7,13 @@ import shlex
 import secrets
 from pathlib import Path
 
-from .config import ALLOWED_MEASUREMENTS_ENV, DEVELOPMENT_PROFILE, PROFILE_ENV, parse_allowed_measurements
+from .config import ALLOWED_MEASUREMENTS_ENV, DEVELOPMENT_PROFILE, PREFLIGHT_COMMAND_ENV, PROFILE_ENV, parse_allowed_measurements
 from .host import AgentHost
 from .metrics import RuntimeMetrics
 from .models import AgentEnvelope, AgentManifest, AgentState, Permit, ResourceBudget, ToolGrant
 from .policy import load_host_policy
 from .providers import DeterministicProvider, GenericHttpProvider, ModelProvider, NativeWasmtimeComponentProvider, WasmDecisionProvider
-from .security import AttestationPolicy, EnvelopeSigner, EnvelopeSigningIdentity, ExternalAttestationVerifier, HmacEnvelopeSigner, HostPolicy, MigrationAttesterProtocol, TrustRegistry, TrustSource, _b64url_decode, normalize_output_projection, validate_constraints
+from .security import AttestationPolicy, EnvelopeSigner, EnvelopeSigningIdentity, ExternalAttestationVerifier, ExternalMigrationPreflight, HmacEnvelopeSigner, HostPolicy, MigrationAttesterProtocol, MigrationPreflightProtocol, TrustRegistry, TrustSource, _b64url_decode, normalize_output_projection, validate_constraints
 from .storage import RuntimeStore, create_runtime_store
 from .tools import ToolRegistry, demo_registry
 from ._clock import ClockRollbackError, TimeFloorError, check_time_floor, clock_tolerance_from_environment, configure_default_clock, trusted_now
@@ -90,6 +90,8 @@ def make_host(
     allow_local_provider_endpoint: bool | None = None,
     audit_floor_path: str | None = None,
     attestation_allowed_measurements: tuple[str, ...] | None = None,
+    migration_preflight_command: str | tuple[str, ...] | None = None,
+    migration_preflight: MigrationPreflightProtocol | None = None,
     production: bool = False,
 ) -> AgentHost:
     # Section 12 #6 (D3): apply the configured clock tolerance BEFORE the first security decision below
@@ -148,6 +150,12 @@ def make_host(
                 # FRESH attestation over a challenge this host mints, never on replayable evidence.
                 require_migration_challenge=production,
             )
+    configured_preflight = migration_preflight
+    if configured_preflight is None:
+        preflight_command = migration_preflight_command or os.environ.get(PREFLIGHT_COMMAND_ENV)
+        preflight_argv = tuple(shlex.split(preflight_command)) if isinstance(preflight_command, str) else preflight_command
+        if preflight_argv:
+            configured_preflight = ExternalMigrationPreflight(preflight_argv)
     configured_policy_path = policy_path or os.environ.get("PORTMARK_POLICY_PATH")
     configured_trust_registry_path = trust_registry_path or os.environ.get("PORTMARK_TRUST_REGISTRY_PATH")
     # One fail-closed trust source shared by the signer AND the store's audit verifier
@@ -159,7 +167,7 @@ def make_host(
         # Boundary audit ATT-01/ATT-02: wrap the loader, so the check runs on the boot load AND on every
         # reload (reload_policy). A reloaded policy that turns migration on without the attestation
         # configuration raises, exactly like any other invalid policy file.
-        policy_loader = _production_policy_loader(policy_loader, configured_attestation_policy)
+        policy_loader = _production_policy_loader(policy_loader, configured_attestation_policy, configured_preflight)
     policy = policy_loader() if policy_loader else HostPolicy(
         host_id,
         # Finding #1: host policy is the projection ceiling, and an omitted
@@ -263,6 +271,7 @@ def make_host(
         migration_attester=migration_attester,
         migration_attester_timeout=migration_attester_timeout,
         migration_attester_max_inflight=migration_attester_max_inflight,
+        migration_preflight=configured_preflight,
         policy_loader=policy_loader,
         reload_policy=reload_policy,
         metrics=metrics,
@@ -275,11 +284,11 @@ def make_host(
     return host
 
 
-def _production_policy_loader(loader, attestation_policy: AttestationPolicy | None):
+def _production_policy_loader(loader, attestation_policy: AttestationPolicy | None, preflight: MigrationPreflightProtocol | None):
     def load() -> HostPolicy:
         loaded = loader()
         if loaded.migration.allowed:
-            problems = production_migration_problems(attestation_policy)
+            problems = production_migration_problems(attestation_policy, preflight)
             if problems:
                 raise ValueError(
                     "host policy allows migration, and the production profile then needs every requirement "
@@ -290,14 +299,20 @@ def _production_policy_loader(loader, attestation_policy: AttestationPolicy | No
     return load
 
 
-def production_migration_problems(policy: AttestationPolicy | None) -> list[str]:
+def production_migration_problems(policy: AttestationPolicy | None, preflight: MigrationPreflightProtocol | None = None) -> list[str]:
     """Boundary audit ATT-01/ATT-02: what a production host that may migrate is missing. Empty means none.
 
     Portmark's own Ed25519 attestation proves possession of a key, not hardware state, so production
-    needs the deployment's platform verifier; an empty measurement list skips the allowlist; and without
-    the challenge a valid unexpired attestation can be replayed for another migration.
+    needs the deployment's platform verifier; an empty measurement list skips the allowlist; without the
+    challenge a valid unexpired attestation can be replayed for another migration; and without the
+    preflight the destination is verified only after the signed (not encrypted) state has left.
     """
     problems = []
+    if preflight is None:
+        problems.append(
+            f"{PREFLIGHT_COMMAND_ENV} is required: the destination must attest over a fresh challenge "
+            "BEFORE migration state is released"
+        )
     if policy is None or policy.external_verifier is None:
         problems.append("PORTMARK_ATTESTATION_VERIFIER_COMMAND is required: the platform (hardware) quote verifier")
     if policy is None or not policy.allowed_measurements:

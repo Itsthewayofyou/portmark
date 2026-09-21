@@ -80,7 +80,7 @@ refusal lists all missing items at once.
 |---|---|---|
 | `PORTMARK_PUBLIC_MODE=behind-tls-proxy`, `PORTMARK_A2A_TOKEN`, `PORTMARK_A2A_TRUSTED_PROXIES`, an `https://` `PORTMARK_A2A_PUBLIC_BASE_URL` | always | The same four public-mode requirements as above. |
 | `PORTMARK_AUDIT_FLOOR_PATH` | a durable store (`PORTMARK_STORE_PATH`) | Without the floor, a rollback of the database or trust registry to an older copy is not detected. |
-| `PORTMARK_ATTESTATION_VERIFIER_COMMAND` and `PORTMARK_ATTESTATION_ALLOWED_MEASUREMENTS` | the host policy allows migration | See [Migration Attestation Freshness](#migration-attestation-freshness). The migration challenge is turned on automatically. |
+| `PORTMARK_ATTESTATION_VERIFIER_COMMAND`, `PORTMARK_ATTESTATION_ALLOWED_MEASUREMENTS` and `PORTMARK_MIGRATION_PREFLIGHT_COMMAND` | the host policy allows migration | See [Migration Attestation Freshness](#migration-attestation-freshness). The destination is verified before any state is released, and the migration challenge is turned on automatically. |
 
 The migration rule is checked on the first policy load **and on every reload** (`PORTMARK_RELOAD_POLICY=1`).
 A reloaded policy that turns migration on without the attestation settings is refused like any other
@@ -388,14 +388,34 @@ runtime stores into the container image.
 ## Migration Attestation Freshness
 
 In the **production profile**, a host whose policy allows migration must have a platform verifier
-(`PORTMARK_ATTESTATION_VERIFIER_COMMAND`) and approved measurements
-(`PORTMARK_ATTESTATION_ALLOWED_MEASUREMENTS`, a comma-separated list of exact strings), and the
-challenge-passing protocol below is turned on for it. Portmark's own Ed25519 attestation proves only that
-a key was held, not hardware state. The verifier command must check the vendor chain, the quote
-signature, debug status, the TCB/security version, the workload measurement, the report-data binding to
-the host identity and challenge, and revocation and freshness data. Do not also set
-`PORTMARK_REQUIRE_ATTESTATION=1` on such a host: it would demand evidence from the model provider at
-migrate time, which the challenge replaces.
+(`PORTMARK_ATTESTATION_VERIFIER_COMMAND`), approved measurements
+(`PORTMARK_ATTESTATION_ALLOWED_MEASUREMENTS`, a comma-separated list of exact strings), and a migration
+preflight command (`PORTMARK_MIGRATION_PREFLIGHT_COMMAND`), and the challenge-passing protocol below is
+turned on for it. Portmark's own Ed25519 attestation proves only that a key was held, not hardware
+state. The verifier command must check the vendor chain, the quote signature, debug status, the
+TCB/security version, the workload measurement, the report-data binding to the host identity and
+challenge, and revocation and freshness data.
+
+**The destination is verified before any state is released.** The migration envelope is signed, not
+encrypted, so it must not reach a destination that has not proved itself. At the migrate decision the
+source mints a fresh challenge and runs the preflight command. The command obtains the destination's
+attestation over that challenge and prints it. The source verifies it with the same checks it uses at
+settlement (platform verifier, approved measurement, subject = the destination, audience = this host,
+nonce = the challenge, validity window). Only then does it build, seal and release the envelope. The same
+challenge becomes the delegated permit nonce, so the destination attests over it again at admission and
+the source checks that proof in the receipt at settlement. A refusal releases nothing, and the task is
+closed as refused (`decision.refused`); submit it again once the destination is fixed.
+
+Preflight command contract: it is run without a shell and with an empty environment, with a 10 s timeout
+and a 64 KiB output limit. It receives `{"destination", "relying_party", "challenge"}` as JSON on stdin
+and must print the destination's `AttestationEvidence` object (the fields in `ATTESTATION.md`) as JSON
+on stdout, and exit 0. How it reaches the destination (for example an authenticated call to the
+destination's attestation agent) is deployment-supplied, like the verifier command.
+
+`PORTMARK_REQUIRE_ATTESTATION=1` is not needed with the preflight. It also sets
+`required_for_execution`, which a destination that receives challenge migrations must not set (see the
+notes below), and `required_for_migration`, which asks the model provider to supply destination evidence
+in the migrate decision in addition to the preflight.
 
 In the development profile, and for hosts that do not migrate, freshness is **opt-in**. To require that a
 destination proves itself with fresh, non-replayable evidence before a source considers a migration

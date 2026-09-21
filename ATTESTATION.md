@@ -48,14 +48,19 @@ For direct execution, the expected subject is the accepting host and the relying
 
 ## Production Profile
 
-In the production profile (the default for the ASGI app), a host whose policy allows migration refuses
-to start, or to reload its policy, unless it has a platform verifier command
-(`PORTMARK_ATTESTATION_VERIFIER_COMMAND`) and a non-empty approved-measurement set
-(`PORTMARK_ATTESTATION_ALLOWED_MEASUREMENTS`, comma-separated exact strings). Production also turns on
-the source-minted migration challenge (`require_migration_challenge`), so a migration settles only on
-the destination's fresh attestation over a challenge the source just minted. An empty measurement set
-would skip the allowlist check, and evidence without a fresh challenge can be replayed for another
-migration. A host that does not migrate needs none of this. See `DEPLOYMENT.md`.
+In the production profile (the default for the ASGI app and the CLI), a host whose policy allows
+migration refuses to start, or to reload its policy, unless it has a platform verifier command
+(`PORTMARK_ATTESTATION_VERIFIER_COMMAND`), a non-empty approved-measurement set
+(`PORTMARK_ATTESTATION_ALLOWED_MEASUREMENTS`, comma-separated exact strings), and a migration preflight
+command (`PORTMARK_MIGRATION_PREFLIGHT_COMMAND`).
+
+The preflight verifies the destination **before** any migration state is released: the source mints a
+fresh challenge, the command returns the destination's evidence over it, and the source verifies that
+evidence (`verify_migration_challenge`) before it builds and seals the envelope. Production also turns on
+the source-minted migration challenge (`require_migration_challenge`) and reuses the same challenge, so
+the destination proves itself a second time in the delivery receipt. An empty measurement set would skip
+the allowlist check, and evidence without a fresh challenge can be replayed for another migration. A
+host that does not migrate needs none of this. See `DEPLOYMENT.md` for the command contract.
 
 ## External Verifier Contract
 

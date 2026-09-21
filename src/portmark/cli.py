@@ -451,6 +451,7 @@ def main() -> None:
         tools=tools,
         audit_floor_path=config.audit_floor_path,
         attestation_allowed_measurements=config.attestation_allowed_measurements,
+        migration_preflight_command=config.migration_preflight_command,
         # Boundary audit (auditor round 1 on #104): the CLI is a supported launcher, so it gets the same
         # production host checks as the ASGI app (audit floor, migration attestation). Its network rule
         # is stricter already: `serve` refuses any non-loopback bind.

@@ -57,6 +57,7 @@ def create_app():
         attestation_verifier_command=config.attestation_verifier_command,
         require_attestation=config.require_attestation,
         attestation_allowed_measurements=config.attestation_allowed_measurements,
+        migration_preflight_command=config.migration_preflight_command,
         tools=tools,
         production=production,
     )

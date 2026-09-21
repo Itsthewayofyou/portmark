@@ -1144,6 +1144,67 @@ class ExternalAttestationVerifier:
             raise SecurityError("external attestation verifier rejected evidence")
 
 
+class MigrationPreflightProtocol(Protocol):
+    def attest(self, destination: str, relying_party: str, challenge: str) -> dict[str, Any]:
+        """Return the DESTINATION's attestation evidence over `challenge`, addressed to `relying_party`."""
+        ...
+
+
+class ExternalMigrationPreflight:
+    """Shell-free adapter that obtains a destination's attestation BEFORE migration state is released.
+
+    Boundary audit ATT-01 (auditor round 1 on #104, owner decision 2): the source mints a fresh challenge
+    and this command asks the destination to attest over it. The source verifies the answer with the
+    same `verify_migration_challenge` it uses at settlement, and only then seals and releases the state.
+    The command receives canonical JSON on stdin -- {"destination", "relying_party", "challenge"} -- and
+    must print the destination's evidence (an `AttestationEvidence` object) as JSON on stdout. How it
+    reaches the destination is deployment-supplied, like the platform verifier command.
+    """
+
+    def __init__(self, command: tuple[str, ...], timeout: float = 10.0, max_response_bytes: int = 65_536) -> None:
+        if not command or not all(isinstance(item, str) and item for item in command):
+            raise ValueError("migration preflight command must be a non-empty argv tuple")
+        if timeout <= 0:
+            raise ValueError("migration preflight timeout must be positive")
+        if max_response_bytes < 2:
+            raise ValueError("migration preflight response limit must be at least 2 bytes")
+        self.command = command
+        self.timeout = timeout
+        # A hardware quote is kilobytes, so this is far above the verifier's {"valid": true} limit.
+        self.max_response_bytes = max_response_bytes
+
+    def attest(self, destination: str, relying_party: str, challenge: str) -> dict[str, Any]:
+        payload = canonical_json({"destination": destination, "relying_party": relying_party, "challenge": challenge})
+        try:
+            with tempfile.TemporaryFile() as stdout:
+                # The command is an operator-provided argv tuple and shell execution is disabled.
+                process = subprocess.run(  # nosec B603
+                    list(self.command),
+                    input=payload,
+                    stdout=stdout,
+                    stderr=subprocess.DEVNULL,
+                    timeout=self.timeout,
+                    check=False,
+                    env={},
+                )
+                stdout.seek(0, 2)
+                if stdout.tell() > self.max_response_bytes:
+                    raise SecurityError("migration preflight response exceeds output limit")
+                stdout.seek(0)
+                response = stdout.read(self.max_response_bytes + 1)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise SecurityError("migration preflight command failed") from error
+        if process.returncode != 0:
+            raise SecurityError("migration preflight command refused to attest the destination")
+        try:
+            value = json.loads(response)
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise SecurityError("migration preflight returned malformed JSON") from error
+        if not isinstance(value, dict):
+            raise SecurityError("migration preflight must return an attestation evidence object")
+        return value
+
+
 def arguments_hash(arguments: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_json(arguments)).hexdigest()
 

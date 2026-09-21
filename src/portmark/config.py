@@ -19,6 +19,7 @@ PROFILE_ENV = "PORTMARK_PROFILE"
 PRODUCTION_PROFILE = "production"
 DEVELOPMENT_PROFILE = "development"
 ALLOWED_MEASUREMENTS_ENV = "PORTMARK_ATTESTATION_ALLOWED_MEASUREMENTS"
+PREFLIGHT_COMMAND_ENV = "PORTMARK_MIGRATION_PREFLIGHT_COMMAND"
 
 
 def parse_profile(value: str | None) -> str:
@@ -80,6 +81,9 @@ class RuntimeConfig:
     profile: str = PRODUCTION_PROFILE
     # ATT-02: the approved attestation measurements (exact strings). Empty means Portmark checks none.
     attestation_allowed_measurements: tuple[str, ...] = ()
+    # ATT-01 (auditor round 1 on #104): the command that obtains a destination's attestation over a fresh
+    # challenge BEFORE migration state is released.
+    migration_preflight_command: tuple[str, ...] | None = None
 
     @classmethod
     def from_environment(cls) -> "RuntimeConfig":
@@ -123,6 +127,7 @@ class RuntimeConfig:
             shutdown_grace_seconds=float(os.environ.get("PORTMARK_SHUTDOWN_GRACE_SECONDS", DEFAULT_SHUTDOWN_GRACE_SECONDS)),
             profile=parse_profile(os.environ.get(PROFILE_ENV)),
             attestation_allowed_measurements=parse_allowed_measurements(os.environ.get(ALLOWED_MEASUREMENTS_ENV)),
+            migration_preflight_command=_argv(os.environ.get(PREFLIGHT_COMMAND_ENV)),
         )
 
     def merged_with_args(self, args) -> "RuntimeConfig":
@@ -165,6 +170,7 @@ class RuntimeConfig:
             shutdown_grace_seconds=self.shutdown_grace_seconds,
             profile=self.profile,
             attestation_allowed_measurements=self.attestation_allowed_measurements,
+            migration_preflight_command=self.migration_preflight_command,
         )
 
 

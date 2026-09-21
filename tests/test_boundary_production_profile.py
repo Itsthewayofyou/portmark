@@ -190,13 +190,13 @@ class MigrationAttestationProductionTests(unittest.TestCase):
         self.policy_path = Path(self._dir.name) / "policy.json"
         self.signer = host_signer()
 
-    def host(self, production, migration, verifier=None, measurements=None, reload_policy=False):
+    def host(self, production, migration, verifier=None, measurements=None, reload_policy=False, preflight=None):
         write_policy(self.policy_path, migration)
         with portmark_env():
             return make_host(
                 host_id=HOST, signer=self.signer, policy_path=str(self.policy_path), reload_policy=reload_policy,
                 attestation_verifier_command=verifier, attestation_allowed_measurements=measurements,
-                production=production,
+                migration_preflight_command=preflight, production=production,
             )
 
     def test_production_migration_without_attestation_is_refused(self):
@@ -219,14 +219,36 @@ class MigrationAttestationProductionTests(unittest.TestCase):
         self.assertIn("PORTMARK_ATTESTATION_VERIFIER_COMMAND", str(raised.exception))
         self.assertNotIn("PORTMARK_ATTESTATION_ALLOWED_MEASUREMENTS", str(raised.exception))
 
+    def test_production_migration_needs_the_preflight_command(self):
+        # Auditor round 1 on #104: without it the destination is verified only after the signed (not
+        # encrypted) state has left the source.
+        with self.assertRaises(ValueError) as raised:
+            self.host(production=True, migration=True, verifier=VERIFIER, measurements=("sha384:approved",))
+        self.assertIn("PORTMARK_MIGRATION_PREFLIGHT_COMMAND", str(raised.exception))
+        self.assertNotIn("PORTMARK_ATTESTATION_VERIFIER_COMMAND", str(raised.exception))
+
+    def test_make_host_reads_the_preflight_command_from_the_environment(self):
+        # Like the verifier command: a library caller that configures only the environment gets it.
+        write_policy(self.policy_path, migration=True)
+        with portmark_env(PORTMARK_MIGRATION_PREFLIGHT_COMMAND=" ".join(VERIFIER)):
+            host = make_host(
+                host_id=HOST, signer=self.signer, policy_path=str(self.policy_path),
+                attestation_verifier_command=VERIFIER, attestation_allowed_measurements=("sha384:approved",),
+                production=True,
+            )
+        self.assertIsNotNone(host.migration_preflight)
+
     def test_production_migration_with_verifier_and_measurements_turns_the_challenge_on(self):
-        host = self.host(production=True, migration=True, verifier=VERIFIER, measurements=("sha384:approved",))
+        host = self.host(production=True, migration=True, verifier=VERIFIER, measurements=("sha384:approved",),
+                         preflight=VERIFIER)
         policy = host.attestation_policy
         self.assertTrue(policy.require_migration_challenge)
         self.assertEqual(policy.allowed_measurements, ("sha384:approved",))
         self.assertIsNotNone(policy.external_verifier)
-        # Not required_for_migration: with the challenge on, that flag would demand PRE-collected
-        # evidence from the provider at migrate time -- the replayable evidence the challenge replaces.
+        self.assertIsNotNone(host.migration_preflight)
+        # required_for_migration stays off: it asks the MODEL PROVIDER to supply destination evidence in
+        # the migrate decision. The preflight has the source obtain that evidence itself, over a
+        # challenge the source minted, and verify it before any state is released.
         self.assertFalse(policy.required_for_migration)
 
     def test_a_caller_policy_without_the_challenge_is_refused_in_production(self):
@@ -242,7 +264,7 @@ class MigrationAttestationProductionTests(unittest.TestCase):
                 with portmark_env():
                     build = lambda: make_host(  # noqa: E731
                         host_id=HOST, signer=self.signer, policy_path=str(self.policy_path),
-                        attestation_policy=supplied, production=True,
+                        attestation_policy=supplied, migration_preflight_command=tuple(VERIFIER), production=True,
                     )
                     if refused:
                         with self.assertRaisesRegex(ValueError, "migration challenge must be on"):
@@ -311,10 +333,15 @@ class CliProductionTests(unittest.TestCase):
         floor = ("--audit-floor-path", str(self.d.floor_path), "--policy-path", str(policy))
         with self.assertRaisesRegex(ValueError, "PORTMARK_ATTESTATION_ALLOWED_MEASUREMENTS"):
             self.run_cli(*floor, PORTMARK_ATTESTATION_VERIFIER_COMMAND=" ".join(VERIFIER))
-        # The measurement list reaches the host from the environment: with it, the host starts.
+        with self.assertRaisesRegex(ValueError, "PORTMARK_MIGRATION_PREFLIGHT_COMMAND"):
+            self.run_cli(*floor, PORTMARK_ATTESTATION_VERIFIER_COMMAND=" ".join(VERIFIER),
+                         PORTMARK_ATTESTATION_ALLOWED_MEASUREMENTS="sha384:approved")
+        # The measurement list and the preflight command reach the host from the environment: with
+        # them, the host starts.
         self.assertIn("task_id", self.run_cli(
             *floor, PORTMARK_ATTESTATION_VERIFIER_COMMAND=" ".join(VERIFIER),
             PORTMARK_ATTESTATION_ALLOWED_MEASUREMENTS="sha384:approved",
+            PORTMARK_MIGRATION_PREFLIGHT_COMMAND=" ".join(VERIFIER),
         ))
 
 

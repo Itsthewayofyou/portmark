@@ -21,15 +21,26 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   New gauge `portmark_audit_witness_active` on the authenticated `/metrics` (not on `/readyz`).
 - **A production host that may migrate needs real attestation (ATT-01, ATT-02).** When the host policy
   allows migration, production requires `PORTMARK_ATTESTATION_VERIFIER_COMMAND` (a platform quote
-  verifier) and the new `PORTMARK_ATTESTATION_ALLOWED_MEASUREMENTS`, and turns on the source-minted
-  migration challenge. The check runs on the boot policy load and on every policy reload.
-  `required_for_migration` is deliberately not set: with the challenge on, it would demand pre-collected
-  provider evidence, which the challenge replaces.
+  verifier), the new `PORTMARK_ATTESTATION_ALLOWED_MEASUREMENTS` and the new
+  `PORTMARK_MIGRATION_PREFLIGHT_COMMAND` (below), and turns on the source-minted migration challenge. The
+  check runs on the boot policy load and on every policy reload. `required_for_migration` is not set: it
+  asks the model provider for destination evidence, and the preflight has the source obtain it itself.
 - **The documented container run works with named volumes.** The image ran as `portmark` but `/data`
   did not exist, so a named volume mounted there was owned by root and the store failed with
   `Permission denied` (also on main). The image now creates `/data` and `/floor` owned by `portmark`,
   mode `0700`; a new named volume copies that owner. The DEPLOYMENT.md example was run end to end:
   ready, `portmark_audit_witness_active 1`, and refused (exit 2) without the floor.
+- **The destination is verified BEFORE migration state is released (auditor round 1, owner decision 2).**
+  The challenge was verified only at settlement, after the signed (not encrypted) envelope with the
+  projected state had been sent. New `PORTMARK_MIGRATION_PREFLIGHT_COMMAND` (shell-free, empty
+  environment, 10 s timeout, 64 KiB output limit): at the migrate decision the source mints a fresh
+  challenge, the command returns the destination's evidence over it, and the source verifies it with
+  `verify_migration_challenge` before it builds and seals the envelope. The same challenge becomes the
+  delegated permit nonce, so the receipt proof at settlement stays. A refusal releases nothing (no
+  envelope, no outbox row) and closes the task as refused. Production requires the command when the
+  policy allows migration.
+- **The CLI gets the production host checks (auditor round 1).** `portmark demo` / `serve` built the host
+  with `production=False`; they now pass the profile, the measurement list and the preflight command.
 - **Not changed (recorded):** hostile-tool containment stays a deployment control (RC-01, see the new
   DEPLOYMENT.md "Production Profile" section); the remote witness is open as EV-013 (DB-02).
 
