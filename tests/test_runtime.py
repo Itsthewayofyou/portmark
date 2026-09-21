@@ -9705,6 +9705,41 @@ def _openat2_available_here() -> bool:
 HAS_OPENAT2 = _openat2_available_here()
 
 
+def _openat2_gap(system: str, has_openat2: bool, environ) -> str | None:
+    """Boundary audit RC-03: why a missing openat2 must FAIL here, or None when the skips are legitimate.
+
+    The SafeRoot tests skip where openat2 is unusable. Off Linux that is correct. On Linux it is correct
+    ONLY in an environment that declares it (PORTMARK_TEST_ENV_HAS_NO_OPENAT2=1), exactly like the Node
+    declaration: otherwise a Linux runner that lost openat2 (an old kernel, a seccomp profile) would turn
+    every capability test into a silent skip and CI would stay green.
+    """
+    if not system.startswith("linux") or has_openat2:
+        return None
+    if environ.get("PORTMARK_TEST_ENV_HAS_NO_OPENAT2") == "1":
+        return None
+    kernel = os.uname().release if hasattr(os, "uname") else "unknown kernel"
+    return (
+        f"openat2(RESOLVE_BENEATH) is not usable on this Linux ({kernel}), so the SafeRoot "
+        "tests would skip. Fix the runner, or declare PORTMARK_TEST_ENV_HAS_NO_OPENAT2=1 on purpose."
+    )
+
+
+class Openat2SkipIsDeclaredOnlyTests(unittest.TestCase):
+    def test_this_environment_runs_the_safe_root_tests_or_declares_why_not(self):
+        self.assertIsNone(_openat2_gap(sys.platform, HAS_OPENAT2, os.environ))
+
+    def test_a_linux_gap_fails_unless_the_environment_declares_it(self):
+        for value in (None, "", "0", "true"):
+            environ = {} if value is None else {"PORTMARK_TEST_ENV_HAS_NO_OPENAT2": value}
+            with self.subTest(flag=value):
+                self.assertIsNotNone(_openat2_gap("linux", False, environ))
+        self.assertIsNone(_openat2_gap("linux", False, {"PORTMARK_TEST_ENV_HAS_NO_OPENAT2": "1"}))
+        # Where openat2 works, or off Linux, the flag changes nothing: nothing to explain.
+        self.assertIsNone(_openat2_gap("linux", True, {}))
+        for system in ("win32", "darwin"):
+            self.assertIsNone(_openat2_gap(system, False, {}))
+
+
 class SafePathCapabilityTests(unittest.TestCase):
     """Section 7 PR 3: the capability-based safe-path helper. Unit tests exercise SafeRoot directly;
     end-to-end tests drive it through a real isolated worker that inherits the runtime-provided root

@@ -301,6 +301,17 @@ class ToolRegistry:
         # so leaked threads cannot grow without bound: once the cap is reached a new
         # invocation fails closed instead of spawning another leak.
         self._inflight_threaded = threading.BoundedSemaphore(max_inflight_threaded)
+        # Boundary audit RC-02: how many of those threads have passed their deadline and are still
+        # running. A timed-out thread can still perform an effect after Portmark recorded the timeout,
+        # so operators must be able to see that it exists. Counted and uncounted under one lock with the
+        # thread's own "finished" mark, so the count can never go negative or keep a finished thread.
+        self._overdue_lock = threading.Lock()
+        self._overdue_threads = 0
+
+    def overdue_threads(self) -> int:
+        """Thread-path tool executions that exceeded their deadline and have not finished yet."""
+        with self._overdue_lock:
+            return self._overdue_threads
 
     def register(self, name: str, tool: Tool, timeout: float | None = None, side_effecting: bool = False) -> None:
         if side_effecting:
@@ -654,6 +665,7 @@ class ToolRegistry:
                 "side-effecting tools with register_isolated so the host can hard-kill them."
             )
         result_queue: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+        progress = {"finished": False, "overdue": False}
 
         def run_tool() -> None:
             try:
@@ -661,6 +673,10 @@ class ToolRegistry:
             except Exception as error:  # noqa: BLE001 - reported as a failed tool
                 result_queue.put((False, error))
             finally:
+                with self._overdue_lock:
+                    progress["finished"] = True
+                    if progress["overdue"]:
+                        self._overdue_threads -= 1
                 self._inflight_threaded.release()
 
         thread = threading.Thread(target=run_tool, daemon=True)
@@ -673,6 +689,10 @@ class ToolRegistry:
         try:
             succeeded, value = result_queue.get(timeout=timeout)
         except queue.Empty as error:
+            with self._overdue_lock:
+                if not progress["finished"]:
+                    progress["overdue"] = True
+                    self._overdue_threads += 1
             raise ToolExecutionError("tool execution exceeded its deadline") from error
         if not succeeded:
             raise ToolExecutionError("tool execution failed") from value

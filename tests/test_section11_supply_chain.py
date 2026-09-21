@@ -132,6 +132,15 @@ class SupplyChainConfigurationTests(unittest.TestCase):
         ]
         self.assertEqual(len(declared), 1, declared)
         self.assertIn("PORTMARK_TEST_ENV_HAS_NO_NODE=1", inside[0])
+        # Boundary audit RC-03: every CI lane runs on a kernel with openat2, so NO workflow may declare
+        # it missing; a declaration would turn the SafeRoot tests back into silent skips.
+        no_openat2 = [
+            (path.name, line)
+            for path in sorted(WORKFLOWS.glob("*.yml"))
+            for line in path.read_text().splitlines()
+            if "PORTMARK_TEST_ENV_HAS_NO_OPENAT2" in line and not line.lstrip().startswith("#")
+        ]
+        self.assertEqual(no_openat2, [])
 
     @unittest.skipUnless(importlib.util.find_spec("yaml"), "needs PyYAML (from requirements/ci.txt)")
     def test_dependabot_never_proposes_an_untested_python(self):

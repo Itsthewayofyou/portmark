@@ -4,6 +4,14 @@ Portmark tools are host-side capabilities. An agent or provider can ask for a
 tool, but only the host installs it, grants it through policy, checks its
 arguments, enforces budgets, and decides what output a remote provider may see.
 
+> **`PORTMARK_TOOLS` loads trusted code.** The module named there is imported into
+> the host process at start-up, and a tool registered with `register()` runs in
+> that process, with every permission the host has. Load only code you would run
+> as the host itself. For a tool that calls an external service, touches the
+> filesystem or network, or has any side effect, use `register_isolated()` (see
+> below), and contain it with the deployment isolation profile if it may be
+> hostile. `register()` stays for small, deterministic functions you own.
+
 ## Register A Tool
 
 Create a Python module that returns a `ToolRegistry`:
@@ -197,7 +205,10 @@ By default a tool runs in-process on a worker thread. That path cannot cancel a
 tool once it has started: if the deadline fires, the host records failure but the
 thread keeps running. To keep such leaked threads bounded, `ToolRegistry` caps how
 many thread-path executions may be in flight at once (`max_inflight_threaded`,
-default 64); beyond the cap a tool invocation fails closed. Any tool with a side
+default 64); beyond the cap a tool invocation fails closed. The gauge
+`portmark_tool_threads_overdue` on `/metrics` counts the threads that passed their
+deadline and are still running (boundary audit RC-02); such a thread can still
+perform an effect after the host recorded the timeout. Any tool with a side
 effect, or any tool that may run long, must be registered isolated so the host can
 enforce its deadline in a separate process — and an untrusted tool must ALSO run
 under the deployment isolation profile above, because the isolated worker alone

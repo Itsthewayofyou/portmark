@@ -208,6 +208,11 @@ class AgentHost:
     CAPACITY_REFRESH_SECONDS = 60.0
 
     def refresh_capacity_metrics(self) -> None:
+        # Boundary audit RC-02: cheap and in memory, so it is refreshed on every scrape, before the
+        # store report's early return and its refresh interval.
+        overdue = getattr(self.tools, "overdue_threads", None)
+        if overdue is not None:
+            self.metrics.set_gauge("tool_threads_overdue", overdue())
         report_fn = getattr(self.store, "capacity_report", None)
         if report_fn is None:
             return

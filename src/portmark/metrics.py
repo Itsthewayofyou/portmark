@@ -25,6 +25,7 @@ _REFUSAL_REASONS = frozenset({
 # new unbounded series.
 _GAUGES = {
     "audit_witness_active": "1 when the audit floor (rollback detection) is active, else 0 (boundary audit DB-01).",
+    "tool_threads_overdue": "Thread-path tool runs past their deadline and still running (boundary audit RC-02).",
 }
 
 
