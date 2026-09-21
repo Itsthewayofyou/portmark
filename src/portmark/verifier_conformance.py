@@ -10,8 +10,9 @@ before the verifier runs, and a rubber-stamp verifier would pass. It drives the 
 directly, through the same shell-free `ExternalAttestationVerifier` adapter the runtime uses.
 
 The operator supplies one real, known-good verifier request (a fresh quote captured on the target
-platform). The kit asserts that the verifier accepts it, then builds each negative case from it by
-changing ONE dimension: the claims and the request agree with each other (so Portmark's own checks
+platform). The kit asserts that the verifier accepts it (at the start and again at the end, so a
+verifier with a replay cache cannot pass by refusing every reuse of the quote), then builds each
+negative case from it by changing ONE dimension: the claims and the request agree with each other (so Portmark's own checks
 would pass), but the quote was issued for the original values. Only the verifier can refuse these.
 The kit cannot cover the evidence `signature`: the adapter never sends it to the verifier.
 """
@@ -28,6 +29,16 @@ from .security import ExternalAttestationVerifierProtocol, SecurityError
 # A value no real host, relying party, measurement or nonce uses. Concrete on purpose: "*" is a
 # legal audience wildcard, so mutating the audience to it would flag a correct verifier.
 _OTHER = "portmark-conformance:other"
+_GARBAGE = "portmark-conformance-not-a-quote"
+_STRING_FIELDS = ("verifier", "subject", "audience", "measurement", "nonce", "quote", "signature_key_id", "signature")
+
+
+def _other(*current: Any) -> str:
+    """A concrete value that differs from every current one, so a case can never be a no-op."""
+    candidate = _OTHER
+    while candidate in current:
+        candidate += "-x"
+    return candidate
 
 
 @dataclass(frozen=True)
@@ -78,6 +89,15 @@ def load_base_request(value: Any) -> dict[str, Any]:
         evidence = AttestationEvidence(**raw)
     except TypeError as error:
         raise ValueError(f"the evidence object has an invalid shape: {error}") from error
+    for name in _STRING_FIELDS:
+        if not isinstance(getattr(evidence, name), str):
+            raise ValueError(f"evidence.{name} must be a string")
+    for name in ("issued_at", "expires_at"):
+        field_value = getattr(evidence, name)
+        if isinstance(field_value, bool) or not isinstance(field_value, int):
+            raise ValueError(f"evidence.{name} must be an integer (epoch seconds)")
+    if not isinstance(evidence.claims, dict):
+        raise ValueError("evidence.claims must be an object")
     subject, relying_party = value.get("expected_subject"), value.get("relying_party")
     nonce, now = value.get("expected_nonce"), value.get("now")
     if not isinstance(subject, str) or not subject or not isinstance(relying_party, str) or not relying_party:
@@ -86,7 +106,8 @@ def load_base_request(value: Any) -> dict[str, Any]:
         raise ValueError("expected_nonce must be a string or null")
     if isinstance(now, bool) or not isinstance(now, int):
         raise ValueError("now must be an integer (epoch seconds)")
-    if not evidence.quote:
+    if len(evidence.quote) < 2:
+        # A real quote is far longer; two characters is the least that truncation can shorten.
         raise ValueError("the evidence must carry a platform quote")
     if evidence.subject != subject:
         raise ValueError("the base evidence subject must equal expected_subject")
@@ -100,22 +121,25 @@ def load_base_request(value: Any) -> dict[str, Any]:
 
 
 def _wrong_subject(request: dict[str, Any]) -> None:
-    request["evidence"]["subject"] = _OTHER
-    request["expected_subject"] = _OTHER
+    value = _other(request["evidence"]["subject"])
+    request["evidence"]["subject"] = value
+    request["expected_subject"] = value
 
 
 def _wrong_audience(request: dict[str, Any]) -> None:
-    request["evidence"]["audience"] = _OTHER
-    request["relying_party"] = _OTHER
+    value = _other(request["evidence"]["audience"], request["relying_party"])
+    request["evidence"]["audience"] = value
+    request["relying_party"] = value
 
 
 def _wrong_measurement(request: dict[str, Any]) -> None:
-    request["evidence"]["measurement"] = _OTHER
+    request["evidence"]["measurement"] = _other(request["evidence"]["measurement"])
 
 
 def _wrong_nonce(request: dict[str, Any]) -> None:
-    request["evidence"]["nonce"] = _OTHER
-    request["expected_nonce"] = _OTHER
+    value = _other(request["evidence"]["nonce"])
+    request["evidence"]["nonce"] = value
+    request["expected_nonce"] = value
 
 
 def _stale(request: dict[str, Any]) -> None:
@@ -136,11 +160,11 @@ def _corrupt_quote(request: dict[str, Any]) -> None:
 
 def _truncated_quote(request: dict[str, Any]) -> None:
     quote = request["evidence"]["quote"]
-    request["evidence"]["quote"] = quote[: max(1, len(quote) // 2)]
+    request["evidence"]["quote"] = quote[: len(quote) // 2]
 
 
 def _garbage_quote(request: dict[str, Any]) -> None:
-    request["evidence"]["quote"] = "portmark-conformance-not-a-quote"
+    request["evidence"]["quote"] = _GARBAGE if request["evidence"]["quote"] != _GARBAGE else _GARBAGE + "-x"
 
 
 # Every negative case, in report order. Each changes one dimension of the known-good base.
@@ -181,5 +205,13 @@ def run_conformance(verifier: ExternalAttestationVerifierProtocol, base: dict[st
     for name, mutate in NEGATIVE_CASES:
         request = copy.deepcopy(plain)
         mutate(request)
+        if request == plain:
+            # A case that changes nothing sends the known-good request and "fails" a correct verifier.
+            raise RuntimeError(f"conformance case {name} does not change the base request")
         cases.append(_run_case(verifier, name, "reject", request))
+    # Every negative case reuses the base quote. A verifier that refuses a quote it has seen before
+    # (a replay cache) refuses them all as replays, whatever they claim, and would pass while it
+    # compares no field. So the base must be accepted again at the end: the same request must get the
+    # same answer. Replay protection is Portmark's job (permit and challenge nonces), not the verifier's.
+    cases.append(_run_case(verifier, "valid-repeat", "accept", copy.deepcopy(plain)))
     return ConformanceReport(tuple(cases))

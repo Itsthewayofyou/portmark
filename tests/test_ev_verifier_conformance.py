@@ -43,6 +43,13 @@ if blind == "reject-all":
     sys.exit(1)
 request = json.loads(sys.stdin.buffer.read())
 evidence = request["evidence"]
+if blind == "replay-cache":
+    # Compares no field, but refuses any quote it has seen before (cache file in argv[2]).
+    import os
+    seen = open(sys.argv[2]).read().split() if os.path.exists(sys.argv[2]) else []
+    if evidence["quote"] in seen:
+        sys.exit(1)
+    open(sys.argv[2], "a").write(evidence["quote"] + "\n")
 try:
     payload, mac = evidence["quote"].split(".")
     body = base64.urlsafe_b64decode(payload.encode() + b"=" * (-len(payload) %% 4))
@@ -55,7 +62,7 @@ except Exception:
         sys.exit(0)
     sys.exit(1)
 skip = {"subject": ("subject",), "audience": ("audience",), "measurement": ("measurement",),
-        "nonce": ("nonce",), "window": ("issued_at", "expires_at")}.get(blind, ())
+        "nonce": ("nonce",), "window": ("issued_at", "expires_at"), "replay-cache": BOUND}.get(blind, ())
 for name in BOUND:
     if name not in skip and quoted.get(name) != evidence[name]:
         sys.exit(1)
@@ -79,7 +86,8 @@ _BLIND = {
     "window": {"stale"},
     "quote-fail-open": {"malformed-quote-corrupted", "malformed-quote-truncated", "malformed-quote-garbage"},
     "rubber-stamp": {name for name, _ in NEGATIVE_CASES},
-    "reject-all": {"valid"},
+    "reject-all": {"valid", "valid-repeat"},
+    "replay-cache": {"valid-repeat"},
 }
 
 
@@ -117,7 +125,8 @@ class VerifierConformanceKitTests(unittest.TestCase):
         self.script.write_text(_VERIFIER, encoding="utf-8")
 
     def _verifier(self, blind: str) -> ExternalAttestationVerifier:
-        return ExternalAttestationVerifier((sys.executable, str(self.script), blind), timeout=30)
+        cache = str(self.root / f"seen-{blind}")
+        return ExternalAttestationVerifier((sys.executable, str(self.script), blind, cache), timeout=30)
 
     def _failed(self, blind: str, base: dict | None = None) -> set:
         report = run_conformance(self._verifier(blind), load_base_request(base or _base_request()))
@@ -129,7 +138,7 @@ class VerifierConformanceKitTests(unittest.TestCase):
         self.assertEqual(
             [case.name for case in report.cases],
             ["valid", "wrong-subject", "wrong-audience", "wrong-measurement", "wrong-nonce", "stale",
-             "malformed-quote-corrupted", "malformed-quote-truncated", "malformed-quote-garbage"],
+             "malformed-quote-corrupted", "malformed-quote-truncated", "malformed-quote-garbage", "valid-repeat"],
         )
         self.assertEqual(report.to_dict()["status"], "pass")
 
@@ -141,6 +150,39 @@ class VerifierConformanceKitTests(unittest.TestCase):
         for blind, expected in _BLIND.items():
             with self.subTest(blind=blind):
                 self.assertEqual(self._failed(blind), expected)
+
+    def test_a_correct_verifier_passes_when_the_base_already_uses_the_kit_values(self):
+        # A base whose values equal the kit's own replacement values must still get a real change in
+        # every case; otherwise a case sends the known-good request and "fails" a correct verifier.
+        other = "portmark-conformance:other"
+        base = _base_request(nonce=other)
+        bound = {name: base["evidence"][name] for name in ("subject", "audience", "measurement", "nonce", "issued_at", "expires_at")}
+        bound.update(subject=other, audience=other, measurement=other)
+        evidence = dict(base["evidence"], **bound)
+        evidence["quote"] = _quote(**bound)
+        base = dict(base, evidence=evidence, expected_subject=other, relying_party=other)
+        self.assertEqual(self._failed("none", base), set())
+
+    def test_every_negative_case_changes_the_request(self):
+        for quote in ("ab", "portmark-conformance-not-a-quote"):
+            with self.subTest(quote=quote):
+                captured = []
+
+                class Recorder:
+                    def verify(self, evidence, *rest):
+                        captured.append((evidence, *rest))
+
+                base = _base_request()
+                run_conformance(Recorder(), load_base_request(dict(base, evidence=dict(base["evidence"], quote=quote))))
+                valid, negatives, repeat = captured[0], captured[1:-1], captured[-1]
+                self.assertEqual(valid, repeat)
+                for case in negatives:
+                    self.assertNotEqual(case, valid)
+
+    def test_a_case_that_changes_nothing_is_refused(self):
+        with patch("portmark.verifier_conformance.NEGATIVE_CASES", (("no-op", lambda request: None),)):
+            with self.assertRaisesRegex(RuntimeError, "no-op does not change the base request"):
+                run_conformance(self._verifier("none"), load_base_request(_base_request()))
 
     def test_negative_cases_keep_claims_and_request_consistent(self):
         # A case where the claims already disagree with the request is refused by Portmark itself, so a
@@ -158,7 +200,7 @@ class VerifierConformanceKitTests(unittest.TestCase):
                 pass
 
         run_conformance(Recorder(), load_base_request(_base_request()))
-        self.assertEqual(len(captured), 1 + len(NEGATIVE_CASES))
+        self.assertEqual(len(captured), 2 + len(NEGATIVE_CASES))
         policy = AttestationPolicy(allowed_measurements=(), external_verifier=Accept())
         for evidence, subject, relying_party, nonce, now in captured:
             with self.subTest(case=evidence):
@@ -173,7 +215,12 @@ class VerifierConformanceKitTests(unittest.TestCase):
             "non-empty strings": dict(_base_request(), relying_party=""),
             "string or null": dict(_base_request(), expected_nonce=5),
             "must be an integer": dict(_base_request(), now=True),
-            "must carry a platform quote": dict(_base_request(), evidence=dict(_base_request()["evidence"], quote="")),
+            "must carry a platform quote": dict(_base_request(), evidence=dict(_base_request()["evidence"], quote="Q")),
+            "evidence.quote must be a string": dict(_base_request(), evidence=dict(_base_request()["evidence"], quote=5)),
+            "evidence.subject must be a string": dict(_base_request(), evidence=dict(_base_request()["evidence"], subject=["a"])),
+            "evidence.issued_at must be an integer": dict(_base_request(), evidence=dict(_base_request()["evidence"], issued_at="x")),
+            "evidence.expires_at must be an integer": dict(_base_request(), evidence=dict(_base_request()["evidence"], expires_at=True)),
+            "evidence.claims must be an object": dict(_base_request(), evidence=dict(_base_request()["evidence"], claims="x")),
             "subject must equal": dict(_base_request(), expected_subject="host:other"),
             "audience must equal": dict(_base_request(), relying_party="host:other"),
             "validity window": dict(_base_request(), now=_NOW + 30),
@@ -231,6 +278,12 @@ class VerifierConformanceCliTests(unittest.TestCase):
         code, _, err = self._run(["attest-conformance", "--evidence", str(self.evidence)], self._command("none"))
         self.assertEqual(code, 2)
         self.assertIn("--evidence:", err)
+        bad = _base_request()
+        bad["evidence"]["issued_at"] = "x"
+        self.evidence.write_text(json.dumps(bad), encoding="utf-8")
+        code, _, err = self._run(["attest-conformance", "--evidence", str(self.evidence)], self._command("none"))
+        self.assertEqual(code, 2)
+        self.assertIn("evidence.issued_at must be an integer", err)
         code, _, err = self._run(["attest-conformance", "--evidence", str(self.root / "missing.json")], self._command("none"))
         self.assertEqual(code, 2)
         self.assertIn("--evidence:", err)
@@ -247,7 +300,7 @@ class VerifierConformanceDocsTests(unittest.TestCase):
     def test_attestation_lists_every_case_the_kit_runs(self):
         text = (self.ROOT / "ATTESTATION.md").read_text(encoding="utf-8")
         self.assertIn("### Verifier Conformance Kit", text)
-        for name in ["valid", *(name for name, _ in NEGATIVE_CASES)]:
+        for name in ["valid", *(name for name, _ in NEGATIVE_CASES), "valid-repeat"]:
             with self.subTest(case=name):
                 self.assertIn(f"| `{name}` |", text)
 

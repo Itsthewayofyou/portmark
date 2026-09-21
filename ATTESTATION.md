@@ -125,12 +125,21 @@ because they would refuse each bad case before the verifier runs.
 | `malformed-quote-corrupted` | reject | one character in the middle of the quote |
 | `malformed-quote-truncated` | reject | the quote is cut in half |
 | `malformed-quote-garbage` | reject | the quote is replaced with text that is not a quote |
+| `valid-repeat` | accept | nothing: the known-good request is sent again, last |
 
 In every negative case the claims and the request agree, so Portmark's own checks would pass. Only the
 quote can show the lie. So the verifier must bind each claimed field to the quote: for example the
 report data carries a hash of the subject, audience, nonce and validity window, and the measurement is
-compared with the measured value in the quote. The output is one JSON document with a result per
-case. Exit 0 means every case passed, and exit 1 means at least one failed.
+compared with the measured value in the quote. Each replacement value differs from the base value, so
+no case can send the known-good request by accident.
+
+**The verifier must give the same answer to the same request.** Every negative case reuses the base
+quote. A verifier that refuses a quote it has seen before (a replay cache) would refuse them all as
+replays and pass while it compares no field. `valid-repeat` catches this: such a verifier fails it.
+Replay protection is Portmark's job (permit and challenge nonces), not the verifier's.
+
+The kit also refuses a base with a field of the wrong type (exit 2). The output is one JSON document
+with a result per case. Exit 0 means every case passed, and exit 1 means at least one failed.
 
 Limits: the contract has no reason channel, so the kit checks accept or reject only. The kit cannot
 forge a quote that the platform signed, so it cannot catch a verifier that skips the quote signature
