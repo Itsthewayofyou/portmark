@@ -243,6 +243,13 @@ histograms. Refusal labels are bounded reason codes only; tool arguments,
 user input, task IDs, and other request-controlled values are intentionally
 excluded from metric labels.
 
+Alert when `portmark_tool_threads_overdue` is above 0. It counts thread-path
+tools that passed their deadline and are still running. The host already
+recorded those calls as failed, but the tool code can still act. Find the tool,
+fix its deadline or its upstream, and move it to `register_isolated()` so the
+host can stop it at the deadline. If the count reaches `max_inflight_threaded`
+(default 64), every thread-path tool call fails closed until threads finish.
+
 ## Backup And Restore
 
 Back up these assets together:

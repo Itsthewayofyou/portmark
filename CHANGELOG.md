@@ -6,6 +6,21 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Boundary audit — release gates (RC-03, RC-02)
+
+- **The SafeRoot tests can no longer skip silently on Linux (RC-03).** The `openat2` (SafeRoot) tests skip
+  where `openat2(RESOLVE_BENEATH)` is unusable. On Linux that now FAILS the suite unless the
+  environment declares `PORTMARK_TEST_ENV_HAS_NO_OPENAT2=1`, the same pattern as the no-Node
+  declaration. No workflow may declare it (a supply-chain test checks this), so a CI runner that loses
+  `openat2` (old kernel, seccomp profile) turns red instead of green. The in-image check under the
+  hardened profile (G14) already ran in the `container` job.
+- **Timed-out thread-path tools are visible (RC-02).** New gauge `portmark_tool_threads_overdue`: tools
+  past their deadline and still running. Such a thread can still perform an effect after the host
+  recorded the timeout. Owner decision 2A: the default execution path is **not** changed; `register()`
+  keeps its behavior until isolated execution has a deliberate migration path. TOOLS.md now says that
+  `PORTMARK_TOOLS` loads trusted code and recommends `register_isolated()` for external or effectful
+  tools; OPERATIONS.md adds the alert.
+
 ### Completeness review — a task belongs to the sender that started it (PM-001, High)
 
 - **Cross-sender task takeover is closed.** The resume path found a checkpoint by caller-supplied
