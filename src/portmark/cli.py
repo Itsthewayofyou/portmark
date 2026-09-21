@@ -267,6 +267,33 @@ def _run_attest_conformance(parser: argparse.ArgumentParser, args: argparse.Name
         raise SystemExit(1)
 
 
+def _run_preflight_conformance(parser: argparse.ArgumentParser, args: argparse.Namespace, config: RuntimeConfig) -> None:
+    from .security import AttestationPolicy, ExternalAttestationVerifier, ExternalMigrationPreflight
+    from .verifier_conformance import run_preflight_conformance
+
+    # The same three settings the production profile requires for a host that migrates.
+    missing = [
+        name for name, value in (
+            ("PORTMARK_MIGRATION_PREFLIGHT_COMMAND", config.migration_preflight_command),
+            ("PORTMARK_ATTESTATION_VERIFIER_COMMAND (or --attestation-verifier-command)", config.attestation_verifier_command),
+            ("PORTMARK_ATTESTATION_ALLOWED_MEASUREMENTS", config.attestation_allowed_measurements),
+        ) if not value
+    ]
+    if missing:
+        parser.error("preflight-conformance requires " + ", ".join(missing))
+    policy = AttestationPolicy(
+        allowed_measurements=config.attestation_allowed_measurements,
+        external_verifier=ExternalAttestationVerifier(config.attestation_verifier_command),
+        require_migration_challenge=True,
+    )
+    report = run_preflight_conformance(
+        ExternalMigrationPreflight(config.migration_preflight_command), policy, args.destination, config.host_id or HOST_ID
+    )
+    print(json.dumps(report.to_dict(), indent=2))
+    if not report.passed:
+        raise SystemExit(1)
+
+
 def _load_spec(parser: argparse.ArgumentParser, path: str | None) -> dict:
     if not path:
         return {}
@@ -417,6 +444,11 @@ def main() -> None:
         required=True,
         help="a real, known-good verifier request (JSON, the stdin shape of the verifier contract) with a fresh platform quote",
     )
+    preflight_kit = subparsers.add_parser(
+        "preflight-conformance",
+        help="check that PORTMARK_MIGRATION_PREFLIGHT_COMMAND attests a destination the way migration verifies it",
+    )
+    preflight_kit.add_argument("--destination", required=True, help="the destination host id to attest (a real one)")
     verify_audit = subparsers.add_parser("verify-audit")
     verify_audit.add_argument("--task-id", required=True, help="task id whose audit chain should be verified")
     verify_audit.add_argument(
@@ -442,6 +474,9 @@ def main() -> None:
         return
     if args.command == "attest-conformance":
         _run_attest_conformance(parser, args, config)
+        return
+    if args.command == "preflight-conformance":
+        _run_preflight_conformance(parser, args, config)
         return
     audit_verifier = load_trust_registry(config.trust_registry_path) if config.trust_registry_path else None
     try:

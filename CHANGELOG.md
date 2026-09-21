@@ -6,6 +6,14 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Preflight conformance kit
+
+- **New command `portmark preflight-conformance --destination <host>`** (library:
+  `run_preflight_conformance`). It runs `PORTMARK_MIGRATION_PREFLIGHT_COMMAND` over two fresh challenges
+  and verifies each answer with `verify_migration_challenge`, like the runtime does, then checks that a
+  destination the command cannot honestly attest is refused. A readiness check, not a new control: the
+  runtime already verifies every preflight answer before it releases state.
+
 ### External validation — EV-006 resolved: optional checkpoint encryption
 
 - **Checkpoints can be sealed at the storage boundary** (new module `portmark.checkpoint_crypto`). Set

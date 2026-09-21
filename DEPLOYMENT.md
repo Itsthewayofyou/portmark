@@ -496,7 +496,9 @@ Preflight command contract: it is run without a shell and with an empty environm
 and a 64 KiB output limit. It receives `{"destination", "relying_party", "challenge"}` as JSON on stdin
 and must print the destination's `AttestationEvidence` object (the fields in `ATTESTATION.md`) as JSON
 on stdout, and exit 0. How it reaches the destination (for example an authenticated call to the
-destination's attestation agent) is deployment-supplied, like the verifier command.
+destination's attestation agent) is deployment-supplied, like the verifier command. Before production
+use, check the whole chain with `portmark preflight-conformance --destination <host>` (see
+[ATTESTATION.md](ATTESTATION.md#preflight-conformance-kit)).
 
 `PORTMARK_REQUIRE_ATTESTATION=1` is not needed with the preflight. It also sets
 `required_for_execution`, which a destination that receives challenge migrations must not set (see the

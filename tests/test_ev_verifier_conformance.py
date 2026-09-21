@@ -22,8 +22,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from portmark.cli import main as cli_main
-from portmark.security import ExternalAttestationVerifier
-from portmark.verifier_conformance import LEADING_CASE, NEGATIVE_CASES, load_base_request, run_conformance
+from portmark.security import AttestationPolicy, ExternalAttestationVerifier, ExternalMigrationPreflight
+from portmark.verifier_conformance import LEADING_CASE, NEGATIVE_CASES, load_base_request, run_conformance, run_preflight_conformance
 
 _KEY = b"portmark-conformance-test-key"
 _NOW = 1_800_000_030
@@ -313,6 +313,112 @@ class VerifierConformanceCliTests(unittest.TestCase):
         self.assertIn("--evidence:", err)
 
 
+# A toy destination attestation agent behind PORTMARK_MIGRATION_PREFLIGHT_COMMAND. It can reach only the
+# real destination and signs a toy quote (the reference verifier's HMAC) over the challenge. argv[1]
+# picks a broken mode; argv[2] is a cache file for the "cached" mode.
+_PREFLIGHT = r'''
+import base64, hashlib, hmac, json, os, sys, time
+
+KEY = %r
+REAL = "host:destination"
+mode = sys.argv[1]
+request = json.loads(sys.stdin.buffer.read())
+if mode == "refuse":
+    sys.exit(1)
+destination = request["destination"]
+if destination != REAL and mode != "impersonate":
+    sys.exit(1)
+if mode == "cached" and os.path.exists(sys.argv[2]):
+    sys.stdout.write(open(sys.argv[2]).read())
+    sys.exit(0)
+now = int(time.time())
+audience = "host:someone-else" if mode == "wrong-audience" else request["relying_party"]
+bound = {"subject": destination, "audience": audience, "measurement": "measurement:destination",
+         "nonce": request["challenge"], "issued_at": now - 5, "expires_at": now + 300}
+body = json.dumps(bound, sort_keys=True).encode()
+quote = base64.urlsafe_b64encode(body).rstrip(b"=").decode() + "." + hmac.new(KEY, body, hashlib.sha256).hexdigest()
+out = json.dumps(dict(bound, verifier="verifier:external", claims={}, quote=quote))
+if mode == "cached":
+    open(sys.argv[2], "w").write(out)
+print(out)
+''' % (_KEY,)
+
+# Each preflight mode, and the ONLY cases the kit may fail it on.
+_PREFLIGHT_MODES = {
+    "honest": set(),
+    "cached": {"second-challenge"},
+    "impersonate": {"other-destination"},
+    "refuse": {"first-challenge", "second-challenge"},
+    "wrong-audience": {"first-challenge", "second-challenge"},
+}
+
+
+class PreflightConformanceKitTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        (self.root / "preflight.py").write_text(_PREFLIGHT, encoding="utf-8")
+        (self.root / "verifier.py").write_text(_VERIFIER, encoding="utf-8")
+
+    def _preflight_argv(self, mode: str) -> list:
+        return [sys.executable, str(self.root / "preflight.py"), mode, str(self.root / f"cache-{mode}")]
+
+    def _verifier_argv(self) -> list:
+        return [sys.executable, str(self.root / "verifier.py"), "none", str(self.root / "unused")]
+
+    def _report(self, mode: str):
+        policy = AttestationPolicy(
+            allowed_measurements=("measurement:destination",),
+            external_verifier=ExternalAttestationVerifier(tuple(self._verifier_argv()), timeout=30),
+            require_migration_challenge=True,
+        )
+        preflight = ExternalMigrationPreflight(tuple(self._preflight_argv(mode)), timeout=30)
+        return run_preflight_conformance(preflight, policy, "host:destination", "host:source")
+
+    def test_each_preflight_mode_fails_exactly_its_own_cases(self):
+        for mode, expected in _PREFLIGHT_MODES.items():
+            with self.subTest(mode=mode):
+                report = self._report(mode)
+                self.assertEqual([case.name for case in report.cases], ["first-challenge", "second-challenge", "other-destination"])
+                self.assertEqual({case.name for case in report.cases if not case.passed}, expected, report.to_dict())
+
+    def _run(self, argv: list, env: dict) -> tuple:
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch.dict(os.environ, env, clear=True), patch.object(sys, "argv", ["portmark", *argv]):
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                try:
+                    cli_main()
+                    code = 0
+                except SystemExit as exit_:
+                    code = exit_.code
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def _env(self, mode: str) -> dict:
+        return {
+            "PORTMARK_HOST_ID": "host:source",
+            "PORTMARK_MIGRATION_PREFLIGHT_COMMAND": shlex.join(self._preflight_argv(mode)),
+            "PORTMARK_ATTESTATION_VERIFIER_COMMAND": shlex.join(self._verifier_argv()),
+            "PORTMARK_ATTESTATION_ALLOWED_MEASUREMENTS": "measurement:destination",
+        }
+
+    def test_cli_passes_an_honest_chain_and_names_a_failed_case(self):
+        argv = ["preflight-conformance", "--destination", "host:destination"]
+        code, out, _ = self._run(argv, self._env("honest"))
+        self.assertEqual((code, json.loads(out)["status"]), (0, "pass"))
+        code, out, _ = self._run(argv, self._env("cached"))
+        self.assertEqual(code, 1)
+        self.assertEqual([case["name"] for case in json.loads(out)["cases"] if not case["passed"]], ["second-challenge"])
+
+    def test_cli_requires_the_production_migration_settings(self):
+        env = self._env("honest")
+        for name in ("PORTMARK_MIGRATION_PREFLIGHT_COMMAND", "PORTMARK_ATTESTATION_VERIFIER_COMMAND", "PORTMARK_ATTESTATION_ALLOWED_MEASUREMENTS"):
+            with self.subTest(missing=name):
+                code, _, err = self._run(["preflight-conformance", "--destination", "host:destination"], {k: v for k, v in env.items() if k != name})
+                self.assertEqual(code, 2)
+                self.assertIn(name, err)
+
+
 class VerifierConformanceDocsTests(unittest.TestCase):
     ROOT = Path(__file__).resolve().parents[1]
 
@@ -328,6 +434,14 @@ class VerifierConformanceDocsTests(unittest.TestCase):
         for name in [LEADING_CASE, "valid", *(name for name, _ in NEGATIVE_CASES), "valid-repeat"]:
             with self.subTest(case=name):
                 self.assertIn(f"| `{name}` |", text)
+
+    def test_the_preflight_kit_is_documented(self):
+        attestation = (self.ROOT / "ATTESTATION.md").read_text(encoding="utf-8")
+        self.assertIn("### Preflight Conformance Kit", attestation)
+        for name in ("first-challenge", "second-challenge", "other-destination"):
+            with self.subTest(case=name):
+                self.assertIn(f"| `{name}` |", attestation)
+        self.assertIn("portmark preflight-conformance --destination", (self.ROOT / "DEPLOYMENT.md").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

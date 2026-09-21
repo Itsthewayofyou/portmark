@@ -24,11 +24,12 @@ The kit cannot cover the evidence `signature`: the adapter never sends it to the
 from __future__ import annotations
 
 import copy
+import secrets
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from .models import AttestationEvidence
-from .security import ExternalAttestationVerifierProtocol, SecurityError
+from .security import AttestationPolicy, ExternalAttestationVerifierProtocol, MigrationPreflightProtocol, SecurityError
 
 # A value no real host, relying party, measurement or nonce uses. Concrete on purpose: "*" is a
 # legal audience wildcard, so mutating the audience to it would flag a correct verifier.
@@ -235,3 +236,35 @@ def run_conformance(verifier: ExternalAttestationVerifierProtocol, base: dict[st
     # same answer. Replay protection is Portmark's job (permit and challenge nonces), not the verifier's.
     cases.append(_run_case(verifier, "valid-repeat", "accept", copy.deepcopy(plain)))
     return ConformanceReport(tuple(cases))
+
+
+def run_preflight_conformance(
+    preflight: MigrationPreflightProtocol,
+    policy: AttestationPolicy,
+    destination: str,
+    relying_party: str,
+) -> ConformanceReport:
+    """Readiness kit for PORTMARK_MIGRATION_PREFLIGHT_COMMAND, checked the way the runtime checks it.
+
+    Not a new security control: at migrate time the source already verifies every preflight answer with
+    `verify_migration_challenge` before it releases any state, so a broken command fails closed. This
+    shows BEFORE production that the whole chain works: the command reaches the destination, returns
+    evidence over EACH fresh challenge (a command that returns saved evidence fails the second case),
+    and the configured verifier and approved measurements accept it. A destination that the command
+    cannot honestly attest must be refused.
+    """
+
+    def attempt(name: str, expect: str, target: str) -> ConformanceCase:
+        challenge = secrets.token_urlsafe(32)
+        try:
+            evidence = preflight.attest(target, relying_party, challenge)
+            policy.verify_migration_challenge(evidence, challenge, target, relying_party)
+        except SecurityError as error:
+            return ConformanceCase(name, expect, "rejected", str(error))
+        return ConformanceCase(name, expect, "accepted", "")
+
+    return ConformanceReport((
+        attempt("first-challenge", "accept", destination),
+        attempt("second-challenge", "accept", destination),
+        attempt("other-destination", "reject", _other(destination)),
+    ))

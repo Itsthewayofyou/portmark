@@ -155,6 +155,31 @@ forge a quote that the platform signed, so it cannot catch a verifier that skips
 check but compares the fields. Review that check in the verifier code. The evidence `signature` field
 is not sent to the verifier, so the kit does not cover it.
 
+### Preflight Conformance Kit
+
+A host that migrates in the production profile also needs `PORTMARK_MIGRATION_PREFLIGHT_COMMAND` (see
+`DEPLOYMENT.md`). This kit is a **readiness check**, not a new security control. At migrate time the
+source already verifies every preflight answer before it releases any state, so a broken command fails
+closed. The kit shows before production that the whole chain works: the command reaches the
+destination, it returns evidence over **each** fresh challenge, and the configured verifier and
+approved measurements accept that evidence.
+
+```bash
+PORTMARK_MIGRATION_PREFLIGHT_COMMAND='...' PORTMARK_ATTESTATION_VERIFIER_COMMAND='...' \
+PORTMARK_ATTESTATION_ALLOWED_MEASUREMENTS='...' portmark --host-id <this host> preflight-conformance --destination <a real destination>
+```
+
+Each case mints a new challenge and verifies the answer with `verify_migration_challenge`, the same
+check the runtime uses:
+
+| Case | Expect | What it checks |
+|---|---|---|
+| `first-challenge` | accept | the command attests the destination over a fresh challenge, addressed to this host |
+| `second-challenge` | accept | a new challenge gets new evidence (a command that returns saved evidence fails here) |
+| `other-destination` | reject | a destination the command cannot honestly attest is refused |
+
+Exit 0 means every case passed, 1 means at least one failed, and 2 means a setting is missing.
+
 ## Sealed Storage Decision
 
 The reference runtime treats these values as requiring sealed storage in a production TEE deployment:
