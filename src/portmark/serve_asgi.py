@@ -48,6 +48,16 @@ def public_mode_problems(bind: str, config: RuntimeConfig, acknowledgement: str 
     """
     if is_loopback_bind(bind):
         return []
+    return network_problems(config, acknowledgement)
+
+
+def network_problems(config: RuntimeConfig, acknowledgement: str | None) -> list[str]:
+    """The four public-exposure requirements, all reported at once. Empty means all are met.
+
+    The ONE copy of these checks. `public_mode_problems` applies them to a public bind; the ASGI app
+    applies them in the production profile (boundary audit NET-02), because an app started by another
+    launcher (`uvicorn portmark.asgi:app`) never passes through this module's bind check.
+    """
     problems = []
     ack = (acknowledgement or "").strip()
     if ack != PUBLIC_MODE_ACK:

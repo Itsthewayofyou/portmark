@@ -21,6 +21,11 @@ _REFUSAL_REASONS = frozenset({
     "request_timeout",
     "shutting_down",
 })
+# Fixed-name runtime gauges (boundary audit). A name outside this set is a programming error, not a
+# new unbounded series.
+_GAUGES = {
+    "audit_witness_active": "1 when the audit floor (rollback detection) is active, else 0 (boundary audit DB-01).",
+}
 
 
 class RuntimeMetrics:
@@ -34,6 +39,7 @@ class RuntimeMetrics:
         # Section 12 #4: store capacity gauges from the last capacity report (fixed names only).
         self._store_gauges: dict[str, float] = {}
         self._store_rows: dict[str, int] = {}
+        self._gauges: dict[str, float] = {}
 
     def increment(self, name: str, value: int = 1) -> None:
         if value < 0:
@@ -60,6 +66,12 @@ class RuntimeMetrics:
         with self._lock:
             self._store_gauges = gauges
             self._store_rows = rows
+
+    def set_gauge(self, name: str, value: float) -> None:
+        if name not in _GAUGES:
+            raise ValueError(f"unknown gauge {name!r}")
+        with self._lock:
+            self._gauges[name] = float(value)
 
     def note_clock_forward_jump(self, drift_seconds: float) -> None:
         # Section 12 #6: registered on the trusted clock (held weakly); one count per jump.
@@ -90,6 +102,7 @@ class RuntimeMetrics:
             histogram_buckets = {name: Counter(buckets) for name, buckets in self._histogram_buckets.items()}
             store_gauges = dict(sorted(self._store_gauges.items()))
             store_rows = dict(sorted(self._store_rows.items()))
+            gauges = dict(sorted(self._gauges.items()))
 
         lines = [
             "# HELP portmark_runtime_counter_total Runtime event counters.",
@@ -125,6 +138,11 @@ class RuntimeMetrics:
         for name, value in store_gauges.items():
             metric = f"portmark_store_{name}"
             lines.append(f"# HELP {metric} Store capacity gauge (Section 12).")
+            lines.append(f"# TYPE {metric} gauge")
+            lines.append(f"{metric} {_float_value(value)}")
+        for name, value in gauges.items():
+            metric = f"portmark_{name}"
+            lines.append(f"# HELP {metric} {_GAUGES[name]}")
             lines.append(f"# TYPE {metric} gauge")
             lines.append(f"{metric} {_float_value(value)}")
         return "\n".join(lines) + "\n"

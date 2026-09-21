@@ -106,6 +106,11 @@ mode, which refuses to start unless `PORTMARK_PUBLIC_MODE=behind-tls-proxy`, `PO
 `PORTMARK_A2A_TRUSTED_PROXIES`, and an `https://` `PORTMARK_A2A_PUBLIC_BASE_URL` are all set
 (see `DEPLOYMENT.md`).
 
+The app runs in the **production profile** by default, and that profile needs the same four settings on
+loopback too, because the app cannot see where it is bound. For the sidecar layout, set
+`PORTMARK_A2A_TRUSTED_PROXIES=127.0.0.1/32` and the rest as above. A durable store also needs
+`PORTMARK_AUDIT_FLOOR_PATH` on its own volume (see "Production Profile" in `DEPLOYMENT.md`).
+
 ## Interaction with the safe-path capability (important)
 
 The capability-based safe-path helper (`portmark.safe_paths.SafeRoot`) resolves paths with

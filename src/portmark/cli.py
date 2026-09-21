@@ -10,7 +10,7 @@ from dataclasses import asdict, replace
 from pathlib import Path
 
 from .a2a import A2AAuthConfig, serve
-from .config import RuntimeConfig
+from .config import PRODUCTION_PROFILE, RuntimeConfig
 from .factory import HOST_ID, build_envelope, make_demo_envelope, make_host, signer_from_environment
 from ._durable_file import (  # noqa: F401 -- re-exported names kept for keygen callers/tests
     _acquire_exclusive_lock,
@@ -450,6 +450,12 @@ def main() -> None:
         allow_local_provider_endpoint=config.allow_local_provider_endpoint,
         tools=tools,
         audit_floor_path=config.audit_floor_path,
+        attestation_allowed_measurements=config.attestation_allowed_measurements,
+        migration_preflight_command=config.migration_preflight_command,
+        # Boundary audit (auditor round 1 on #104): the CLI is a supported launcher, so it gets the same
+        # production host checks as the ASGI app (audit floor, migration attestation). Its network rule
+        # is stricter already: `serve` refuses any non-loopback bind.
+        production=config.profile == PRODUCTION_PROFILE,
     )
     if args.command == "demo":
         provider = "wasm" if config.wasm_component else ("http" if config.provider_endpoint else "deterministic")
