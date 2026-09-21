@@ -26,7 +26,8 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
 - **BREAKING: the ASGI app is production by default.** `PORTMARK_PROFILE` is `production` (default,
   also when unset or blank) or `development`; any other value refuses to start. A container or
   `portmark.asgi` import with no configuration now refuses to start and lists what is missing. Set
-  `PORTMARK_PROFILE=development` for local work. The CLI `portmark serve` (loopback-only) is unchanged.
+  `PORTMARK_PROFILE=development` for local work. The CLI (`portmark demo` / `serve`) gets the same
+  production host checks; its network rule is unchanged, because it is already loopback-only.
 - **The public-exposure gate moved into app construction (NET-02).** `serve_asgi` checked the four
   public-mode requirements only before it started uvicorn, so `uvicorn portmark.asgi:app --host 0.0.0.0`
   or an embedding server skipped them. `create_app()` now applies the same four checks (one shared
