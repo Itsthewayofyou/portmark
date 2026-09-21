@@ -96,6 +96,47 @@ runtime does not ship SEV-SNP, TDX, Nitro, or vendor-specific quote validation
 logic; that verifier is deployment-supplied and must own its platform trust
 roots.
 
+### Verifier Conformance Kit
+
+Portmark checks the claimed fields (subject, audience, validity window, measurement, nonce) before it
+calls the verifier. Those checks are only as good as the verifier's proof that the quote binds the same
+values. A verifier that parses the quote but does not compare it with the claims turns each Portmark
+check into a check of text that the sender chose. **Run the kit before production use**, and again
+after each change to the verifier, its trust roots or the platform:
+
+```bash
+PORTMARK_ATTESTATION_VERIFIER_COMMAND='...' portmark attest-conformance --evidence known-good-request.json
+```
+
+`--evidence` is one real, known-good request in the stdin shape above, with a fresh quote captured on
+the target platform. The kit refuses a base whose claims disagree with its own request (exit 2). It
+sends the requests to the command directly, through the same shell-free adapter the runtime uses
+(empty environment, 2 s timeout, 4 KiB output limit). It does not go through Portmark's own checks,
+because they would refuse each bad case before the verifier runs.
+
+| Case | Expect | What changes from the known-good base |
+|---|---|---|
+| `valid` | accept | nothing |
+| `wrong-subject` | reject | claimed subject and `expected_subject` |
+| `wrong-audience` | reject | claimed audience and `relying_party` (a concrete value, not `*`) |
+| `wrong-measurement` | reject | claimed measurement |
+| `wrong-nonce` | reject | claimed nonce and `expected_nonce` |
+| `stale` | reject | `now` moves past the window, and the claimed window moves with it |
+| `malformed-quote-corrupted` | reject | one character in the middle of the quote |
+| `malformed-quote-truncated` | reject | the quote is cut in half |
+| `malformed-quote-garbage` | reject | the quote is replaced with text that is not a quote |
+
+In every negative case the claims and the request agree, so Portmark's own checks would pass. Only the
+quote can show the lie. So the verifier must bind each claimed field to the quote: for example the
+report data carries a hash of the subject, audience, nonce and validity window, and the measurement is
+compared with the measured value in the quote. The output is one JSON document with a result per
+case. Exit 0 means every case passed, and exit 1 means at least one failed.
+
+Limits: the contract has no reason channel, so the kit checks accept or reject only. The kit cannot
+forge a quote that the platform signed, so it cannot catch a verifier that skips the quote signature
+check but compares the fields. Review that check in the verifier code. The evidence `signature` field
+is not sent to the verifier, so the kit does not cover it.
+
 ## Sealed Storage Decision
 
 The reference runtime treats these values as requiring sealed storage in a production TEE deployment:

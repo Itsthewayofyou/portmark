@@ -415,6 +415,17 @@ state. The verifier command must check the vendor chain, the quote signature, de
 TCB/security version, the workload measurement, the report-data binding to the host identity and
 challenge, and revocation and freshness data.
 
+**Requirement: run the verifier conformance kit before production use.** Portmark checks the claimed
+evidence fields itself, but only the verifier can prove that the quote binds the same values. Capture one
+real, fresh verifier request on the target platform, then run:
+
+```bash
+PORTMARK_ATTESTATION_VERIFIER_COMMAND='...' portmark attest-conformance --evidence known-good-request.json
+```
+
+It must print `"status": "pass"` and exit 0. Run it again after each change to the verifier, its trust
+roots or the platform. See [ATTESTATION.md](ATTESTATION.md#verifier-conformance-kit) for the cases.
+
 **The destination is verified before any state is released.** The migration envelope is signed, not
 encrypted, so it must not reach a destination that has not proved itself. At the migrate decision the
 source mints a fresh challenge and runs the preflight command. The command obtains the destination's

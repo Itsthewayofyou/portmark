@@ -6,6 +6,16 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### External validation — EV-004 resolved: verifier conformance kit
+
+- **New command `portmark attest-conformance --evidence <file>`** (library: `portmark.verifier_conformance`).
+  It takes one real, known-good verifier request and sends it, plus 8 negative cases built from it
+  (wrong subject, audience, measurement and nonce; stale; corrupted, truncated and garbage quote),
+  straight to `PORTMARK_ATTESTATION_VERIFIER_COMMAND`. In each negative case the claims and the request
+  agree, so only the verifier's quote binding can refuse it. Exit 0 = pass, 1 = a case failed,
+  2 = bad input. It needs no store and no policy.
+- DEPLOYMENT.md and ATTESTATION.md now require a pass before production use.
+
 ### External validation — EV-001 and EV-007 resolved
 
 - **EV-001:** DEPLOYMENT.md "Multiple Replicas" states that a multi-replica deployment must enforce the

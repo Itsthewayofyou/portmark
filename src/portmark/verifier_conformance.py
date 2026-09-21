@@ -1,0 +1,185 @@
+"""Conformance kit for a deployment-supplied external attestation verifier (EV-004, TM-007).
+
+Portmark checks the CLAIMED evidence fields itself (subject, audience, validity window, measurement,
+nonce) before it calls the external verifier. Those checks are only as good as the verifier's proof
+that the platform quote binds the same values: a verifier that parses the quote but never compares it
+with the claims turns every Portmark check into a check of attacker-chosen text.
+
+So the kit does not go through `AttestationPolicy.verify` -- those checks would refuse each bad case
+before the verifier runs, and a rubber-stamp verifier would pass. It drives the verifier command
+directly, through the same shell-free `ExternalAttestationVerifier` adapter the runtime uses.
+
+The operator supplies one real, known-good verifier request (a fresh quote captured on the target
+platform). The kit asserts that the verifier accepts it, then builds each negative case from it by
+changing ONE dimension: the claims and the request agree with each other (so Portmark's own checks
+would pass), but the quote was issued for the original values. Only the verifier can refuse these.
+The kit cannot cover the evidence `signature`: the adapter never sends it to the verifier.
+"""
+
+from __future__ import annotations
+
+import copy
+from dataclasses import dataclass
+from typing import Any, Callable
+
+from .models import AttestationEvidence
+from .security import ExternalAttestationVerifierProtocol, SecurityError
+
+# A value no real host, relying party, measurement or nonce uses. Concrete on purpose: "*" is a
+# legal audience wildcard, so mutating the audience to it would flag a correct verifier.
+_OTHER = "portmark-conformance:other"
+
+
+@dataclass(frozen=True)
+class ConformanceCase:
+    name: str
+    expect: str  # "accept" or "reject"
+    outcome: str  # "accepted" or "rejected"
+    detail: str
+
+    @property
+    def passed(self) -> bool:
+        return (self.expect == "accept") == (self.outcome == "accepted")
+
+
+@dataclass(frozen=True)
+class ConformanceReport:
+    cases: tuple[ConformanceCase, ...]
+
+    @property
+    def passed(self) -> bool:
+        return all(case.passed for case in self.cases)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": "pass" if self.passed else "fail",
+            "cases": [
+                {"name": case.name, "expect": case.expect, "outcome": case.outcome, "passed": case.passed, "detail": case.detail}
+                for case in self.cases
+            ],
+        }
+
+
+def load_base_request(value: Any) -> dict[str, Any]:
+    """Validate the operator's known-good request. Raise ValueError when it cannot be a clean base.
+
+    Every negative case changes one dimension of this base. If the base is already inconsistent (its
+    claims disagree with its own request), a case can be refused for the wrong reason and pass.
+    """
+    if not isinstance(value, dict):
+        raise ValueError("the evidence file must hold a JSON object in the verifier request shape")
+    unknown = set(value) - {"evidence", "expected_subject", "relying_party", "expected_nonce", "now"}
+    if unknown:
+        raise ValueError(f"the evidence file has unknown request keys: {sorted(unknown)}")
+    raw = value.get("evidence")
+    if not isinstance(raw, dict):
+        raise ValueError("the evidence file must carry an 'evidence' object")
+    try:
+        evidence = AttestationEvidence(**raw)
+    except TypeError as error:
+        raise ValueError(f"the evidence object has an invalid shape: {error}") from error
+    subject, relying_party = value.get("expected_subject"), value.get("relying_party")
+    nonce, now = value.get("expected_nonce"), value.get("now")
+    if not isinstance(subject, str) or not subject or not isinstance(relying_party, str) or not relying_party:
+        raise ValueError("expected_subject and relying_party must be non-empty strings")
+    if nonce is not None and not isinstance(nonce, str):
+        raise ValueError("expected_nonce must be a string or null")
+    if isinstance(now, bool) or not isinstance(now, int):
+        raise ValueError("now must be an integer (epoch seconds)")
+    if not evidence.quote:
+        raise ValueError("the evidence must carry a platform quote")
+    if evidence.subject != subject:
+        raise ValueError("the base evidence subject must equal expected_subject")
+    if evidence.audience not in {relying_party, "*"}:
+        raise ValueError("the base evidence audience must equal relying_party (or '*')")
+    if not evidence.issued_at <= now < evidence.expires_at:
+        raise ValueError("now must fall inside the base evidence validity window")
+    if (nonce or "") != evidence.nonce:
+        raise ValueError("the base evidence nonce must equal expected_nonce")
+    return {"evidence": evidence, "expected_subject": subject, "relying_party": relying_party, "expected_nonce": nonce, "now": now}
+
+
+def _wrong_subject(request: dict[str, Any]) -> None:
+    request["evidence"]["subject"] = _OTHER
+    request["expected_subject"] = _OTHER
+
+
+def _wrong_audience(request: dict[str, Any]) -> None:
+    request["evidence"]["audience"] = _OTHER
+    request["relying_party"] = _OTHER
+
+
+def _wrong_measurement(request: dict[str, Any]) -> None:
+    request["evidence"]["measurement"] = _OTHER
+
+
+def _wrong_nonce(request: dict[str, Any]) -> None:
+    request["evidence"]["nonce"] = _OTHER
+    request["expected_nonce"] = _OTHER
+
+
+def _stale(request: dict[str, Any]) -> None:
+    # Replay the quote after its window has closed, with the claimed window moved to cover the new
+    # time. Portmark checks only the claimed window, so the verifier must bind it to the quote.
+    evidence = request["evidence"]
+    shift = (evidence["expires_at"] - evidence["issued_at"]) + 86_400
+    evidence["issued_at"] += shift
+    evidence["expires_at"] += shift
+    request["now"] += shift
+
+
+def _corrupt_quote(request: dict[str, Any]) -> None:
+    quote = request["evidence"]["quote"]
+    middle = len(quote) // 2
+    request["evidence"]["quote"] = quote[:middle] + ("B" if quote[middle] == "A" else "A") + quote[middle + 1:]
+
+
+def _truncated_quote(request: dict[str, Any]) -> None:
+    quote = request["evidence"]["quote"]
+    request["evidence"]["quote"] = quote[: max(1, len(quote) // 2)]
+
+
+def _garbage_quote(request: dict[str, Any]) -> None:
+    request["evidence"]["quote"] = "portmark-conformance-not-a-quote"
+
+
+# Every negative case, in report order. Each changes one dimension of the known-good base.
+NEGATIVE_CASES: tuple[tuple[str, Callable[[dict[str, Any]], None]], ...] = (
+    ("wrong-subject", _wrong_subject),
+    ("wrong-audience", _wrong_audience),
+    ("wrong-measurement", _wrong_measurement),
+    ("wrong-nonce", _wrong_nonce),
+    ("stale", _stale),
+    ("malformed-quote-corrupted", _corrupt_quote),
+    ("malformed-quote-truncated", _truncated_quote),
+    ("malformed-quote-garbage", _garbage_quote),
+)
+
+
+def _run_case(verifier: ExternalAttestationVerifierProtocol, name: str, expect: str, request: dict[str, Any]) -> ConformanceCase:
+    try:
+        verifier.verify(
+            AttestationEvidence(**request["evidence"]),
+            request["expected_subject"],
+            request["relying_party"],
+            request["expected_nonce"],
+            request["now"],
+        )
+    except SecurityError as error:
+        return ConformanceCase(name, expect, "rejected", str(error))
+    return ConformanceCase(name, expect, "accepted", "")
+
+
+def run_conformance(verifier: ExternalAttestationVerifierProtocol, base: dict[str, Any]) -> ConformanceReport:
+    """Send the known-good base and every negative case to `verifier`; report accept or reject per case.
+
+    `base` is the result of `load_base_request`. The verifier contract has no reason channel, so the
+    kit asserts accept or reject only.
+    """
+    plain = dict(base, evidence=base["evidence"].unsigned_dict())
+    cases = [_run_case(verifier, "valid", "accept", copy.deepcopy(plain))]
+    for name, mutate in NEGATIVE_CASES:
+        request = copy.deepcopy(plain)
+        mutate(request)
+        cases.append(_run_case(verifier, name, "reject", request))
+    return ConformanceReport(tuple(cases))
