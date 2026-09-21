@@ -234,6 +234,23 @@ def _run_keygen(parser: argparse.ArgumentParser, args: argparse.Namespace) -> No
         print(json.dumps(material, indent=2))
 
 
+def _run_attest_conformance(parser: argparse.ArgumentParser, args: argparse.Namespace, config: RuntimeConfig) -> None:
+    from .security import ExternalAttestationVerifier
+    from .verifier_conformance import load_base_request, run_conformance
+
+    if not config.attestation_verifier_command:
+        parser.error("attest-conformance requires --attestation-verifier-command or PORTMARK_ATTESTATION_VERIFIER_COMMAND")
+    try:
+        with open(args.evidence, encoding="utf-8") as handle:
+            base = load_base_request(json.load(handle))
+    except (OSError, ValueError) as error:
+        parser.error(f"--evidence: {error}")
+    report = run_conformance(ExternalAttestationVerifier(config.attestation_verifier_command), base)
+    print(json.dumps(report.to_dict(), indent=2))
+    if not report.passed:
+        raise SystemExit(1)
+
+
 def _load_spec(parser: argparse.ArgumentParser, path: str | None) -> dict:
     if not path:
         return {}
@@ -370,6 +387,15 @@ def main() -> None:
     floor_set.add_argument("--to", type=int, required=True, help="the new floor, in epoch seconds")
     floor_set.add_argument("--reason", required=True, help="why (recorded in the maintenance log and the audit floor)")
     floor_set.add_argument("--confirm", action="store_true", help="required: acknowledge that this may lower the floor")
+    conformance = subparsers.add_parser(
+        "attest-conformance",
+        help="run the EV-004 conformance kit against the external attestation verifier command (before production use)",
+    )
+    conformance.add_argument(
+        "--evidence",
+        required=True,
+        help="a real, known-good verifier request (JSON, the stdin shape of the verifier contract) with a fresh platform quote",
+    )
     verify_audit = subparsers.add_parser("verify-audit")
     verify_audit.add_argument("--task-id", required=True, help="task id whose audit chain should be verified")
     verify_audit.add_argument(
@@ -392,6 +418,9 @@ def main() -> None:
         return
     if args.command == "envelope":
         _run_envelope(parser, args, config)
+        return
+    if args.command == "attest-conformance":
+        _run_attest_conformance(parser, args, config)
         return
     audit_verifier = load_trust_registry(config.trust_registry_path) if config.trust_registry_path else None
     store = create_runtime_store(config.store_backend, config.store_path, audit_verifier) if config.store_path else None
