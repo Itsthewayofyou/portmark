@@ -19,12 +19,16 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from contextlib import redirect_stderr, redirect_stdout
+import io
+
+from portmark.cli import main as cli_main
 from portmark.config import parse_allowed_measurements, parse_profile
 from portmark.factory import make_host
 from portmark.metrics import RuntimeMetrics
 from portmark.security import AttestationPolicy, ExternalAttestationVerifier
 from portmark.storage import SQLiteRuntimeStore
-from test_audit_floor import HOST, host_signer
+from test_audit_floor import HOST, Deployment, host_signer
 
 SRC = str(Path(__file__).resolve().parents[1] / "src")
 TOKEN = "production-profile-token"  # nosec B105 -- a synthetic test token, not a credential
@@ -56,7 +60,8 @@ def create_app():
 def write_policy(path, migration):
     document = {
         "version": "boundary-v1",
-        "tools": {"catalog.search": {"impact": "low", "constraints": {"max_limit": 5}, "output_projection": ["title"]}},
+        "tools": {"catalog.search": {"impact": "low", "constraints": {"max_limit": 5, "arguments": {"query": {"type": "string"}}},
+                                        "output_projection": ["title"]}},
     }
     if migration:
         document["migration"] = {"allowed": True, "destinations": ["host:destination"]}
@@ -264,6 +269,53 @@ class MigrationAttestationProductionTests(unittest.TestCase):
             host._active_policy()
         self.assertIs(host.policy, before)  # the refused policy was never adopted
         self.assertFalse(host.policy.migration.allowed)
+
+
+class CliProductionTests(unittest.TestCase):
+    """Auditor round 1 on #104: `portmark demo` / `portmark serve` build the host through the same
+    production checks as the ASGI app. (Their network rule is already stricter: loopback only.)"""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.d = Deployment(self._dir.name)
+
+    def run_cli(self, *extra_args, command=("demo", "cli production"), **env):
+        argv = ["portmark", "--host-id", HOST, "--store-path", str(self.d.store_path),
+                "--trust-registry-path", str(self.d.registry_path), *extra_args, *command]
+        stdout = io.StringIO()
+        with portmark_env(**self.d.env(), **env), patch.object(sys, "argv", argv), \
+                redirect_stdout(stdout), redirect_stderr(io.StringIO()):
+            cli_main()
+        return stdout.getvalue()
+
+    def test_the_cli_refuses_a_durable_store_without_a_floor(self):
+        with self.assertRaisesRegex(ValueError, "production profile needs an audit floor"):
+            self.run_cli()
+
+    def test_cli_serve_is_refused_before_it_binds(self):
+        with patch("portmark.cli.serve") as serve:
+            with self.assertRaisesRegex(ValueError, "production profile needs an audit floor"):
+                self.run_cli(command=("serve",))
+        serve.assert_not_called()
+
+    def test_the_cli_with_a_floor_starts(self):
+        self.assertIn("task_id", self.run_cli("--audit-floor-path", str(self.d.floor_path)))
+
+    def test_the_cli_in_development_starts_without_a_floor(self):
+        self.assertIn("task_id", self.run_cli(PORTMARK_PROFILE="development"))
+
+    def test_the_cli_applies_the_migration_attestation_rule(self):
+        policy = Path(self._dir.name) / "policy.json"
+        write_policy(policy, migration=True)
+        floor = ("--audit-floor-path", str(self.d.floor_path), "--policy-path", str(policy))
+        with self.assertRaisesRegex(ValueError, "PORTMARK_ATTESTATION_ALLOWED_MEASUREMENTS"):
+            self.run_cli(*floor, PORTMARK_ATTESTATION_VERIFIER_COMMAND=" ".join(VERIFIER))
+        # The measurement list reaches the host from the environment: with it, the host starts.
+        self.assertIn("task_id", self.run_cli(
+            *floor, PORTMARK_ATTESTATION_VERIFIER_COMMAND=" ".join(VERIFIER),
+            PORTMARK_ATTESTATION_ALLOWED_MEASUREMENTS="sha384:approved",
+        ))
 
 
 class GaugeTests(unittest.TestCase):
