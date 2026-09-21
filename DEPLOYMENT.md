@@ -16,6 +16,10 @@ The image's command is `python -m portmark.serve_asgi`. It listens on **loopback
 (`PORTMARK_BIND_HOST=127.0.0.1`), so a container started without further settings is reachable only from
 inside itself, even if a port is published with `-p`.
 
+The app is in the **production profile** by default (see [Production Profile](#production-profile)), so a
+container started with no settings at all **refuses to start** and lists what is missing. For a local
+trial, set `PORTMARK_PROFILE=development`.
+
 ### Public mode (a reverse proxy in another container or host)
 
 To accept connections from a reverse proxy, the listener must bind a non-loopback address. The entrypoint
@@ -43,11 +47,16 @@ docker run --rm --name portmark \
   -e PORTMARK_TRUST_REGISTRY_PATH=/config/trust.json \
   -e PORTMARK_STORE_BACKEND=sqlite \
   -e PORTMARK_STORE_PATH=/data/runtime.sqlite \
+  -e PORTMARK_AUDIT_FLOOR_PATH=/floor/audit-floor.json \
   -v "$PWD/examples/host-policy.json:/config/host-policy.json:ro" \
   -v "$PWD/trust.json:/config/trust.json:ro" \
   -v portmark-data:/data \
+  -v portmark-floor:/floor \
   portmark:local
 ```
+
+The audit floor lives on its own volume, outside the store directory, so a restore of the database does
+not carry the floor with it.
 
 Put `PORTMARK_A2A_TOKEN` in `portmark.env` (mode `0600`), not on the command line. Use the proxy
 network's real CIDR for `PORTMARK_A2A_TRUSTED_PROXIES`. Do not publish the container's port to the
@@ -56,6 +65,39 @@ internet with `-p`: only the proxy should reach it.
 If you load custom tools, set `PORTMARK_TOOLS=module:function` and provide a
 matching `PORTMARK_POLICY_PATH`. Tool modules must be present in the image or on
 the Python import path.
+
+## Production Profile
+
+`PORTMARK_PROFILE` selects the profile: `production` (the default, also when unset or blank) or
+`development`. Any other value refuses to start, so a typo cannot pick a profile.
+
+The production checks run **where the app is built** (`portmark.asgi`), not only in the `serve_asgi`
+launcher. So `uvicorn portmark.asgi:app`, gunicorn, or a server that embeds the app gets the same checks.
+The app cannot see the address it will be bound to, so production applies them on loopback too. Every
+refusal lists all missing items at once.
+
+| Production requires | When | Why |
+|---|---|---|
+| `PORTMARK_PUBLIC_MODE=behind-tls-proxy`, `PORTMARK_A2A_TOKEN`, `PORTMARK_A2A_TRUSTED_PROXIES`, an `https://` `PORTMARK_A2A_PUBLIC_BASE_URL` | always | The same four public-mode requirements as above. |
+| `PORTMARK_AUDIT_FLOOR_PATH` | a durable store (`PORTMARK_STORE_PATH`) | Without the floor, a rollback of the database or trust registry to an older copy is not detected. |
+| `PORTMARK_ATTESTATION_VERIFIER_COMMAND` and `PORTMARK_ATTESTATION_ALLOWED_MEASUREMENTS` | the host policy allows migration | See [Migration Attestation Freshness](#migration-attestation-freshness). The migration challenge is turned on automatically. |
+
+The migration rule is checked on the first policy load **and on every reload** (`PORTMARK_RELOAD_POLICY=1`).
+A reloaded policy that turns migration on without the attestation settings is refused like any other
+invalid policy file.
+
+`PORTMARK_PROFILE=development` keeps the older behavior: warnings instead of refusals. Use it only for
+local work.
+
+`portmark_audit_witness_active` on `/metrics` is `1` when the audit floor is active and `0` when it is
+not. `/readyz` does not report it, because `/readyz` needs no token.
+
+What the production profile does **not** do: it cannot contain a hostile tool. The isolated tool worker
+is a resource-bounded, hard-deadline worker, not a sandbox. It runs as the same user, with the same
+filesystem and network access. If a tool may be hostile, the deployment must contain it: a dedicated
+unprivileged user, a read-only root filesystem, one narrow writable mount, PID and cgroup limits, dropped
+capabilities, no host credential mounts, and egress denied by default (see
+[Tool Isolation Requirement](#tool-isolation-requirement) and `deploy/README.md`).
 
 ## Tool Isolation Requirement
 
@@ -343,11 +385,21 @@ Dockerfile. Common configuration:
 Do not bake tokens, private keys, policy files containing local secrets, or
 runtime stores into the container image.
 
-## Migration Attestation Freshness (optional)
+## Migration Attestation Freshness
 
-Migration attestation freshness is **opt-in** and off by default. To require that a destination proves
-itself with fresh, non-replayable evidence before a source considers a migration delivered, enable the
-**challenge-passing protocol**:
+In the **production profile**, a host whose policy allows migration must have a platform verifier
+(`PORTMARK_ATTESTATION_VERIFIER_COMMAND`) and approved measurements
+(`PORTMARK_ATTESTATION_ALLOWED_MEASUREMENTS`, a comma-separated list of exact strings), and the
+challenge-passing protocol below is turned on for it. Portmark's own Ed25519 attestation proves only that
+a key was held, not hardware state. The verifier command must check the vendor chain, the quote
+signature, debug status, the TCB/security version, the workload measurement, the report-data binding to
+the host identity and challenge, and revocation and freshness data. Do not also set
+`PORTMARK_REQUIRE_ATTESTATION=1` on such a host: it would demand evidence from the model provider at
+migrate time, which the challenge replaces.
+
+In the development profile, and for hosts that do not migrate, freshness is **opt-in**. To require that a
+destination proves itself with fresh, non-replayable evidence before a source considers a migration
+delivered, enable the **challenge-passing protocol**:
 
 - On the **source** host: `AttestationPolicy(require_migration_challenge=True)`, and the source must
   trust the destination's attestation authority (add it to the policy's `authorities`). The source mints

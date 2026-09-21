@@ -189,7 +189,8 @@ class EntrypointLogRedactionTests(unittest.TestCase):
         secret = "entrypoint-secret-value"  # nosec B105 -- a synthetic marker, not a credential
         result = subprocess.run(  # nosec B603 -- this interpreter, fixed inline script
             [sys.executable, "-c", ENTRYPOINT_LOG_SCRIPT, secret], capture_output=True, text=True, timeout=120,
-            env=child_env(),
+            # Development profile: a loopback run with no public controls (production needs them all).
+            env=child_env(PORTMARK_PROFILE="development"),
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         # Layer 1 (uvicorn.run(log_config=None)): uvicorn installed no handler of its own. Two layers
@@ -212,7 +213,9 @@ class SingleProxyAuthorityTests(unittest.TestCase):
         server = subprocess.Popen(  # nosec B603 -- this interpreter, fixed module
             [sys.executable, "-m", "portmark.serve_asgi"],
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
-            env=child_env(PORTMARK_BIND_PORT=str(port), PORTMARK_A2A_AGENT_CARD_RATE_LIMIT_PER_IP="1"),
+            # Development profile: this test needs NO trusted proxy, which production refuses.
+            env=child_env(PORTMARK_BIND_PORT=str(port), PORTMARK_A2A_AGENT_CARD_RATE_LIMIT_PER_IP="1",
+                          PORTMARK_PROFILE="development"),
         )
         try:
             base = f"http://127.0.0.1:{port}"
@@ -292,8 +295,18 @@ class DeploymentProfileTestsPublicMode(unittest.TestCase):
         for name in ("PORTMARK_PUBLIC_MODE", "PORTMARK_A2A_TOKEN", "PORTMARK_A2A_TRUSTED_PROXIES", "PORTMARK_A2A_PUBLIC_BASE_URL"):
             self.assertIn(name, result.stderr)
 
+    def test_the_default_image_refuses_to_start_without_production_controls(self):
+        # Boundary audit NET-02 (owner decision 1A): the image is production by default. With no
+        # configuration it refuses to start and names every missing control, even on loopback.
+        result = self.docker("run", "--rm", _IMAGE, check=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("production profile", result.stderr)
+        for name in ("PORTMARK_PUBLIC_MODE", "PORTMARK_A2A_TOKEN", "PORTMARK_A2A_TRUSTED_PROXIES", "PORTMARK_A2A_PUBLIC_BASE_URL"):
+            self.assertIn(name, result.stderr)
+
     def test_the_default_image_listens_on_loopback_only(self):
-        name = self.start()
+        # Development profile: this test is about the loopback bind, not the production controls.
+        name = self.start("PORTMARK_PROFILE=development")
         self.assertEqual(self.inside_health(name), 200)  # the HEALTHCHECK path works
         self.assertIsNone(self.outside_status(self.published_port(name)))  # even when -p publishes the port
 

@@ -42,6 +42,8 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
 # Section 11 #1/#6: the Portmark entrypoint owns the bind. Loopback by default; a public bind needs
 # PORTMARK_PUBLIC_MODE=behind-tls-proxy + PORTMARK_A2A_TOKEN + PORTMARK_A2A_TRUSTED_PROXIES +
 # an https PORTMARK_A2A_PUBLIC_BASE_URL, all together. uvicorn runs with proxy_headers=False.
+# Boundary audit NET-02: the app is in the production profile by default, which needs those four on
+# loopback too, so this image refuses to start until they are set (or PORTMARK_PROFILE=development).
 ENV PORTMARK_BIND_HOST=127.0.0.1 \
     PORTMARK_BIND_PORT=8080
 

@@ -15,6 +15,34 @@ from .a2a import (
 )
 
 
+PROFILE_ENV = "PORTMARK_PROFILE"
+PRODUCTION_PROFILE = "production"
+DEVELOPMENT_PROFILE = "development"
+ALLOWED_MEASUREMENTS_ENV = "PORTMARK_ATTESTATION_ALLOWED_MEASUREMENTS"
+
+
+def parse_profile(value: str | None) -> str:
+    """Unset or blank is production. Any value other than the two names is refused, never guessed:
+    a typo such as "dev" or "prod " must not silently pick a profile."""
+    if value is None or not value.strip():
+        return PRODUCTION_PROFILE
+    if value not in (PRODUCTION_PROFILE, DEVELOPMENT_PROFILE):
+        raise ValueError(f"{PROFILE_ENV} must be {PRODUCTION_PROFILE!r} or {DEVELOPMENT_PROFILE!r}, got {value!r}")
+    return value
+
+
+def parse_allowed_measurements(value: str | None) -> tuple[str, ...]:
+    """A comma-separated list of exact measurement strings. An empty item or an item with whitespace
+    inside is refused: it is a typo, and a typo in an allowlist must not quietly change what it admits."""
+    if value is None or not value.strip():
+        return ()
+    items = [item.strip() for item in value.split(",")]
+    for item in items:
+        if not item or any(character.isspace() for character in item):
+            raise ValueError(f"{ALLOWED_MEASUREMENTS_ENV} has an empty or malformed item: {value!r}")
+    return tuple(dict.fromkeys(items))
+
+
 @dataclass(frozen=True)
 class RuntimeConfig:
     host_id: str = "host:local-demo"
@@ -47,6 +75,11 @@ class RuntimeConfig:
     # the start instead of disabling the bound.
     a2a_body_read_timeout_seconds: float = DEFAULT_BODY_READ_TIMEOUT_SECONDS
     shutdown_grace_seconds: float = DEFAULT_SHUTDOWN_GRACE_SECONDS
+    # Boundary audit NET-02/DB-01/ATT-01/ATT-02 (owner decision 1A): the ASGI app is production by
+    # default; only an explicit PORTMARK_PROFILE=development relaxes the production start-up checks.
+    profile: str = PRODUCTION_PROFILE
+    # ATT-02: the approved attestation measurements (exact strings). Empty means Portmark checks none.
+    attestation_allowed_measurements: tuple[str, ...] = ()
 
     @classmethod
     def from_environment(cls) -> "RuntimeConfig":
@@ -88,6 +121,8 @@ class RuntimeConfig:
                 DEFAULT_BODY_READ_TIMEOUT_SECONDS,
             )),
             shutdown_grace_seconds=float(os.environ.get("PORTMARK_SHUTDOWN_GRACE_SECONDS", DEFAULT_SHUTDOWN_GRACE_SECONDS)),
+            profile=parse_profile(os.environ.get(PROFILE_ENV)),
+            attestation_allowed_measurements=parse_allowed_measurements(os.environ.get(ALLOWED_MEASUREMENTS_ENV)),
         )
 
     def merged_with_args(self, args) -> "RuntimeConfig":
@@ -128,6 +163,8 @@ class RuntimeConfig:
             ) or self.a2a_agent_card_rate_limit_window_seconds,
             a2a_body_read_timeout_seconds=self.a2a_body_read_timeout_seconds,
             shutdown_grace_seconds=self.shutdown_grace_seconds,
+            profile=self.profile,
+            attestation_allowed_measurements=self.attestation_allowed_measurements,
         )
 
 

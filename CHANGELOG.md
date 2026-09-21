@@ -6,6 +6,28 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Boundary audit — production profile (NET-02, DB-01, ATT-01, ATT-02)
+
+- **BREAKING: the ASGI app is production by default.** `PORTMARK_PROFILE` is `production` (default,
+  also when unset or blank) or `development`; any other value refuses to start. A container or
+  `portmark.asgi` import with no configuration now refuses to start and lists what is missing. Set
+  `PORTMARK_PROFILE=development` for local work. The CLI `portmark serve` (loopback-only) is unchanged.
+- **The public-exposure gate moved into app construction (NET-02).** `serve_asgi` checked the four
+  public-mode requirements only before it started uvicorn, so `uvicorn portmark.asgi:app --host 0.0.0.0`
+  or an embedding server skipped them. `create_app()` now applies the same four checks (one shared
+  function, `network_problems`) in production, whatever the bind: the app cannot see where it is bound.
+- **A durable store needs the audit floor in production (DB-01).** A new database could start without
+  rollback detection and only log a warning. Production now refuses; development keeps the warning.
+  New gauge `portmark_audit_witness_active` on the authenticated `/metrics` (not on `/readyz`).
+- **A production host that may migrate needs real attestation (ATT-01, ATT-02).** When the host policy
+  allows migration, production requires `PORTMARK_ATTESTATION_VERIFIER_COMMAND` (a platform quote
+  verifier) and the new `PORTMARK_ATTESTATION_ALLOWED_MEASUREMENTS`, and turns on the source-minted
+  migration challenge. The check runs on the boot policy load and on every policy reload.
+  `required_for_migration` is deliberately not set: with the challenge on, it would demand pre-collected
+  provider evidence, which the challenge replaces.
+- **Not changed (recorded):** hostile-tool containment stays a deployment control (RC-01, see the new
+  DEPLOYMENT.md "Production Profile" section); the remote witness is open as EV-013 (DB-02).
+
 ### Completeness review — a task belongs to the sender that started it (PM-001, High)
 
 - **Cross-sender task takeover is closed.** The resume path found a checkpoint by caller-supplied

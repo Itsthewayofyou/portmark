@@ -46,6 +46,17 @@ The built-in verifier signs the canonical JSON form of every field except `signa
 
 For direct execution, the expected subject is the accepting host and the relying party is the permit issuer. For migration, the expected subject is the destination host and the relying party is the source host creating the delegated permit.
 
+## Production Profile
+
+In the production profile (the default for the ASGI app), a host whose policy allows migration refuses
+to start, or to reload its policy, unless it has a platform verifier command
+(`PORTMARK_ATTESTATION_VERIFIER_COMMAND`) and a non-empty approved-measurement set
+(`PORTMARK_ATTESTATION_ALLOWED_MEASUREMENTS`, comma-separated exact strings). Production also turns on
+the source-minted migration challenge (`require_migration_challenge`), so a migration settles only on
+the destination's fresh attestation over a challenge the source just minted. An empty measurement set
+would skip the allowlist check, and evidence without a fresh challenge can be replayed for another
+migration. A host that does not migrate needs none of this. See `DEPLOYMENT.md`.
+
 ## External Verifier Contract
 
 Configure a verifier with `PORTMARK_ATTESTATION_VERIFIER_COMMAND` or
