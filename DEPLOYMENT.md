@@ -372,9 +372,17 @@ or volume encryption of the database is still a valid control on its own. Checkp
 second layer: a copy of the database file or a database dump shows no task state without the key.
 
 With a keyring, the store seals each checkpoint with AES-256-GCM before it writes the row, and opens it
-when it reads the row. The sealed value also authenticates the task id, the row generation and the key
-id. So a changed byte, a wrong key, or a sealed value moved to another task or generation is **refused**.
-The task fails closed, and nothing is guessed.
+when it reads the row. The sealed value also authenticates the task id, the row generation, the key id,
+and the `closed` and owner columns that the store checks before a write. The `status` column is compared
+with the sealed state on every read. So each of these is **refused**:
+
+- a changed byte, or a wrong key;
+- a sealed value moved to another task or generation;
+- a closed task reopened by editing `closed`, or an owner rewritten by editing the owner columns;
+- a `status` column that does not match the sealed state.
+
+The run stops with an error (`CheckpointCryptoError`) before it writes anything. Nothing is guessed.
+(Changing `closed` from open to closed is accepted: it only restricts the task.)
 
 Set the keyring with **one** of these (not both):
 
@@ -411,8 +419,9 @@ requires this control.
 
 **Residual risk:** these points are not covered by checkpoint encryption.
 
-- The `status`, `generation`, `closed` and owner columns stay plaintext, because the store queries them.
-  The audit log, the migration outbox and receipts are not sealed by this key.
+- The `status`, `generation`, `closed` and owner columns stay **readable** (the store queries them).
+  They are authenticated, not hidden. The audit log, the migration outbox and receipts are not sealed
+  by this key.
 - A restore of a whole older row (its old sealed value **and** its old generation) still authenticates.
   That is a rollback, which the audit floor and a future remote witness (EV-013) address.
 - A process that holds the key (the host) can read every checkpoint. The key must not be stored with the

@@ -14,6 +14,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -97,6 +98,44 @@ class _StoreCases:
         with self.assertRaisesRegex(CheckpointCryptoError, "failed authentication"):
             store.load_checkpoint("t1")
 
+    def test_edited_gate_columns_fail_closed(self):
+        store = self._open(_ring(f"a:{KEY_A}"))
+        with store.transaction() as transaction:
+            transaction.save_checkpoint("done", AgentState("done", "g", status="completed"), 0, closed=True, owner=("user:alice", "agent:demo"))
+        # Reopening a closed task by editing the column: the read and the next save both refuse.
+        self._set_column("done", "closed", False)
+        with self.assertRaisesRegex(CheckpointCryptoError, "failed authentication"):
+            store.load_checkpoint("done")
+        with self.assertRaisesRegex(CheckpointCryptoError, "failed authentication"):
+            _save(store, "done", expected=1)
+        with store.transaction() as transaction:
+            transaction.save_checkpoint("owned", AgentState("owned", "g"), 0, owner=("user:alice", "agent:demo"))
+        # Rewriting the owner (PM-001 takeover by a store writer): refused before the owner compare.
+        self._set_column("owned", "owner_issuer", "user:mallory")
+        with self.assertRaisesRegex(CheckpointCryptoError, "failed authentication"):
+            store.load_checkpoint("owned")
+        with self.assertRaisesRegex(CheckpointCryptoError, "failed authentication"):
+            with store.transaction() as transaction:
+                transaction.save_checkpoint("owned", AgentState("owned", "g"), 1, owner=("user:mallory", "agent:demo"))
+        _save(store, "running")
+        self._set_column("running", "status", "completed")
+        with self.assertRaisesRegex(CheckpointCryptoError, "status column does not match"):
+            store.load_checkpoint("running")
+
+    def test_closing_a_row_only_restricts_it(self):
+        store = self._open(_ring(f"a:{KEY_A}"))
+        _save(store, "t1")
+        self._set_column("t1", "closed", True)
+        self.assertEqual(store.load_checkpoint("t1")["goal"], "secret goal text")
+        with self.assertRaisesRegex(Exception, "task checkpoint is closed"):
+            _save(store, "t1", expected=1)
+
+    def test_migration_refuses_a_plaintext_row_whose_status_column_disagrees(self):
+        _save(self._open(None), "p1")
+        self._set_column("p1", "status", "completed")
+        with self.assertRaisesRegex(CheckpointCryptoError, "'p1' cannot be migrated"):
+            self._open(_ring(f"a:{KEY_A}")).encrypt_checkpoints(apply=True)
+
     def test_reads_are_strict_in_both_directions(self):
         _save(self._open(None), "plain")
         with self.assertRaisesRegex(CheckpointCryptoError, "encrypt-checkpoints"):
@@ -179,6 +218,11 @@ class SQLiteCheckpointEncryptionTests(_StoreCases, unittest.TestCase):
     def _sql_generation(self, task_id, generation):
         self._query("UPDATE checkpoints SET generation = ? WHERE task_id = ?", (generation, task_id))
 
+    def _set_column(self, task_id, column, value):
+        if column not in {"closed", "status", "owner_issuer"}:
+            raise ValueError(column)
+        self._query(f"UPDATE checkpoints SET {column} = ? WHERE task_id = ?", (int(value) if column == "closed" else value, task_id))  # nosec B608 -- fixed column set
+
 
 @unittest.skipUnless(PG_DSN and HAVE_PSYCOPG, "live PostgreSQL required (PORTMARK_TEST_POSTGRES_DSN)")
 class PostgresCheckpointEncryptionTests(_StoreCases, unittest.TestCase):
@@ -206,6 +250,11 @@ class PostgresCheckpointEncryptionTests(_StoreCases, unittest.TestCase):
 
     def _sql_generation(self, task_id, generation):
         self._query("UPDATE checkpoints SET generation = %s WHERE task_id = %s", (generation, task_id))
+
+    def _set_column(self, task_id, column, value):
+        if column not in {"closed", "status", "owner_issuer"}:
+            raise ValueError(column)
+        self._query(f"UPDATE checkpoints SET {column} = %s WHERE task_id = %s", (value, task_id))  # nosec B608 -- fixed column set
 
 
 class KeyringTests(unittest.TestCase):
@@ -283,6 +332,30 @@ class HostAndGaugeTests(unittest.TestCase):
             connection.close()
         self.assertTrue(raw.startswith("pmc1:a:"))
         self.assertNotIn("Telescript", raw)
+
+    def test_a_tampered_checkpoint_stops_the_run_before_any_write(self):
+        store = SQLiteRuntimeStore(self.path, checkpoint_codec=_ring(f"a:{KEY_A}"))
+        host = make_host(host_id=HOST, store=store, allow_ephemeral_signing_key=True)
+        first = make_demo_envelope(host, "research Telescript")
+        self.assertEqual(host.run(first).status, "completed")
+        connection = sqlite3.connect(self.path)
+        try:
+            with connection:
+                raw = connection.execute("SELECT checkpoint_json FROM checkpoints").fetchone()[0]
+                middle = len(raw) // 2
+                connection.execute("UPDATE checkpoints SET checkpoint_json = ?", (raw[:middle] + ("B" if raw[middle] == "A" else "A") + raw[middle + 1:],))
+            before = connection.execute("SELECT checkpoint_json, generation FROM checkpoints").fetchone()
+        finally:
+            connection.close()
+        again = make_demo_envelope(host, "research Telescript")
+        again = host.signer.seal(replace(again, state=replace(again.state, task_id=first.state.task_id)))
+        with self.assertRaisesRegex(CheckpointCryptoError, "failed authentication"):
+            host.run(again)
+        connection = sqlite3.connect(self.path)
+        try:
+            self.assertEqual(connection.execute("SELECT checkpoint_json, generation FROM checkpoints").fetchone(), before)
+        finally:
+            connection.close()
 
     def test_the_gauge_is_0_without_a_keyring(self):
         host = make_host(host_id=HOST, store=SQLiteRuntimeStore(self.path), allow_ephemeral_signing_key=True)

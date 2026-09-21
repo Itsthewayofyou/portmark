@@ -2,8 +2,10 @@
 
 A checkpoint row holds the task state as JSON. With a keyring configured, the durable stores seal
 that JSON with AES-256-GCM before they write it and open it when they read it. The associated data
-binds the format version, the task id, the row generation and the key id, so a sealed checkpoint
-cannot be moved to another task or another generation, and a changed byte fails authentication.
+binds the format version, the task id, the row generation, the key id and the plaintext columns the
+store gates on (`closed` and the owner), so a sealed checkpoint cannot be moved to another task or
+generation, a closed task cannot be reopened and an owner cannot be rewritten by editing a column, and a
+changed byte fails authentication. The `status` column is compared with the sealed state on every read.
 
 Reads are strict (owner decision D2): with a keyring, a plaintext row is refused; without one, a
 sealed row is refused. Existing plaintext rows are converted once with
@@ -12,7 +14,7 @@ sealed row is refused. Existing plaintext rows are converted once with
 
 Not covered: a restore of a whole older row (its old ciphertext AND its old generation) still
 authenticates. That is rollback, which the audit floor and a remote witness (EV-013) address. The
-`status`, `generation`, `closed` and owner columns stay plaintext because the store queries them.
+columns stay readable (the store queries them); they are authenticated, not hidden.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ import re
 import secrets
 import stat
 from collections.abc import Mapping
+from typing import Any
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -45,8 +48,13 @@ def is_sealed(stored: str) -> bool:
     return stored.startswith(SEALED_PREFIX)
 
 
-def _associated_data(task_id: str, generation: int, key_id: str) -> bytes:
-    return canonical_json({"format": "portmark.checkpoint.v1", "task_id": task_id, "generation": int(generation), "key_id": key_id})
+def _associated_data(task_id: str, generation: int, key_id: str, row: Mapping[str, Any] | None) -> bytes:
+    # `row` carries the plaintext columns the store gates on (closed, owner), so a changed column no
+    # longer authenticates with the sealed state it claims to describe.
+    return canonical_json({
+        "format": "portmark.checkpoint.v1", "task_id": task_id, "generation": int(generation), "key_id": key_id,
+        "row": dict(row or {}),
+    })
 
 
 class CheckpointCodec:
@@ -71,10 +79,10 @@ class CheckpointCodec:
     def key_ids(self) -> tuple[str, ...]:
         return tuple(self._keys)
 
-    def seal(self, task_id: str, generation: int, plaintext: str) -> str:
+    def seal(self, task_id: str, generation: int, plaintext: str, row: Mapping[str, Any] | None = None) -> str:
         nonce = secrets.token_bytes(_NONCE_BYTES)
         sealed = self._keys[self.current_key_id].encrypt(
-            nonce, plaintext.encode("utf-8"), _associated_data(task_id, generation, self.current_key_id)
+            nonce, plaintext.encode("utf-8"), _associated_data(task_id, generation, self.current_key_id, row)
         )
         body = base64.urlsafe_b64encode(nonce + sealed).decode("ascii").rstrip("=")
         return f"{SEALED_PREFIX}{self.current_key_id}:{body}"
@@ -87,7 +95,7 @@ class CheckpointCodec:
             raise CheckpointCryptoError("encrypted checkpoint has a malformed header")
         return key_id
 
-    def open(self, task_id: str, generation: int, stored: str) -> str:
+    def open(self, task_id: str, generation: int, stored: str, row: Mapping[str, Any] | None = None) -> str:
         key_id = self.key_id_of(stored)
         aead = self._keys.get(key_id)
         if aead is None:
@@ -100,19 +108,19 @@ class CheckpointCodec:
         if len(raw) < _NONCE_BYTES + 16:
             raise CheckpointCryptoError("encrypted checkpoint is too short")
         try:
-            plaintext = aead.decrypt(raw[:_NONCE_BYTES], raw[_NONCE_BYTES:], _associated_data(task_id, generation, key_id))
+            plaintext = aead.decrypt(raw[:_NONCE_BYTES], raw[_NONCE_BYTES:], _associated_data(task_id, generation, key_id, row))
         except InvalidTag as error:
             raise CheckpointCryptoError("checkpoint failed authentication (wrong key, changed bytes, or moved row)") from error
         return plaintext.decode("utf-8")
 
-    def open_stored(self, task_id: str, generation: int, stored: str) -> str:
+    def open_stored(self, task_id: str, generation: int, stored: str, row: Mapping[str, Any] | None = None) -> str:
         """The strict read (D2): refuse a plaintext row when a keyring is configured."""
         if not is_sealed(stored):
             raise CheckpointCryptoError(
                 "checkpoint is not encrypted but a checkpoint keyring is configured; "
                 "run `portmark store encrypt-checkpoints --apply` with the host stopped"
             )
-        return self.open(task_id, generation, stored)
+        return self.open(task_id, generation, stored, row)
 
 
 def refuse_sealed_without_key(stored: str) -> str:

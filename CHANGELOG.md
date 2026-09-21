@@ -19,8 +19,9 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
 - **Checkpoints can be sealed at the storage boundary** (new module `portmark.checkpoint_crypto`). Set
   `PORTMARK_CHECKPOINT_KEYS` (`key-id:base64-key[,...]`) or `PORTMARK_CHECKPOINT_KEYS_FILE` (mode 600).
   The SQLite and Postgres stores then seal each checkpoint with AES-256-GCM, bound to the task id,
-  generation and key id. A changed byte, a wrong key, or a row moved to another task or generation is
-  refused. No schema change.
+  generation, key id and the `closed` and owner columns; the `status` column is checked against the
+  sealed state. A changed byte, a wrong key, a row moved to another task or generation, a reopened task,
+  a rewritten owner or an edited status is refused, and the run stops before it writes. No schema change.
 - **Optional (owner decision D1).** New gauge `portmark_checkpoint_encryption_active` on the authenticated
   `/metrics`. Disk or volume encryption remains a valid deployment-level control.
 - **Strict reads and a one-time migration (owner decision D2).** With a keyring a plaintext row is refused;
