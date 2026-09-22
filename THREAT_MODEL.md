@@ -260,6 +260,7 @@ flowchart LR
 | TM-006 | Malicious provider endpoint | Host configured to remote provider | Return oversized, malformed, or adversarial decisions | DoS or policy bypass attempt | Provider adapter, host loop | Bounded reads, JSON parsing, decision validation (`providers.py`) | Endpoint can be plain HTTP for local gateways | Add task to document/optionally enforce HTTPS for non-loopback provider endpoints | Alert on provider failures and response-limit refusals | Medium | Medium | Medium |
 | TM-007 | Weak attestation verifier | External verifier configured incorrectly | Accept wrong quote, stale measurement, or wrong subject | Migration to untrusted host | Checkpoints, attestation roots | Subject, audience, expiry, measurement, nonce, signature/external verifier checks (`security.py`, `ATTESTATION.md`) | No shipped platform verifier. The conformance harness exists: `portmark attest-conformance` (EV-004) | Add at least one real platform verifier integration | Log and alert on attestation rejection reasons | Medium | High | High |
 | TM-008 | Approval token attacker | Token leaked into checkpoint or operator channel | Replay or mutate approval token | High-impact tool misuse | Approval tokens, tools | Token binds tool, subject, audience, task, nonce, args hash, policy hash; replay list (`security.py`, `host.py`) | Used approvals live in checkpoint state, not a dedicated durable table | Add task for durable approval-use index independent of mutable checkpoint content | Alert on approval denied/replayed events | Low | High | Medium |
+| TM-009 | SIEM reader or SIEM tamperer | Read or write access to the exported audit copy | Read sensitive arguments or model output from the SIEM; guess small values from digests; change exported values | Data leak outside the host boundary; a false SIEM record | Tool arguments, model output, audit export | Export is a default-deny projection per event kind; digests are HMAC-SHA-256 with a dedicated keyring; the exporter re-checks every hash and link before copying; `verify-export` Level 1 (links + signed heads) and Level 2 (values against the store) (`audit_export.py`) | Level 1 cannot prove projected values; equal values give equal digests under one key | Run Level 2 on a schedule; rotate or scope keyrings if equality is too revealing | Alert on export-control `integrity_failure` records and a non-zero `audit export` exit | Medium | Medium | Medium |
 
 ## Criticality Calibration
 
@@ -418,6 +419,27 @@ what would address non-detections 1-3.
 rollback that would re-trust a revoked key, a clone behind the floor, a clone that diverged on its own
 floor copy, concurrent writers (threads and processes), crash before/after the floor write, a floor
 that stays unwritable, corrupted and deleted floors, and backup restore followed by `floor-reset`.
+
+
+### The SIEM export is a projection (MCP/SIEM plan, D3c)
+
+**Decision (owner, 2026-09-22): the authoritative audit record does not change; the SIEM receives a controlled
+projection.** Store richly at the trusted boundary; release minimally across it. The export copies only
+host-written fields by default. Every other field becomes a key name plus an HMAC-SHA-256 digest of the
+original value, keyed by a dedicated, rotatable keyring (`hmac_key_id` in every record). A plain SHA-256 was
+rejected because small argument values can be guessed from it. Hashing the arguments inside the audit record
+itself was rejected because it would weaken the authoritative record.
+
+**What each check proves.** The exported `hash`/`previous` fields are the authoritative event hashes, so the
+SIEM copy alone proves order and completeness against the signed heads. The projected values are not inside
+that hash, so proving them needs the store (`verify-export` Level 2). This is stated to operators rather
+than claimed away.
+
+**Delivery.** At-least-once, with a per-task cursor saved only after the output file is fsynced. Each run scans
+all heads by `task_id` and trusts no clock, because `audit_heads.updated_at` is the writer's wall clock in
+seconds and a late commit could fall behind a time cursor.
+
+**Enforcement:** `tests/test_audit_export.py`.
 
 ## Quality Check
 
