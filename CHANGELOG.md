@@ -14,8 +14,9 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   `portmark.providers.resolve_public_address`.
 - **Re-registering a tool replaces its limits completely**: an omitted timeout or output cap reverts to
   the registry default instead of keeping the replaced tool's value.
-- **A2A submission failures report who caused them.** A server failure is HTTP 500 (it was 400); a refused
-  request stays 400; an unreachable remote witness is 503 with `Retry-After` and the new refusal metric
+- **A2A submission failures report who caused them.** A server failure is HTTP 500 (it was 400), including
+  any failure after the request was admitted (the configured provider's answer or decision); a request
+  refused at admission, or whose permit expired during the run, stays 400; an unreachable remote witness is 503 with `Retry-After` and the new refusal metric
   reason `witness_unavailable`. The body stays the same generic error.
 
 ### External validation — EV-013 resolved: every save is witnessed by the optional remote witness

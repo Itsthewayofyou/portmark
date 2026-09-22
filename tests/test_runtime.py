@@ -8153,7 +8153,7 @@ class RuntimeTests(unittest.TestCase):
             ("the host's own rollback floor", FloorError("rolled-back", sentinel), 500),
             ("a tool failure", ToolExecutionError(sentinel), 500),
             ("the remote witness is down", WitnessUnavailable(sentinel), 503),
-            ("a refused request", SecurityError(sentinel), 400),
+            ("a refusal at admission (an untagged SecurityError)", SecurityError(sentinel), 400),
         ]
         host = make_host()
         app = make_asgi_app(host, A2AAuthConfig("secret"))
@@ -8192,6 +8192,42 @@ class RuntimeTests(unittest.TestCase):
         metrics = host.metrics.prometheus_text()
         self.assertIn('reason="witness_unavailable"', metrics)
         self.assertIn('reason="internal"', metrics)
+
+    def test_a2a_failures_after_admission_are_server_errors_end_to_end(self):
+        # PR #113 review: WHERE a failure happens decides the status, not its type. A malformed answer from
+        # the configured provider is a SecurityError, yet it is not the client's doing: the request was
+        # admitted, so it is a 500 -- real paths here, no patched host.run. An expired permit is the request's
+        # own authority running out, so it stays 400.
+        from portmark.security import PermitExpiredError
+
+        upstream_secret = b"UPSTREAM-SECRET-9f2"
+        with tempfile.TemporaryDirectory() as directory, \
+                local_provider_server(_respond_json(b'{"kind": "complete", ' + upstream_secret)) as (_server, url):
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            host = make_host(store=store, allow_ephemeral_signing_key=True)
+            host.providers["upstream"] = GenericHttpProvider(url, allow_local_endpoint=True)
+            host.providers["bad-shape"] = FixedProvider(object())
+            host.providers["ungranted"] = FixedProvider(ProviderDecision("tool", "not.granted", {}))
+            app = make_asgi_app(host, A2AAuthConfig("secret"))
+            cases = [
+                ("the provider's answer is malformed JSON", "upstream", None, 500),
+                ("an in-process provider returns a malformed decision", "bad-shape", None, 500),
+                ("the provider proposes a tool the permit does not grant", "ungranted", None, 500),
+                ("the permit expires during the run", "deterministic", PermitExpiredError("permit expired"), 400),
+            ]
+            for label, provider, expire, expected in cases:
+                with self.subTest(label):
+                    envelope = make_demo_envelope(host, f"after admission: {label}", provider)
+                    body = self._a2a_request_body(host, label, envelope=envelope)
+                    headers = {"Content-Type": "application/json", "Content-Length": str(len(body)), "Authorization": "Bearer secret"}
+                    patched = patch("portmark.host.require_unexpired", side_effect=expire) if expire else contextlib.nullcontext()
+                    with patched, patch("portmark.a2a.logger.exception"):
+                        status, _, payload = self._asgi_call(app, "POST", "/message:send", headers, body)
+                    self.assertEqual(status, expected)
+                    self.assertEqual(json.loads(payload)["error"], {"code": -32000, "message": "message submission failed"})
+                    self.assertNotIn(upstream_secret, payload)
+                    checkpoint = store.load_checkpoint(envelope.state.task_id)
+                    self.assertEqual(checkpoint["status"], "failed")  # admitted, then closed durably -- never `running`
 
     def test_a2a_requires_bearer_auth_before_envelope_parsing(self):
         host = make_host()

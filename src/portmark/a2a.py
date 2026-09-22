@@ -22,7 +22,7 @@ from urllib.parse import urlsplit
 from . import _run_progress
 from .json_guard import StrictJSONError, strict_json_loads
 from .a2a_types import A2ARequestError, error_response, make_agent_card, parse_jsonrpc_request, success_response, task_from_run_result
-from .host import AgentHost
+from .host import AgentHost, failed_after_admission
 from .models import AgentEnvelope, AgentManifest, AgentState, AttestationEvidence, Permit, ResourceBudget, ToolGrant
 from .security import SecurityError, normalize_output_projection, validate_constraints
 from .official_a2a import make_sdk_agent_card, validate_sdk_message_send_params
@@ -704,7 +704,10 @@ class A2ARouter:
             # The body stays generic either way: never the exception's type, message, or trace.
             self.host.metrics.increment_refusal("internal")
             logger.exception("A2A message submission failed")
-            refused = isinstance(error, SecurityError) and not isinstance(error, _SERVER_SECURITY_ERRORS)
+            # 400 only for a refusal of the REQUEST (its signature, permit, replay, grants) -- never for a
+            # failure after it was admitted (the provider, its decision), whatever that error's type.
+            refused = (isinstance(error, SecurityError) and not isinstance(error, _SERVER_SECURITY_ERRORS)
+                       and not failed_after_admission(error))
             return self.response(400 if refused else 500, error_response(request_id, -32000, "message submission failed"))
 
 

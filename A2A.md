@@ -156,9 +156,12 @@ Client errors use JSON-RPC error envelopes and generic messages. Internal except
 
 The HTTP status says who caused a failed submission; the body is the same generic error either way:
 
-- **400**: the request was refused (a bad signature, a bad or expired permit, a replay, a refused grant).
-- **500**: a server failure (a bug, a storage fault, the host's own rollback floor or checkpoint keyring,
-  its clock, or a tool failure).
+- **400**: the request was refused at admission (a bad signature, a bad permit, a replay, a refused
+  grant), or its permit expired during the run.
+- **500**: a server failure: anything that goes wrong after the request was admitted (the configured
+  provider's answer or decision, or acting on it), a bug, a storage fault, the host's own rollback floor
+  or checkpoint keyring, its clock, or a tool failure. Where a failure happens decides this, not the
+  error's type: a malformed provider answer is refused as unsafe, but it is not the client's doing.
 - **503** with `Retry-After`: the remote witness (EV-013) could not be reached. The save was refused and
   nothing was committed, so the same request can be sent again once the witness is back.
 
