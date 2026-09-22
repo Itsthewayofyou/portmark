@@ -18,6 +18,7 @@ from .storage import RuntimeStore, create_runtime_store
 from .tools import ToolRegistry, demo_registry
 from ._clock import ClockRollbackError, TimeFloorError, check_time_floor, clock_tolerance_from_environment, configure_default_clock, trusted_now
 from .witness import FloorError, LocalFloorWitness, floor_path_inside, open_audit_floor
+from .witness_binding import HostWitness, host_witness_from_environment, registry_identity, stored_receipt
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +94,7 @@ def make_host(
     migration_preflight_command: str | tuple[str, ...] | None = None,
     migration_preflight: MigrationPreflightProtocol | None = None,
     production: bool = False,
+    remote_witness: HostWitness | None = None,
 ) -> AgentHost:
     # Section 12 #6 (D3): apply the configured clock tolerance BEFORE the first security decision below
     # (the audit-key check, the audit floor, trust loading), and judge the clock once with it. The
@@ -252,12 +254,17 @@ def make_host(
         audit_floor_path or os.environ.get("PORTMARK_AUDIT_FLOOR_PATH"), host_id, host_signer, configured_store, trust_source,
         production=production,
     )
+    # EV-013: the remote witness, compared with this database's last receipt before anything runs.
+    configured_remote, remote_time_floor = _open_remote_witness(
+        remote_witness if remote_witness is not None else host_witness_from_environment(host_id, registry_identity(trust_source)),
+        configured_store, host_id, production,
+    )
     # Section 12 #6 (owner decision D3): refuse to start when the clock is behind the durable time floor --
-    # the higher of the database's floor and the audit-floor file's mirror -- by more than the tolerance.
-    # A boot ValueError like every neighbouring start-up check; never lowered automatically.
+    # the higher of the database's floor, the audit-floor file's mirror, and the remote witness's -- by more
+    # than the tolerance. A boot ValueError like every neighbouring start-up check; never lowered automatically.
     if getattr(configured_store, "is_durable", False):
         try:
-            check_time_floor(configured_store, audit_floor, clock)
+            check_time_floor(configured_store, _HighestTimeFloor(audit_floor, remote_time_floor), clock)
         except TimeFloorError as error:
             raise ValueError(f"time floor refused to start ({error.code}): {error}") from error
     host = AgentHost(
@@ -277,8 +284,11 @@ def make_host(
         metrics=metrics,
     )
     host.audit_floor = audit_floor
+    host.remote_witness = configured_remote
     # Boundary audit DB-01: whether rollback detection is on, on the authenticated /metrics (not /readyz).
     host.metrics.set_gauge("audit_witness_active", 1 if audit_floor is not None else 0)
+    # EV-013 (owner decision F3): the remote witness is optional; whether it is on is a gauge.
+    host.metrics.set_gauge("remote_witness_active", 1 if configured_remote is not None else 0)
     # EV-006 (owner decision D1): checkpoint encryption is optional, so its state is reported here, on
     # the authenticated /metrics, instead of refusing to start without it.
     host.metrics.set_gauge("checkpoint_encryption_active", 1 if getattr(configured_store, "checkpoint_codec", None) is not None else 0)
@@ -384,6 +394,49 @@ def _open_audit_floor(
     except FloorError as error:
         raise ValueError(f"audit floor refused to start ({error.code}): {error}") from error
     return witness
+
+
+class _HighestTimeFloor:
+    """The mirrored time floor for the boot clock check: the higher of the audit-floor file's and the
+    remote witness's (a restore of this machine cannot lower the remote one)."""
+
+    def __init__(self, audit_floor: LocalFloorWitness | None, remote_time_floor: int) -> None:
+        self._audit_floor, self._remote = audit_floor, remote_time_floor
+
+    def witnessed_time_floor(self) -> int:
+        local = self._audit_floor.witnessed_time_floor() if self._audit_floor is not None else 0
+        return max(int(local), int(self._remote))
+
+
+def _open_remote_witness(
+    binding: HostWitness | None, store: RuntimeStore | None, host_id: str, production: bool,
+) -> tuple[HostWitness | None, int]:
+    """EV-013 boot check. Returns (the binding, the witness's time floor). Every refusal is a boot ValueError."""
+    durable = bool(getattr(store, "is_durable", False))
+    stored = stored_receipt(store, host_id)
+    if binding is None:
+        if stored is not None:
+            # Once a database has a witness receipt, the witness cannot be silently switched off: a host
+            # started without it would write commits the witness never sees.
+            raise ValueError(
+                f"this database holds a remote-witness receipt for {host_id!r} (receipt {stored[0]}); start the host "
+                "with PORTMARK_REMOTE_WITNESS_URL, PORTMARK_REMOTE_WITNESS_PUBLIC_KEY and PORTMARK_REMOTE_WITNESS_KEY_FILE"
+            )
+        return None, 0
+    if not durable:
+        raise ValueError("a remote witness requires a durable store; an in-memory store has nothing to roll back")
+    if binding.host_id != host_id:
+        raise ValueError(f"the remote witness binding is for {binding.host_id!r}, not {host_id!r}")
+    if production and host_id == HOST_ID:
+        raise ValueError(
+            f"the production profile with a remote witness needs a unique host id, not the default {HOST_ID!r}: two "
+            "hosts sharing an id share one witness chain"
+        )
+    try:
+        state = binding.check_boot(store)
+    except FloorError as error:
+        raise ValueError(f"remote witness refused to start ({error.code}): {error}") from error
+    return binding, int(state["time_floor"])
 
 
 SPEC_FIELDS = frozenset(

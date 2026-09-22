@@ -46,14 +46,16 @@ def asgi_transport(app, path_prefix=""):
 class Witness:
     """A reference witness on a temporary SQLite file, with enrolled host, operator, and auditor keys."""
 
-    def __init__(self, root):
+    def __init__(self, root, extra_hosts=()):
         self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
         self.key = Ed25519PrivateKey.generate()
-        self.keys = {name: Ed25519PrivateKey.generate() for name in (HOST, OTHER_HOST, CONFORMANCE_HOST, OPERATOR, AUDITOR)}
+        hosts = (HOST, OTHER_HOST, CONFORMANCE_HOST, *extra_hosts)
+        self.keys = {name: Ed25519PrivateKey.generate() for name in (*hosts, OPERATOR, AUDITOR)}
         self.enrolment_path = self.root / "enrolment.json"
         self.enrolment_path.write_text(json.dumps({
             "format": ENROLMENT_FORMAT,
-            "hosts": {name: {"public_key_b64": self.public(name)} for name in (HOST, OTHER_HOST, CONFORMANCE_HOST)},
+            "hosts": {name: {"public_key_b64": self.public(name)} for name in hosts},
             "operators": {OPERATOR: {"public_key_b64": self.public(OPERATOR)}},
             "auditors": {AUDITOR: {"public_key_b64": self.public(AUDITOR)}},
         }), encoding="utf-8")

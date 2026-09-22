@@ -231,8 +231,24 @@ environment. It is never run automatically: work done after the backup is lost a
 ## Remote Witness (EV-013)
 
 The reference witness (`portmark witness serve`, see DEPLOYMENT.md "Remote Witness") keeps a hash chain
-of advances per host. The host integration is the second EV-013 change; until then these are the
-witness-side tasks.
+of advances per host, and a host with `PORTMARK_REMOTE_WITNESS_URL` advances it on every save.
+
+- **The witness is down.** Hosts refuse every save (and refuse to start) with `witness-unavailable`
+  (owner decision F1). Nothing is committed and nothing is wedged: bring the witness back and the same
+  saves go through. `verify-audit` reports `remote_status: witness-unavailable` (exit 2).
+- **`verify-audit` reports `witness-unconfigured`** (exit 2). The database holds a witness receipt, but
+  the command ran without the `PORTMARK_REMOTE_WITNESS_*` settings. Set them and run it again.
+- **A recovery reports `rebaseline-unconfirmed`.** The witness gave no answer to the rebaseline, and it
+  may have accepted it. Do not repeat `time-floor reset`. Run `floor-reset --reason ... --confirm
+  --operator-id <id> --operator-key-file <file>`: it works whether the witness moved or not.
+- **A host refuses to start with `rolled-back`.** Its database is older than the witness: it was restored,
+  or it is a stale copy. If the restore was deliberate, run `floor-reset ... --operator-id
+  --operator-key-file` (DEPLOYMENT.md "Remote Witness", Recovery). Work after the backup is lost.
+- **`forked`.** Another copy of this host advanced the chain (a clone). Stop every copy but one; the
+  copy the witness refused must not write again. Then rebaseline the one you keep.
+- **`witness-behind`.** The witness has less than this database: it was wiped or restored, or the host
+  points at the wrong witness. Never adopt it silently: check the witness and its backups first, then
+  rebaseline with the operator key.
 
 - **Health.** `GET /healthz` answers `ok`. For a real check, run `portmark witness conformance` with the
   `conformance:` host id (exit 0 = the witness enforces every rule).
@@ -308,7 +324,9 @@ check the clock first. Lower the floor with `time-floor reset` only when the clo
   `clock.forward_jumps`). Correct the clock at once. If the time floor already followed it, start-up
   refuses with `clock-behind-floor`. Then run
   `time-floor reset --to <the correct epoch> --reason "<what happened>" --confirm`, with the same
-  `--audit-floor-path` and `--trust-registry-path` the host uses.
+  `--audit-floor-path` and `--trust-registry-path` the host uses. With a remote witness, check
+  `time-floor show`: if `remote_floor` is above the correct epoch, also add `--operator-id <id>
+  --operator-key-file <operator.key>` (the witness is rebaselined; a refusal changes nothing).
 
 ## File Permissions
 
@@ -361,7 +379,7 @@ receipts, and audit details. It must be readable by the host's own user only.
 
 ## Storage Migrations
 
-SQLite runtime databases (current version 12) carry their schema version in `PRAGMA user_version`. Hosts migrate version `0` stores to the current baseline on open and refuse to open databases with a newer schema version than the runtime supports. Postgres stores (current version 10) keep their schema version in the `portmark_schema` table in the configured schema. Back up the runtime database before deploying runtime versions that include storage migrations, and validate representative task IDs with `verify-audit` after migration.
+SQLite runtime databases (current version 15) carry their schema version in `PRAGMA user_version`. Hosts migrate version `0` stores to the current baseline on open and refuse to open databases with a newer schema version than the runtime supports. Postgres stores (current version 13) keep their schema version in the `portmark_schema` table in the configured schema. Back up the runtime database before deploying runtime versions that include storage migrations, and validate representative task IDs with `verify-audit` after migration.
 
 **Crash safety.** Each SQLite step is one transaction with its version bump, so a crash or kill during
 an upgrade leaves the complete old version or the complete new one. Just start the host again: it

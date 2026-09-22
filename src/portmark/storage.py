@@ -29,8 +29,8 @@ from .security import (
 )
 
 
-SQLITE_SCHEMA_VERSION = 14
-POSTGRES_SCHEMA_VERSION = 12
+SQLITE_SCHEMA_VERSION = 15
+POSTGRES_SCHEMA_VERSION = 13
 
 # Section 4 #3: a migration lease is bounded. Zero/negative would defeat exclusivity (two workers
 # could claim the same row at the same instant); an unbounded lease would let a dead worker hold a
@@ -521,6 +521,15 @@ class RuntimeTransaction(Protocol):
         """
         ...
 
+    def witness_receipt(self, host_id: str) -> tuple[int, str] | None:
+        """EV-013: (host_seq, receipt_hash) of the newest remote-witness receipt this database committed."""
+        ...
+
+    def store_witness_receipt(self, host_id: str, host_seq: int, receipt_hash: str, receipt_json: str) -> None:
+        """EV-013: record the remote witness's receipt for this save, in the SAME transaction as the save,
+        so the database names the receipt of its own last commit (the next advance's `prev`)."""
+        ...
+
 
 class RuntimeStore(Protocol):
     # Whether checkpoints/audit heads survive a process restart. A durable store must
@@ -785,6 +794,8 @@ class InMemoryRuntimeStore:
         self._cancelled: set[str] = set()
         self._effects: dict[str, dict[str, Any]] = {}
         self._floor_markers: dict[str, tuple[int, bool]] = {}
+        # EV-013: the newest remote-witness receipt per host (restored with the rest on a rolled-back save).
+        self._witness_receipts: dict[str, tuple[int, str, str]] = {}
         # Section 12: the durable time floor (#6) and the maintenance log (#4).
         self._time_floor = 0
         self._maintenance_log: list[dict[str, Any]] = []
@@ -1161,6 +1172,15 @@ class InMemoryRuntimeStore:
         with self._lock:
             self._floor_markers[host_id] = (epoch, pending)
 
+    def witness_receipt(self, host_id: str) -> tuple[int, str] | None:
+        with self._lock:
+            row = self._witness_receipts.get(host_id)
+            return None if row is None else (row[0], row[1])
+
+    def set_witness_receipt(self, host_id: str, host_seq: int, receipt_hash: str, receipt_json: str) -> None:
+        with self._lock:
+            self._witness_receipts[host_id] = (host_seq, receipt_hash, receipt_json)
+
 
 class _InMemoryTransaction:
     def __init__(self, store: InMemoryRuntimeStore) -> None:
@@ -1170,6 +1190,7 @@ class _InMemoryTransaction:
     def __enter__(self) -> "_InMemoryTransaction":
         self._store._lock.acquire()
         self._time_floor_snapshot = self._store._time_floor
+        self._witness_snapshot = dict(self._store._witness_receipts)
         self._snapshots = (
             dict(self._store._nonces),
             json.loads(json.dumps(self._store._checkpoints)),
@@ -1193,6 +1214,7 @@ class _InMemoryTransaction:
                 self._store._migration_receipts,
             ) = self._snapshots
             self._store._time_floor = self._time_floor_snapshot
+            self._store._witness_receipts = self._witness_snapshot
         self._store._lock.release()
 
     def consume_nonce(self, nonce: str, subject: str, audience: str, task_id: str, expires_at: int | None = None) -> None:
@@ -1301,6 +1323,13 @@ class _InMemoryTransaction:
         # Keep-first: the first receipt issued for an admitted migration wins, so a
         # duplicate delivery returns the same proof.
         self._store._migration_receipts.setdefault(task_id, receipt_json)
+
+    def witness_receipt(self, host_id: str) -> tuple[int, str] | None:
+        row = self._store._witness_receipts.get(host_id)
+        return None if row is None else (row[0], row[1])
+
+    def store_witness_receipt(self, host_id: str, host_seq: int, receipt_hash: str, receipt_json: str) -> None:
+        self._store._witness_receipts[host_id] = (host_seq, receipt_hash, receipt_json)
 
 
 # Section 11 #5: the SQLite store holds checkpoints, messages, tool arguments and results,
@@ -1596,6 +1625,7 @@ class SQLiteRuntimeStore:
             11: self._migrate_to_v12,
             12: self._migrate_to_v13,
             13: self._migrate_to_v14,
+            14: self._migrate_to_v15,
         }
 
     @staticmethod
@@ -1833,6 +1863,22 @@ class SQLiteRuntimeStore:
         # rather than let the first caller claim it. A closed one is unaffected -- it is evidence.
         self._add_column(connection, "checkpoints", "owner_issuer", "TEXT")
         self._add_column(connection, "checkpoints", "owner_subject", "TEXT")
+
+    def _migrate_to_v15(self, connection: sqlite3.Connection) -> None:
+        # EV-013: the newest remote-witness receipt this database committed, one row per host, written in
+        # the save transaction. The next advance names it as `prev`, so a restored database names an OLD
+        # receipt and the witness refuses it.
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS witness_receipts (
+                host_id TEXT PRIMARY KEY,
+                host_seq INTEGER NOT NULL,
+                receipt_hash TEXT NOT NULL,
+                receipt_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
 
     def _migrate_to_v13(self, connection: sqlite3.Connection) -> None:
         # Section 12. #4: a nonce keeps the expiry of the authorization it belongs to (the only fact that
@@ -2339,6 +2385,16 @@ class SQLiteRuntimeStore:
                 (host_id, epoch, pending, int(time.time())),
             )
 
+    def witness_receipt(self, host_id: str) -> tuple[int, str] | None:
+        with self._connection() as connection:
+            row = connection.execute("SELECT host_seq, receipt_hash FROM witness_receipts WHERE host_id = ?", (host_id,)).fetchone()
+        return None if row is None else (int(row["host_seq"]), str(row["receipt_hash"]))
+
+    def set_witness_receipt(self, host_id: str, host_seq: int, receipt_hash: str, receipt_json: str) -> None:
+        """Outside a save: only an operator rebaseline (`floor-reset --operator-key-file`) writes here."""
+        with self._connection() as connection:
+            _upsert_witness_receipt(connection, "?", host_id, host_seq, receipt_hash, receipt_json)
+
 
 class PostgresRuntimeStore:
     is_durable = True
@@ -2578,6 +2634,18 @@ class PostgresRuntimeStore:
                 host_id TEXT PRIMARY KEY,
                 epoch BIGINT NOT NULL,
                 pending BOOLEAN NOT NULL DEFAULT FALSE,
+                updated_at BIGINT NOT NULL
+            )
+            """
+        )
+        # EV-013 (schema v13): the newest remote-witness receipt this database committed, one row per host.
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS witness_receipts (
+                host_id TEXT PRIMARY KEY,
+                host_seq BIGINT NOT NULL,
+                receipt_hash TEXT NOT NULL,
+                receipt_json TEXT NOT NULL,
                 updated_at BIGINT NOT NULL
             )
             """
@@ -3095,6 +3163,16 @@ class PostgresRuntimeStore:
                 (host_id, epoch, pending, int(time.time())),
             )
 
+    def witness_receipt(self, host_id: str) -> tuple[int, str] | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT host_seq, receipt_hash FROM witness_receipts WHERE host_id = %s", (host_id,)).fetchone()
+        return None if row is None else (int(row["host_seq"]), str(row["receipt_hash"]))
+
+    def set_witness_receipt(self, host_id: str, host_seq: int, receipt_hash: str, receipt_json: str) -> None:
+        """Outside a save: only an operator rebaseline (`floor-reset --operator-key-file`) writes here."""
+        with self._connect() as connection:
+            _upsert_witness_receipt(connection, "%s", host_id, host_seq, receipt_hash, receipt_json)
+
 
 class _PostgresTransaction:
     def __init__(self, store: PostgresRuntimeStore) -> None:
@@ -3321,6 +3399,23 @@ class _PostgresTransaction:
             """,
             (task_id, receipt_json, int(time.time())),
         )
+
+    def witness_receipt(self, host_id: str) -> tuple[int, str] | None:
+        if self._connection is None:
+            raise RuntimeError("Postgres transaction was not opened")
+        # Replicas of one host may share this database. Every save of the host must build on the receipt
+        # the previous save committed, so saves take a transaction-scoped lock per host first: a row lock
+        # alone would not serialize two replicas' very first saves (no row exists yet).
+        self._connection.execute("SELECT pg_advisory_xact_lock(%s)", (_advisory_lock_key("portmark-witness:" + host_id),))
+        row = self._connection.execute(
+            "SELECT host_seq, receipt_hash FROM witness_receipts WHERE host_id = %s", (host_id,)
+        ).fetchone()
+        return None if row is None else (int(row["host_seq"]), str(row["receipt_hash"]))
+
+    def store_witness_receipt(self, host_id: str, host_seq: int, receipt_hash: str, receipt_json: str) -> None:
+        if self._connection is None:
+            raise RuntimeError("Postgres transaction was not opened")
+        _upsert_witness_receipt(self._connection, "%s", host_id, host_seq, receipt_hash, receipt_json)
 
 
 
@@ -3653,6 +3748,28 @@ class _SQLiteTransaction:
             (task_id, receipt_json, int(time.time())),
         )
 
+    def witness_receipt(self, host_id: str) -> tuple[int, str] | None:
+        if self._connection is None:
+            raise RuntimeError("SQLite transaction was not opened")
+        row = self._connection.execute("SELECT host_seq, receipt_hash FROM witness_receipts WHERE host_id = ?", (host_id,)).fetchone()
+        return None if row is None else (int(row["host_seq"]), str(row["receipt_hash"]))
+
+    def store_witness_receipt(self, host_id: str, host_seq: int, receipt_hash: str, receipt_json: str) -> None:
+        if self._connection is None:
+            raise RuntimeError("SQLite transaction was not opened")
+        _upsert_witness_receipt(self._connection, "?", host_id, host_seq, receipt_hash, receipt_json)
+
+
+
+def _upsert_witness_receipt(connection: Any, mark: str, host_id: str, host_seq: int, receipt_hash: str, receipt_json: str) -> None:
+    # `mark` is the driver's placeholder ("?" for sqlite3, "%s" for psycopg); the SQL is otherwise fixed.
+    marks = ", ".join([mark] * 5)
+    connection.execute(
+        f"INSERT INTO witness_receipts (host_id, host_seq, receipt_hash, receipt_json, updated_at) VALUES ({marks}) "  # nosec B608 -- fixed placeholders only
+        "ON CONFLICT (host_id) DO UPDATE SET host_seq = EXCLUDED.host_seq, receipt_hash = EXCLUDED.receipt_hash, "
+        "receipt_json = EXCLUDED.receipt_json, updated_at = EXCLUDED.updated_at",
+        (host_id, host_seq, receipt_hash, receipt_json, int(time.time())),
+    )
 
 
 def _audit_hash(record: dict[str, Any]) -> str:

@@ -229,7 +229,7 @@ class AuditFloorBootAndResetTests(unittest.TestCase):
     def test_schema_has_the_marker_table(self):
         with self.store._connection() as connection:
             self.assertEqual(int(connection.execute("PRAGMA user_version").fetchone()[0]), SQLITE_SCHEMA_VERSION)
-            self.assertEqual(SQLITE_SCHEMA_VERSION, 14)  # PM-001 (v14) keeps the Section 10 marker table
+            self.assertEqual(SQLITE_SCHEMA_VERSION, 15)  # PM-001 (v14) and EV-013 (v15) keep the Section 10 marker table
             columns = {row[1] for row in connection.execute("PRAGMA table_info(audit_floor_markers)").fetchall()}
         self.assertEqual(columns, {"host_id", "epoch", "pending", "updated_at"})
 
@@ -956,7 +956,7 @@ class AuditFloorPostgresTests(unittest.TestCase):
     def test_postgres_store_anchors_and_refuses_a_rolled_back_chain(self):
         from portmark.storage import POSTGRES_SCHEMA_VERSION
 
-        self.assertEqual(POSTGRES_SCHEMA_VERSION, 12)  # PM-001 (v12) keeps the Section 10 marker table
+        self.assertEqual(POSTGRES_SCHEMA_VERSION, 13)  # PM-001 (v12) and EV-013 (v13) keep the Section 10 marker table
         host = self.host()
         envelope, first = start_task(host)
         store = self.make_store()
