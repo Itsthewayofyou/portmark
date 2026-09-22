@@ -218,7 +218,9 @@ class LogTests(WitnessCase, unittest.TestCase):
         self.assertEqual(heads, {"t1": head(2, "b"), "t3": head(2, "zz")})
 
     def test_files_are_owner_only(self):
-        self.assertEqual(mode_of(self.w.log.path), 0o600)
+        posix = os.name == "posix"  # Windows has no group/other mode bits: the checks are POSIX-only
+        if posix:
+            self.assertEqual(mode_of(self.w.log.path), 0o600)
         loose = os.path.join(self._dir.name, "loose.sqlite")
         with open(loose, "w"):
             pass
@@ -228,7 +230,8 @@ class LogTests(WitnessCase, unittest.TestCase):
                 WitnessLog(loose)
         key_path = os.path.join(self._dir.name, "witness.key")
         public = generate_key_file(key_path)
-        self.assertEqual(mode_of(key_path), 0o600)
+        if posix:
+            self.assertEqual(mode_of(key_path), 0o600)
         self.assertEqual(public_key_bytes(load_private_key_file(key_path)), public)
         with self.assertRaises(FileExistsError):
             generate_key_file(key_path)
@@ -261,6 +264,7 @@ class EnrolmentAndBindTests(WitnessCase, unittest.TestCase):
     def test_a_public_bind_needs_the_tls_acknowledgement(self):
         self.assertEqual(bind_problems("127.0.0.1", None), [])
         self.assertEqual(bind_problems("::1", None), [])
+        self.assertEqual(bind_problems("localhost", None), [])
         for bind in ("0.0.0.0", "10.0.0.5", "witness.example"):  # nosec B104 -- the refusal under test
             self.assertTrue(bind_problems(bind, None), bind)
             self.assertTrue(bind_problems(bind, "yes"), bind)

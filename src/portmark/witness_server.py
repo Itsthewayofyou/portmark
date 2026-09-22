@@ -36,7 +36,6 @@ from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from .a2a import is_loopback_bind
 from .json_guard import StrictJSONError, strict_json_loads
 from .remote_witness import (
     ADVANCE_FORMAT,
@@ -51,6 +50,7 @@ from .remote_witness import (
     STATE_PATH,
     TOO_LARGE,
     UNAUTHENTICATED,
+    WRONG_WITNESS,
     Decision,
     HostState,
     KnownEntry,
@@ -63,6 +63,7 @@ from .remote_witness import (
     decide_rebaseline,
     decode_public_key,
     digest,
+    is_loopback_host,
     key_id_for,
     open_request,
     public_key_bytes,
@@ -87,7 +88,7 @@ SIGNER_RATE_PER_SECOND = 100.0
 SIGNER_BURST = 200.0
 
 _PATH_FORMATS = {ADVANCE_PATH: ADVANCE_FORMAT, STATE_PATH: STATE_FORMAT, REBASELINE_PATH: REBASELINE_FORMAT}
-_STATUS = {MALFORMED: 400, UNAUTHENTICATED: 401, NOT_FOUND: 404, TOO_LARGE: 413, RATE_LIMITED: 429, "wrong-witness": 400}
+_STATUS = {MALFORMED: 400, UNAUTHENTICATED: 401, NOT_FOUND: 404, TOO_LARGE: 413, RATE_LIMITED: 429, WRONG_WITNESS: 400}
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS witness_log (
@@ -480,7 +481,7 @@ def make_witness_app(service: WitnessService) -> Callable[..., Any]:
 
 
 def bind_problems(bind: str, public_mode: str | None) -> list[str]:
-    if is_loopback_bind(bind):
+    if is_loopback_host(bind):
         return []
     if (public_mode or "").strip() != PUBLIC_MODE_ACK:
         return [f"a non-loopback bind needs --public-mode {PUBLIC_MODE_ACK}: acknowledge that a reverse proxy terminates TLS "
@@ -497,7 +498,10 @@ def serve_witness(database: str, key_file: str, enrolment_path: str, bind: str, 
     problems = bind_problems(bind, public_mode)
     if problems:
         raise ValueError("; ".join(problems))
-    service = WitnessService(WitnessLog(database), load_private_key_file(key_file), Enrolment.from_path(enrolment_path))
+    # The key and enrolment first: a bad one must not leave a new, empty witness database behind.
+    private_key = load_private_key_file(key_file)
+    enrolment = Enrolment.from_path(enrolment_path)
+    service = WitnessService(WitnessLog(database), private_key, enrolment)
     config = uvicorn.Config(
         make_witness_app(service), host=bind, port=port, proxy_headers=False, server_header=False, lifespan="on", log_level="info",
     )

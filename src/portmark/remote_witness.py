@@ -522,7 +522,8 @@ def refusal_body(code: str, message: str, request_sha256: str | None, host_id: s
 Transport = Callable[[str, bytes], tuple[int, bytes]]
 
 
-def _is_loopback_host(host: str) -> bool:
+def is_loopback_host(host: str) -> bool:
+    """localhost, or a loopback IP address (the witness bind rule and the client URL rule share it)."""
     if host == "localhost":
         return True
     try:
@@ -537,7 +538,7 @@ def http_transport(base_url: str, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> T
     parsed = urllib.parse.urlsplit(base_url)
     if parsed.scheme not in ("https", "http") or not parsed.hostname or parsed.query or parsed.fragment:
         raise ValueError("the witness URL must be https://host[:port][/prefix]")
-    if parsed.scheme == "http" and not _is_loopback_host(parsed.hostname):
+    if parsed.scheme == "http" and not is_loopback_host(parsed.hostname):
         raise ValueError("the witness URL must use https (plain http only to a loopback address)")
     if not timeout > 0:
         raise ValueError("the witness timeout must be positive")
