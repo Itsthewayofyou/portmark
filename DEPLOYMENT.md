@@ -484,6 +484,8 @@ portmark witness serve --db /var/lib/portmark-witness/witness.sqlite \
 - **Deadlines are absolute.** The server reads a whole request body within one 10 s deadline (not per
   chunk), and it answers 503 above 256 open connections. The client's timeout is one deadline for the
   whole call: connect, TLS, headers and body. A witness that answers slowly cannot hold the caller past it.
+  At most 4 calls are in flight per client. A call stuck where it cannot be aborted (a stalled DNS lookup)
+  keeps its slot until it ends, and when all 4 are stuck a new call fails at once without starting a thread.
   uvicorn has no timeout for slow request *headers*: set one on the TLS proxy (for nginx,
   `client_header_timeout 10s;`).
 - The database file is created mode 600; a looser file is refused. Key files must be mode 600.

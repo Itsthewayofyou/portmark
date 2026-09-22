@@ -68,6 +68,10 @@ MAX_REQUEST_BYTES = 1024 * 1024
 MAX_HEADS = 10_000
 MAX_ID_LENGTH = 512
 DEFAULT_TIMEOUT_SECONDS = 2.0
+# At most this many witness calls in flight per transport. A slot is freed only when its worker thread
+# really exits: a worker blocked where no socket exists yet (a stalled DNS lookup) cannot be aborted,
+# so without the cap every timed-out save would leave one more thread behind.
+MAX_OUTSTANDING_CALLS = 4
 
 # Refusal codes (the witness answers these, signed). ROLLED_BACK and FORKED are the audit-floor codes.
 SEQUENCE_MISMATCH = "sequence-mismatch"
@@ -546,6 +550,7 @@ def http_transport(base_url: str, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> T
         raise ValueError("the witness timeout must be positive")
     https = parsed.scheme == "https"
     base_path = parsed.path.rstrip("/")
+    slots = threading.BoundedSemaphore(MAX_OUTSTANDING_CALLS)
     host, port = parsed.hostname, parsed.port
 
     def send(path: str, payload: bytes) -> tuple[int, bytes]:
@@ -553,12 +558,25 @@ def http_transport(base_url: str, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> T
         socket timeout alone bounds each read, so a witness sending a small chunk just under it would
         hold the caller (in PR 2: the host's database write transaction) forever. The exchange runs in
         a worker thread; at the deadline the caller gets WitnessUnavailable and the socket is shut down,
-        which ends the worker's blocked read."""
-        if https:
-            connection: http.client.HTTPConnection = http.client.HTTPSConnection(host, port, timeout=timeout, context=ssl.create_default_context())
-        else:
-            connection = http.client.HTTPConnection(host, port, timeout=timeout)
+        which ends the worker's blocked read. A worker blocked BEFORE a socket exists (a stalled DNS
+        lookup) cannot be ended that way; it keeps its slot until it exits, and once every slot is held
+        a new call fails at once without starting a thread."""
+        if not slots.acquire(blocking=False):
+            raise WitnessUnavailable(
+                f"{MAX_OUTSTANDING_CALLS} earlier calls to the witness at {base_url} are still stuck (for example in a DNS "
+                "lookup); not starting another"
+            )
         result: dict[str, Any] = {}
+        try:
+            if https:
+                connection: http.client.HTTPConnection = http.client.HTTPSConnection(
+                    host, port, timeout=timeout, context=ssl.create_default_context()
+                )
+            else:
+                connection = http.client.HTTPConnection(host, port, timeout=timeout)
+        except BaseException:
+            slots.release()  # no worker was started, so none will release the slot
+            raise
 
         def exchange() -> None:
             try:
@@ -568,9 +586,15 @@ def http_transport(base_url: str, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> T
                 result["answer"] = (response.status, response.read(MAX_REQUEST_BYTES + 1))
             except Exception as error:  # every failure here means "no usable answer"
                 result["error"] = error
+            finally:
+                slots.release()
 
         worker = threading.Thread(target=exchange, name="portmark-witness-call", daemon=True)
-        worker.start()
+        try:
+            worker.start()
+        except BaseException:
+            slots.release()  # the worker never ran, so it cannot release its slot
+            raise
         worker.join(timeout)
         if worker.is_alive():
             _abort(connection)

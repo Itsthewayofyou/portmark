@@ -464,6 +464,55 @@ class DeadlineTests(WitnessCase, unittest.TestCase):
             finally:
                 server.close()
 
+    def test_a_stalled_dns_lookup_cannot_pile_up_worker_threads(self):
+        # No socket exists while getaddrinfo is blocked, so a timed-out worker cannot be aborted: the
+        # transport must cap how many such workers exist, and free a slot only when a worker exits.
+        from portmark import remote_witness
+
+        release = threading.Event()
+        real_getaddrinfo = socket.getaddrinfo
+
+        def stalled(*args, **kwargs):
+            release.wait(30)
+            raise OSError("DNS is down")
+
+        def workers():
+            return sum(1 for thread in threading.enumerate() if thread.name == "portmark-witness-call")
+
+        send = http_transport("http://localhost:9", timeout=0.1)
+        try:
+            with patch("socket.getaddrinfo", stalled):
+                messages = []
+                for _ in range(12):
+                    with self.assertRaises(WitnessUnavailable) as caught:
+                        send(STATE_PATH, b"{}")
+                    messages.append(str(caught.exception))
+                    self.assertLessEqual(workers(), remote_witness.MAX_OUTSTANDING_CALLS)
+                cap = remote_witness.MAX_OUTSTANDING_CALLS
+                self.assertTrue(all("within 0.1s" in message for message in messages[:cap]))
+                self.assertTrue(all("still stuck" in message for message in messages[cap:]))
+                self.assertEqual(workers(), cap)
+                release.set()  # DNS answers (with an error): the stuck workers exit and free their slots
+                end = time.monotonic() + 5
+                while workers() and time.monotonic() < end:
+                    time.sleep(0.02)
+                self.assertEqual(workers(), 0)
+            with socket.socket() as probe:  # a free port with nothing listening
+                probe.bind(("127.0.0.1", 0))
+                port = probe.getsockname()[1]
+            again = http_transport(f"http://127.0.0.1:{port}", timeout=2)
+            with self.assertRaises(WitnessUnavailable) as caught:
+                again(STATE_PATH, b"{}")
+            self.assertNotIn("still stuck", str(caught.exception))
+            # The first transport's slots are free again too.
+            with patch("socket.getaddrinfo", lambda *a, **k: (_ for _ in ()).throw(OSError("no such host"))):
+                with self.assertRaises(WitnessUnavailable) as caught:
+                    send(STATE_PATH, b"{}")
+                self.assertIn("no such host", str(caught.exception))
+        finally:
+            release.set()
+            self.assertIs(socket.getaddrinfo, real_getaddrinfo)
+
     def test_the_server_caps_open_connections(self):
         captured = {}
 
