@@ -60,7 +60,12 @@ PYTHONPATH=src:. python -m portmark.cli \
 ```
 
 The example tool enforces a fixed GET method, HTTPS URLs, no URL userinfo, no
-redirect following, a two-second network timeout, and a 65 KiB response cap. The
+redirect following, a two-second network timeout, and a 65 KiB response cap. The URL's
+host must also resolve only to **public** addresses: one loopback, private, link-local,
+multicast, reserved, or unspecified answer (IPv4-mapped IPv6 included) refuses the call.
+The tool asks DNS once and connects to the address it checked, with TLS verifying the
+original name, so the name cannot be re-pointed at an internal address in between (DNS
+rebinding). There is no private-range override. The
 allowlist belongs in host policy with URL constraints such as `scheme`,
 `allowed_hosts`, or `allowed_domains`; provider-supplied arguments cannot expand
 that allowlist.
@@ -279,7 +284,9 @@ fails closed at startup unless BOTH hold:
 
 The gate is also **re-asserted at the launch boundary** in `invoke()` (a startup-only
 check over a mutable set is advisory, not a gate), and re-registration cannot strip
-the reconcile target while keeping a tool side-effecting. When a side-effecting effect
+the reconcile target while keeping a tool side-effecting. A registration under an existing
+name is a **complete replacement**: a timeout or output cap it does not name reverts to the
+registry default, never to the replaced tool's value. When a side-effecting effect
 settles `unknown`, its `tool.killed`/`tool.failed` audit event records the profile's
 `mechanism` + `acknowledged_by`, so an incident responder sees what containment was
 claimed. This closes the public-API path into a side-effecting launch without the

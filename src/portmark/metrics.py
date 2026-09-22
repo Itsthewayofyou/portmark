@@ -20,6 +20,8 @@ _REFUSAL_REASONS = frozenset({
     # Section 12: a body not received within the deadline (#2); a request refused while draining (#1).
     "request_timeout",
     "shutting_down",
+    # EV-013: a save refused because the remote witness could not be reached (HTTP 503).
+    "witness_unavailable",
 })
 # Fixed-name runtime gauges (boundary audit). A name outside this set is a programming error, not a
 # new unbounded series.

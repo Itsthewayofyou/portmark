@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import urllib.error
-import urllib.request
+import http.client
+import ssl
 from typing import Any
 from urllib.parse import urlparse
 
+from portmark.providers import PinnedHTTPSConnection, resolve_public_address
 from portmark.security import SecurityError
 from portmark.tools import ToolExecutionError, ToolRegistry
 
@@ -12,11 +13,6 @@ from portmark.tools import ToolExecutionError, ToolRegistry
 MAX_RESPONSE_BYTES = 65_536
 TIMEOUT_SECONDS = 2.0
 USER_AGENT = "PortmarkExampleHttpFetch/1.0"
-
-
-class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
 
 
 def registry() -> ToolRegistry:
@@ -37,20 +33,39 @@ def fetch(arguments: dict[str, Any]) -> dict[str, Any]:
         raise SecurityError("http.fetch requires an absolute URL")
     if parsed.username is not None or parsed.password is not None:
         raise SecurityError("http.fetch URLs must not contain userinfo")
-
-    request = urllib.request.Request(url, method="GET", headers={"User-Agent": USER_AGENT})
-    opener = urllib.request.build_opener(NoRedirectHandler)
+    hostname = parsed.hostname
     try:
-        with opener.open(request, timeout=TIMEOUT_SECONDS) as response:  # nosec B310
-            raw = response.read(MAX_RESPONSE_BYTES + 1)
-            status = response.status
-            content_type = response.headers.get("Content-Type", "")
-    except urllib.error.HTTPError as error:
-        if 300 <= error.code < 400:
-            raise SecurityError("http.fetch redirects are disabled") from error
+        port = parsed.port or 443
+    except ValueError as error:
+        raise SecurityError("http.fetch URL has an invalid port") from error
+    target = (parsed.path or "/") + (f"?{parsed.query}" if parsed.query else "")
+
+    # The host policy allowlists the NAME; the name must also resolve only to public addresses, and the
+    # connection goes to the address checked here -- DNS is not asked again, so the name cannot be
+    # re-pointed (rebound) at an internal address between the check and the connect. TLS still verifies
+    # the certificate against the original name.
+    try:
+        address = resolve_public_address(hostname, port)
+    except OSError as error:
         raise ToolExecutionError("http.fetch request failed") from error
-    except (OSError, TimeoutError) as error:
+    host_header = f"[{hostname}]" if ":" in hostname else hostname
+    if port != 443:
+        host_header += f":{port}"
+    connection = PinnedHTTPSConnection(address, port, hostname, TIMEOUT_SECONDS, ssl.create_default_context())
+    try:
+        connection.request("GET", target, headers={"Host": host_header, "User-Agent": USER_AGENT})
+        response = connection.getresponse()
+        status = response.status
+        if 300 <= status < 400:
+            raise SecurityError("http.fetch redirects are disabled")
+        if status >= 400:
+            raise ToolExecutionError("http.fetch request failed")
+        raw = response.read(MAX_RESPONSE_BYTES + 1)
+        content_type = response.getheader("Content-Type", "") or ""
+    except (OSError, http.client.HTTPException) as error:
         raise ToolExecutionError("http.fetch request failed") from error
+    finally:
+        connection.close()
     if len(raw) > MAX_RESPONSE_BYTES:
         raise ToolExecutionError("http.fetch response exceeds output limit")
     return {

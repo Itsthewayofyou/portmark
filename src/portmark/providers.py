@@ -105,7 +105,7 @@ class ProviderError(Exception):
     checkpoint on ANY decide() failure, so an admitted task is never left only as `running`."""
 
 
-class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+class PinnedHTTPSConnection(http.client.HTTPSConnection):
     """Connects to a pre-validated IP while validating the TLS certificate against the ORIGINAL
     hostname (server_hostname). Connecting to the literal we already classified -- not re-resolving
     the hostname at connect time -- is the DNS-rebinding defense; the cert check stays on the name."""
@@ -118,6 +118,25 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
     def connect(self) -> None:
         http.client.HTTPConnection.connect(self)  # TCP-connect to self.host, which is the pinned IP
         self.sock = self._ssl_context.wrap_socket(self.sock, server_hostname=self._pin_hostname)
+
+
+def resolve_public_address(host: str, port: int) -> str:
+    """Resolve `host` ONCE and return the address to connect to. Every answer must be a PUBLIC address:
+    one loopback, private, link-local, multicast, reserved, or unspecified answer (IPv4-mapped IPv6
+    included) fails the whole lookup closed (SecurityError), so a mixed answer cannot slip through on its
+    public half. Connect to the returned literal with PinnedHTTPSConnection, so DNS is never asked again
+    for routing (the DNS-rebinding defense). A lookup failure is an OSError."""
+    try:
+        answers = [str(ipaddress.ip_address(host))]
+    except ValueError:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        answers = [str(sockaddr[0]) for family, _t, _p, _c, sockaddr in infos if family in (socket.AF_INET, socket.AF_INET6)]
+    if not answers:
+        raise OSError(f"{host!r} resolved to no usable address")
+    for ip in answers:
+        if _address_is_disallowed(_classify_address(ip)):
+            raise SecurityError(f"{host!r} resolves to a non-public address ({ip})")
+    return answers[0]
 
 
 def _classify_address(ip_str: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
@@ -243,7 +262,7 @@ class GenericHttpProvider(ModelProvider):
         if remaining <= 0:
             raise ProviderError("provider deadline exceeded before connect")
         if self._scheme == "https":
-            connection: http.client.HTTPConnection = _PinnedHTTPSConnection(
+            connection: http.client.HTTPConnection = PinnedHTTPSConnection(
                 ip, self._port, self._host, remaining, ssl.create_default_context()
             )
         else:
