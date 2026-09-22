@@ -9,7 +9,7 @@ import sqlite3
 import stat
 import threading
 import time
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -438,6 +438,93 @@ class AuditVerificationResult:
         return self.status == "valid"
 
 
+# SIEM export (MCP/SIEM plan, PR 1): a page of audit chains read for `portmark audit export`.
+DEFAULT_EXPORT_EVENTS = 2000
+MAX_EXPORT_EVENTS = 10_000
+_EXPORT_HEAD_FIELDS = ("head_hash", "sequence", "host_id", "signature_key_id", "signature", "signed_at")
+
+
+@dataclass(frozen=True)
+class AuditExportTask:
+    """One task's stored head and the events after the exporter's watermark, read in one snapshot.
+
+    `events` hold the stored row as it is: `details_json` is NOT parsed here, so the exporter's own
+    integrity check sees exactly the stored bytes. `truncated` is True only when the page's event
+    budget stopped the read; events missing from the store show as an incomplete, untruncated task."""
+
+    task_id: str
+    head: dict[str, Any]
+    events: tuple[dict[str, Any], ...]
+    truncated: bool
+
+
+@dataclass(frozen=True)
+class AuditExportPage:
+    tasks: tuple[AuditExportTask, ...]
+    # The `after` to pass for the next page. A truncated task is NOT passed: the next page reads it again
+    # from the advanced watermark.
+    next_after: str | None
+    done: bool
+
+
+def _validate_export_page(after: Any, watermarks: Any, limit: Any, max_events: Any) -> None:
+    _validate_page(limit, after)
+    if isinstance(max_events, bool) or not isinstance(max_events, int) or not 1 <= max_events <= MAX_EXPORT_EVENTS:
+        raise ValueError(f"max_events must be an integer from 1 to {MAX_EXPORT_EVENTS}, got {max_events!r}")
+    if not isinstance(watermarks, Mapping):
+        raise ValueError("watermarks must map task id to the next sequence to export")
+
+
+def _assemble_export_page(
+    heads: list[dict[str, Any]],
+    fetch_events: Callable[[str, int, int], list[dict[str, Any]]],
+    after: str | None,
+    watermarks: Mapping[str, int],
+    limit: int,
+    max_events: int,
+) -> AuditExportPage:
+    """The paging rule shared by every store, so the three cannot drift apart.
+
+    Every head in the page is returned (the exporter compares each with its cursor, which is how a head
+    that moved BACKWARDS or was rewritten is found). Events are fetched only past the watermark, at most
+    `max_events` for the whole page. When the budget cuts a task short, the page ends there."""
+    tasks: list[AuditExportTask] = []
+    budget = max_events
+    last_done = after
+    for head in heads:
+        task_id = head["task_id"]
+        head_fields = {field: head[field] for field in _EXPORT_HEAD_FIELDS}
+        start = watermarks.get(task_id, 0)
+        needed = int(head["sequence"]) - start
+        if needed <= 0:
+            tasks.append(AuditExportTask(task_id, head_fields, (), False))
+            last_done = task_id
+            continue
+        if budget == 0:
+            return AuditExportPage(tuple(tasks), last_done, False)
+        want = min(needed, budget)
+        events = fetch_events(task_id, start, want)
+        budget -= len(events)
+        if want < needed:
+            tasks.append(AuditExportTask(task_id, head_fields, tuple(events), True))
+            return AuditExportPage(tuple(tasks), last_done, False)
+        tasks.append(AuditExportTask(task_id, head_fields, tuple(events), False))
+        last_done = task_id
+    return AuditExportPage(tuple(tasks), last_done, len(heads) < limit)
+
+
+def _export_event_row(row: Any) -> dict[str, Any]:
+    return {
+        "sequence": int(row["sequence"]),
+        "event": row["event"],
+        "details_json": row["details_json"],
+        "previous": row["previous_hash"],
+        "hash": row["hash"],
+        "host_id": row["host_id"],
+        "created_at": row["created_at"],
+    }
+
+
 class RuntimeTransaction(Protocol):
     def consume_nonce(self, nonce: str, subject: str, audience: str, task_id: str, expires_at: int | None = None) -> None:
         """Consume a one-time nonce. `expires_at` is the expiry of the authorization it belongs to,
@@ -627,6 +714,18 @@ class RuntimeStore(Protocol):
         ...
 
     def verify_audit_chain(self, task_id: str) -> bool:
+        ...
+
+    def audit_export_page(
+        self,
+        after: str | None,
+        watermarks: Mapping[str, int],
+        limit: int = DEFAULT_ADMIN_PAGE_SIZE,
+        max_events: int = DEFAULT_EXPORT_EVENTS,
+    ) -> AuditExportPage:
+        """READ-ONLY. One page of audit heads (task_id > `after`, in task_id order) and, per head, the stored
+        events from `watermarks[task_id]` (default 0) onward -- all from ONE snapshot, so a head is never
+        paired with events from a different moment. For `portmark audit export`; it never writes."""
         ...
 
     def list_pending_migrations(self, limit: int = DEFAULT_ADMIN_PAGE_SIZE, after: str | None = None) -> list[dict[str, Any]]:
@@ -1158,6 +1257,37 @@ class InMemoryRuntimeStore:
     def audit_heads_for_host(self, host_id: str) -> list[tuple[str, str, int]]:
         with self._lock:
             return [(task_id, head["head_hash"], int(head["sequence"])) for task_id, head in self._audit_heads.items() if head.get("host_id") == host_id]
+
+    def audit_export_page(
+        self,
+        after: str | None,
+        watermarks: Mapping[str, int],
+        limit: int = DEFAULT_ADMIN_PAGE_SIZE,
+        max_events: int = DEFAULT_EXPORT_EVENTS,
+    ) -> AuditExportPage:
+        _validate_export_page(after, watermarks, limit, max_events)
+
+        def fetch_events(task_id: str, start: int, count: int) -> list[dict[str, Any]]:
+            stored = self._audit_events.get(task_id, [])
+            return [
+                {
+                    "sequence": event["sequence"],
+                    "event": event["event"],
+                    # The SQL stores keep exactly this encoding in details_json.
+                    "details_json": json.dumps(event["details"], sort_keys=True, separators=(",", ":")),
+                    "previous": event["previous"],
+                    "hash": event["hash"],
+                    "host_id": event.get("host_id", ""),
+                    "created_at": None,
+                }
+                for event in stored
+                if start <= event["sequence"] < start + count
+            ]
+
+        with self._lock:  # the lock is this store's snapshot
+            task_ids = sorted(task_id for task_id in self._audit_heads if after is None or task_id > after)[:limit]
+            heads = [{"task_id": task_id, **{field: self._audit_heads[task_id].get(field) for field in _EXPORT_HEAD_FIELDS}} for task_id in task_ids]
+            return _assemble_export_page(heads, fetch_events, after, watermarks, limit, max_events)
 
     def audit_event_hash(self, task_id: str, sequence: int) -> str | None:
         with self._lock:
@@ -2365,6 +2495,31 @@ class SQLiteRuntimeStore:
             rows = connection.execute("SELECT task_id, head_hash, sequence FROM audit_heads WHERE host_id = ?", (host_id,)).fetchall()
         return [(row["task_id"], row["head_hash"], int(row["sequence"])) for row in rows]
 
+    def audit_export_page(
+        self,
+        after: str | None,
+        watermarks: Mapping[str, int],
+        limit: int = DEFAULT_ADMIN_PAGE_SIZE,
+        max_events: int = DEFAULT_EXPORT_EVENTS,
+    ) -> AuditExportPage:
+        _validate_export_page(after, watermarks, limit, max_events)
+        with self._connection() as connection:
+            # One snapshot for the heads and every event read (as verify_audit_chain_status): under WAL a
+            # deferred read transaction pins its snapshot at the first read and does not block writers.
+            connection.execute("BEGIN DEFERRED")
+            if after is None:
+                heads = connection.execute("SELECT task_id, head_hash, sequence, host_id, signature_key_id, signature, signed_at FROM audit_heads ORDER BY task_id LIMIT ?", (limit,)).fetchall()
+            else:
+                heads = connection.execute("SELECT task_id, head_hash, sequence, host_id, signature_key_id, signature, signed_at FROM audit_heads WHERE task_id > ? ORDER BY task_id LIMIT ?", (after, limit)).fetchall()
+
+            def fetch_events(task_id: str, start: int, count: int) -> list[dict[str, Any]]:
+                rows = connection.execute(
+                    "SELECT sequence, event, details_json, previous_hash, hash, host_id, created_at FROM audit_events WHERE task_id = ? AND sequence >= ? ORDER BY sequence LIMIT ?", (task_id, start, count)
+                ).fetchall()
+                return [_export_event_row(row) for row in rows]
+
+            return _assemble_export_page([dict(row) for row in heads], fetch_events, after, watermarks, limit, max_events)
+
     def audit_event_hash(self, task_id: str, sequence: int) -> str | None:
         with self._connection() as connection:
             row = connection.execute(
@@ -3142,6 +3297,34 @@ class PostgresRuntimeStore:
         with self._connect() as connection:
             rows = connection.execute("SELECT task_id, head_hash, sequence FROM audit_heads WHERE host_id = %s", (host_id,)).fetchall()
         return [(row["task_id"], row["head_hash"], int(row["sequence"])) for row in rows]
+
+    def audit_export_page(
+        self,
+        after: str | None,
+        watermarks: Mapping[str, int],
+        limit: int = DEFAULT_ADMIN_PAGE_SIZE,
+        max_events: int = DEFAULT_EXPORT_EVENTS,
+    ) -> AuditExportPage:
+        _validate_export_page(after, watermarks, limit, max_events)
+        psycopg, _, _, _ = _postgres_modules()
+        with self._connect() as connection:
+            # As verify_audit_chain_status (Section 10 F3): end the transaction _connect opened for SET
+            # search_path, then read heads and events inside one REPEATABLE READ, READ ONLY transaction.
+            connection.commit()
+            connection.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
+            connection.read_only = True
+            if after is None:
+                heads = connection.execute("SELECT task_id, head_hash, sequence, host_id, signature_key_id, signature, signed_at FROM audit_heads ORDER BY task_id LIMIT %s", (limit,)).fetchall()
+            else:
+                heads = connection.execute("SELECT task_id, head_hash, sequence, host_id, signature_key_id, signature, signed_at FROM audit_heads WHERE task_id > %s ORDER BY task_id LIMIT %s", (after, limit)).fetchall()
+
+            def fetch_events(task_id: str, start: int, count: int) -> list[dict[str, Any]]:
+                rows = connection.execute(
+                    "SELECT sequence, event, details_json, previous_hash, hash, host_id, created_at FROM audit_events WHERE task_id = %s AND sequence >= %s ORDER BY sequence LIMIT %s", (task_id, start, count)
+                ).fetchall()
+                return [_export_event_row(row) for row in rows]
+
+            return _assemble_export_page([dict(row) for row in heads], fetch_events, after, watermarks, limit, max_events)
 
     def audit_event_hash(self, task_id: str, sequence: int) -> str | None:
         with self._connect() as connection:

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import secrets
 import shlex
+import stat
 import sys
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -19,7 +21,7 @@ from ._durable_file import (  # noqa: F401 -- re-exported names kept for keygen 
     sidecar_lock as _registry_write_lock,
 )
 from .logging_config import configure_logging
-from .storage import MAX_PRUNE_BATCH
+from .storage import DEFAULT_ADMIN_PAGE_SIZE, DEFAULT_EXPORT_EVENTS, MAX_PRUNE_BATCH
 from .tool_loading import ToolLoaderError, load_tools
 
 
@@ -258,6 +260,86 @@ def _floor_reader(config, audit_verifier):
     if audit_verifier is None:
         raise SystemExit("reading the audit floor needs --trust-registry-path (its signature is verified)")
     return LocalFloorWitness(config.audit_floor_path, config.host_id, None, audit_verifier)
+
+
+def _run_audit(parser: argparse.ArgumentParser, args: argparse.Namespace, store, audit_verifier) -> None:
+    """`portmark audit export` and `portmark audit verify-export` (MCP/SIEM plan PR 1, owner decision D3c).
+
+    Both report on stderr, so stdout can carry the exported records (`export --no-cursor` without --out)."""
+    from ._durable_file import sidecar_lock
+    from .audit_export import (
+        ExportConfigError, ExportCursor, Keyring, ProjectionPolicy, Projector, VerifyReport,
+        read_export, run_export, verify_against_store, verify_records,
+    )
+
+    try:
+        if args.audit_command == "export":
+            if store is None:
+                parser.error("audit export requires --store-path or PORTMARK_STORE_PATH")
+            if args.no_cursor and args.cursor_file:
+                parser.error("--no-cursor and --cursor-file cannot be combined")
+            if not args.no_cursor and not (args.out and args.cursor_file):
+                # A cursor may advance only past records that are durably written; a pipe cannot confirm that.
+                parser.error("audit export needs --out FILE and --cursor-file FILE (or --no-cursor to print all history)")
+            projector = Projector(ProjectionPolicy.load(args.projection_policy), Keyring.load(args.projection_keyring))
+            report = _export_with_cursor(args, store, audit_verifier, projector, run_export, ExportCursor, sidecar_lock)
+            print(json.dumps({
+                "events": report.events, "heads": report.heads, "tasks_completed": report.tasks,
+                "integrity_failures": report.integrity_failures,
+            }, indent=2, sort_keys=True), file=sys.stderr)
+            if not report.ok:
+                raise SystemExit(1)
+            return
+        verification = VerifyReport()
+        with open(args.input, "rb") as handle:
+            records = read_export(handle, verification)
+        verify_records(records, audit_verifier, verification)
+        if args.against_store:
+            if store is None:
+                parser.error("verify-export --against-store requires --store-path or PORTMARK_STORE_PATH")
+            if not args.projection_keyring:
+                parser.error("verify-export --against-store requires --projection-keyring")
+            verify_against_store(
+                records, store, ProjectionPolicy.load(args.projection_policy), Keyring.load(args.projection_keyring), verification
+            )
+    except ExportConfigError as error:
+        parser.error(str(error))
+    except OSError as error:
+        parser.error(f"{error.filename or 'file'}: {error.strerror}")
+    print(json.dumps(verification.as_dict(), indent=2, sort_keys=True))
+    if verification.status == "invalid":
+        raise SystemExit(1)
+    if verification.status == "unverifiable":
+        raise SystemExit(2)
+
+
+def _export_with_cursor(args, store, audit_verifier, projector, run_export, cursor_type, sidecar_lock):
+    if args.no_cursor:
+        cursor = cursor_type(None)
+        if args.out:
+            with _open_append(args.out) as out:
+                return run_export(store, cursor, projector, out, verifier=audit_verifier, page_size=args.page_size, max_events=args.max_events)
+        return run_export(
+            store, cursor, projector, sys.stdout.buffer, verifier=audit_verifier, durable=False,
+            page_size=args.page_size, max_events=args.max_events,
+        )
+    # One exporter per cursor: a second concurrent run would export the same records and race the cursor.
+    with sidecar_lock(args.cursor_file):
+        cursor = cursor_type.load(args.cursor_file)
+        with _open_append(args.out) as out:
+            return run_export(store, cursor, projector, out, verifier=audit_verifier, page_size=args.page_size, max_events=args.max_events)
+
+
+def _open_append(path: str):
+    # O_NOFOLLOW: a redirected link cannot send projected audit data somewhere else. A new file is 0600;
+    # an existing file keeps its mode, because a log shipper often reads it as another user (OPERATIONS.md).
+    # O_NONBLOCK: a FIFO with no reader fails at once instead of hanging the export (a regular file ignores it).
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(path, flags, 0o600)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise OSError(errno.EINVAL, "export output must be a regular file", path)
+    return os.fdopen(fd, "ab")
 
 
 def _run_store(parser: argparse.ArgumentParser, args: argparse.Namespace, config, store, audit_verifier) -> None:
@@ -673,6 +755,28 @@ def main() -> None:
     witness_kit.add_argument("--host-key-file", required=True, help="that host id's Ed25519 private key file")
     witness_kit.add_argument("--witness-public-key", required=True, help="the witness's public key (base64url), pinned for every answer")
     witness_kit.add_argument("--timeout", type=float, default=5.0, help="seconds per request (default 5)")
+    audit_parser = subparsers.add_parser("audit", help="export the audit chains for a SIEM, or verify an export")
+    audit_commands = audit_parser.add_subparsers(dest="audit_command", required=True)
+    export_parser = audit_commands.add_parser(
+        "export", help="append new audit records, as a policy-controlled projection, to a JSON Lines file"
+    )
+    export_parser.add_argument("--out", help="JSON Lines file to append to (fsynced before the cursor advances)")
+    export_parser.add_argument("--cursor-file", help="per-task export cursor (created on first run)")
+    export_parser.add_argument("--no-cursor", action="store_true", help="export all history and save no cursor")
+    export_parser.add_argument("--projection-policy", help="JSON projection policy (default: built-in, host-written fields only)")
+    export_parser.add_argument(
+        "--projection-keyring", required=True, help="dedicated HMAC keyring for digests (mode 600; never a signing key)"
+    )
+    export_parser.add_argument("--page-size", type=int, default=DEFAULT_ADMIN_PAGE_SIZE, help="task heads per page")
+    export_parser.add_argument("--max-events", type=int, default=DEFAULT_EXPORT_EVENTS, help="events per page")
+    verify_export = audit_commands.add_parser("verify-export", help="verify an exported JSON Lines file (level 1, or 2 with --against-store)")
+    verify_export.add_argument("--in", dest="input", required=True, help="exported JSON Lines file")
+    verify_export.add_argument(
+        "--against-store", action="store_true",
+        help="level 2: recompute every exported event from the store (needs --store-path and --projection-keyring)",
+    )
+    verify_export.add_argument("--projection-policy", help="the projection policy the export used (default: built-in)")
+    verify_export.add_argument("--projection-keyring", help="the keyring the export used (level 2)")
     verify_audit = subparsers.add_parser("verify-audit")
     verify_audit.add_argument("--task-id", required=True, help="task id whose audit chain should be verified")
     verify_audit.add_argument(
@@ -737,6 +841,9 @@ def main() -> None:
             raise SystemExit(1)
         if verification.status == "unverifiable":
             raise SystemExit(2)
+        return
+    if args.command == "audit":
+        _run_audit(parser, args, store, audit_verifier)
         return
     if args.command == "floor-reset":
         _run_floor_reset(parser, args, config, store)

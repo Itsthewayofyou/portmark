@@ -158,6 +158,131 @@ portmark --store-backend postgres --store-path postgresql://user:pass@db/portmar
 
 The command prints `{"status": "valid"}` and exits 0 for an intact chain whose stored audit head is signed by a trusted host key. It prints `{"status": "invalid"}` and exits 1 when the task is missing or when event sequence, previous hash, event hash, stored audit-head validation, missing signature material, trust-registry rejection, or audit-head signature validation fails. It prints `{"status": "unverifiable"}` and exits 2 when the local verifier cannot prove the signed head because no trust registry is configured. Treat invalid results as tampered or corrupted task history; treat unverifiable results as an operator configuration failure and re-run with `--trust-registry-path`.
 
+## Audit Export To A SIEM
+
+`portmark audit export` copies the audit chains into a JSON Lines file. A log shipper (Vector, Fluent Bit,
+an OpenTelemetry collector) sends that file to the SIEM. Portmark itself opens no network connection
+for the export and holds no SIEM credential.
+
+The SIEM is a downstream observer, not the source of truth. The store keeps the full, authoritative
+record. The export is a **projection**: it copies only the fields a projection policy allows, and
+replaces every other field with a keyed digest of the original value.
+
+```bash
+portmark --store-path runtime.sqlite --trust-registry-path trust.json audit export \
+  --out /var/log/portmark/audit.jsonl --cursor-file /var/lib/portmark/export-cursor.json \
+  --projection-policy siem-projection.json --projection-keyring /etc/portmark/siem-keyring.json
+```
+
+Run it from a timer (for example every minute). Each run exports what is new since the cursor and exits.
+
+- **Delivery is at-least-once.** A run appends records to `--out`, calls `fsync`, and only then saves the
+  cursor. A crash between the two repeats those records on the next run; it never loses one. Every
+  record has a `key` (`<task_id>:<sequence>:<hash>`), so the SIEM can remove duplicates.
+- **The cursor needs a durable file.** `--out` is required when a cursor is saved. `--no-cursor` writes the
+  whole history to standard output and saves nothing, because a pipe cannot confirm that a record arrived.
+- **No clock is trusted.** Each run reads every task head in `task_id` order and compares its sequence with
+  the cursor. A slow transaction or a skewed host clock cannot make the export skip a record.
+- **The export checks before it copies.** For each record it recomputes the event hash and the link to the
+  previous event. The last exported event of a task must hash to the stored head. On any mismatch it writes
+  an export-control record (`portmark.audit.export.control.v1`, `kind: integrity_failure`), stops that task,
+  and exits 1. It never repairs or skips history.
+- **The export never changes audit data** (it only reads audit rows) and needs no signing key. A failed export
+  does not affect the host. Point `--store-path` at the real store: like `verify-audit`, opening a path that
+  holds no store creates an empty one.
+- Only one export runs per cursor file: a lock beside the cursor (`<cursor>.lock`) makes a second run wait.
+- `--out` must be a regular file; a symbolic link is refused. A new file is created with mode `600`. An existing
+  file keeps its mode, so you can give a log shipper that runs as another user group read access.
+- The export is not a rollback check. It finds a head that moved backwards or was rewritten only relative to
+  its own cursor; a restored older database with a new cursor exports without complaint. Use the audit floor
+  and the remote witness for rollback detection.
+
+### Projection policy
+
+The policy is a JSON file. Unknown keys are refused. With no policy file, the built-in defaults apply.
+
+```json
+{
+  "schema": "portmark.siem.projection.v1",
+  "events": {
+    "approval.approved": {"include": ["approval_id", "tool"], "redact": ["approved_by"]}
+  },
+  "tool_arguments": {
+    "default": "hash_only",
+    "tools": {
+      "catalog.search": {"include": ["query", "limit"]},
+      "payments.reserve": {"include": ["amount", "currency"], "redact": ["account"]},
+      "secrets.get": {"mode": "hash_only"}
+    }
+  }
+}
+```
+
+- **Every event kind is default-deny, not only tool arguments.** Model output and user data also appear in
+  `agent.completed`, `agent.failed`, `agent.awaiting_input`, `approval.requested`, and `content.rejected`.
+  The built-in defaults copy only fields the host writes itself: tool names, host-written reasons and error
+  codes, effect status, policy version and hash, approval ids. A field that is not included is left out of
+  `details`, and its name and keyed digest go in `omitted`. An `events` entry in the policy **replaces**
+  the built-in entry for that event kind; it is not merged.
+- **Tool arguments** follow `tool_arguments`. `include` copies a value, `redact` writes `"[REDACTED]"`, and an
+  argument that is not listed is left out. Every tool event carries `arguments_hmac` (a digest of the complete
+  original arguments). A tool the policy names also carries `argument_keys`. A tool the policy does not name,
+  including every future MCP tool, is `hash_only`: it exports only `argument_count` and `arguments_hmac`,
+  because argument **names** are chosen by the model just as the values are. `default` accepts only
+  `hash_only`, so raw arguments are never the default.
+- The approval record's `arguments_hash` is a plain SHA-256 of the arguments. Low-entropy arguments can be
+  guessed from it, so it is never copied by default.
+- Each record carries `policy_digest` (the SHA-256 of the policy file), so a reader can see which rules
+  produced it.
+
+### Keyed digests and the keyring
+
+A digest is `hmac-sha256:` + HMAC-SHA-256(key, canonical JSON of the **original, unredacted** value). A plain
+SHA-256 of a value like `{"amount": 50}` can be found by hashing likely values; the key prevents that.
+
+```json
+{"active": "siem-2026-09", "keys": {"siem-2026-09": "<base64 of at least 32 random bytes>"}}
+```
+
+- Use a key made only for this. It is never the Ed25519 audit or envelope key. The host never reads it.
+- Keep the keyring outside the repository and the store, read-only, mode `600`. On POSIX the export refuses a
+  keyring that the group or others can read.
+- Each record names its `hmac_key_id`. To rotate, add a new key and change `active`. Keep old keys for as long
+  as you need to verify old records.
+- **Known property:** the digest is deterministic. The same original value under the same key gives the same
+  digest, so a SIEM reader can see that two calls had equal arguments without seeing them. This helps
+  correlation. If it is too revealing, use separate keyrings per tenant or per time period.
+
+### Verifying an export
+
+`portmark audit verify-export` has two levels. They prove different things:
+
+```bash
+# Level 1: the SIEM copy alone
+portmark --trust-registry-path trust.json audit verify-export --in audit.jsonl
+# Level 2: against the authoritative store
+portmark --store-path runtime.sqlite --trust-registry-path trust.json audit verify-export --in audit.jsonl \
+  --against-store --projection-policy siem-projection.json --projection-keyring /etc/portmark/siem-keyring.json
+```
+
+- **Level 1** proves, per task, that the exported events link without a gap from sequence 0 and that each
+  exported head matches them and carries a valid host signature. So no event was dropped, added, or
+  reordered, and the chain is the host's. Events that no signed head covers make the result
+  `unverifiable`, never `valid`: a run still in progress leaves them, but so would removed head records or a
+  forged task. An empty file is `unverifiable` too. It does **not** prove the projected values. The projection is
+  not inside the signed hash, so a person who can write to the SIEM could change `"amount": 78` to `7`
+  and Level 1 would not see it.
+- **Level 2** (`--against-store`) re-reads each exported event from the store, recomputes its hash and its projection, and
+  requires a byte-identical match. This proves the values. It needs the store, the policy, and the keyring.
+- Duplicate records from at-least-once delivery are accepted only when they are byte-identical.
+- A record made under another projection policy, or with a key that is not in the keyring, is
+  **unverifiable** at Level 2, not invalid: changing the policy or rotating a key is not tampering.
+- Exit codes follow `verify-audit`: 0 valid, 1 invalid, 2 unverifiable (for example, no trust registry).
+- `audit export` exits 0 when all is exported, 1 when it wrote an `integrity_failure` record, and 2 when a
+  policy, keyring, cursor, or argument is refused (then nothing is written).
+
+`audit export` writes Portmark's own record format. An OCSF mapping is not included yet.
+
 ## Audit Floor
 
 A signed audit head is stored in the same database as the events it signs, so an older, internally

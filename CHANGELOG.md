@@ -6,6 +6,25 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Audit export to a SIEM (MCP/SIEM plan, PR 1)
+
+- **`portmark audit export`** appends the audit chains to a JSON Lines file for a log shipper (Vector,
+  Fluent Bit, an OpenTelemetry collector). Portmark opens no network connection and holds no SIEM credential.
+  Delivery is at-least-once: the per-task cursor is saved only after the output is fsynced, and every record
+  carries a deduplication `key`. No clock is trusted: each run scans every task head.
+- **The export is a projection, not a copy (owner decision D3c).** The authoritative audit record does not
+  change. Each record keeps the authoritative `hash` and `previous`, but its `details` hold only the fields a
+  projection policy allows: default-deny for every event kind, with a per-tool argument policy whose default
+  is keys + digest only. Other fields become their name plus an HMAC-SHA-256 digest of the original value,
+  under a dedicated keyring (`--projection-keyring`, mode 600, rotatable, `hmac_key_id` in every record).
+- **The exporter checks before it copies:** each event's hash and link, and each head against its last event.
+  A damaged, rolled-back, or rewritten chain produces an export-control `integrity_failure` record and exit 1.
+- **`portmark audit verify-export`**: Level 1 proves, from the SIEM copy alone, that each task's events link
+  without a gap and match a validly signed head. It cannot prove the projected values. Level 2
+  (`--against-store`) recomputes every exported record from the store and proves them.
+- New store read `audit_export_page` (in-memory, SQLite, Postgres), from one snapshot, never writing.
+- Not included yet: an OCSF record mapping.
+
 ### Runtime audit (2026-09-22): SSRF in the fetch example, stale tool limits, A2A error statuses
 
 - **The example `http.fetch` tool refuses a name that resolves to a non-public address**, and connects
