@@ -87,11 +87,14 @@ class RemoteWitnessHostTests(unittest.TestCase):
         shutil.copyfile(self.d.floor_path, other.floor_path)
         return other
 
-    def commit_once(self, deployment=None):
-        """Exactly ONE witnessed commit (a task run makes several), with nothing else in it."""
+    def commit_once(self, deployment=None, task_id="one-commit-task"):
+        """Exactly ONE witnessed commit, shaped like a real save (one task head, advanced through the same
+        HostWitness.advance the save path calls). A task run makes several commits, so the tests that need
+        the chain exactly one commit ahead use this; the chain rules (`prev`) do not depend on the head."""
         store = (deployment or self.d).store()
+        self.one_commit_sequence = getattr(self, "one_commit_sequence", 0) + 1
         with store.transaction() as transaction:
-            self.binding().advance(transaction, {}, 0)
+            self.binding().advance(transaction, {task_id: {"sequence": self.one_commit_sequence, "head_hash": f"h{self.one_commit_sequence}"}}, 0)
 
     def registry_host(self):
         """A host bound to the on-disk trust registry (what `floor-reset` records), with the remote witness."""
@@ -183,6 +186,19 @@ class RemoteWitnessHostTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, FORKED)
         self.assertBootRefused(FORKED)  # restarting it is refused too
         self.assertEqual(resume(clone, _reseal(clone_dir, envelope)).status, "awaiting_input")  # the clone goes on
+
+    def test_a_running_clone_is_refused_at_its_next_save_after_the_other_copy_runs(self):
+        # Real runs only (no synthetic commits): both copies are up; the original runs a task to its next
+        # suspension (several commits), so the clone's next save builds on an OLD receipt.
+        original = self.host()
+        envelope, first = start_task(original)
+        clone_dir = self.clone_to("host-b")
+        clone = self.host(clone_dir, tag="clone")
+        resume(original, envelope)
+        with self.assertRaises(FloorError) as caught:
+            resume(clone, copy_envelope(envelope, first))
+        self.assertEqual(caught.exception.code, ROLLED_BACK)
+        self.assertEqual(resume(original, envelope).status, "awaiting_input")  # the original goes on
 
     def test_a_stale_clone_is_refused_at_boot(self):
         original = self.host()

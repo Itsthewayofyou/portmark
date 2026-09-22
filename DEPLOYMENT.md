@@ -534,7 +534,8 @@ A partial configuration is refused. The production profile refuses the default h
 
   An unreachable witness refuses the start. A database that holds a receipt refuses to start without its
   witness, so the witness cannot be switched off silently. The witness's time floor joins the boot clock
-  check.
+  check: the host sends its durable time floor with the save that raises it (at most once a minute), and
+  the witness keeps the highest value it has confirmed.
 - **`verify-audit`** adds `remote_status`: `anchored`; `rolled-back` / `forked` / `witness-behind` (exit 1);
   `witness-unavailable` (exit 2); `no-remote`. An auditor asks with its own enrolled key: set
   `PORTMARK_REMOTE_WITNESS_SIGNER` to its id and `PORTMARK_REMOTE_WITNESS_KEY_FILE` to its key.
