@@ -60,7 +60,8 @@ PYTHONPATH=src:. python -m portmark.cli \
 ```
 
 The example tool enforces a fixed GET method, HTTPS URLs, no URL userinfo, no
-redirect following, a two-second network timeout, and a 65 KiB response cap. The URL's
+redirect following, a two-second timeout on each network operation (not a total deadline; the
+tool registry bounds the whole call at 2.5 s), and a 65 KiB response cap. The URL's
 host must also resolve only to **public** addresses: one loopback, private, link-local,
 multicast, reserved, or unspecified answer (IPv4-mapped IPv6 included) refuses the call.
 The tool asks DNS once and connects to the address it checked, with TLS verifying the

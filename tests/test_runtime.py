@@ -2551,6 +2551,70 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(network.lookups, [])
         self.assertEqual([connection[0] for connection in network.connections], [PUBLIC_TEST_ADDRESS])
 
+    def test_http_fetch_example_round_trips_over_real_tls_to_the_pinned_address(self):
+        # The fakes above prove the address rules; this proves the real transport: http.client over TLS to
+        # the pinned address, the certificate checked against the URL's NAME, and what reaches the wire.
+        import datetime
+        import ssl
+
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.x509.oid import NameOID
+
+        key = ec.generate_private_key(ec.SECP256R1())
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+        now = datetime.datetime.now(datetime.timezone.utc)
+        certificate = (
+            x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+            .serial_number(x509.random_serial_number()).not_valid_before(now - datetime.timedelta(minutes=5))
+            .not_valid_after(now + datetime.timedelta(hours=1))
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost")]), critical=False)
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+            .sign(key, hashes.SHA256())
+        )
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.append((self.path, self.headers.get("Host")))
+                body = b"fetched over tls"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format, *args):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            cert_path, key_path = Path(directory) / "cert.pem", Path(directory) / "key.pem"
+            cert_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+            key_path.write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+            server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            server_context.load_cert_chain(cert_path, key_path)
+            server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            server.socket = server_context.wrap_socket(server.socket, server_side=True)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            client_context = ssl.create_default_context(cafile=str(cert_path))
+            port = server.server_port
+            try:
+                # Only the public-address rule is bypassed (the test server is on loopback); DNS is not used.
+                with patch.object(http_fetch, "resolve_public_address", return_value="127.0.0.1"), \
+                        patch.object(http_fetch.ssl, "create_default_context", return_value=client_context):
+                    result = http_fetch.fetch({"url": f"https://localhost:{port}/page?x=1"})
+                    self.assertEqual((result["status"], result["body"], result["content_type"]), (200, "fetched over tls", "text/plain"))
+                    self.assertEqual(seen, [("/page?x=1", f"localhost:{port}")])
+                    # The same pinned address under ANOTHER name: the certificate is checked against the
+                    # URL's name, not the address, so it is refused.
+                    with self.assertRaisesRegex(ToolExecutionError, "request failed"):
+                        http_fetch.fetch({"url": f"https://other.test:{port}/"})
+            finally:
+                server.shutdown()
+                server.server_close()
+        self.assertEqual(len(seen), 1)
+
     def test_http_fetch_example_keeps_its_redirect_and_error_rules(self):
         with FakeFetchNetwork(response=FakeHttpResponse(b"", status=302)):
             with self.assertRaisesRegex(SecurityError, "redirects are disabled"):
@@ -8114,6 +8178,14 @@ class RuntimeTests(unittest.TestCase):
                                      str(WITNESS_RETRY_AFTER_SECONDS))
                 else:
                     self.assertEqual(decoded, {"code": -32000, "message": "message submission failed"})
+            # A structurally malformed envelope (valid JSON, past auth) is the CLIENT's fault through the real
+            # parser: still 400, never reclassified as a server failure by the 500 default.
+            malformed = json.loads(body)
+            del malformed["params"]["metadata"]["portmark_envelope"]["signature"]
+            malformed_body = json.dumps(malformed).encode()
+            status, _, payload = self._asgi_call(app, "POST", "/message:send", {**headers, "Content-Length": str(len(malformed_body))},
+                                                 malformed_body)
+            self.assertEqual((status, json.loads(payload)["error"]["code"]), (400, -32602))
         finally:
             server.shutdown()
             server.server_close()
