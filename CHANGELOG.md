@@ -6,6 +6,19 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Runtime audit (2026-09-22): SSRF in the fetch example, stale tool limits, A2A error statuses
+
+- **The example `http.fetch` tool refuses a name that resolves to a non-public address**, and connects
+  only to the address it checked (DNS rebinding), with TLS still verifying the original name. It now
+  uses the provider's pinned connection (`portmark.providers.PinnedHTTPSConnection`, public) and a new
+  `portmark.providers.resolve_public_address`.
+- **Re-registering a tool replaces its limits completely**: an omitted timeout or output cap reverts to
+  the registry default instead of keeping the replaced tool's value.
+- **A2A submission failures report who caused them.** A server failure is HTTP 500 (it was 400), including
+  any failure after the request was admitted (the configured provider's answer or decision); a request
+  refused at admission, or whose permit expired during the run, stays 400; an unreachable remote witness is 503 with `Retry-After` and the new refusal metric
+  reason `witness_unavailable`. The body stays the same generic error.
+
 ### External validation — EV-013 resolved: every save is witnessed by the optional remote witness
 
 - **The host advances the remote witness on every save** (new module `portmark.witness_binding`), inside

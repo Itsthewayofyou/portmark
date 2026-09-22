@@ -22,10 +22,22 @@ from urllib.parse import urlsplit
 from . import _run_progress
 from .json_guard import StrictJSONError, strict_json_loads
 from .a2a_types import A2ARequestError, error_response, make_agent_card, parse_jsonrpc_request, success_response, task_from_run_result
-from .host import AgentHost
+from .host import AgentHost, failed_after_admission
 from .models import AgentEnvelope, AgentManifest, AgentState, AttestationEvidence, Permit, ResourceBudget, ToolGrant
 from .security import SecurityError, normalize_output_projection, validate_constraints
 from .official_a2a import make_sdk_agent_card, validate_sdk_message_send_params
+from ._clock import ClockRollbackError
+from .checkpoint_crypto import CheckpointCryptoError
+from .remote_witness import WitnessUnavailable
+from .tools import ToolExecutionError
+from .witness import FloorError
+
+# SecurityError subclasses raised by the host's OWN state or machinery (its rollback floors, its checkpoint
+# keyring, its clock, its tools), not by the request: a server failure (500), never a refused request (400).
+_SERVER_SECURITY_ERRORS = (FloorError, CheckpointCryptoError, ClockRollbackError, ToolExecutionError)
+# The remote witness is down (EV-013 owner decision F1 refuses the save): nothing was committed, and the
+# same request can go through once the witness is back.
+WITNESS_RETRY_AFTER_SECONDS = 5
 
 
 logger = logging.getLogger(__name__)
@@ -682,10 +694,21 @@ class A2ARouter:
         except A2ARequestError as exc:
             self.host.metrics.increment_refusal(refusal_reason_for_error(exc.code, exc.http_status))
             return self.response(exc.http_status, error_response(exc.request_id, exc.code, exc.message))
-        except Exception:
+        except WitnessUnavailable:
+            # A temporary outage of a dependency, not a fault in the request or the server: 503 + Retry-After.
+            self.host.metrics.increment_refusal("witness_unavailable")
+            logger.exception("A2A message submission failed: the remote witness is unavailable")
+            return self.response(503, error_response(request_id, -32003, "service temporarily unavailable"),
+                                 {"Retry-After": str(WITNESS_RETRY_AFTER_SECONDS)})
+        except Exception as error:
+            # The body stays generic either way: never the exception's type, message, or trace.
             self.host.metrics.increment_refusal("internal")
             logger.exception("A2A message submission failed")
-            return self.response(400, error_response(request_id, -32000, "message submission failed"))
+            # 400 only for a refusal of the REQUEST (its signature, permit, replay, grants) -- never for a
+            # failure after it was admitted (the provider, its decision), whatever that error's type.
+            refused = (isinstance(error, SecurityError) and not isinstance(error, _SERVER_SECURITY_ERRORS)
+                       and not failed_after_admission(error))
+            return self.response(400 if refused else 500, error_response(request_id, -32000, "message submission failed"))
 
 
 def make_handler(host: AgentHost, auth: A2AAuthConfig | None = None, enable_hsts: bool = False, **kwargs: Any):

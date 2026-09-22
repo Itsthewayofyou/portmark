@@ -65,6 +65,21 @@ def _namespaced_migration_task_id(source_host_id: str, task_id: str) -> str:
     return f"{_MIGRATION_TASK_NAMESPACE}{len(source_host_id)}::{source_host_id}::{task_id}"
 
 
+_FAILED_AFTER_ADMISSION = "portmark_failed_after_admission"
+
+
+def mark_failed_after_admission(error: BaseException) -> None:
+    """Tag an error raised AFTER the request was admitted -- by the provider, its decision, or acting on
+    it. The request was accepted, so such a failure is the server's side (A2A answers 500), whatever the
+    error's type: a provider's malformed answer is a SecurityError too, but not the client's doing. The
+    error keeps its type, so callers that catch it are unchanged."""
+    setattr(error, _FAILED_AFTER_ADMISSION, True)
+
+
+def failed_after_admission(error: BaseException) -> bool:
+    return getattr(error, _FAILED_AFTER_ADMISSION, False) is True
+
+
 def _require_wellformed_decision(decision: Any) -> None:
     """A provider decision is UNTRUSTED input, so check its shape once, up front (auditor round 2).
 
@@ -600,7 +615,7 @@ class AgentHost:
                     decision = provider.decide(view, tool_names)
                 finally:
                     self.metrics.observe_duration("provider_decision_duration_seconds", time.monotonic() - decision_started)
-            except Exception:
+            except Exception as error:
                 # Section 8 finding #3: a provider failure AFTER admission (network reset, slow-drip
                 # timeout, malformed response, or any provider exception) must reach a DURABLE terminal
                 # checkpoint -- it must never leave the admitted task represented only as `running`.
@@ -615,6 +630,7 @@ class AgentHost:
                     self._persist(envelope, effective, state, audit, persisted_events, closed=True)
                 else:
                     self._terminalize_over_budget(envelope, effective, state, audit, persisted_events, None, False)
+                mark_failed_after_admission(error)
                 raise
             self.metrics.increment("provider.decisions")
             tool_calls_before = state.tool_calls
@@ -658,6 +674,9 @@ class AgentHost:
                     self._persist(envelope, effective, state, audit, persisted_events, closed=True)
                 else:
                     self._terminalize_over_budget(envelope, effective, state, audit, persisted_events, decision, state.tool_calls > tool_calls_before)
+                if not expired:
+                    # An expired permit is the request's own authority running out: it stays a refusal.
+                    mark_failed_after_admission(error)
                 raise
             state.step += 1
             # Close the checkpoint's lineage at this host when the task terminates

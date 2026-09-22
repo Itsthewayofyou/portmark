@@ -233,7 +233,7 @@ flowchart LR
 | Custom tool loader | `--tools module:function` | Operator code to host runtime | Imports Python modules without shell | `src/portmark/tool_loading.py` |
 | Generic HTTP provider | Configured endpoint | Host to remote model gateway | Sends projected state and receives decisions | `src/portmark/providers.py` |
 | Wasm providers | Component file | Capsule to host | Runs provider code under Node or wasmtime path | `src/portmark/providers.py`, `src/portmark/wasm_runner.mjs` |
-| Example HTTP fetch tool | Granted tool invocation | Provider decision to outbound network | Enforces HTTPS, no redirects, output cap | `examples/tools/http_fetch.py` |
+| Example HTTP fetch tool | Granted tool invocation | Provider decision to outbound network | Enforces HTTPS, no redirects, output cap, public resolved addresses only, connection pinned to the checked address | `examples/tools/http_fetch.py` |
 | Runtime store | SQLite/Postgres | Host to durable state | Stores nonces, checkpoints, audit chains | `src/portmark/storage.py` |
 | External attestation verifier | Subprocess argv | Host to deployment verifier | No shell, empty env, bounded stdout | `src/portmark/security.py` `ExternalAttestationVerifier` |
 

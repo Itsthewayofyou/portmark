@@ -71,6 +71,7 @@ from portmark.cli import main as cli_main
 from portmark.tools import (
     IsolationMechanism,
     IsolationProfile,
+    ToolExecutionError,
     ToolRegistry,
     _CAN_KILL_PROCESS_GROUP,
     _has_tree_termination_primitive,
@@ -325,6 +326,56 @@ class FakeHttpResponse:
         if size < 0:
             return self.body
         return self.body[:size]
+
+    def getheader(self, name, default=None):
+        return self.headers.get(name, default)
+
+
+PUBLIC_TEST_ADDRESS = "93.184.215.14"  # a public address; never contacted (the connection is faked)
+
+
+class FakeFetchNetwork:
+    """The example http.fetch tool's network, faked: DNS answers (a list per lookup, the last one
+    repeating), and a pinned connection that records where it was pointed and returns `response`."""
+
+    def __init__(self, *answers, response=None, error=None):
+        self.answers = [list(answer) for answer in answers] or [[PUBLIC_TEST_ADDRESS]]
+        self.response, self.error = response, error
+        self.lookups, self.connections, self.requests = [], [], []
+
+    def _getaddrinfo(self, host, port, *args, **kwargs):
+        answer = self.answers[min(len(self.lookups), len(self.answers) - 1)]
+        self.lookups.append(host)
+        return [(socket.AF_INET6 if ":" in ip else socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port)) for ip in answer]
+
+    def __enter__(self):
+        network = self
+
+        class Connection:
+            def __init__(self, ip, port, hostname, timeout, context):
+                network.connections.append((ip, port, hostname))
+
+            def request(self, method, target, headers=None):
+                network.requests.append((method, target, dict(headers or {})))
+                if network.error is not None:
+                    raise network.error
+
+            def getresponse(self):
+                return network.response
+
+            def close(self):
+                pass
+
+        self._patches = [patch("portmark.providers.socket.getaddrinfo", self._getaddrinfo),
+                         patch.object(http_fetch, "PinnedHTTPSConnection", Connection)]
+        for active in self._patches:
+            active.start()
+        return self
+
+    def __exit__(self, *exc):
+        for active in self._patches:
+            active.stop()
+        return False
 
 
 class _LocalProviderHandler(http.server.BaseHTTPRequestHandler):
@@ -2360,7 +2411,7 @@ class RuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             host, envelope = self._http_fetch_host(directory, {"url": "https://allowed.example/resource", "method": "GET"})
             response = FakeHttpResponse(b"hello", headers={"Content-Type": "text/plain"})
-            with patch("urllib.request.OpenerDirector.open", return_value=response) as opened:
+            with FakeFetchNetwork(response=response) as network:
                 result = host.run(envelope)
 
         self.assertEqual(result.status, "completed")
@@ -2373,16 +2424,16 @@ class RuntimeTests(unittest.TestCase):
         self.assertNotIn("body", result.result["fetch"])
         self.assertEqual(result.result["fetch"]["url"], "https://allowed.example/resource")
         self.assertEqual(response.read_size, http_fetch.MAX_RESPONSE_BYTES + 1)
-        self.assertEqual(opened.call_count, 1)
+        self.assertEqual(network.connections, [(PUBLIC_TEST_ADDRESS, 443, "allowed.example")])
 
     def test_http_fetch_example_denies_disallowed_host_before_network_call(self):
         with tempfile.TemporaryDirectory() as directory:
             host, envelope = self._http_fetch_host(directory, {"url": "https://evil.example/resource", "method": "GET"})
-            with patch("urllib.request.OpenerDirector.open") as opened:
+            with FakeFetchNetwork() as network:
                 with self.assertRaisesRegex(SecurityError, "host is outside its allowed set"):
                     host.run(envelope)
 
-        opened.assert_not_called()
+        self.assertEqual((network.lookups, network.connections), ([], []))
 
     def test_http_fetch_example_denies_ssrf_host_confusion_before_network_call(self):
         cases = [
@@ -2395,37 +2446,37 @@ class RuntimeTests(unittest.TestCase):
             with self.subTest(label=label):
                 with tempfile.TemporaryDirectory() as directory:
                     host, envelope = self._http_fetch_host(directory, {"url": url, "method": "GET"})
-                    with patch("urllib.request.OpenerDirector.open") as opened:
+                    with FakeFetchNetwork() as network:
                         with self.assertRaisesRegex(SecurityError, message):
                             host.run(envelope)
 
-                opened.assert_not_called()
+                self.assertEqual((network.lookups, network.connections), ([], []))
 
     def test_http_fetch_example_accepts_uppercase_allowed_host(self):
         with tempfile.TemporaryDirectory() as directory:
             host, envelope = self._http_fetch_host(directory, {"url": "https://ALLOWED.EXAMPLE/resource", "method": "GET"})
             response = FakeHttpResponse(b"hello", headers={"Content-Type": "text/plain"})
-            with patch("urllib.request.OpenerDirector.open", return_value=response) as opened:
+            with FakeFetchNetwork(response=response) as network:
                 result = host.run(envelope)
 
         self.assertEqual(result.status, "completed")
         self.assertEqual(result.result["fetch"]["url"], "https://ALLOWED.EXAMPLE/resource")
-        self.assertEqual(opened.call_count, 1)
+        self.assertEqual(len(network.connections), 1)
 
     def test_http_fetch_example_denies_non_https_before_network_call(self):
         with tempfile.TemporaryDirectory() as directory:
             host, envelope = self._http_fetch_host(directory, {"url": "http://allowed.example/resource", "method": "GET"})
-            with patch("urllib.request.OpenerDirector.open") as opened:
+            with FakeFetchNetwork() as network:
                 with self.assertRaisesRegex(SecurityError, "URL scheme must be https"):
                     host.run(envelope)
 
-        opened.assert_not_called()
+        self.assertEqual((network.lookups, network.connections), ([], []))
 
     def test_http_fetch_example_oversized_output_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             host, envelope = self._http_fetch_host(directory, {"url": "https://allowed.example/resource", "method": "GET"})
             response = FakeHttpResponse(b"x" * (http_fetch.MAX_RESPONSE_BYTES + 1), headers={"Content-Type": "text/plain"})
-            with patch("urllib.request.OpenerDirector.open", return_value=response):
+            with FakeFetchNetwork(response=response):
                 result = host.run(envelope)
 
         self.assertEqual(result.status, "failed")
@@ -2437,7 +2488,7 @@ class RuntimeTests(unittest.TestCase):
     def test_http_fetch_example_timeout_fails_as_tool_failed(self):
         with tempfile.TemporaryDirectory() as directory:
             host, envelope = self._http_fetch_host(directory, {"url": "https://allowed.example/resource", "method": "GET"})
-            with patch("urllib.request.OpenerDirector.open", side_effect=TimeoutError("timed out")):
+            with FakeFetchNetwork(error=TimeoutError("timed out")):
                 result = host.run(envelope)
 
         self.assertEqual(result.status, "failed")
@@ -2452,11 +2503,128 @@ class RuntimeTests(unittest.TestCase):
                 "method": "GET",
                 "headers": {"Authorization": "Bearer secret"},
             })
-            with patch("urllib.request.OpenerDirector.open") as opened:
+            with FakeFetchNetwork() as network:
                 with self.assertRaisesRegex(SecurityError, "unsupported fields"):
                     host.run(envelope)
 
-        opened.assert_not_called()
+        self.assertEqual((network.lookups, network.connections), ([], []))
+
+    def test_http_fetch_example_refuses_a_name_that_resolves_to_a_non_public_address(self):
+        # Audit plan 005: the policy allowlists the NAME; every address it resolves to must be public too.
+        cases = {
+            "loopback": ["127.0.0.1"],
+            "private": ["10.0.0.5"],
+            "link-local (cloud metadata)": ["169.254.169.254"],
+            "unspecified": ["0.0.0.0"],  # nosec B104 -- a faked DNS answer the tool must refuse, not a bind
+            "multicast": ["224.0.0.1"],
+            "reserved": ["240.0.0.1"],
+            "documentation range": ["192.0.2.10"],
+            "IPv6 loopback": ["::1"],
+            "IPv6 unique local": ["fd00::1"],
+            "IPv4-mapped IPv6 loopback": ["::ffff:127.0.0.1"],
+            "mixed public and private": [PUBLIC_TEST_ADDRESS, "10.0.0.1"],
+        }
+        for label, answer in cases.items():
+            with self.subTest(label), FakeFetchNetwork(answer) as network:
+                with self.assertRaisesRegex(SecurityError, "non-public address"):
+                    http_fetch.fetch({"url": "https://allowed.example/resource"})
+                self.assertEqual(network.connections, [])
+
+    def test_http_fetch_example_connects_only_to_the_address_it_checked(self):
+        # DNS rebinding: the name answers a public address once, then an internal one. The tool asks DNS
+        # ONCE and connects to that checked literal; TLS still verifies the ORIGINAL name.
+        response = FakeHttpResponse(b"ok", headers={"Content-Type": "text/plain"})
+        with FakeFetchNetwork([PUBLIC_TEST_ADDRESS], ["127.0.0.1"], response=response) as network:
+            result = http_fetch.fetch({"url": "https://allowed.example:8443/a/b?q=1#frag"})
+        self.assertEqual(result["status"], 200)
+        self.assertEqual(network.lookups, ["allowed.example"])
+        self.assertEqual(network.connections, [(PUBLIC_TEST_ADDRESS, 8443, "allowed.example")])
+        method, target, headers = network.requests[0]
+        self.assertEqual((method, target, headers["Host"]), ("GET", "/a/b?q=1", "allowed.example:8443"))
+
+    def test_http_fetch_example_classifies_a_literal_address_without_dns(self):
+        response = FakeHttpResponse(b"ok")
+        with FakeFetchNetwork(response=response) as network:
+            http_fetch.fetch({"url": f"https://{PUBLIC_TEST_ADDRESS}/"})
+            with self.assertRaisesRegex(SecurityError, "non-public address"):
+                http_fetch.fetch({"url": "https://[::ffff:10.0.0.1]/"})
+        self.assertEqual(network.lookups, [])
+        self.assertEqual([connection[0] for connection in network.connections], [PUBLIC_TEST_ADDRESS])
+
+    def test_http_fetch_example_round_trips_over_real_tls_to_the_pinned_address(self):
+        # The fakes above prove the address rules; this proves the real transport: http.client over TLS to
+        # the pinned address, the certificate checked against the URL's NAME, and what reaches the wire.
+        import datetime
+        import ssl
+
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.x509.oid import NameOID
+
+        key = ec.generate_private_key(ec.SECP256R1())
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+        now = datetime.datetime.now(datetime.timezone.utc)
+        certificate = (
+            x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+            .serial_number(x509.random_serial_number()).not_valid_before(now - datetime.timedelta(minutes=5))
+            .not_valid_after(now + datetime.timedelta(hours=1))
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost")]), critical=False)
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+            .sign(key, hashes.SHA256())
+        )
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.append((self.path, self.headers.get("Host")))
+                body = b"fetched over tls"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format, *args):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            cert_path, key_path = Path(directory) / "cert.pem", Path(directory) / "key.pem"
+            cert_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+            key_path.write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+            server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            server_context.load_cert_chain(cert_path, key_path)
+            server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            server.socket = server_context.wrap_socket(server.socket, server_side=True)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            client_context = ssl.create_default_context(cafile=str(cert_path))
+            port = server.server_port
+            try:
+                # Only the public-address rule is bypassed (the test server is on loopback); DNS is not used.
+                with patch.object(http_fetch, "resolve_public_address", return_value="127.0.0.1"), \
+                        patch.object(http_fetch.ssl, "create_default_context", return_value=client_context):
+                    result = http_fetch.fetch({"url": f"https://localhost:{port}/page?x=1"})
+                    self.assertEqual((result["status"], result["body"], result["content_type"]), (200, "fetched over tls", "text/plain"))
+                    self.assertEqual(seen, [("/page?x=1", f"localhost:{port}")])
+                    # The same pinned address under ANOTHER name: the certificate is checked against the
+                    # URL's name, not the address, so it is refused.
+                    with self.assertRaisesRegex(ToolExecutionError, "request failed"):
+                        http_fetch.fetch({"url": f"https://other.test:{port}/"})
+            finally:
+                server.shutdown()
+                server.server_close()
+        self.assertEqual(len(seen), 1)
+
+    def test_http_fetch_example_keeps_its_redirect_and_error_rules(self):
+        with FakeFetchNetwork(response=FakeHttpResponse(b"", status=302)):
+            with self.assertRaisesRegex(SecurityError, "redirects are disabled"):
+                http_fetch.fetch({"url": "https://allowed.example/"})
+        with FakeFetchNetwork(response=FakeHttpResponse(b"", status=404)):
+            with self.assertRaisesRegex(ToolExecutionError, "request failed"):
+                http_fetch.fetch({"url": "https://allowed.example/"})
+        with patch("portmark.providers.socket.getaddrinfo", side_effect=socket.gaierror("no such name")):
+            with self.assertRaisesRegex(ToolExecutionError, "request failed"):
+                http_fetch.fetch({"url": "https://allowed.example/"})
 
     def test_host_rejects_oversized_tool_output_before_checkpointing_it(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -7971,6 +8139,96 @@ class RuntimeTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    def test_a2a_errors_are_classified_by_who_caused_them(self):
+        # Audit plan 007: a server failure is a 5xx, a refused request stays 400, and the body is the same
+        # generic error either way. A witness outage (EV-013 F1: the save was refused, nothing committed)
+        # is 503 + Retry-After, so a client retries instead of treating it as its own mistake.
+        from portmark.a2a import WITNESS_RETRY_AFTER_SECONDS
+        from portmark.remote_witness import WitnessUnavailable
+        from portmark.witness import FloorError
+
+        sentinel = "SENTINEL-db-password-/var/lib/secret"
+        cases = [
+            ("a bug or storage fault", RuntimeError(sentinel), 500),
+            ("the host's own rollback floor", FloorError("rolled-back", sentinel), 500),
+            ("a tool failure", ToolExecutionError(sentinel), 500),
+            ("the remote witness is down", WitnessUnavailable(sentinel), 503),
+            ("a refusal at admission (an untagged SecurityError)", SecurityError(sentinel), 400),
+        ]
+        host = make_host()
+        app = make_asgi_app(host, A2AAuthConfig("secret"))
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(host, A2AAuthConfig("secret")))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        body = self._a2a_request_body(host, "classified")
+        headers = {"Content-Type": "application/json", "Content-Length": str(len(body)), "Authorization": "Bearer secret"}
+        try:
+            for label, error, expected in cases:
+                with self.subTest(label), patch.object(host, "run", side_effect=error), patch("portmark.a2a.logger.exception"):
+                    status, response_headers, payload = self._asgi_call(app, "POST", "/message:send", headers, body)
+                    request = urllib.request.Request(f"http://127.0.0.1:{server.server_port}/message:send", data=body, headers=headers)
+                    with self.assertRaises(urllib.error.HTTPError) as raised:
+                        urllib.request.urlopen(request)  # nosec B310
+                    local_status, local_payload = raised.exception.code, raised.exception.read()
+                self.assertEqual((status, local_status), (expected, expected))  # both transports share the router
+                self.assertNotIn(sentinel.encode(), payload + local_payload)
+                decoded = json.loads(payload)["error"]
+                if expected == 503:
+                    self.assertEqual(decoded, {"code": -32003, "message": "service temporarily unavailable"})
+                    self.assertEqual(dict(response_headers).get("retry-after", dict(response_headers).get("Retry-After")),
+                                     str(WITNESS_RETRY_AFTER_SECONDS))
+                else:
+                    self.assertEqual(decoded, {"code": -32000, "message": "message submission failed"})
+            # A structurally malformed envelope (valid JSON, past auth) is the CLIENT's fault through the real
+            # parser: still 400, never reclassified as a server failure by the 500 default.
+            malformed = json.loads(body)
+            del malformed["params"]["metadata"]["portmark_envelope"]["signature"]
+            malformed_body = json.dumps(malformed).encode()
+            status, _, payload = self._asgi_call(app, "POST", "/message:send", {**headers, "Content-Length": str(len(malformed_body))},
+                                                 malformed_body)
+            self.assertEqual((status, json.loads(payload)["error"]["code"]), (400, -32602))
+        finally:
+            server.shutdown()
+            server.server_close()
+        metrics = host.metrics.prometheus_text()
+        self.assertIn('reason="witness_unavailable"', metrics)
+        self.assertIn('reason="internal"', metrics)
+
+    def test_a2a_failures_after_admission_are_server_errors_end_to_end(self):
+        # PR #113 review: WHERE a failure happens decides the status, not its type. A malformed answer from
+        # the configured provider is a SecurityError, yet it is not the client's doing: the request was
+        # admitted, so it is a 500 -- real paths here, no patched host.run. An expired permit is the request's
+        # own authority running out, so it stays 400.
+        from portmark.security import PermitExpiredError
+
+        upstream_secret = b"UPSTREAM-SECRET-9f2"
+        with tempfile.TemporaryDirectory() as directory, \
+                local_provider_server(_respond_json(b'{"kind": "complete", ' + upstream_secret)) as (_server, url):
+            store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
+            host = make_host(store=store, allow_ephemeral_signing_key=True)
+            host.providers["upstream"] = GenericHttpProvider(url, allow_local_endpoint=True)
+            host.providers["bad-shape"] = FixedProvider(object())
+            host.providers["ungranted"] = FixedProvider(ProviderDecision("tool", "not.granted", {}))
+            app = make_asgi_app(host, A2AAuthConfig("secret"))
+            cases = [
+                ("the provider's answer is malformed JSON", "upstream", None, 500),
+                ("an in-process provider returns a malformed decision", "bad-shape", None, 500),
+                ("the provider proposes a tool the permit does not grant", "ungranted", None, 500),
+                ("the permit expires during the run", "deterministic", PermitExpiredError("permit expired"), 400),
+            ]
+            for label, provider, expire, expected in cases:
+                with self.subTest(label):
+                    envelope = make_demo_envelope(host, f"after admission: {label}", provider)
+                    body = self._a2a_request_body(host, label, envelope=envelope)
+                    headers = {"Content-Type": "application/json", "Content-Length": str(len(body)), "Authorization": "Bearer secret"}
+                    patched = patch("portmark.host.require_unexpired", side_effect=expire) if expire else contextlib.nullcontext()
+                    with patched, patch("portmark.a2a.logger.exception"):
+                        status, _, payload = self._asgi_call(app, "POST", "/message:send", headers, body)
+                    self.assertEqual(status, expected)
+                    self.assertEqual(json.loads(payload)["error"], {"code": -32000, "message": "message submission failed"})
+                    self.assertNotIn(upstream_secret, payload)
+                    checkpoint = store.load_checkpoint(envelope.state.task_id)
+                    self.assertEqual(checkpoint["status"], "failed")  # admitted, then closed durably -- never `running`
+
     def test_a2a_requires_bearer_auth_before_envelope_parsing(self):
         host = make_host()
         server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(host, A2AAuthConfig("a2a-secret")))
@@ -9583,6 +9841,41 @@ class IsolationProfileGateTests(unittest.TestCase):
             registry._side_effecting.add("pay")
             registry.register("pay", lambda arguments: {"ok": True})
             self.assertFalse(registry.is_side_effecting("pay"))
+
+    def test_reregistration_replaces_the_tool_limits_completely(self):
+        # Audit plan 006: a registration under an existing name is a complete replacement. A limit it
+        # does not name is the registry default, never a leftover of the replaced tool.
+        def limits(registry, name):  # what invoke() uses
+            return registry._timeouts.get(name, registry.default_timeout), registry._max_output.get(name, registry.max_output_bytes)
+
+        plain = lambda arguments: {"ok": True}  # noqa: E731
+        seeded = {
+            "plain": lambda registry: registry.register("t", plain, timeout=0.25),
+            "isolated": lambda registry: registry.register_isolated("t", "m:f", timeout=0.25, max_output_bytes=10),
+        }
+        replaced = {
+            "plain": lambda registry, **limit: registry.register("t", plain, **limit),
+            "isolated": lambda registry, **limit: registry.register_isolated("t", "m:g", **limit),
+        }
+        for before, seed in seeded.items():
+            for after, replace in replaced.items():
+                with self.subTest(before=before, after=after):
+                    registry = ToolRegistry(default_timeout=7.0, max_output_bytes=4096)
+                    seed(registry)
+                    replace(registry)
+                    self.assertEqual(limits(registry, "t"), (7.0, 4096))
+                    replace(registry, timeout=3.0)  # an explicit override of the replacement wins
+                    self.assertEqual(limits(registry, "t")[0], 3.0)
+        registry = ToolRegistry(default_timeout=7.0, max_output_bytes=4096)
+        registry.register_isolated("t", "m:f", max_output_bytes=99)
+        registry.register_isolated("t", "m:g", max_output_bytes=55)
+        self.assertEqual(limits(registry, "t"), (7.0, 55))
+        # A REFUSED replacement changes nothing.
+        with self.assertRaises(ValueError):
+            registry.register_isolated("t", "not-a-target", timeout=1.0)
+        with self.assertRaises(SecurityError):
+            registry.register("t", plain, side_effecting=True)
+        self.assertEqual(limits(registry, "t"), (7.0, 55))
 
     def test_invoke_reasserts_side_effecting_contract_at_launch(self):  # G9 (CALIBRATED)
         with patch("portmark.tools._has_tree_termination_primitive", return_value=True):

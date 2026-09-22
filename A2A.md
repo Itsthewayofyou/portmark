@@ -153,3 +153,17 @@ The adapter fails closed for:
 - envelope verification or execution failure
 
 Client errors use JSON-RPC error envelopes and generic messages. Internal exception details are logged server-side only.
+
+The HTTP status says who caused a failed submission; the body is the same generic error either way:
+
+- **400**: the request was refused at admission (a bad signature, a bad permit, a replay, a refused
+  grant), or its permit expired during the run.
+- **500**: a server failure: anything that goes wrong after the request was admitted (the configured
+  provider's answer or decision, or acting on it), a bug, a storage fault, the host's own rollback floor
+  or checkpoint keyring, its clock, or a tool failure. Where a failure happens decides this, not the
+  error's type: a malformed provider answer is refused as unsafe, but it is not the client's doing.
+- **503** with `Retry-After`: the remote witness (EV-013) could not be reached. The save was refused and
+  nothing was committed, so the same request can be sent again once the witness is back.
+
+A 5xx does not make it safe to replay a single-use signed envelope in general: a run that committed
+before the failure has consumed its nonce, and the host refuses a replay of it.

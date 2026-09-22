@@ -329,12 +329,21 @@ class ToolRegistry:
             )
         self._tools[name] = tool
         self._isolated.pop(name, None)
-        if timeout is not None:
-            self._timeouts[name] = timeout
+        # A registration REPLACES the tool completely: a limit it does not name is the registry default,
+        # never a leftover from the tool it replaces (register() has no output-cap override at all).
+        self._set_override(self._timeouts, name, timeout)
+        self._max_output.pop(name, None)
         # A plain (non-side-effecting) register REPLACES any prior registration of this name, so it
         # must also clear a stale side-effecting membership (e.g. re-registering an isolated
         # side-effecting name as a plain thread tool). Fail closed on the invariant, not just add.
         self._side_effecting.discard(name)
+
+    @staticmethod
+    def _set_override(overrides: dict[str, Any], name: str, value: Any) -> None:
+        if value is None:
+            overrides.pop(name, None)
+        else:
+            overrides[name] = value
 
     def register_isolated(
         self,
@@ -415,10 +424,9 @@ class ToolRegistry:
             # test, run in a credential-free, egress-denied environment -- not a runtime import.
         self._isolated[name] = _IsolatedSpec(target=target, env=dict(env or {}), reconcile=reconcile)
         self._tools.pop(name, None)
-        if timeout is not None:
-            self._timeouts[name] = timeout
-        if max_output_bytes is not None:
-            self._max_output[name] = max_output_bytes
+        # Complete replacement, as in register(): an omitted limit reverts to the registry default.
+        self._set_override(self._timeouts, name, timeout)
+        self._set_override(self._max_output, name, max_output_bytes)
         # Reconcile membership on EVERY registration, both branches: only adding on True let a
         # re-registration strip reconcile (register_isolated(name, side_effecting=False)) while the
         # name stayed in _side_effecting -- gate passed once, invariant then violated (Section 7 PR 2b).
