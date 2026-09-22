@@ -481,6 +481,11 @@ portmark witness serve --db /var/lib/portmark-witness/witness.sqlite \
   `http://` only to a loopback address.
 - Every endpoint except `GET /healthz` needs an Ed25519-signed request from an enrolled key. There is
   no bearer token: the per-request signatures authenticate more than a shared token would.
+- **Deadlines are absolute.** The server reads a whole request body within one 10 s deadline (not per
+  chunk), and it answers 503 above 256 open connections. The client's timeout is one deadline for the
+  whole call: connect, TLS, headers and body. A witness that answers slowly cannot hold the caller past it.
+  uvicorn has no timeout for slow request *headers*: set one on the TLS proxy (for nginx,
+  `client_header_timeout 10s;`).
 - The database file is created mode 600; a looser file is refused. Key files must be mode 600.
 - The same container image runs it: override the command with `portmark witness serve ...` and mount a
   volume for `--db`.

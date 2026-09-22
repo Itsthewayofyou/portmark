@@ -30,14 +30,16 @@ Every signature is Ed25519 over a domain-separated canonical JSON body:
 from __future__ import annotations
 
 import hashlib
+import http.client
 import ipaddress
 import json
 import os
 import secrets
+import socket
+import ssl
 import stat
-import urllib.error
+import threading
 import urllib.parse
-import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -542,23 +544,53 @@ def http_transport(base_url: str, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> T
         raise ValueError("the witness URL must use https (plain http only to a loopback address)")
     if not timeout > 0:
         raise ValueError("the witness timeout must be positive")
-    prefix = base_url.rstrip("/")
+    https = parsed.scheme == "https"
+    base_path = parsed.path.rstrip("/")
+    host, port = parsed.hostname, parsed.port
 
     def send(path: str, payload: bytes) -> tuple[int, bytes]:
-        request = urllib.request.Request(
-            prefix + path, data=payload, method="POST", headers={"Content-Type": "application/json"}
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:  # nosec B310 -- https or loopback http, checked above
-                return response.status, response.read(MAX_REQUEST_BYTES + 1)
-        except urllib.error.HTTPError as error:
-            # A refusal is a signed answer with a 4xx status: read it like any answer.
-            with error:
-                return error.code, error.read(MAX_REQUEST_BYTES + 1)
-        except (urllib.error.URLError, OSError, ValueError) as error:
-            raise WitnessUnavailable(f"the witness at {base_url} did not answer: {error}") from error
+        """`timeout` is ONE absolute deadline for the whole call -- connect, TLS, headers, and body. A
+        socket timeout alone bounds each read, so a witness sending a small chunk just under it would
+        hold the caller (in PR 2: the host's database write transaction) forever. The exchange runs in
+        a worker thread; at the deadline the caller gets WitnessUnavailable and the socket is shut down,
+        which ends the worker's blocked read."""
+        if https:
+            connection: http.client.HTTPConnection = http.client.HTTPSConnection(host, port, timeout=timeout, context=ssl.create_default_context())
+        else:
+            connection = http.client.HTTPConnection(host, port, timeout=timeout)
+        result: dict[str, Any] = {}
+
+        def exchange() -> None:
+            try:
+                connection.request("POST", base_path + path, body=payload, headers={"Content-Type": "application/json"})
+                response = connection.getresponse()
+                # Any status is read the same way: a refusal is a signed answer with a 4xx status.
+                result["answer"] = (response.status, response.read(MAX_REQUEST_BYTES + 1))
+            except Exception as error:  # every failure here means "no usable answer"
+                result["error"] = error
+
+        worker = threading.Thread(target=exchange, name="portmark-witness-call", daemon=True)
+        worker.start()
+        worker.join(timeout)
+        if worker.is_alive():
+            _abort(connection)
+            raise WitnessUnavailable(f"the witness at {base_url} did not answer within {timeout}s")
+        connection.close()
+        if "error" in result:
+            raise WitnessUnavailable(f"the witness at {base_url} did not answer: {result['error']}") from result["error"]
+        return result["answer"]
 
     return send
+
+
+def _abort(connection: http.client.HTTPConnection) -> None:
+    sock = connection.sock
+    if sock is not None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass  # already closed: nothing left to unblock
+    connection.close()
 
 
 @dataclass(frozen=True)

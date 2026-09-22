@@ -79,7 +79,13 @@ ENROLMENT_FORMAT = "portmark.witness.enrolment.v1"
 PUBLIC_MODE_ACK = "behind-tls-proxy"
 DEFAULT_PORT = 8787
 SCHEMA_VERSION = 1
+# ONE absolute deadline for the whole request body (not per chunk: a client sending a byte just under
+# every per-chunk timeout would hold the connection forever). Checked before authentication.
 BODY_READ_TIMEOUT_SECONDS = 10.0
+# uvicorn answers 503 above this many open connections, so slow clients cannot exhaust the process.
+# Slow HEADERS are the TLS proxy's job (uvicorn has no header timeout): see DEPLOYMENT.md.
+MAX_CONNECTIONS = 256
+KEEP_ALIVE_SECONDS = 5
 
 # Rate limits (token buckets): before authentication for everyone together, after it per signer.
 GLOBAL_RATE_PER_SECOND = 500.0
@@ -457,9 +463,14 @@ def make_witness_app(service: WitnessService) -> Callable[..., Any]:
         chunks: list[bytes] = []
         size = 0
         more = True
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + BODY_READ_TIMEOUT_SECONDS
         try:
             while more:
-                message = await asyncio.wait_for(receive(), BODY_READ_TIMEOUT_SECONDS)
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                message = await asyncio.wait_for(receive(), remaining)
                 if message["type"] == "http.disconnect":
                     return
                 chunk = message.get("body", b"")
@@ -504,5 +515,6 @@ def serve_witness(database: str, key_file: str, enrolment_path: str, bind: str, 
     service = WitnessService(WitnessLog(database), private_key, enrolment)
     config = uvicorn.Config(
         make_witness_app(service), host=bind, port=port, proxy_headers=False, server_header=False, lifespan="on", log_level="info",
+        limit_concurrency=MAX_CONNECTIONS, timeout_keep_alive=KEEP_ALIVE_SECONDS,
     )
     uvicorn.Server(config).run()

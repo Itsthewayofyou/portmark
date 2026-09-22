@@ -6,7 +6,10 @@ import json
 import os
 import socket
 import sqlite3
+import threading
+import time
 import unittest
+from unittest.mock import patch
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from witness_fixtures import AUDITOR, HOST, OPERATOR, OTHER_HOST, WitnessCase, asgi_transport, head, mode_of
@@ -25,6 +28,7 @@ from portmark.remote_witness import (
     sign_answer,
     sign_request,
 )
+from portmark import witness_server
 from portmark.security import canonical_json
 from portmark.witness_server import Enrolment, WitnessLog, WitnessService, bind_problems, fold_log, make_witness_app
 
@@ -372,6 +376,111 @@ class ClientTests(WitnessCase, unittest.TestCase):
         answer = self.w.client().state(HOST)
         self.assertEqual(answer.body["request_sha256"], answer.request_sha256)
         self.assertEqual(answer.receipt_hash, digest(answer.body))
+
+
+class _TricklingServer:
+    """A local TCP server that answers byte by byte, one byte every `gap` seconds, for at most
+    `duration` seconds: the status line and headers (`slow_headers`) or only the body."""
+
+    def __init__(self, slow_headers, gap=0.02, duration=3.0):
+        self.slow_headers, self.gap, self.duration = slow_headers, gap, duration
+        self.listener = socket.socket()
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(1)
+        self.port = self.listener.getsockname()[1]
+        self.thread = threading.Thread(target=self.serve, daemon=True)
+        self.thread.start()
+
+    def serve(self):
+        try:
+            client, _ = self.listener.accept()
+        except OSError:
+            return
+        with client:
+            client.recv(65536)
+            head = b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n"
+            deadline = time.monotonic() + self.duration
+            try:
+                if not self.slow_headers:
+                    client.sendall(head)
+                    head = b"x" * 100000
+                for byte in head:
+                    if time.monotonic() > deadline:
+                        return
+                    client.sendall(bytes([byte]))
+                    time.sleep(self.gap)
+            except OSError:
+                return  # the client hung up: expected
+
+    def close(self):
+        self.listener.close()
+        self.thread.join(timeout=10)
+
+
+class DeadlineTests(WitnessCase, unittest.TestCase):
+    """PR #110 review: every timeout is ONE absolute deadline, never a per-chunk or per-read gap."""
+
+    def test_the_server_body_read_has_one_deadline_for_the_whole_body(self):
+        async def slow_client():
+            # A chunk every 0.05 s, forever: well under any per-chunk timeout.
+            async def receive():
+                await asyncio.sleep(0.05)
+                return {"type": "http.request", "body": b" ", "more_body": True}
+
+            out = {"body": b""}
+
+            async def send(message):
+                if message["type"] == "http.response.start":
+                    out["status"] = message["status"]
+                else:
+                    out["body"] += message.get("body", b"")
+
+            await self.w.app({"type": "http", "method": "POST", "path": STATE_PATH, "headers": []}, receive, send)
+            return out
+
+        with patch.object(witness_server, "BODY_READ_TIMEOUT_SECONDS", 0.3):
+            started = time.monotonic()
+            out = asyncio.run(asyncio.wait_for(slow_client(), 5))
+            elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual((out["status"], json.loads(out["body"])["body"]["code"]), (400, "malformed"))
+
+    def test_the_client_call_has_one_deadline_for_slow_headers_and_slow_bodies(self):
+        for slow_headers in (True, False):
+            server = _TricklingServer(slow_headers)
+            try:
+                send = http_transport(f"http://127.0.0.1:{server.port}", timeout=0.3)
+                started = time.monotonic()
+                with self.assertRaises(WitnessUnavailable, msg=f"slow_headers={slow_headers}") as caught:
+                    send(STATE_PATH, b"{}")
+                elapsed = time.monotonic() - started
+                self.assertLess(elapsed, 1.0, f"slow_headers={slow_headers}")
+                self.assertIn("within 0.3s", str(caught.exception))
+                # The worker's blocked read is ended by the socket shutdown, not left running.
+                end = time.monotonic() + 1.0  # the trickling server would keep it alive for 3 s
+                while any(t.name == "portmark-witness-call" for t in threading.enumerate()) and time.monotonic() < end:
+                    time.sleep(0.02)
+                self.assertFalse(any(t.name == "portmark-witness-call" for t in threading.enumerate()))
+            finally:
+                server.close()
+
+    def test_the_server_caps_open_connections(self):
+        captured = {}
+
+        class FakeServer:
+            def __init__(self, config):
+                captured["config"] = config
+
+            def run(self):
+                pass
+
+        key = os.path.join(self._dir.name, "w.key")
+        generate_key_file(key)
+        with patch("uvicorn.Server", FakeServer):
+            witness_server.serve_witness(os.path.join(self._dir.name, "x.sqlite"), key, str(self.w.enrolment_path), "127.0.0.1", 0, None)
+        config = captured["config"]
+        self.assertEqual((config.limit_concurrency, config.timeout_keep_alive), (256, 5))
+        self.assertFalse(config.proxy_headers)
 
 
 class ServerRestartTests(WitnessCase, unittest.TestCase):
