@@ -679,7 +679,12 @@ class WitnessClient:
     def send_envelope(self, path: str, envelope: dict[str, Any]) -> Answer:
         body = envelope["body"]
         request_sha256 = digest(body)
-        status, raw = self._transport(path, canonical_json(envelope))
+        payload = canonical_json(envelope)
+        if len(payload) > MAX_REQUEST_BYTES:
+            # Measured on the exact bytes about to be sent. The witness would refuse them (`too-large`);
+            # refusing here says why, without a network call, and never as "unavailable".
+            raise FloorError(TOO_LARGE, f"the witness request is {len(payload)} bytes; a request is at most {MAX_REQUEST_BYTES} bytes")
+        status, raw = self._transport(path, payload)
         if len(raw) > MAX_REQUEST_BYTES:
             raise WitnessUnavailable("the witness answer is too large")
         try:

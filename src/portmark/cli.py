@@ -120,7 +120,15 @@ def _apply_remote_witness(parser, config, store, verification):
     """EV-013: compare this database's last witness receipt with the remote witness. The request is signed
     as PORTMARK_REMOTE_WITNESS_SIGNER (an enrolled auditor) or, by default, as the host id."""
     from .remote_witness import WITNESS_UNAVAILABLE
-    from .witness_binding import ANCHORED, NO_REMOTE, REMOTE_WITNESS_SIGNER_ENV, HostWitness, client_from_environment
+    from .witness_binding import (
+        ANCHORED,
+        NO_REMOTE,
+        REMOTE_WITNESS_SIGNER_ENV,
+        WITNESS_UNCONFIGURED,
+        HostWitness,
+        client_from_environment,
+        stored_receipt,
+    )
 
     signer = (os.environ.get(REMOTE_WITNESS_SIGNER_ENV) or "").strip() or config.host_id
     try:
@@ -128,7 +136,15 @@ def _apply_remote_witness(parser, config, store, verification):
     except ValueError as error:
         parser.error(str(error))
     if client is None:
-        return verification, NO_REMOTE
+        if stored_receipt(store, config.host_id) is None:
+            return verification, NO_REMOTE
+        # Remote witnessing was on for this database (the host refuses to start this way too). Without the
+        # witness, a restore of the database AND its local floor together cannot be ruled out.
+        if verification.status == "invalid":
+            return verification, WITNESS_UNCONFIGURED
+        return replace(verification, status="unverifiable", reason=(
+            "this database holds a remote-witness receipt, but no remote witness is configured "
+            "(PORTMARK_REMOTE_WITNESS_URL); rollback cannot be ruled out")), WITNESS_UNCONFIGURED
     status = HostWitness(client, config.host_id).status(store)
     if status == ANCHORED:
         return verification, status
@@ -139,10 +155,41 @@ def _apply_remote_witness(parser, config, store, verification):
     return replace(verification, status="invalid", reason=f"the remote witness does not accept this database ({status})"), status
 
 
+def _remote_recovery(parser: argparse.ArgumentParser, args: argparse.Namespace, config):
+    """EV-013, for an operator recovery (`floor-reset`, `time-floor reset`): the host's binding to the remote
+    witness (None when none is configured) and the operator's client (None without --operator-id)."""
+    from .witness_binding import HostWitness, client_from_environment
+
+    if bool(args.operator_id) != bool(args.operator_key_file):
+        parser.error("--operator-id and --operator-key-file go together")
+    try:
+        host_client = client_from_environment(config.host_id)
+        operator = client_from_environment(args.operator_id, key_file=args.operator_key_file) if args.operator_id else None
+    except ValueError as error:
+        parser.error(str(error))
+    if args.operator_id and (host_client is None or operator is None):
+        parser.error("--operator-key-file rebaselines the remote witness, which needs PORTMARK_REMOTE_WITNESS_URL")
+    return (None if host_client is None else HostWitness(host_client, config.host_id)), operator
+
+
+def _registry_body(trust) -> dict | None:
+    """The trust registry a rebaseline names: {version, digest} of a versioned registry, else None."""
+    return {"version": trust.version, "digest": trust.digest} if trust is not None and trust.version else None
+
+
+def _database_heads(store, host_id: str) -> dict:
+    return {task_id: {"sequence": sequence, "head_hash": head_hash} for task_id, head_hash, sequence in store.audit_heads_for_host(host_id)}
+
+
+def _refuse_remote(result: dict, error) -> None:
+    print(json.dumps({**result, "remote_status": "refused", "remote_code": error.code, "reason": str(error)}, indent=2))
+    raise SystemExit(1) from error
+
+
 def _run_floor_reset(parser: argparse.ArgumentParser, args: argparse.Namespace, config, store) -> None:
-    from .remote_witness import MAX_HEADS
     from .security import TrustSource
     from .witness import FloorError, LocalFloorWitness, reset_audit_floor
+    from .witness_binding import stored_receipt
 
     if not args.confirm:
         parser.error("floor-reset accepts the CURRENT database as truth; re-run with --confirm once the cause is understood")
@@ -153,20 +200,13 @@ def _run_floor_reset(parser: argparse.ArgumentParser, args: argparse.Namespace, 
     if getattr(signer, "ephemeral", None) is not False:
         parser.error("floor-reset must sign with the host's stable audit key (PORTMARK_ED25519_PRIVATE_KEY_B64), not a generated one")
     store.set_audit_head_verifier(trust)
-    operator = remote = None
-    if args.operator_id or args.operator_key_file:
-        from .witness_binding import HostWitness, client_from_environment
-
-        if not (args.operator_id and args.operator_key_file):
-            parser.error("--operator-id and --operator-key-file go together")
+    remote, operator = _remote_recovery(parser, args, config)
+    if operator is not None:
+        # Before anything local changes: the witness answers and knows this host.
         try:
-            host_client = client_from_environment(config.host_id)
-            operator = client_from_environment(args.operator_id, key_file=args.operator_key_file)
-        except ValueError as error:
-            parser.error(str(error))
-        if host_client is None or operator is None:
-            parser.error("--operator-key-file rebaselines the remote witness, which needs PORTMARK_REMOTE_WITNESS_URL")
-        remote = HostWitness(host_client, config.host_id)
+            remote.state()
+        except FloorError as error:
+            _refuse_remote({"host_id": config.host_id, "status": "refused"}, error)
     witness = LocalFloorWitness(config.audit_floor_path, config.host_id, signer, signer)
     try:
         epoch = reset_audit_floor(witness, store, args.reason, trust.version or None, trust.digest, allow_legacy_anchor=args.allow_legacy_anchor)
@@ -177,20 +217,19 @@ def _run_floor_reset(parser: argparse.ArgumentParser, args: argparse.Namespace, 
     result: dict = {"host_id": config.host_id, "status": "reset", "epoch": epoch}
     if operator is not None and remote is not None:
         # EV-013: the local reset above re-verified every chain first, so a tampered chain is never
-        # rebaselined into the witness either.
-        heads = {task_id: {"sequence": sequence, "head_hash": head_hash} for task_id, head_hash, sequence in store.audit_heads_for_host(config.host_id)}
-        if len(heads) > MAX_HEADS:
-            # debt: one rebaseline carries every head; upgrade to a paged rebaseline when a host has more tasks.
-            print(json.dumps({**result, "remote_status": "refused", "reason": f"more than {MAX_HEADS} tasks for one rebaseline"}, indent=2))
-            raise SystemExit(1)
-        registry = {"version": trust.version, "digest": trust.digest} if trust.version else None
+        # rebaselined into the witness either. The heads go in pages that each fit one request.
         try:
-            remote_epoch = remote.rebaseline(operator, store, heads, args.reason, registry, int(store.time_floor()))
+            remote_epoch = remote.rebaseline(operator, store, _database_heads(store, config.host_id), args.reason, _registry_body(trust),
+                                             int(store.time_floor()))
         except FloorError as error:
-            print(json.dumps({**result, "remote_status": "refused", "remote_code": error.code, "reason": str(error)}, indent=2))
-            raise SystemExit(1) from error
+            _refuse_remote(result, error)
         print(f"WARNING: the remote witness for {config.host_id} was rebaselined to epoch {remote_epoch}.", file=sys.stderr)
         result.update(remote_status="rebaselined", remote_epoch=remote_epoch)
+    elif stored_receipt(store, config.host_id) is not None:
+        # The witness keeps its own chain: a database it does not accept stays refused at start.
+        print("WARNING: the remote witness was NOT rebaselined (no --operator-id); the host starts only if the witness "
+              "accepts this database.", file=sys.stderr)
+        result["remote_status"] = "not-rebaselined"
     print(json.dumps(result, indent=2))
 
 
@@ -256,15 +295,33 @@ def _run_time_floor(parser: argparse.ArgumentParser, args: argparse.Namespace, c
 
     if store is None:
         parser.error(f"time-floor {args.time_floor_command} requires --store-path or PORTMARK_STORE_PATH")
+    from .security import TrustSource
+    from .witness_binding import REMOTE_WITNESS_URL_ENV, stored_receipt
+
     if args.time_floor_command == "show":
-        print(json.dumps(time_floor_status(store, _floor_reader(config, audit_verifier)), indent=2, sort_keys=True))
+        report = time_floor_status(store, _floor_reader(config, audit_verifier))
+        try:
+            from .witness_binding import host_witness_from_environment
+
+            remote = host_witness_from_environment(config.host_id)
+        except ValueError as error:
+            parser.error(str(error))
+        if remote is not None:
+            # EV-013: the witness keeps its own copy of the floor, and the boot clock check uses it too.
+            try:
+                report["remote_floor"] = int(remote.state()["time_floor"])
+            except FloorError as error:
+                report.update(remote_floor=None, remote_status=error.code)
+        elif stored_receipt(store, config.host_id) is not None:
+            from .witness_binding import WITNESS_UNCONFIGURED
+
+            report.update(remote_floor=None, remote_status=WITNESS_UNCONFIGURED)
+        print(json.dumps(report, indent=2, sort_keys=True))
         return
     if not args.confirm:
         parser.error("time-floor reset changes the durable time floor, which may LOWER it; re-run with --confirm once the clock is known to be right")
-    witness = None
+    witness = trust = None
     if config.audit_floor_path:
-        from .security import TrustSource
-
         if not config.trust_registry_path:
             parser.error("time-floor reset with an audit floor needs --trust-registry-path (the mirrored floor is signed)")
         trust = TrustSource.from_path(config.trust_registry_path)
@@ -272,12 +329,44 @@ def _run_time_floor(parser: argparse.ArgumentParser, args: argparse.Namespace, c
         if getattr(signer, "ephemeral", None) is not False:
             parser.error("time-floor reset must sign the audit floor with the host's stable audit key (PORTMARK_ED25519_PRIVATE_KEY_B64)")
         witness = LocalFloorWitness(config.audit_floor_path, config.host_id, signer, signer)
+    # EV-013: the remote witness keeps its own time floor, and the boot clock check takes the highest one.
+    # Everything about it is checked BEFORE the local floors change, so a refusal changes nothing.
+    remote, operator = _remote_recovery(parser, args, config)
+    rebaseline = False
+    if remote is None and stored_receipt(store, config.host_id) is not None:
+        parser.error(f"this database holds a remote-witness receipt, and the witness keeps its own time floor; set {REMOTE_WITNESS_URL_ENV}, "
+                     "PORTMARK_REMOTE_WITNESS_PUBLIC_KEY and PORTMARK_REMOTE_WITNESS_KEY_FILE")
+    if remote is not None:
+        try:
+            # Only a database the witness accepts: the rebaseline below takes this database's heads as they
+            # are, so a restored database must go through `floor-reset` (which re-verifies every chain).
+            state = remote.check_boot(store)
+        except FloorError as error:
+            _refuse_remote({"status": "refused", "note": "nothing was changed; recover the database with `portmark floor-reset "
+                            "--operator-id <id> --operator-key-file <file>` first"}, error)
+        rebaseline = int(state["time_floor"]) > args.to
+        if rebaseline and operator is None:
+            parser.error(f"the remote witness holds a time floor of {state['time_floor']}, above --to; lowering it is an operator "
+                         "rebaseline: add --operator-id and --operator-key-file")
+        if rebaseline and trust is None:
+            if not config.trust_registry_path:
+                parser.error("lowering the remote witness's time floor needs --trust-registry-path (the rebaseline names the registry)")
+            trust = TrustSource.from_path(config.trust_registry_path)
     try:
         outcome = reset_time_floor(store, witness, args.to, args.reason, int(_time.time()))
     except (ValueError, FloorError) as error:
         print(json.dumps({"status": "refused", "reason": str(error)}, indent=2))
         raise SystemExit(1) from error
     print(f"WARNING: the durable time floor was set to {args.to} by an operator ({args.reason!r}).", file=sys.stderr)
+    if rebaseline:
+        try:
+            remote_epoch = remote.rebaseline(operator, store, _database_heads(store, config.host_id), args.reason, _registry_body(trust), args.to)
+        except FloorError as error:
+            _refuse_remote({"status": "reset", **outcome, "note": "the local floors were reset; run the same command again"}, error)
+        print(f"WARNING: the remote witness for {config.host_id} was rebaselined to epoch {remote_epoch} to lower its time floor.", file=sys.stderr)
+        outcome.update(remote_status="rebaselined", remote_epoch=remote_epoch)
+    elif remote is not None:
+        outcome["remote_status"] = "unchanged"
     print(json.dumps({"status": "reset", **outcome}, indent=2, sort_keys=True))
 
 
@@ -530,6 +619,8 @@ def main() -> None:
     floor_set.add_argument("--to", type=int, required=True, help="the new floor, in epoch seconds")
     floor_set.add_argument("--reason", required=True, help="why (recorded in the maintenance log and the audit floor)")
     floor_set.add_argument("--confirm", action="store_true", help="required: acknowledge that this may lower the floor")
+    floor_set.add_argument("--operator-id", help="EV-013: an operator id enrolled with the remote witness (lowers ITS time floor too)")
+    floor_set.add_argument("--operator-key-file", help="EV-013: that operator's Ed25519 private key file (the host never holds it)")
     conformance = subparsers.add_parser(
         "attest-conformance",
         help="run the EV-004 conformance kit against the external attestation verifier command (before production use)",

@@ -236,6 +236,8 @@ of advances per host, and a host with `PORTMARK_REMOTE_WITNESS_URL` advances it 
 - **The witness is down.** Hosts refuse every save (and refuse to start) with `witness-unavailable`
   (owner decision F1). Nothing is committed and nothing is wedged: bring the witness back and the same
   saves go through. `verify-audit` reports `remote_status: witness-unavailable` (exit 2).
+- **`verify-audit` reports `witness-unconfigured`** (exit 2). The database holds a witness receipt, but
+  the command ran without the `PORTMARK_REMOTE_WITNESS_*` settings. Set them and run it again.
 - **A host refuses to start with `rolled-back`.** Its database is older than the witness: it was restored,
   or it is a stale copy. If the restore was deliberate, run `floor-reset ... --operator-id
   --operator-key-file` (DEPLOYMENT.md "Remote Witness", Recovery). Work after the backup is lost.
@@ -319,7 +321,9 @@ check the clock first. Lower the floor with `time-floor reset` only when the clo
   `clock.forward_jumps`). Correct the clock at once. If the time floor already followed it, start-up
   refuses with `clock-behind-floor`. Then run
   `time-floor reset --to <the correct epoch> --reason "<what happened>" --confirm`, with the same
-  `--audit-floor-path` and `--trust-registry-path` the host uses.
+  `--audit-floor-path` and `--trust-registry-path` the host uses. With a remote witness, check
+  `time-floor show`: if `remote_floor` is above the correct epoch, also add `--operator-id <id>
+  --operator-key-file <operator.key>` (the witness is rebaselined; a refusal changes nothing).
 
 ## File Permissions
 

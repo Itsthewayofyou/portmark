@@ -18,7 +18,7 @@ from .storage import RuntimeStore, create_runtime_store
 from .tools import ToolRegistry, demo_registry
 from ._clock import ClockRollbackError, TimeFloorError, check_time_floor, clock_tolerance_from_environment, configure_default_clock, trusted_now
 from .witness import FloorError, LocalFloorWitness, floor_path_inside, open_audit_floor
-from .witness_binding import HostWitness, host_witness_from_environment, registry_identity
+from .witness_binding import HostWitness, host_witness_from_environment, registry_identity, stored_receipt
 
 logger = logging.getLogger(__name__)
 
@@ -413,7 +413,7 @@ def _open_remote_witness(
 ) -> tuple[HostWitness | None, int]:
     """EV-013 boot check. Returns (the binding, the witness's time floor). Every refusal is a boot ValueError."""
     durable = bool(getattr(store, "is_durable", False))
-    stored = store.witness_receipt(host_id) if durable and hasattr(store, "witness_receipt") else None  # type: ignore[union-attr]
+    stored = stored_receipt(store, host_id)
     if binding is None:
         if stored is not None:
             # Once a database has a witness receipt, the witness cannot be silently switched off: a host

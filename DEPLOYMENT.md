@@ -325,7 +325,13 @@ and on the PostgreSQL server.
     time-floor reset --to <epoch-seconds> --reason "<why>" --confirm
   ```
   The reset is recorded in the maintenance log and in the audit floor. `portmark ... time-floor show`
-  prints both floors and both clocks.
+  prints both floors and both clocks (and `remote_floor` with a remote witness).
+- **With a remote witness (EV-013),** the witness keeps its own copy of the floor, and start-up checks it
+  too. If it is above `--to`, add `--operator-id <id> --operator-key-file <operator.key>`: the witness is
+  rebaselined (a new epoch) with the lower floor. Without them, the command refuses and changes nothing.
+  It also refuses, changing nothing, when the witness is unreachable, when a database that holds a
+  witness receipt has no witness settings, and when the witness does not accept the database (recover
+  that first with `floor-reset`).
 
 ## Retention And Capacity
 
@@ -537,13 +543,20 @@ A partial configuration is refused. The production profile refuses the default h
   check: the host sends its durable time floor with the save that raises it (at most once a minute), and
   the witness keeps the highest value it has confirmed.
 - **`verify-audit`** adds `remote_status`: `anchored`; `rolled-back` / `forked` / `witness-behind` (exit 1);
-  `witness-unavailable` (exit 2); `no-remote`. An auditor asks with its own enrolled key: set
+  `witness-unavailable` (exit 2); `witness-unconfigured` (exit 2: the database holds a witness receipt,
+  but no witness is configured, so a rollback cannot be ruled out); `no-remote` (the database was never
+  witnessed). An auditor asks with its own enrolled key: set
   `PORTMARK_REMOTE_WITNESS_SIGNER` to its id and `PORTMARK_REMOTE_WITNESS_KEY_FILE` to its key.
 
 **Recovery.** After a deliberate restore, `portmark floor-reset --reason ... --confirm --operator-id <id>
 --operator-key-file <operator.key>` resets the local floor (it re-verifies every chain first) and then
 rebaselines the witness from the database's current heads. Without the operator key only the local floor
-is reset, and the witness still refuses the restored database. The host's own key cannot rebaseline.
+is reset (`remote_status: not-rebaselined`), and the witness still refuses the restored database. The
+host's own key cannot rebaseline. The witness is asked first, so an unreachable witness refuses before the
+local floor changes. The heads go in pages that each fit one request (1 MiB): the first page in the
+rebaseline, the others in ordinary advances built on it. If the command stops part-way, the host still
+starts, and a task not yet sent is witnessed again from its next save; run the command again to finish.
+A too-low clock after a wrong forward jump is recovered with `time-floor reset` (see "Clock And The Durable Time Floor").
 
 **Residual risk:** these points are not covered by the remote witness.
 

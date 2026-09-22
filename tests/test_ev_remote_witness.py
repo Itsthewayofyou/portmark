@@ -87,14 +87,14 @@ class RemoteWitnessHostTests(unittest.TestCase):
         shutil.copyfile(self.d.floor_path, other.floor_path)
         return other
 
-    def commit_once(self, deployment=None, task_id="one-commit-task"):
+    def commit_once(self, deployment=None, task_id="one-commit-task", time_floor=0):
         """Exactly ONE witnessed commit, shaped like a real save (one task head, advanced through the same
         HostWitness.advance the save path calls). A task run makes several commits, so the tests that need
         the chain exactly one commit ahead use this; the chain rules (`prev`) do not depend on the head."""
         store = (deployment or self.d).store()
         self.one_commit_sequence = getattr(self, "one_commit_sequence", 0) + 1
         with store.transaction() as transaction:
-            self.binding().advance(transaction, {task_id: {"sequence": self.one_commit_sequence, "head_hash": f"h{self.one_commit_sequence}"}}, 0)
+            self.binding().advance(transaction, {task_id: {"sequence": self.one_commit_sequence, "head_hash": f"h{self.one_commit_sequence}"}}, time_floor)
 
     def registry_host(self):
         """A host bound to the on-disk trust registry (what `floor-reset` records), with the remote witness."""
@@ -337,8 +337,15 @@ class RemoteWitnessHostTests(unittest.TestCase):
             code, report = self.d.verify_cli(first.task_id)
         # The local floor was restored with the database, so it says anchored; the witness does not.
         self.assertEqual((code, report["status"], report["floor_status"], report["remote_status"]), (1, "invalid", "anchored", ROLLED_BACK))
-        code, report = self.d.verify_cli(first.task_id)  # no remote configured
-        self.assertEqual(report["remote_status"], "no-remote")
+        # The same restored pair with the witness settings LEFT OUT: the database holds a receipt, so remote
+        # witnessing was on, and without the witness the rollback cannot be ruled out (the review's repro).
+        code, report = self.d.verify_cli(first.task_id)
+        self.assertEqual((code, report["status"], report["remote_status"]), (2, "unverifiable", "witness-unconfigured"))
+        # A database that never had a witness is unchanged: no-remote, and the result stands.
+        plain = Deployment(os.path.join(self.root, "never-witnessed"))
+        _, plain_task = start_task(plain.host())
+        code, report = plain.verify_cli(plain_task.task_id)
+        self.assertEqual((code, report["status"], report["remote_status"]), (0, "valid", "no-remote"))
 
     def test_floor_reset_with_an_operator_key_rebaselines_the_witness(self):
         host = self.host()
@@ -354,7 +361,7 @@ class RemoteWitnessHostTests(unittest.TestCase):
         stdout = io.StringIO()
         with patch.dict(os.environ, self.d.env()), patch.object(sys, "argv", base), redirect_stdout(stdout), redirect_stderr(io.StringIO()):
             cli_main()
-        self.assertNotIn("remote_status", json.loads(stdout.getvalue()))
+        self.assertEqual(json.loads(stdout.getvalue())["remote_status"], "not-rebaselined")
         with self.assertRaisesRegex(ValueError, r"remote witness refused to start \(rolled-back\)"):
             self.registry_host()
         # With the operator key, the witness is rebaselined too.
@@ -377,6 +384,128 @@ class RemoteWitnessHostTests(unittest.TestCase):
                 cli_main()
         self.assertEqual(raised.exception.code, 1)
         self.assertEqual(json.loads(out.getvalue())["remote_code"], "unauthenticated")
+
+    # -- review round 1 on #111 ------------------------------------------------------------------------
+    def cli(self, *argv, witness="up"):
+        """Run `portmark` against this deployment. witness: "up", "down", or None (no witness settings)."""
+        full = ["portmark", "--host-id", HOST, "--store-path", str(self.d.store_path), "--trust-registry-path", str(self.d.registry_path),
+                "--audit-floor-path", str(self.d.floor_path), *argv]
+        stdout, stderr, code = io.StringIO(), io.StringIO(), 0
+        with patch.dict(os.environ, self.d.env()), patch.object(sys, "argv", full), redirect_stdout(stdout), redirect_stderr(stderr):
+            context = self.clients(down=witness == "down") if witness is not None else patch.dict(os.environ, {})
+            with context:
+                try:
+                    cli_main()
+                except SystemExit as exit_:
+                    code = exit_.code
+        text = stdout.getvalue()
+        return code, (json.loads(text) if text.strip() else None), stderr.getvalue()
+
+    def local_floors(self):
+        return self.d.store().time_floor(), self.d.floor_path.read_bytes()
+
+    def test_time_floor_reset_lowers_the_witness_floor_and_the_host_starts_again(self):
+        import time
+
+        host = self.host()
+        envelope, _ = start_task(host)
+        now, ahead = int(time.time()), int(time.time()) + 100_000
+        self.commit_once(time_floor=ahead)  # a wrong clock moved the witnessed floor far ahead ...
+        self.commit_once(time_floor=ahead)  # ... (the witness takes a floor when the next advance confirms it)
+        self.assertEqual(self.remote_state()["time_floor"], ahead)
+        with self.assertRaisesRegex(ValueError, "time floor refused to start") as raised:
+            self.host()
+        self.assertIn("--operator-key-file", str(raised.exception))  # the boot message names the working command
+        key_file = os.path.join(self.root, "operator.key")
+        reset = ("time-floor", "reset", "--to", str(now), "--reason", "the clock jumped ahead", "--confirm")
+        # Without the operator key: refused, and NOTHING changed (the local floors are not lowered alone).
+        before = self.local_floors()
+        code, _, err = self.cli(*reset)
+        self.assertEqual(code, 2)
+        self.assertIn(f"time floor of {ahead}", err)
+        self.assertEqual(self.local_floors(), before)
+        # With it: the local floors AND the witness's floor are lowered, and the host starts again.
+        code, result, err = self.cli(*reset, "--operator-id", OPERATOR, "--operator-key-file", key_file)
+        self.assertEqual((code, result["status"], result["remote_status"], result["remote_epoch"]), (0, "reset", "rebaselined", 2))
+        self.assertEqual(self.remote_state()["time_floor"], now)
+        code, shown, _ = self.cli("time-floor", "show")
+        self.assertEqual((shown["database_floor"], shown["remote_floor"]), (now, now))
+        restarted = self.registry_host()
+        self.assertEqual(resume(restarted, envelope).status, "awaiting_input")
+        # Once the witness floor is not above --to, the witness is left alone.
+        code, result, _ = self.cli("time-floor", "reset", "--to", str(now + 5), "--reason", "again", "--confirm")
+        self.assertEqual((code, result["remote_status"]), (0, "unchanged"))
+
+    def test_time_floor_reset_refuses_before_any_change_when_the_witness_is_missing_or_disagrees(self):
+        import time
+
+        host = self.host()
+        envelope, _ = start_task(host)
+        snapshot, floor_bytes = self.d.snapshot("pair"), self.d.floor_path.read_bytes()
+        resume(host, envelope)
+        resume(host, envelope)
+        key_file = os.path.join(self.root, "operator.key")
+        reset = ("time-floor", "reset", "--to", str(int(time.time())), "--reason", "clock", "--confirm",
+                 "--operator-id", OPERATOR, "--operator-key-file", key_file)
+        before = self.local_floors()
+        # A database with a receipt, but no witness settings: the witness's own floor would be left behind.
+        code, _, err = self.cli(*reset[:7], witness=None)
+        self.assertEqual(code, 2)
+        self.assertIn("holds a remote-witness receipt", err)
+        self.assertEqual(self.local_floors(), before)
+        # The witness is down: refused before anything local changes.
+        code, result, _ = self.cli(*reset, witness="down")
+        self.assertEqual((code, result["remote_code"]), (1, "witness-unavailable"))
+        self.assertEqual(self.local_floors(), before)
+        # A restored pair: a time-floor rebaseline would take its heads as they are; floor-reset is the way.
+        self.restore_pair(snapshot, floor_bytes)
+        before = self.local_floors()
+        code, result, _ = self.cli(*reset)
+        self.assertEqual((code, result["remote_code"]), (1, ROLLED_BACK))
+        self.assertIn("floor-reset", result["note"])
+        self.assertEqual(self.local_floors(), before)
+
+    def test_floor_reset_asks_the_witness_before_the_local_reset(self):
+        host = self.host()
+        envelope, _ = start_task(host)
+        resume(host, envelope)
+        key_file = os.path.join(self.root, "operator.key")
+        before = self.d.floor_path.read_bytes()
+        code, result, _ = self.cli("floor-reset", "--reason", "r", "--confirm", "--operator-id", OPERATOR, "--operator-key-file", key_file,
+                                   witness="down")
+        self.assertEqual((code, result["remote_code"]), (1, "witness-unavailable"))
+        self.assertEqual(self.d.floor_path.read_bytes(), before)  # the local floor was not reset
+
+    def test_a_rebaseline_larger_than_one_request_goes_in_pages(self):
+        import hashlib
+
+        from portmark.remote_witness import MAX_HEADS, MAX_REQUEST_BYTES
+        from portmark.witness_server import fold_log
+
+        operator = WitnessClient(self.switch, public_key_bytes(self.w.key), OPERATOR, self.w.keys[OPERATOR])
+        store = self.d.store()
+        short = {f"task-{index:05d}": {"sequence": index + 1, "head_hash": hashlib.sha256(str(index).encode()).hexdigest()}
+                 for index in range(MAX_HEADS)}
+        long = {("t" * 505) + f"{index:07d}": {"sequence": 1, "head_hash": "h" * 512} for index in range(1_200)}
+        tiny = {f"{index:05d}": {"sequence": 1, "head_hash": "h"} for index in range(2 * MAX_HEADS)}  # > MAX_HEADS fit in the bytes
+        for epoch, heads, one_request in ((2, short, "too-large"), (3, long, "too-large"), (4, tiny, "malformed")):
+            # One request cannot carry these heads: too many bytes (the review measured 1,070,385 for the short
+            # ones; refused before it is sent), or more than MAX_HEADS heads (the witness refuses it) ...
+            try:
+                answer = operator.rebaseline(HOST, None, "one request", heads, None, 0)  # the shape is judged first
+                refused, message = (answer.body["code"], "") if answer.kind == "refusal" else (None, "")
+            except FloorError as error:
+                refused, message = error.code, str(error)
+            self.assertEqual(refused, one_request)
+            if one_request == "too-large":
+                self.assertIn(str(MAX_REQUEST_BYTES), message)
+            # ... the rebaseline sends them in pages, and the witness ends up holding every one.
+            self.assertEqual(self.binding().rebaseline(operator, store, heads, "restore", None, 0), epoch)
+            state, confirmed = fold_log(self.w.log, HOST)
+            witnessed = {**confirmed, **(state.pending.heads if state.pending is not None else {})}
+            self.assertEqual(witnessed, heads)
+            self.assertEqual(store.witness_receipt(HOST)[1], state.last_hash)
+            self.binding().check_boot(store)  # the database names the witness's newest receipt
 
 
 def _reseal(deployment, envelope):

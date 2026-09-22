@@ -119,7 +119,8 @@ class TrustedClock:
             logger.critical(
                 "the wall clock jumped FORWARD by %.0fs (tolerance %ds). If this is wrong, correct it now: the "
                 "durable time floor will follow it, and once it has, correcting the clock makes the host refuse "
-                "to start until an operator runs `portmark time-floor reset --to <epoch> --reason <text>`.",
+                "to start until an operator runs `portmark time-floor reset --to <epoch> --reason <text> --confirm` "
+                "(with a remote witness, also --operator-id and --operator-key-file).",
                 drift,
                 self.tolerance_seconds,
             )
@@ -164,7 +165,9 @@ class TimeFloorError(ClockRollbackError):
 _RECOVERY = (
     "Correct the clock and start again. If the clock is right and the FLOOR is wrong (it followed a clock that "
     "was wrong, for example after a forward jump), an operator lowers it explicitly: "
-    "`portmark time-floor reset --to <epoch-seconds> --reason <text>`. Portmark never lowers it by itself."
+    "`portmark time-floor reset --to <epoch-seconds> --reason <text> --confirm`. With a remote witness (EV-013), "
+    "which keeps its own copy of the floor, also add `--operator-id <id> --operator-key-file <file>`. "
+    "Portmark never lowers it by itself."
 )
 
 

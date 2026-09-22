@@ -16,7 +16,11 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
 - **Fail closed (owner decision F1):** a refusal or an unreachable witness refuses the save and the start.
   **Optional (F3):** gauge `portmark_remote_witness_active`.
 - **Boot check** of the database's last receipt against the witness; `verify-audit` reports
-  `remote_status`; `floor-reset --operator-id --operator-key-file` rebaselines the witness.
+  `remote_status` (`witness-unconfigured`, exit 2, when a database that holds a receipt is verified without
+  the witness settings); `floor-reset --operator-id --operator-key-file` rebaselines the witness, and
+  `time-floor reset` takes the same arguments to lower the witness's time floor. A rebaseline sends the
+  heads in pages that each fit one request, and every witness request is measured before it is sent. The
+  witness is asked before anything local changes.
 - **Schema:** SQLite v15 / Postgres v13 add `witness_receipts`. **Upgrade note:** a database that holds a
   receipt refuses to start without its witness.
 

@@ -28,7 +28,16 @@ import os
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from .remote_witness import DEFAULT_TIMEOUT_SECONDS, Answer, WitnessClient, decode_public_key, http_transport, load_private_key_file
+from .remote_witness import (
+    DEFAULT_TIMEOUT_SECONDS,
+    MAX_HEADS,
+    MAX_REQUEST_BYTES,
+    Answer,
+    WitnessClient,
+    decode_public_key,
+    http_transport,
+    load_private_key_file,
+)
 from .security import canonical_json
 from .witness import FORKED, ROLLED_BACK, FloorError
 
@@ -41,6 +50,17 @@ REMOTE_WITNESS_SIGNER_ENV = "PORTMARK_REMOTE_WITNESS_SIGNER"
 WITNESS_BEHIND = "witness-behind"
 ANCHORED = "anchored"
 NO_REMOTE = "no-remote"
+# The database holds a witness receipt, but no witness is configured: remote witnessing was on, so a
+# rollback cannot be ruled out without it (verify-audit: unverifiable).
+WITNESS_UNCONFIGURED = "witness-unconfigured"
+
+
+def stored_receipt(store: Any, host_id: str) -> tuple[int, str] | None:
+    """This database's last witness receipt (seq, hash), or None. Once it is not None, remote witnessing
+    was on for this database, and nothing may treat it as "no remote witness" (start, verify-audit, resets)."""
+    if store is None or not getattr(store, "is_durable", False) or not hasattr(store, "witness_receipt"):
+        return None
+    return store.witness_receipt(host_id)
 
 
 def classify_boot(database: tuple[int, str] | None, state: Mapping[str, Any]) -> tuple[str, str] | None:
@@ -111,11 +131,14 @@ class HostWitness:
         # debt: the call runs while the store's write lock is held, so one host commits at most ~1/RTT saves
         # per second (DEFAULT_TIMEOUT_SECONDS bounds a stuck call); upgrade to batched advances when witness
         # p99 latency x the commit rate approaches 1 (see DEPLOYMENT.md "Remote Witness").
+        self._advance(transaction, heads, self._registry(), time_floor, "the save")
+
+    def _advance(self, transaction: Any, heads: dict[str, dict[str, Any]], registry: dict[str, Any] | None, time_floor: int, doing: str) -> None:
         prev = transaction.witness_receipt(self.host_id)
         seq, prev_hash = (0, None) if prev is None else prev
-        answer = self.client.advance(self.host_id, seq + 1, prev_hash, heads, self._registry(), time_floor)
+        answer = self.client.advance(self.host_id, seq + 1, prev_hash, heads, registry, time_floor)
         if answer.kind == "refusal":
-            raise _refusal(answer, "the save")
+            raise _refusal(answer, doing)
         transaction.store_witness_receipt(
             self.host_id, int(answer.body["host_seq"]), answer.receipt_hash, canonical_json(answer.document).decode("utf-8")
         )
@@ -125,14 +148,45 @@ class HostWitness:
         registry: dict[str, Any] | None, time_floor: int,
     ) -> int:
         """Operator recovery: start a new witness epoch from this database's CURRENT heads, and record the
-        rebaseline receipt as the database's last receipt. Returns the new epoch."""
+        rebaseline receipt as the database's last receipt. Returns the new epoch.
+
+        The heads go in pages that each fit one request (`head_pages`): the first page in the rebaseline, the
+        others in ordinary advances built on it (signed by the host), each stored in its own transaction. If
+        this stops part-way, the database still names a receipt the witness holds, so the host starts; a task
+        not yet sent is witnessed again from its next save. Running the recovery again starts it over."""
+        pages = head_pages(heads)
         state = self.state()
         newest = state["pending"] or state["confirmed"]
-        answer = operator.rebaseline(self.host_id, None if newest is None else newest["receipt_hash"], reason, heads, registry, time_floor)
+        answer = operator.rebaseline(self.host_id, None if newest is None else newest["receipt_hash"], reason, pages[0], registry, time_floor)
         if answer.kind == "refusal":
             raise _refusal(answer, "the rebaseline")
         store.set_witness_receipt(self.host_id, int(answer.body["host_seq"]), answer.receipt_hash, canonical_json(answer.document).decode("utf-8"))
+        for page in pages[1:]:
+            with store.transaction() as transaction:
+                self._advance(transaction, page, registry, time_floor, "a rebaseline page")
         return int(answer.body["epoch"])
+
+
+# One page of heads is at most this many bytes of canonical JSON (and at most MAX_HEADS heads), so the
+# request that carries it -- with the signature, the reason (at most 2000 characters) and the other fields
+# -- stays well under MAX_REQUEST_BYTES. One head is at most ~6 KB (two 512-character ids, JSON-escaped).
+HEAD_PAGE_BYTES = MAX_REQUEST_BYTES // 2
+
+
+def head_pages(heads: Mapping[str, dict[str, Any]]) -> list[dict[str, dict[str, Any]]]:
+    """Split `heads` into pages that each fit one witness request. Always at least one page (maybe empty)."""
+    pages: list[dict[str, dict[str, Any]]] = []
+    page: dict[str, dict[str, Any]] = {}
+    size = 2  # "{}"
+    for task_id in sorted(heads):
+        entry = len(canonical_json({task_id: heads[task_id]}))  # the entry, its braces standing in for a comma
+        if page and (size + entry > HEAD_PAGE_BYTES or len(page) >= MAX_HEADS):
+            pages.append(page)
+            page, size = {}, 2
+        page[task_id] = heads[task_id]
+        size += entry
+    pages.append(page)
+    return pages
 
 
 def client_from_environment(
