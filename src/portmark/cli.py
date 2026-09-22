@@ -226,6 +226,44 @@ def _run_time_floor(parser: argparse.ArgumentParser, args: argparse.Namespace, c
     print(json.dumps({"status": "reset", **outcome}, indent=2, sort_keys=True))
 
 
+def _run_witness(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """EV-013: the reference remote witness. It needs no host, store, or trust registry."""
+    from .remote_witness import generate_key_file, key_id_for
+    from .security import _b64url_encode
+
+    if args.witness_command == "keygen":
+        try:
+            public_key = generate_key_file(args.out)
+        except FileExistsError:
+            parser.error(f"{args.out} exists; a witness key is never overwritten")
+        except OSError as error:
+            parser.error(f"cannot write {args.out}: {error}")
+        print(json.dumps({"key_id": key_id_for(public_key), "public_key_b64": _b64url_encode(public_key)}, indent=2))
+        return
+    if args.witness_command == "serve":
+        from .witness_server import serve_witness
+
+        try:
+            serve_witness(args.db, args.key_file, args.enrolment, args.bind, args.port, args.public_mode)
+        except ValueError as error:
+            print(json.dumps({"status": "refused", "reason": str(error)}, indent=2))
+            raise SystemExit(2) from error
+        return
+    from .remote_witness import decode_public_key, http_transport, load_private_key_file
+    from .witness_conformance import run_witness_conformance
+
+    try:
+        transport = http_transport(args.url, args.timeout)
+        pinned = decode_public_key(args.witness_public_key)
+        host_key = load_private_key_file(args.host_key_file)
+        report = run_witness_conformance(transport, pinned, args.host_id, host_key)
+    except ValueError as error:
+        parser.error(str(error))
+    print(json.dumps(report.to_dict(), indent=2))
+    if not report.passed:
+        raise SystemExit(1)
+
+
 def _run_keygen(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     from .security import generate_signing_material
 
@@ -449,6 +487,27 @@ def main() -> None:
         help="check that PORTMARK_MIGRATION_PREFLIGHT_COMMAND attests a destination the way migration verifies it",
     )
     preflight_kit.add_argument("--destination", required=True, help="the destination host id to attest (a real one)")
+    witness_parser = subparsers.add_parser("witness", help="EV-013: run or check a remote witness (the reference server)")
+    witness_commands = witness_parser.add_subparsers(dest="witness_command", required=True)
+    witness_keygen = witness_commands.add_parser("keygen", help="write a new Ed25519 private key (mode 600) and print its public key")
+    witness_keygen.add_argument("--out", required=True, help="private key file to create (never overwritten)")
+    witness_serve = witness_commands.add_parser("serve", help="run the reference remote witness (on a machine OUTSIDE the host's failure domain)")
+    witness_serve.add_argument("--db", required=True, help="the witness SQLite file (created mode 600)")
+    witness_serve.add_argument("--key-file", required=True, help="the witness's own Ed25519 private key file (`portmark witness keygen`)")
+    witness_serve.add_argument("--enrolment", required=True, help="JSON: the host, operator, and auditor public keys (portmark.witness.enrolment.v1)")
+    witness_serve.add_argument("--bind", default="127.0.0.1", help="listen address (default loopback)")
+    witness_serve.add_argument("--port", type=int, default=8787)
+    witness_serve.add_argument(
+        "--public-mode", help="behind-tls-proxy: required for a non-loopback bind (a reverse proxy terminates TLS in front)"
+    )
+    witness_kit = witness_commands.add_parser(
+        "conformance", help="check that a deployed witness enforces the chain rules (uses a dedicated conformance: host id)"
+    )
+    witness_kit.add_argument("--url", required=True, help="the witness base URL (https, or http on loopback)")
+    witness_kit.add_argument("--host-id", required=True, help="an enrolled host id starting with 'conformance:' (never a real host's id)")
+    witness_kit.add_argument("--host-key-file", required=True, help="that host id's Ed25519 private key file")
+    witness_kit.add_argument("--witness-public-key", required=True, help="the witness's public key (base64url), pinned for every answer")
+    witness_kit.add_argument("--timeout", type=float, default=5.0, help="seconds per request (default 5)")
     verify_audit = subparsers.add_parser("verify-audit")
     verify_audit.add_argument("--task-id", required=True, help="task id whose audit chain should be verified")
     verify_audit.add_argument(
@@ -471,6 +530,9 @@ def main() -> None:
         return
     if args.command == "envelope":
         _run_envelope(parser, args, config)
+        return
+    if args.command == "witness":
+        _run_witness(parser, args)
         return
     if args.command == "attest-conformance":
         _run_attest_conformance(parser, args, config)

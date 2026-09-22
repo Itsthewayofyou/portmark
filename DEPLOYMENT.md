@@ -424,10 +424,99 @@ requires this control.
   They are authenticated, not hidden. The audit log, the migration outbox and receipts are not sealed
   by this key.
 - A restore of a whole older row (its old sealed value **and** its old generation) still authenticates.
-  That is a rollback, which the audit floor and a future remote witness (EV-013) address.
+  That is a rollback, which the audit floor and the remote witness (EV-013, "Remote Witness" below) address.
 - A process that holds the key (the host) can read every checkpoint. The key must not be stored with the
   database or its backups.
 - `verify-audit` stays an integrity check and does not need the key.
+
+## Remote Witness (EV-013, server side)
+
+The audit floor lives on the host's own storage. A restore of the database **and** the floor together,
+or two clones of the pair, stays internally consistent and passes it. A **remote witness** on another
+machine closes that gap: it keeps, per host, a hash chain of every advance the host made, and each
+advance names the witness receipt of the one before it. A restored host names an old receipt and is
+refused (`rolled-back`); two clones that share a receipt are refused (`forked`) at the latest on the
+second one's next commit.
+
+**Status.** This release ships the witness protocol, a reference server, and a conformance kit. The
+host does not call the witness yet: that is the second EV-013 change (the local floor stays the second
+layer). Deploy and check the server now; the host settings follow with that change.
+
+**Where to run it.** On a machine **outside the host's failure domain**: a different machine and a
+different backup set, so no restore of the host can also restore the witness. One small, always-on
+process. It needs no vendor and no GPU. Storage is about 300 bytes per commit (one million commits is
+about 300 MB).
+
+**Keys.** The witness signs every answer with its own Ed25519 key, which hosts pin. Each host signs its
+requests with a key the witness has enrolled. A rebaseline (the remote side of `floor-reset`) needs an
+**operator** key that the host does not hold, so a compromised host cannot erase its own history.
+
+```bash
+portmark witness keygen --out /etc/portmark-witness/witness.key     # prints key_id + public_key_b64
+portmark witness keygen --out ./conformance.key                      # a key for the conformance host id
+```
+
+**Enrolment** (`portmark.witness.enrolment.v1`; restart the witness after a change). One host id and
+key per deployment: two hosts must never share an id. Each id appears in one role only.
+
+```json
+{
+  "format": "portmark.witness.enrolment.v1",
+  "hosts": {"host:prod-1": {"public_key_b64": "..."}, "conformance:ci": {"public_key_b64": "..."}},
+  "operators": {"operator:alice": {"public_key_b64": "..."}},
+  "auditors": {"auditor:siem": {"public_key_b64": "..."}}
+}
+```
+
+**Run.**
+
+```bash
+portmark witness serve --db /var/lib/portmark-witness/witness.sqlite \
+  --key-file /etc/portmark-witness/witness.key --enrolment /etc/portmark-witness/enrolment.json \
+  --bind 0.0.0.0 --port 8787 --public-mode behind-tls-proxy
+```
+
+- The bind is loopback by default. A non-loopback bind needs `--public-mode behind-tls-proxy`: a reverse
+  proxy must terminate TLS in front of it (requests name tasks). Clients accept `https://`, or plain
+  `http://` only to a loopback address.
+- Every endpoint except `GET /healthz` needs an Ed25519-signed request from an enrolled key. There is
+  no bearer token: the per-request signatures authenticate more than a shared token would.
+- **Deadlines are absolute.** The server reads a whole request body within one 10 s deadline (not per
+  chunk), and it answers 503 above 256 open connections. The client's timeout is one deadline for the
+  whole call: connect, TLS, headers and body. A witness that answers slowly cannot hold the caller past it.
+  At most 4 calls are in flight per client. A call stuck where it cannot be aborted (a stalled DNS lookup)
+  keeps its slot until it ends, and when all 4 are stuck a new call fails at once without starting a thread.
+  uvicorn has no timeout for slow request *headers*: set one on the TLS proxy (for nginx,
+  `client_header_timeout 10s;`).
+- The database file is created mode 600; a looser file is refused. Key files must be mode 600.
+- The same container image runs it: override the command with `portmark witness serve ...` and mount a
+  volume for `--db`.
+
+**Check it before use.** Enrol a dedicated `conformance:` host id and run the kit against the deployed
+URL. It drives that id through advance, confirm, retry, a restored host, a lost commit, a clone's
+discarded receipt, split and older task heads, an older registry, and an unenrolled key, then reads the
+state back. Every answer must be signed by the pinned key and bound to its request. It refuses any id
+that does not start with `conformance:`, because it moves that host's chain.
+
+```bash
+portmark witness conformance --url https://witness.internal:8443 --host-id conformance:ci \
+  --host-key-file ./conformance.key --witness-public-key=<public_key_b64 of witness.key>
+# Use the `=` form: a base64url key can start with "-", which a separate argument would read as an option.
+# exit 0: pass; exit 1: fail (the JSON names the failing case); exit 2: usage error
+```
+
+**Residual risk:** these points are not covered by the remote witness.
+
+- A compromised host can still send valid advances. The witness orders history; it does not judge it.
+- A restore to exactly the last **confirmed** state loses at most **one** unconfirmed commit without
+  detection (the newest advance stays pending until the next one builds on it).
+- When the host integration lands, the witness becomes a dependency of every write: a host refuses to
+  save while its witness is unreachable (owner decision F1).
+- The reference server is append-only at the application level (SQLite triggers refuse UPDATE and
+  DELETE on its log), not WORM storage. For WORM, put the database file or its backups on object-lock
+  storage.
+- The wrong choice above about 50 commits per second per host, or above about 50 ms round trip (the host
+  holds its database write lock during the call). Then batch advances or use a real transparency log.
 
 ## Metrics
 
