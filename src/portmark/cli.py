@@ -249,6 +249,19 @@ def _run_witness(parser: argparse.ArgumentParser, args: argparse.Namespace) -> N
             print(json.dumps({"status": "refused", "reason": str(error)}, indent=2))
             raise SystemExit(2) from error
         return
+    from .remote_witness import decode_public_key, http_transport, load_private_key_file
+    from .witness_conformance import run_witness_conformance
+
+    try:
+        transport = http_transport(args.url, args.timeout)
+        pinned = decode_public_key(args.witness_public_key)
+        host_key = load_private_key_file(args.host_key_file)
+        report = run_witness_conformance(transport, pinned, args.host_id, host_key)
+    except ValueError as error:
+        parser.error(str(error))
+    print(json.dumps(report.to_dict(), indent=2))
+    if not report.passed:
+        raise SystemExit(1)
 
 
 def _run_keygen(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -487,6 +500,14 @@ def main() -> None:
     witness_serve.add_argument(
         "--public-mode", help="behind-tls-proxy: required for a non-loopback bind (a reverse proxy terminates TLS in front)"
     )
+    witness_kit = witness_commands.add_parser(
+        "conformance", help="check that a deployed witness enforces the chain rules (uses a dedicated conformance: host id)"
+    )
+    witness_kit.add_argument("--url", required=True, help="the witness base URL (https, or http on loopback)")
+    witness_kit.add_argument("--host-id", required=True, help="an enrolled host id starting with 'conformance:' (never a real host's id)")
+    witness_kit.add_argument("--host-key-file", required=True, help="that host id's Ed25519 private key file")
+    witness_kit.add_argument("--witness-public-key", required=True, help="the witness's public key (base64url), pinned for every answer")
+    witness_kit.add_argument("--timeout", type=float, default=5.0, help="seconds per request (default 5)")
     verify_audit = subparsers.add_parser("verify-audit")
     verify_audit.add_argument("--task-id", required=True, help="task id whose audit chain should be verified")
     verify_audit.add_argument(
