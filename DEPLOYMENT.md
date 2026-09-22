@@ -429,7 +429,7 @@ requires this control.
   database or its backups.
 - `verify-audit` stays an integrity check and does not need the key.
 
-## Remote Witness (EV-013, server side)
+## Remote Witness (EV-013)
 
 The audit floor lives on the host's own storage. A restore of the database **and** the floor together,
 or two clones of the pair, stays internally consistent and passes it. A **remote witness** on another
@@ -438,9 +438,9 @@ advance names the witness receipt of the one before it. A restored host names an
 refused (`rolled-back`); two clones that share a receipt are refused (`forked`) at the latest on the
 second one's next commit.
 
-**Status.** This release ships the witness protocol, a reference server, and a conformance kit. The
-host does not call the witness yet: that is the second EV-013 change (the local floor stays the second
-layer). Deploy and check the server now; the host settings follow with that change.
+**Optional (owner decision F3).** A host without a remote witness runs as before, with the local floor
+only. Gauge `portmark_remote_witness_active` (0/1) on the authenticated `/metrics` says which. The local
+floor stays on as the second layer when the witness is used.
 
 **Where to run it.** On a machine **outside the host's failure domain**: a different machine and a
 different backup set, so no restore of the host can also restore the witness. One small, always-on
@@ -505,13 +505,52 @@ portmark witness conformance --url https://witness.internal:8443 --host-id confo
 # exit 0: pass; exit 1: fail (the JSON names the failing case); exit 2: usage error
 ```
 
+**Connect a host.** Enrol the host's witness key (`portmark witness keygen` on the host), then set:
+
+| Variable | Value |
+|---|---|
+| `PORTMARK_REMOTE_WITNESS_URL` | the witness base URL (https, or http on loopback) |
+| `PORTMARK_REMOTE_WITNESS_PUBLIC_KEY` | the witness's public key (base64url), pinned for every answer |
+| `PORTMARK_REMOTE_WITNESS_KEY_FILE` | the host's witness key file (mode 600) |
+| `PORTMARK_REMOTE_WITNESS_TIMEOUT` | seconds per call, default 2, at most 30 |
+
+A partial configuration is refused. The production profile refuses the default host id
+(`host:local-demo`) with a remote witness: two hosts sharing an id share one chain.
+
+**What the host does.**
+
+- **On every save**, inside the database transaction and before its commit, the host advances the chain
+  from the receipt its database committed last, and stores the new receipt in the same commit. A refusal
+  (`rolled-back`, `forked`, `registry-rolled-back`, ...) or an unreachable witness **refuses the save**
+  (owner decision F1): the save rolls back and nothing is committed. The next save tries again; a lost
+  answer never wedges a task.
+- **At start**, the database's last receipt is compared with the witness:
+
+  | Witness state | Database: no receipt | Database = the witness's newest (or the confirmed one before it) | Database: another receipt |
+  |---|---|---|---|
+  | empty | first run: starts | - | refused `witness-behind` |
+  | confirmed only | refused `rolled-back` | starts | older: `rolled-back`; newer: `witness-behind`; same position: `forked` |
+  | confirmed + pending | starts only if nothing is confirmed yet, else `rolled-back` | starts | older than confirmed: `rolled-back`; newer than pending: `witness-behind`; else `forked` |
+
+  An unreachable witness refuses the start. A database that holds a receipt refuses to start without its
+  witness, so the witness cannot be switched off silently. The witness's time floor joins the boot clock
+  check.
+- **`verify-audit`** adds `remote_status`: `anchored`; `rolled-back` / `forked` / `witness-behind` (exit 1);
+  `witness-unavailable` (exit 2); `no-remote`. An auditor asks with its own enrolled key: set
+  `PORTMARK_REMOTE_WITNESS_SIGNER` to its id and `PORTMARK_REMOTE_WITNESS_KEY_FILE` to its key.
+
+**Recovery.** After a deliberate restore, `portmark floor-reset --reason ... --confirm --operator-id <id>
+--operator-key-file <operator.key>` resets the local floor (it re-verifies every chain first) and then
+rebaselines the witness from the database's current heads. Without the operator key only the local floor
+is reset, and the witness still refuses the restored database. The host's own key cannot rebaseline.
+
 **Residual risk:** these points are not covered by the remote witness.
 
 - A compromised host can still send valid advances. The witness orders history; it does not judge it.
 - A restore to exactly the last **confirmed** state loses at most **one** unconfirmed commit without
   detection (the newest advance stays pending until the next one builds on it).
-- When the host integration lands, the witness becomes a dependency of every write: a host refuses to
-  save while its witness is unreachable (owner decision F1).
+- The witness is a dependency of every write: a host refuses to save, and to start, while its witness is
+  unreachable (owner decision F1).
 - The reference server is append-only at the application level (SQLite triggers refuse UPDATE and
   DELETE on its log), not WORM storage. For WORM, put the database file or its backups on object-lock
   storage.
@@ -643,6 +682,14 @@ Operational notes:
   migrates to a given destination once (identical re-delivery remains idempotent).
 
 ## Upgrading
+
+### Remote witness receipts (new schema: SQLite v15, Postgres v13)
+
+A new table `witness_receipts` holds the newest remote-witness receipt per host. The upgrade adds it on
+open; nothing else changes, and a host without `PORTMARK_REMOTE_WITNESS_URL` never writes to it. To turn
+the witness on for an existing host: enrol it, set the variables above, and start it (the witness is
+empty, the database has no receipt: a first run). Once the database holds a receipt, it cannot start
+without the witness.
 
 ### Task ownership (new schema: SQLite v14, Postgres v12)
 

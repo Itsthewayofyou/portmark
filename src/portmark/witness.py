@@ -21,11 +21,13 @@ depend on where it stores that:
   never has two digests.
 
 The local floor (`LocalFloorWitness`) is ONE implementation: a single signed JSON record per host,
-on a path outside the runtime database. A remote transparency service can later replace or
-supplement it (check both) without changing audit-head semantics.
+on a path outside the runtime database. EV-013 adds a remote witness beside it (remote_witness.py,
+witness_binding.py): every save also advances a per-host chain on another machine, which closes items
+1-3 below when it is configured.
 
 WHAT THE LOCAL FLOOR GUARANTEES, exactly: it detects rollback or divergence of the database or trust
-registry RELATIVE TO THE SURVIVING AUTHORITATIVE FLOOR FILE. It does NOT detect:
+registry RELATIVE TO THE SURVIVING AUTHORITATIVE FLOOR FILE. On its own it does NOT detect (1-3 are
+detected when the remote witness is configured, EV-013):
   1. whole-machine rollback that restores both the database and the floor;
   2. copying the database and the floor together (or running clones with independent floor copies);
   3. forks across separate hosts;

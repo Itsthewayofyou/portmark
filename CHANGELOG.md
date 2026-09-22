@@ -6,6 +6,20 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### External validation — EV-013 resolved: every save is witnessed by the optional remote witness
+
+- **The host advances the remote witness on every save** (new module `portmark.witness_binding`), inside
+  the database transaction, and stores the witness's receipt in the same commit. A whole-host restore
+  (database and floor together) and a clone of the pair are refused. Configure it with
+  `PORTMARK_REMOTE_WITNESS_URL`, `PORTMARK_REMOTE_WITNESS_PUBLIC_KEY`, `PORTMARK_REMOTE_WITNESS_KEY_FILE`
+  (and optionally `PORTMARK_REMOTE_WITNESS_TIMEOUT`).
+- **Fail closed (owner decision F1):** a refusal or an unreachable witness refuses the save and the start.
+  **Optional (F3):** gauge `portmark_remote_witness_active`.
+- **Boot check** of the database's last receipt against the witness; `verify-audit` reports
+  `remote_status`; `floor-reset --operator-id --operator-key-file` rebaselines the witness.
+- **Schema:** SQLite v15 / Postgres v13 add `witness_receipts`. **Upgrade note:** a database that holds a
+  receipt refuses to start without its witness.
+
 ### External validation — EV-013 part 1: remote witness protocol, reference server, conformance kit
 
 - **New module `portmark.remote_witness`**: the protocol for a remote witness on another machine. Per

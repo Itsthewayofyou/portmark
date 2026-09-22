@@ -39,7 +39,7 @@ If any write fails, the transaction is rolled back. For example, a duplicate aud
 Each durable store records its schema version and migrates forward on open. A store whose version is
 **newer** than the running code fails closed, so an older runtime never writes to an unknown schema.
 
-- **SQLite:** version in `PRAGMA user_version`. Current version: **12** (`SQLITE_SCHEMA_VERSION`).
+- **SQLite:** version in `PRAGMA user_version`. Current version: **15** (`SQLITE_SCHEMA_VERSION`).
   Each step runs in ONE `BEGIN IMMEDIATE` transaction together with its `user_version` bump (never
   `executescript()`, which commits first and then runs each statement on its own). A crash leaves the
   complete old version or the complete new one. The version is read inside the write transaction, so
@@ -47,7 +47,7 @@ Each durable store records its schema version and migrates forward on open. A st
   `ADD COLUMN` checks `PRAGMA table_info` first, and the v2 `audit_events` rebuild recognises a
   half-finished copy. So a database left half-migrated by an older runtime also continues.
   `tests/sqlite_schema_versions.json` is the reference schema of every version.
-- **PostgreSQL:** version in the single-row `portmark_schema` table. Current version: **10**
+- **PostgreSQL:** version in the single-row `portmark_schema` table. Current version: **13**
   (`POSTGRES_SCHEMA_VERSION`). DDL runs behind a session-level advisory lock and uses
   `ADD COLUMN IF NOT EXISTS`, so concurrent first opens are safe. The Postgres version numbers are
   NOT the same as the SQLite ones; both reach the same current tables below.
@@ -68,6 +68,9 @@ SQLite migration steps (each step runs once, in order):
 | 10 | New `tool_effects` + index on `task_id` (effect ledger). |
 | 11 | `tool_effects` gains `reconcile_claim_id`, `reconcile_lease_expires_at` (reconcile lease). |
 | 12 | New `audit_floor_markers` (Section 10 audit floor; PostgreSQL version 10). |
+| 13 | New `time_floor` and `maintenance_log`; nonce expiry and delivery time (Section 12; PostgreSQL version 11). |
+| 14 | `checkpoints` gains `owner_issuer`, `owner_subject` (task ownership, PM-001; PostgreSQL version 12). |
+| 15 | New `witness_receipts` (EV-013 remote witness; PostgreSQL version 13). |
 
 ## Tables
 
@@ -122,6 +125,14 @@ SQLite migration steps (each step runs once, in order):
 - `host_id`: primary key
 - `epoch`: the audit floor's current epoch (raised by `floor-reset`)
 - `pending`: set while a floor is being created or reset (crash recovery), then cleared
+- `updated_at`
+
+`witness_receipts` (EV-013)
+
+- `host_id`: primary key
+- `host_seq`, `receipt_hash`: the newest remote-witness receipt this database committed (the next
+  advance's `prev`), written in the save transaction
+- `receipt_json`: the witness's signed receipt
 - `updated_at`
 
 `tool_effects`
