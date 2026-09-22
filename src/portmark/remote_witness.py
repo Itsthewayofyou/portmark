@@ -667,7 +667,15 @@ class WitnessClient:
         self, host_id: str, expected_last: str | None, reason: str, heads: dict[str, dict[str, Any]],
         registry: dict[str, Any] | None, time_floor: int,
     ) -> Answer:
-        return self.send(REBASELINE_PATH, {
+        return self.send_envelope(REBASELINE_PATH, self.rebaseline_envelope(host_id, expected_last, reason, heads, registry, time_floor))
+
+    def rebaseline_envelope(
+        self, host_id: str, expected_last: str | None, reason: str, heads: dict[str, dict[str, Any]],
+        registry: dict[str, Any] | None, time_floor: int,
+    ) -> dict[str, Any]:
+        """One signed rebaseline request. Sending the SAME envelope again after a lost answer gets the same
+        answer from the reference witness (a new envelope would be a second rebaseline)."""
+        return sign_request(self._private_key, self.signer, {
             "format": REBASELINE_FORMAT, "witness_key_id": self.witness_key_id, "host_id": host_id,
             "expected_last": expected_last, "nonce": secrets.token_hex(16), "reason": reason, "heads": heads,
             "registry": registry, "time_floor": time_floor,

@@ -554,8 +554,16 @@ rebaselines the witness from the database's current heads. Without the operator 
 is reset (`remote_status: not-rebaselined`), and the witness still refuses the restored database. The
 host's own key cannot rebaseline. The witness is asked first, so an unreachable witness refuses before the
 local floor changes. The heads go in pages that each fit one request (1 MiB): the first page in the
-rebaseline, the others in ordinary advances built on it. If the command stops part-way, the host still
-starts, and a task not yet sent is witnessed again from its next save; run the command again to finish.
+rebaseline, the others in ordinary advances built on it.
+
+A lost answer does not strand the recovery. Each request is sent up to 3 times with the same bytes, and
+the reference witness answers an identical rebaseline (or advance) again with the same receipt. If no
+answer arrives at all, the result is `rebaseline-unconfirmed`: the witness may or may not have moved.
+Then run `floor-reset --operator-id --operator-key-file`. It rebaselines from the witness's newest receipt,
+so it works either way. Do not repeat `time-floor reset`: if the witness moved, the database is behind it,
+and the command refuses (`rolled-back`) and names `floor-reset`. If a later page of heads fails
+(`rebaseline-incomplete`), the witness was rebaselined and the host starts; a task not yet sent is
+witnessed again from its next save, and `floor-reset` sends them all again.
 A too-low clock after a wrong forward jump is recovered with `time-floor reset` (see "Clock And The Durable Time Floor").
 
 **Residual risk:** these points are not covered by the remote witness.

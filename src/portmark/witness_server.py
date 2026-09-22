@@ -271,6 +271,13 @@ class WitnessLog:
             (host_id, kind, epoch, host_seq, receipt_hash, request_json, answer_json, at),
         )
 
+    def rebaseline_row(self, host_id: str, receipt_hash: str) -> tuple[str, str] | None:
+        """(request_json, answer_json) of the rebaseline that issued `receipt_hash`, or None."""
+        return self._connection.execute(
+            "SELECT request_json, answer_json FROM witness_log WHERE host_id = ? AND receipt_hash = ? AND kind = 'rebaseline'",
+            (host_id, receipt_hash),
+        ).fetchone()
+
     def log_rows(self, host_id: str) -> list[tuple[str, str, str]]:
         return self._connection.execute(
             "SELECT kind, request_json, answer_json FROM witness_log WHERE host_id = ? ORDER BY id", (host_id,)
@@ -414,6 +421,12 @@ class WitnessService:
                             canonical_json(answer).decode("utf-8"), at)
             self.log.save_state(new_state)
             return 200, answer
+        if state.pending is None and state.confirmed_hash is not None:
+            # The same signed rebaseline again, while it is still the newest thing on the chain (its answer was
+            # lost on the way back): the same answer, and nothing changes. Like an identical advance retry.
+            row = self.log.rebaseline_row(host_id, state.confirmed_hash)
+            if row is not None and digest(json.loads(row[0])["body"]) == request_sha256:
+                return 200, json.loads(row[1])
         decision = decide_rebaseline(state, body)
         if decision.outcome != "accept":
             return self.refusal(str(decision.code), decision.message, request_sha256, host_id)

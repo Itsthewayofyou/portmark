@@ -238,6 +238,9 @@ of advances per host, and a host with `PORTMARK_REMOTE_WITNESS_URL` advances it 
   saves go through. `verify-audit` reports `remote_status: witness-unavailable` (exit 2).
 - **`verify-audit` reports `witness-unconfigured`** (exit 2). The database holds a witness receipt, but
   the command ran without the `PORTMARK_REMOTE_WITNESS_*` settings. Set them and run it again.
+- **A recovery reports `rebaseline-unconfirmed`.** The witness gave no answer to the rebaseline, and it
+  may have accepted it. Do not repeat `time-floor reset`. Run `floor-reset --reason ... --confirm
+  --operator-id <id> --operator-key-file <file>`: it works whether the witness moved or not.
 - **A host refuses to start with `rolled-back`.** Its database is older than the witness: it was restored,
   or it is a stale copy. If the restore was deliberate, run `floor-reset ... --operator-id
   --operator-key-file` (DEPLOYMENT.md "Remote Witness", Recovery). Work after the backup is lost.

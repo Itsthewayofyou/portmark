@@ -32,8 +32,10 @@ from .remote_witness import (
     DEFAULT_TIMEOUT_SECONDS,
     MAX_HEADS,
     MAX_REQUEST_BYTES,
+    REBASELINE_PATH,
     Answer,
     WitnessClient,
+    WitnessUnavailable,
     decode_public_key,
     http_transport,
     load_private_key_file,
@@ -53,6 +55,20 @@ NO_REMOTE = "no-remote"
 # The database holds a witness receipt, but no witness is configured: remote witnessing was on, so a
 # rollback cannot be ruled out without it (verify-audit: unverifiable).
 WITNESS_UNCONFIGURED = "witness-unconfigured"
+# An operator rebaseline whose answer never arrived: the witness may or may not have moved. `floor-reset`
+# with the operator key recovers either way (it rebaselines from the witness's newest receipt).
+REBASELINE_UNCONFIRMED = "rebaseline-unconfirmed"
+# The rebaseline was accepted, but a later page of task heads was not: the host starts, and those tasks
+# are witnessed again from their next save.
+REBASELINE_INCOMPLETE = "rebaseline-incomplete"
+# How many times one request of an operator recovery is sent (the same bytes each time) before giving up.
+RECOVERY_ATTEMPTS = 3
+
+
+class RebaselineIncomplete(FloorError):
+    def __init__(self, epoch: int, message: str) -> None:
+        super().__init__(REBASELINE_INCOMPLETE, message)
+        self.epoch = epoch
 
 
 def stored_receipt(store: Any, host_id: str) -> tuple[int, str] | None:
@@ -157,14 +173,44 @@ class HostWitness:
         pages = head_pages(heads)
         state = self.state()
         newest = state["pending"] or state["confirmed"]
-        answer = operator.rebaseline(self.host_id, None if newest is None else newest["receipt_hash"], reason, pages[0], registry, time_floor)
-        if answer.kind == "refusal":
-            raise _refusal(answer, "the rebaseline")
+        # ONE signed request, sent again unchanged if its answer is lost: the witness answers an identical
+        # rebaseline with the same receipt, so a lost answer does not leave this database behind the witness.
+        envelope = operator.rebaseline_envelope(self.host_id, None if newest is None else newest["receipt_hash"], reason, pages[0],
+                                                registry, time_floor)
+        lost: WitnessUnavailable | None = None
+        for _ in range(RECOVERY_ATTEMPTS):
+            try:
+                answer = operator.send_envelope(REBASELINE_PATH, envelope)
+            except WitnessUnavailable as error:
+                lost = error
+                continue
+            if answer.kind == "refusal":
+                if lost is not None:
+                    # An earlier copy may have been accepted (a witness that does not replay answers the copy
+                    # with stale-rebaseline): whether the witness moved is not known.
+                    raise FloorError(REBASELINE_UNCONFIRMED, f"the witness did not confirm the rebaseline, and may have accepted it "
+                                     f"({lost}; then {answer.code})")
+                raise _refusal(answer, "the rebaseline")
+            break
+        else:
+            raise FloorError(REBASELINE_UNCONFIRMED, f"the witness did not confirm the rebaseline, and may have accepted it ({lost})")
         store.set_witness_receipt(self.host_id, int(answer.body["host_seq"]), answer.receipt_hash, canonical_json(answer.document).decode("utf-8"))
+        epoch = int(answer.body["epoch"])
         for page in pages[1:]:
-            with store.transaction() as transaction:
-                self._advance(transaction, page, registry, time_floor, "a rebaseline page")
-        return int(answer.body["epoch"])
+            self._send_page(store, page, registry, time_floor, epoch)
+        return epoch
+
+    def _send_page(self, store: Any, page: dict[str, dict[str, Any]], registry: dict[str, Any] | None, time_floor: int, epoch: int) -> None:
+        # An identical advance retry gets the same receipt (the transaction rolled back, so `prev` is unchanged).
+        for attempt in range(RECOVERY_ATTEMPTS):
+            try:
+                with store.transaction() as transaction:
+                    self._advance(transaction, page, registry, time_floor, "a rebaseline page")
+                return
+            except FloorError as error:
+                if isinstance(error, WitnessUnavailable) and attempt + 1 < RECOVERY_ATTEMPTS:
+                    continue
+                raise RebaselineIncomplete(epoch, f"the witness was rebaselined (epoch {epoch}), but not every task head was sent: {error}") from error
 
 
 # One page of heads is at most this many bytes of canonical JSON (and at most MAX_HEADS heads), so the

@@ -37,6 +37,7 @@ class _Switch:
         self.inner = inner
         self.down = False
         self.lose_next_answer = False
+        self.lose_answers, self.lose_path = 0, None  # lose the next N answers (on this path only, if set)
 
     def __call__(self, path, payload):
         if self.down:
@@ -44,6 +45,9 @@ class _Switch:
         answer = self.inner(path, payload)
         if self.lose_next_answer:
             self.lose_next_answer = False
+            raise WitnessUnavailable("the answer was lost on the way back")
+        if self.lose_answers and self.lose_path in (None, path):
+            self.lose_answers -= 1
             raise WitnessUnavailable("the answer was lost on the way back")
         return answer
 
@@ -475,6 +479,94 @@ class RemoteWitnessHostTests(unittest.TestCase):
                                    witness="down")
         self.assertEqual((code, result["remote_code"]), (1, "witness-unavailable"))
         self.assertEqual(self.d.floor_path.read_bytes(), before)  # the local floor was not reset
+
+    # -- review round 2 on #111: a lost rebaseline answer ----------------------------------------------
+    def floor_ahead(self):
+        """A host whose witnessed time floor a wrong clock moved far ahead. Returns (envelope, now, reset argv)."""
+        import time
+
+        envelope, _ = start_task(self.host())
+        now = int(time.time())
+        self.commit_once(time_floor=now + 100_000)
+        self.commit_once(time_floor=now + 100_000)
+        key_file = os.path.join(self.root, "operator.key")
+        reset = ("time-floor", "reset", "--to", str(now), "--reason", "the clock jumped ahead", "--confirm",
+                 "--operator-id", OPERATOR, "--operator-key-file", key_file)
+        return envelope, now, reset
+
+    def rebaseline_rows(self):
+        return [row for row in self.w.log.log_rows(HOST) if row[0] == "rebaseline"]
+
+    def test_a_lost_rebaseline_answer_is_healed_by_sending_the_same_request_again(self):
+        envelope, now, reset = self.floor_ahead()
+        self.switch.lose_answers, self.switch.lose_path = 1, "/v1/rebaseline"  # the witness accepts; the answer is lost
+        code, result, _ = self.cli(*reset)
+        self.assertEqual((code, result["remote_status"], result["remote_epoch"]), (0, "rebaselined", 2))
+        self.assertEqual(len(self.rebaseline_rows()), 1)  # the retry was answered, not applied a second time
+        self.assertEqual(self.remote_state()["time_floor"], now)
+        self.assertEqual(resume(self.registry_host(), envelope).status, "awaiting_input")
+
+    def test_an_unconfirmed_rebaseline_sends_the_operator_to_floor_reset_which_recovers(self):
+        # The review's sequence: the witness accepts the rebaseline, and no answer ever arrives.
+        from portmark.witness_binding import RECOVERY_ATTEMPTS
+
+        envelope, now, reset = self.floor_ahead()
+        self.switch.lose_answers, self.switch.lose_path = RECOVERY_ATTEMPTS, "/v1/rebaseline"
+        code, result, _ = self.cli(*reset)
+        self.assertEqual((code, result["remote_code"]), (1, "rebaseline-unconfirmed"))
+        self.assertIn("floor-reset", result["note"])
+        self.assertNotIn("run the same command again", result["note"])
+        self.assertEqual((len(self.rebaseline_rows()), self.remote_state()["time_floor"]), (1, now))  # it WAS accepted
+        # Running the same command again is refused (the database is behind the witness), and says what to do.
+        code, result, _ = self.cli(*reset)
+        self.assertEqual((code, result["remote_code"]), (1, ROLLED_BACK))
+        self.assertIn("floor-reset", result["note"])
+        # floor-reset recovers, and the host starts and saves again.
+        code, result, _ = self.cli("floor-reset", "--reason", "the rebaseline answer was lost", "--confirm", *reset[-4:])
+        self.assertEqual((code, result["remote_status"], result["remote_epoch"]), (0, "rebaselined", 3))
+        self.assertEqual(self.remote_state()["time_floor"], now)
+        self.assertEqual(resume(self.registry_host(), envelope).status, "awaiting_input")
+
+    def test_a_witness_that_does_not_replay_still_gives_an_unconfirmed_rebaseline(self):
+        # Another witness implementation may answer the retried copy with stale-rebaseline. That refusal says
+        # the witness MOVED, not that it refused: the outcome is unknown, not "refused".
+        envelope, _, reset = self.floor_ahead()
+        self.switch.lose_answers, self.switch.lose_path = 1, "/v1/rebaseline"
+        with patch.object(type(self.w.log), "rebaseline_row", lambda *args: None):
+            code, result, _ = self.cli(*reset)
+        self.assertEqual((code, result["remote_code"]), (1, "rebaseline-unconfirmed"))
+        self.assertIn("stale-rebaseline", result["reason"])
+        self.assertIn("floor-reset", result["note"])
+
+    def test_the_witness_replays_only_the_identical_rebaseline_while_it_is_the_newest(self):
+        operator = WitnessClient(self.switch, public_key_bytes(self.w.key), OPERATOR, self.w.keys[OPERATOR])
+        request = operator.rebaseline_envelope(HOST, None, "restore", {}, None, 0)
+        first = operator.send_envelope("/v1/rebaseline", request)
+        again = operator.send_envelope("/v1/rebaseline", request)
+        self.assertEqual((again.kind, again.document), ("rebaseline", first.document))
+        self.assertEqual(len(self.rebaseline_rows()), 1)
+        other = operator.rebaseline(HOST, None, "another request", {}, None, 0)  # a NEW request is judged on its own
+        self.assertEqual(other.body["code"], "stale-rebaseline")
+        store = self.d.store()
+        store.set_witness_receipt(HOST, first.body["host_seq"], first.receipt_hash, "{}")
+        self.commit_once()  # the chain moved on: the old request is no longer replayed
+        self.assertEqual(operator.send_envelope("/v1/rebaseline", request).body["code"], "stale-rebaseline")
+
+    def test_a_lost_page_answer_is_retried_and_a_lost_page_leaves_a_host_that_starts(self):
+        from portmark.witness_binding import RECOVERY_ATTEMPTS, head_pages
+
+        operator = WitnessClient(self.switch, public_key_bytes(self.w.key), OPERATOR, self.w.keys[OPERATOR])
+        store = self.d.store()
+        heads = {f"{index:05d}": {"sequence": 1, "head_hash": "h"} for index in range(25_000)}
+        self.assertEqual(len(head_pages(heads)), 3)
+        self.switch.lose_answers, self.switch.lose_path = 1, "/v1/advance"
+        self.assertEqual(self.binding().rebaseline(operator, store, heads, "restore", None, 0), 2)
+        self.binding().check_boot(store)
+        self.switch.lose_answers = RECOVERY_ATTEMPTS  # every answer for the next page is lost
+        with self.assertRaises(FloorError) as caught:
+            self.binding().rebaseline(operator, store, heads, "restore", None, 0)
+        self.assertEqual((caught.exception.code, caught.exception.epoch), ("rebaseline-incomplete", 3))
+        self.binding().check_boot(store)  # the database still names a receipt the witness holds
 
     def test_a_rebaseline_larger_than_one_request_goes_in_pages(self):
         import hashlib

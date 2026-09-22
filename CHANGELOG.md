@@ -20,7 +20,9 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   the witness settings); `floor-reset --operator-id --operator-key-file` rebaselines the witness, and
   `time-floor reset` takes the same arguments to lower the witness's time floor. A rebaseline sends the
   heads in pages that each fit one request, and every witness request is measured before it is sent. The
-  witness is asked before anything local changes.
+  witness is asked before anything local changes. A lost rebaseline answer is healed by sending the same
+  signed request again (the reference witness replays an identical rebaseline); if no answer arrives, the
+  result is `rebaseline-unconfirmed` and the operator is sent to `floor-reset`, which recovers either way.
 - **Schema:** SQLite v15 / Postgres v13 add `witness_receipts`. **Upgrade note:** a database that holds a
   receipt refuses to start without its witness.
 

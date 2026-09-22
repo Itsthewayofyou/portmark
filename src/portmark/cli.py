@@ -181,6 +181,22 @@ def _database_heads(store, host_id: str) -> dict:
     return {task_id: {"sequence": sequence, "head_hash": head_hash} for task_id, head_hash, sequence in store.audit_heads_for_host(host_id)}
 
 
+_FLOOR_RESET_COMMAND = "`portmark floor-reset --reason <text> --confirm --operator-id <id> --operator-key-file <file>`"
+
+
+def _rebaseline_note(error, local: str) -> str:
+    """What the operator does next after a rebaseline failed. `local` says what already changed locally."""
+    from .witness_binding import REBASELINE_INCOMPLETE, REBASELINE_UNCONFIRMED
+
+    if error.code == REBASELINE_UNCONFIRMED:
+        return (f"{local} The witness did not confirm the rebaseline and may have accepted it, so this database may no longer "
+                f"match it. Run {_FLOOR_RESET_COMMAND}: it rebaselines from this database either way.")
+    if error.code == REBASELINE_INCOMPLETE:
+        return (f"{local} The witness WAS rebaselined (its floor is set), but not every task head was sent; the host can start, "
+                f"and those tasks are witnessed again from their next save. To send every head, run {_FLOOR_RESET_COMMAND}.")
+    return f"{local} The witness refused the rebaseline and did not change: fix the cause and run the same command again."
+
+
 def _refuse_remote(result: dict, error) -> None:
     print(json.dumps({**result, "remote_status": "refused", "remote_code": error.code, "reason": str(error)}, indent=2))
     raise SystemExit(1) from error
@@ -222,7 +238,7 @@ def _run_floor_reset(parser: argparse.ArgumentParser, args: argparse.Namespace, 
             remote_epoch = remote.rebaseline(operator, store, _database_heads(store, config.host_id), args.reason, _registry_body(trust),
                                              int(store.time_floor()))
         except FloorError as error:
-            _refuse_remote(result, error)
+            _refuse_remote({**result, "note": _rebaseline_note(error, "The local floor was reset.")}, error)
         print(f"WARNING: the remote witness for {config.host_id} was rebaselined to epoch {remote_epoch}.", file=sys.stderr)
         result.update(remote_status="rebaselined", remote_epoch=remote_epoch)
     elif stored_receipt(store, config.host_id) is not None:
@@ -342,8 +358,9 @@ def _run_time_floor(parser: argparse.ArgumentParser, args: argparse.Namespace, c
             # are, so a restored database must go through `floor-reset` (which re-verifies every chain).
             state = remote.check_boot(store)
         except FloorError as error:
-            _refuse_remote({"status": "refused", "note": "nothing was changed; recover the database with `portmark floor-reset "
-                            "--operator-id <id> --operator-key-file <file>` first"}, error)
+            _refuse_remote({"status": "refused", "note": "Nothing was changed. The witness does not accept this database (it was "
+                            "restored, or an earlier rebaseline was not confirmed to this database): recover it with "
+                            f"{_FLOOR_RESET_COMMAND}."}, error)
         rebaseline = int(state["time_floor"]) > args.to
         if rebaseline and operator is None:
             parser.error(f"the remote witness holds a time floor of {state['time_floor']}, above --to; lowering it is an operator "
@@ -362,7 +379,7 @@ def _run_time_floor(parser: argparse.ArgumentParser, args: argparse.Namespace, c
         try:
             remote_epoch = remote.rebaseline(operator, store, _database_heads(store, config.host_id), args.reason, _registry_body(trust), args.to)
         except FloorError as error:
-            _refuse_remote({"status": "reset", **outcome, "note": "the local floors were reset; run the same command again"}, error)
+            _refuse_remote({"status": "reset", **outcome, "note": _rebaseline_note(error, "The local floors were reset.")}, error)
         print(f"WARNING: the remote witness for {config.host_id} was rebaselined to epoch {remote_epoch} to lower its time floor.", file=sys.stderr)
         outcome.update(remote_status="rebaselined", remote_epoch=remote_epoch)
     elif remote is not None:
