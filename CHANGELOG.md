@@ -6,6 +6,23 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### External validation — EV-013 part 1: remote witness protocol, reference server, conformance kit
+
+- **New module `portmark.remote_witness`**: the protocol for a remote witness on another machine. Per
+  host, a hash chain of advances (`prev` = the receipt of the one before), pending until the next advance
+  confirms it or discards it, per-task heads that never go back or split, a registry that never goes
+  back, a time floor that only rises. Requests and answers are Ed25519-signed; the client accepts only
+  answers signed by the pinned witness key and bound to the request, and fails closed otherwise.
+- **New command `portmark witness keygen|serve`**: the reference witness (`portmark.witness_server`). An
+  append-only SQLite log, signed requests from enrolled host, operator, and auditor keys, loopback by
+  default and `--public-mode behind-tls-proxy` for a public bind.
+- **New command `portmark witness conformance`**: checks that a deployed witness enforces the chain rules,
+  with a dedicated `conformance:` host id.
+- **Witness seam** (no behaviour change): `MonotonicWitness` gains `host_id` and `witnessed_head` and a
+  written failure rule (raise when the witness cannot answer; `None` only for "never witnessed"). New
+  `LocalFloorStore` protocol for the floor file and its epoch. The host does not use the remote witness
+  yet: that is EV-013 part 2, and EV-013 stays open until it lands.
+
 ### Preflight conformance kit
 
 - **New command `portmark preflight-conformance --destination <host>`** (library:

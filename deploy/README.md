@@ -71,6 +71,23 @@ docker run --rm --read-only --tmpfs /work:rw --env PORTMARK_WORKDIR=/work \
 docker compose -f deploy/docker-compose.hardened.yml run --rm runner
 ```
 
+## Remote witness (EV-013), same image
+
+The image also runs the reference remote witness. Run it on a **different machine** from the hosts it
+witnesses, with its own volume. Override the command; the image's `HEALTHCHECK` targets port 8080, so
+disable it or map the witness to that port. See DEPLOYMENT.md "Remote Witness" for keys and enrolment.
+
+```sh
+docker run -d --name portmark-witness --no-healthcheck -p 127.0.0.1:8787:8787 \
+  -v witness-data:/data -v /etc/portmark-witness:/etc/portmark-witness:ro \
+  portmark:latest portmark witness serve --db /data/witness.sqlite \
+  --key-file /etc/portmark-witness/witness.key --enrolment /etc/portmark-witness/enrolment.json \
+  --bind 0.0.0.0 --port 8787 --public-mode behind-tls-proxy
+```
+
+`--public-mode behind-tls-proxy` is required for the container's non-loopback bind: put a TLS-terminating
+reverse proxy in front of it.
+
 ## Kubernetes
 
 The equivalent `securityContext` / `Pod` spec:

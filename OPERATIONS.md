@@ -228,6 +228,26 @@ a new floor at the current heads with the next epoch, and records the time, reas
 the prior floor file's SHA-256 in the floor. It needs the host's stable signing key in the
 environment. It is never run automatically: work done after the backup is lost and the reset says so.
 
+## Remote Witness (EV-013)
+
+The reference witness (`portmark witness serve`, see DEPLOYMENT.md "Remote Witness") keeps a hash chain
+of advances per host. The host integration is the second EV-013 change; until then these are the
+witness-side tasks.
+
+- **Health.** `GET /healthz` answers `ok`. For a real check, run `portmark witness conformance` with the
+  `conformance:` host id (exit 0 = the witness enforces every rule).
+- **Refusal codes** (signed answers): `rolled-back` (the host builds on an older receipt: restored or
+  cloned), `forked` (on a discarded or unknown receipt: two copies of the host, or a chain from
+  elsewhere), `sequence-mismatch`, `registry-rolled-back` / `registry-forked` / `registry-missing`,
+  `stale-rebaseline`, `unauthenticated`, `wrong-witness`, `malformed`, `too-large`, `rate-limited`.
+- **Log.** `witness_log` in the witness database is the record: every advance, discard, and rebaseline
+  with the signed request and the signed answer. It is append-only (UPDATE and DELETE are refused). The
+  `witness_hosts` and `witness_task_heads` tables are an index derived from it.
+- **Backups.** Back the witness database up on its own schedule, never with a host's backup. Restoring
+  the witness to an older copy makes hosts look ahead of it; treat that as an incident, not routine.
+- **Enrolment changes** (new host, rotated key, removed operator): edit the enrolment file and restart
+  the witness. A host id must never be reused by a second host.
+
 ## Metrics
 
 `AgentHost` owns an in-process `RuntimeMetrics` instance. Embedders can pass
