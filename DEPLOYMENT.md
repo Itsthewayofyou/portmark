@@ -382,7 +382,8 @@ with the sealed state on every read. So each of these is **refused**:
 - a `status` column that does not match the sealed state.
 
 The run stops with an error (`CheckpointCryptoError`) before it writes anything. Nothing is guessed.
-(Changing `closed` from open to closed is accepted: it only restricts the task.)
+A completed or failed task counts as closed whatever its `closed` column says, so the schema step that
+closes such rows leaves them valid, and editing the column cannot reopen them.
 
 Set the keyring with **one** of these (not both):
 

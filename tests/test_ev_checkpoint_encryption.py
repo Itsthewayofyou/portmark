@@ -100,35 +100,58 @@ class _StoreCases:
 
     def test_edited_gate_columns_fail_closed(self):
         store = self._open(_ring(f"a:{KEY_A}"))
+        owner = ("user:alice", "agent:demo")
         with store.transaction() as transaction:
-            transaction.save_checkpoint("done", AgentState("done", "g", status="completed"), 0, closed=True, owner=("user:alice", "agent:demo"))
+            transaction.save_checkpoint("moved", AgentState("moved", "g", status="migrating"), 0, closed=True, owner=owner)
         # Reopening a closed task by editing the column: the read and the next save both refuse.
+        self._set_column("moved", "closed", False)
+        with self.assertRaisesRegex(CheckpointCryptoError, "failed authentication"):
+            store.load_checkpoint("moved")
+        with self.assertRaisesRegex(CheckpointCryptoError, "failed authentication"):
+            with store.transaction() as transaction:
+                transaction.save_checkpoint("moved", AgentState("moved", "g"), 1, owner=owner)
+        # A completed task stays closed whatever the column says: readable, never writable again.
+        with store.transaction() as transaction:
+            transaction.save_checkpoint("done", AgentState("done", "g", status="completed"), 0, closed=True, owner=owner)
         self._set_column("done", "closed", False)
-        with self.assertRaisesRegex(CheckpointCryptoError, "failed authentication"):
-            store.load_checkpoint("done")
-        with self.assertRaisesRegex(CheckpointCryptoError, "failed authentication"):
-            _save(store, "done", expected=1)
+        self.assertEqual(store.load_checkpoint("done")["status"], "completed")
+        with self.assertRaisesRegex(Exception, "task checkpoint is closed"):
+            with store.transaction() as transaction:
+                transaction.save_checkpoint("done", AgentState("done", "g"), 1, owner=owner)
         with store.transaction() as transaction:
             transaction.save_checkpoint("owned", AgentState("owned", "g"), 0, owner=("user:alice", "agent:demo"))
-        # Rewriting the owner (PM-001 takeover by a store writer): refused before the owner compare.
+        self.assertEqual(store.checkpoint_owner("owned"), ("user:alice", "agent:demo"))
+        # Rewriting the owner (PM-001 takeover by a store writer): refused before the owner compare,
+        # and the owner accessor never returns the edited value.
         self._set_column("owned", "owner_issuer", "user:mallory")
+        with self.assertRaisesRegex(CheckpointCryptoError, "failed authentication"):
+            store.checkpoint_owner("owned")
         with self.assertRaisesRegex(CheckpointCryptoError, "failed authentication"):
             store.load_checkpoint("owned")
         with self.assertRaisesRegex(CheckpointCryptoError, "failed authentication"):
             with store.transaction() as transaction:
                 transaction.save_checkpoint("owned", AgentState("owned", "g"), 1, owner=("user:mallory", "agent:demo"))
         _save(store, "running")
-        self._set_column("running", "status", "completed")
+        # Another open status, so the effective closed value is unchanged and only the status compare can see it.
+        self._set_column("running", "status", "awaiting_input")
         with self.assertRaisesRegex(CheckpointCryptoError, "status column does not match"):
             store.load_checkpoint("running")
 
-    def test_closing_a_row_only_restricts_it(self):
+    def test_closing_a_live_task_by_editing_the_column_fails_closed(self):
         store = self._open(_ring(f"a:{KEY_A}"))
-        _save(store, "t1")
+        _save(store, "live")
+        self._set_column("live", "closed", True)
+        with self.assertRaisesRegex(CheckpointCryptoError, "failed authentication"):
+            store.load_checkpoint("live")
+
+    def test_the_schema_backfill_leaves_a_sealed_terminal_row_valid(self):
+        # The backfill closes a completed/failed row whose column still says open (Postgres runs it
+        # on every open). The seal binds the effective closed value, so the row still authenticates.
+        store = self._open(_ring(f"a:{KEY_A}"))
+        with store.transaction() as transaction:
+            transaction.save_checkpoint("t1", AgentState("t1", "g", status="completed"), 0, closed=False)
         self._set_column("t1", "closed", True)
-        self.assertEqual(store.load_checkpoint("t1")["goal"], "secret goal text")
-        with self.assertRaisesRegex(Exception, "task checkpoint is closed"):
-            _save(store, "t1", expected=1)
+        self.assertEqual(store.load_checkpoint("t1")["status"], "completed")
 
     def test_migration_refuses_a_plaintext_row_whose_status_column_disagrees(self):
         _save(self._open(None), "p1")

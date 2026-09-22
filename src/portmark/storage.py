@@ -2246,9 +2246,9 @@ class SQLiteRuntimeStore:
     def checkpoint_owner(self, task_id: str) -> tuple[str | None, str | None] | None:
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT owner_issuer, owner_subject FROM checkpoints WHERE task_id = ?", (task_id,)
+                f"SELECT {_CHECKPOINT_ROW} FROM checkpoints WHERE task_id = ?", (task_id,)  # nosec B608 -- constant column list
             ).fetchone()
-            return None if row is None else (row["owner_issuer"], row["owner_subject"])
+        return _authenticated_owner(self.checkpoint_codec, task_id, row)
 
     def audit_head(self, task_id: str) -> tuple[str, int] | None:
         with self._connection() as connection:
@@ -3000,9 +3000,9 @@ class PostgresRuntimeStore:
     def checkpoint_owner(self, task_id: str) -> tuple[str | None, str | None] | None:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT owner_issuer, owner_subject FROM checkpoints WHERE task_id = %s", (task_id,)
+                f"SELECT {_CHECKPOINT_ROW} FROM checkpoints WHERE task_id = %s", (task_id,)  # nosec B608 -- constant column list
             ).fetchone()
-            return None if row is None else (row["owner_issuer"], row["owner_subject"])
+        return _authenticated_owner(self.checkpoint_codec, task_id, row)
 
     def audit_head(self, task_id: str) -> tuple[str, int] | None:
         with self._connect() as connection:
@@ -3259,9 +3259,12 @@ class _PostgresTransaction:
                 raise SecurityError("stale checkpoint generation")
             return new_generation
         if self._store.checkpoint_codec is not None:
-            # EV-006: with a keyring the closed and owner gates below read AUTHENTICATED columns --
-            # an edited column no longer matches the sealed row and is refused here.
+            # EV-006: with a keyring the closed and owner gates below read AUTHENTICATED values -- an
+            # edited column no longer matches the sealed row and is refused here, and the closed gate
+            # uses the same effective value the seal binds.
             _decode_row(self._store.checkpoint_codec, task_id, row)
+            if _effective_closed(row["closed"], row["status"]):
+                raise SecurityError("task checkpoint is closed")
         if row["closed"]:
             raise SecurityError("task checkpoint is closed")
         # PM-001: ownership is compared in the same transaction as the generation CAS, and the
@@ -3344,9 +3347,20 @@ def create_runtime_store(
 _CHECKPOINT_ROW = "checkpoint_json, generation, status, closed, owner_issuer, owner_subject"
 
 
-def _row_binding(closed: Any, owner: tuple[str | None, str | None] | None) -> dict[str, Any]:
+_TERMINAL_STATUSES = ("completed", "failed")
+
+
+def _effective_closed(closed: Any, status: str) -> bool:
+    # A completed or failed task is closed whatever its `closed` column says: the host always closes
+    # it, and the schema backfill (Postgres runs it on every open) sets the column for any row that is
+    # not. Binding THIS value, not the raw column, lets that backfill leave a sealed row valid while an
+    # edit that opens or closes a task still changes the bound value and is refused.
+    return bool(closed) or status in _TERMINAL_STATUSES
+
+
+def _row_binding(closed: Any, status: str, owner: tuple[str | None, str | None] | None) -> dict[str, Any]:
     issuer, subject = owner if owner else (None, None)
-    return {"closed": bool(closed), "owner": [issuer, subject]}
+    return {"closed": _effective_closed(closed, status), "owner": [issuer, subject]}
 
 
 def _encode_checkpoint(
@@ -3355,21 +3369,13 @@ def _encode_checkpoint(
     blob = asdict(state)
     blob["checkpoint_generation"] = generation
     text = json.dumps(blob, sort_keys=True, separators=(",", ":"))
-    return codec.seal(task_id, generation, text, _row_binding(closed, owner)) if codec is not None else text
+    return codec.seal(task_id, generation, text, _row_binding(closed, state.status, owner)) if codec is not None else text
 
 
 def _open_row(codec: CheckpointCodec, task_id: str, row: Any, strict: bool = True) -> str:
-    owner = (row["owner_issuer"], row["owner_subject"])
+    binding = _row_binding(row["closed"], row["status"], (row["owner_issuer"], row["owner_subject"]))
     opener = codec.open_stored if strict else codec.open
-    try:
-        return opener(task_id, int(row["generation"]), row["checkpoint_json"], _row_binding(row["closed"], owner))
-    except CheckpointCryptoError:
-        if not row["closed"] or not is_sealed(row["checkpoint_json"]):
-            raise
-        # Closing only restricts a task (a schema backfill may close a terminal row without rewriting
-        # it), so a row sealed while open still opens once its column says closed. Reopening -- a
-        # column changed from closed to open -- never authenticates.
-        return codec.open(task_id, int(row["generation"]), row["checkpoint_json"], _row_binding(False, owner))
+    return opener(task_id, int(row["generation"]), row["checkpoint_json"], binding)
 
 
 def _decode_row(codec: CheckpointCodec | None, task_id: str, row: Any) -> dict[str, Any]:
@@ -3381,6 +3387,16 @@ def _decode_row(codec: CheckpointCodec | None, task_id: str, row: Any) -> dict[s
     blob = json.loads(_open_row(codec, task_id, row))
     _check_sealed_status(task_id, blob, row)
     return blob
+
+
+def _authenticated_owner(codec: CheckpointCodec | None, task_id: str, row: Any) -> tuple[str | None, str | None] | None:
+    # EV-006: with a keyring the owner columns are returned only after the row authenticates, so an
+    # edited owner is refused here like in load_checkpoint and save_checkpoint.
+    if row is None:
+        return None
+    if codec is not None:
+        _decode_row(codec, task_id, row)
+    return (row["owner_issuer"], row["owner_subject"])
 
 
 def _check_sealed_status(task_id: str, blob: dict[str, Any], row: Any) -> None:
@@ -3400,7 +3416,7 @@ def _plan_checkpoint_encryption(codec: CheckpointCodec, rows: list[Any]) -> tupl
     report = {"encrypted": 0, "rekeyed": 0, "verified": 0, "key_id": codec.current_key_id}
     for row in rows:
         task_id, generation, stored = row["task_id"], int(row["generation"]), row["checkpoint_json"]
-        binding = _row_binding(row["closed"], (row["owner_issuer"], row["owner_subject"]))
+        binding = _row_binding(row["closed"], row["status"], (row["owner_issuer"], row["owner_subject"]))
         try:
             if not is_sealed(stored):
                 _check_sealed_status(task_id, json.loads(stored), row)
@@ -3578,9 +3594,12 @@ class _SQLiteTransaction:
                 raise SecurityError("stale checkpoint generation")
             return new_generation
         if self._store.checkpoint_codec is not None:
-            # EV-006: with a keyring the closed and owner gates below read AUTHENTICATED columns --
-            # an edited column no longer matches the sealed row and is refused here.
+            # EV-006: with a keyring the closed and owner gates below read AUTHENTICATED values -- an
+            # edited column no longer matches the sealed row and is refused here, and the closed gate
+            # uses the same effective value the seal binds.
             _decode_row(self._store.checkpoint_codec, task_id, row)
+            if _effective_closed(row["closed"], row["status"]):
+                raise SecurityError("task checkpoint is closed")
         if row["closed"]:
             raise SecurityError("task checkpoint is closed")
         # PM-001: ownership is compared in the same transaction as the generation CAS, and the
