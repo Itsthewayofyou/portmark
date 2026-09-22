@@ -193,7 +193,8 @@ class CursorTests(ExportCase):
         cursor = ExportCursor(cursor_path)
         _, data = self.export(cursor)
         self.assertTrue(data)
-        self.assertEqual(os.stat(cursor_path).st_mode & 0o777, 0o600)
+        if os.name == "posix":  # Windows has no POSIX mode bits
+            self.assertEqual(os.stat(cursor_path).st_mode & 0o777, 0o600)
         _, again = self.export(ExportCursor.load(cursor_path))
         self.assertEqual(again, b"")
         second = self.run_task("another goal")
