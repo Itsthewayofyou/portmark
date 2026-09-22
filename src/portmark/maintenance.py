@@ -18,10 +18,13 @@ maintenance-log record per batch plus a summary.
 from __future__ import annotations
 
 import datetime as _datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ._clock import TrustedClock, check_time_floor, default_clock
 from .storage import MAX_PRUNE_BATCH
+
+if TYPE_CHECKING:
+    from .witness import LocalFloorStore
 
 
 def parse_cutoff(value: str) -> int:
@@ -67,7 +70,7 @@ def time_floor_status(store: Any, witness: Any, clock: TrustedClock | None = Non
     }
 
 
-def reset_time_floor(store: Any, witness: Any, floor_at: int, reason: str, at: int) -> dict[str, Any]:
+def reset_time_floor(store: Any, witness: "LocalFloorStore | None", floor_at: int, reason: str, at: int) -> dict[str, Any]:
     """Operator recovery ONLY: set the database floor and (if configured) the mirrored floor to `floor_at`,
     recording the reason in both. Never called by Portmark itself."""
     prior_database = store.reset_time_floor(floor_at, reason)

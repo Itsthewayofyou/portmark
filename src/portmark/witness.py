@@ -46,7 +46,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from ._durable_file import atomic_write_bytes, sidecar_lock
 from .security import AUDIT_FLOOR_TYPE, SecurityError, canonical_json
@@ -74,7 +74,22 @@ class FloorError(SecurityError):
         self.code = code
 
 
+@runtime_checkable
 class MonotonicWitness(Protocol):
+    """What the save path needs from ANY witness (local floor, remote witness, or both together).
+
+    Failure rule for every method: when the witness cannot answer (a missing or corrupt floor file, an
+    unreachable or unverifiable remote), it RAISES FloorError. It never answers "nothing witnessed" in
+    place of "I do not know": `witnessed_head` returns None ONLY when the witness positively knows it has
+    never witnessed the task, because the save path treats None as "verify the whole chain, then adopt".
+    """
+
+    host_id: str
+
+    def witnessed_head(self, task_id: str) -> tuple[str, int] | None:
+        """The witnessed (head_hash, sequence) for the task, or None if it was never witnessed."""
+        ...
+
     def check_head(self, task_id: str, local_head: tuple[str, int] | None, event_hash_at: Callable[[int], str | None]) -> None:
         """Raise FloorError(rolled-back|forked) if the local chain is behind or diverged."""
         ...
@@ -97,6 +112,36 @@ class MonotonicWitness(Protocol):
     def advance_time_floor(self, floor_at: int) -> None:
         """Monotonic: a lower value is ignored."""
         ...
+
+
+@runtime_checkable
+class LocalFloorStore(Protocol):
+    """The signed floor FILE and its epoch: host boot (`open_audit_floor`), operator recovery
+    (`reset_audit_floor`, `time-floor reset`), and offline verification (`apply_floor`) work on it.
+
+    These are not part of MonotonicWitness on purpose. A remote witness has no file and no epoch: it
+    gets its own boot comparison, and it is rebaselined only with an operator key the host does not hold.
+    """
+
+    path: str
+    host_id: str
+
+    def load(self) -> dict[str, Any] | None: ...
+
+    def read_raw(self) -> bytes | None: ...
+
+    def verified_body(self, raw: bytes) -> dict[str, Any]: ...
+
+    def create(
+        self, epoch: int, registry: dict[str, Any] | None, tasks: dict[str, dict[str, Any]], resets: list[dict[str, Any]],
+        time_floor: int = 0,
+    ) -> None: ...
+
+    def advance_heads(self, heads: dict[str, tuple[str, int]]) -> None: ...
+
+    def advance_registry(self, version: int | None, digest: str | None) -> None: ...
+
+    def reset_time_floor(self, floor_at: int, reason: str, at: int) -> int: ...
 
 
 def compare_head(witnessed: tuple[str, int] | None, local_head: tuple[str, int] | None, event_hash_at: Callable[[int], str | None]) -> str:
@@ -211,9 +256,10 @@ class LocalFloorWitness:
 
     def _load_locked(self) -> dict[str, Any] | None:
         raw = self.read_raw()
-        return None if raw is None else self._verified_body(raw)
+        return None if raw is None else self.verified_body(raw)
 
-    def _verified_body(self, raw: bytes) -> dict[str, Any]:
+    def verified_body(self, raw: bytes) -> dict[str, Any]:
+        """Parse, validate, and signature-check raw floor bytes; the body in the current format."""
         try:
             document = json.loads(raw)
         except (json.JSONDecodeError, UnicodeDecodeError) as error:
@@ -424,7 +470,7 @@ def _upgraded(body: dict[str, Any]) -> dict[str, Any]:
 
 # -- host boot, verification, and operator reset -----------------------------------------------
 
-def open_audit_floor(witness: LocalFloorWitness, store: Any, registry_version: int | None, registry_digest: str | None) -> None:
+def open_audit_floor(witness: LocalFloorStore, store: Any, registry_version: int | None, registry_digest: str | None) -> None:
     """Boot-time compare-before-use for this host. Raises FloorError on any refusal.
 
     Marker (in the DB) x floor file (outside it):
@@ -503,7 +549,7 @@ def open_audit_floor(witness: LocalFloorWitness, store: Any, registry_version: i
 
 
 def reset_audit_floor(
-    witness: LocalFloorWitness,
+    witness: LocalFloorStore,
     store: Any,
     reason: str,
     registry_version: int | None,
@@ -534,7 +580,7 @@ def reset_audit_floor(
     prior_time_floor = 0
     if raw is not None:
         try:
-            prior = witness._verified_body(raw)
+            prior = witness.verified_body(raw)
             prior_epoch, prior_resets = prior["epoch"], list(prior["resets"])
             # Section 12 #6: an audit-floor reset re-baselines HEADS, not time. The time floor carries
             # over; only `portmark time-floor reset` may lower it.
@@ -561,7 +607,7 @@ def reset_audit_floor(
 
 def apply_floor(
     result: Any,
-    witness: LocalFloorWitness | None,
+    witness: LocalFloorStore | None,
     store: Any,
     task_id: str,
     registry_version: int | None,
