@@ -151,6 +151,9 @@ class AgentHost:
         # Section 10 PR B: the monotonic witness (local audit floor), set by make_host after its
         # boot checks pass. None = no floor configured.
         self.audit_floor: Any = None
+        # EV-013: the remote witness binding (witness_binding.HostWitness), set by make_host after its boot
+        # check passes. None = no remote witness configured.
+        self.remote_witness: Any = None
         self._capacity_lock = threading.Lock()
         self._capacity_next_refresh = 0.0
         # Section 7 PR 2 (round 3): give the tool registry a READ-ONLY view of this host's durable
@@ -1538,6 +1541,7 @@ class AgentHost:
         # to reuse and the audit it tried to append are rolled back with it. The store
         # owns the generation; state.checkpoint_generation is only the CAS assertion.
         floor = self.audit_floor
+        remote = self.remote_witness
         floor_advanced = False
         try:
             with self.store.transaction() as transaction:
@@ -1643,6 +1647,19 @@ class AgentHost:
                 if migration is not None and closed:
                     transaction.enqueue_migration(
                         state.task_id, migration["permit"]["audience"], canonical_json(migration).decode("utf-8")
+                    )
+                if remote is not None:
+                    # EV-013 (owner decision F1): the remote witness advances INSIDE this transaction, after
+                    # everything the commit will contain and before the local floor. The advance names the
+                    # receipt this database committed last, and the new receipt is stored here, in the same
+                    # commit. A refusal (rolled-back / forked / ...) or an unreachable witness raises
+                    # FloorError and rolls the whole save back; nothing local has been advanced yet. If the
+                    # commit fails after this, the witness holds a pending advance the next save discards.
+                    remote_head = transaction.audit_head(state.task_id)
+                    remote.advance(
+                        transaction,
+                        {} if remote_head is None else {state.task_id: {"sequence": remote_head[1], "head_hash": remote_head[0]}},
+                        advanced_floor or 0,
                     )
                 if floor is not None and advanced_floor is not None:
                     # Section 12 #6: mirror the time floor OUTSIDE the database, so restoring an older

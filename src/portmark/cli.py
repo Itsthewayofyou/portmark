@@ -116,7 +116,31 @@ def _apply_audit_floor(parser, config, store, audit_verifier, task_id, verificat
     return apply_floor(verification, witness, store, task_id, version, digest)
 
 
+def _apply_remote_witness(parser, config, store, verification):
+    """EV-013: compare this database's last witness receipt with the remote witness. The request is signed
+    as PORTMARK_REMOTE_WITNESS_SIGNER (an enrolled auditor) or, by default, as the host id."""
+    from .remote_witness import WITNESS_UNAVAILABLE
+    from .witness_binding import ANCHORED, NO_REMOTE, REMOTE_WITNESS_SIGNER_ENV, HostWitness, client_from_environment
+
+    signer = (os.environ.get(REMOTE_WITNESS_SIGNER_ENV) or "").strip() or config.host_id
+    try:
+        client = client_from_environment(signer)
+    except ValueError as error:
+        parser.error(str(error))
+    if client is None:
+        return verification, NO_REMOTE
+    status = HostWitness(client, config.host_id).status(store)
+    if status == ANCHORED:
+        return verification, status
+    if verification.status == "invalid":
+        return verification, status
+    if status == WITNESS_UNAVAILABLE:
+        return replace(verification, status="unverifiable", reason="the remote witness could not be asked; rollback cannot be ruled out"), status
+    return replace(verification, status="invalid", reason=f"the remote witness does not accept this database ({status})"), status
+
+
 def _run_floor_reset(parser: argparse.ArgumentParser, args: argparse.Namespace, config, store) -> None:
+    from .remote_witness import MAX_HEADS
     from .security import TrustSource
     from .witness import FloorError, LocalFloorWitness, reset_audit_floor
 
@@ -129,6 +153,20 @@ def _run_floor_reset(parser: argparse.ArgumentParser, args: argparse.Namespace, 
     if getattr(signer, "ephemeral", None) is not False:
         parser.error("floor-reset must sign with the host's stable audit key (PORTMARK_ED25519_PRIVATE_KEY_B64), not a generated one")
     store.set_audit_head_verifier(trust)
+    operator = remote = None
+    if args.operator_id or args.operator_key_file:
+        from .witness_binding import HostWitness, client_from_environment
+
+        if not (args.operator_id and args.operator_key_file):
+            parser.error("--operator-id and --operator-key-file go together")
+        try:
+            host_client = client_from_environment(config.host_id)
+            operator = client_from_environment(args.operator_id, key_file=args.operator_key_file)
+        except ValueError as error:
+            parser.error(str(error))
+        if host_client is None or operator is None:
+            parser.error("--operator-key-file rebaselines the remote witness, which needs PORTMARK_REMOTE_WITNESS_URL")
+        remote = HostWitness(host_client, config.host_id)
     witness = LocalFloorWitness(config.audit_floor_path, config.host_id, signer, signer)
     try:
         epoch = reset_audit_floor(witness, store, args.reason, trust.version or None, trust.digest, allow_legacy_anchor=args.allow_legacy_anchor)
@@ -136,7 +174,24 @@ def _run_floor_reset(parser: argparse.ArgumentParser, args: argparse.Namespace, 
         print(json.dumps({"host_id": config.host_id, "status": "refused", "floor_status": error.code, "reason": str(error)}, indent=2))
         raise SystemExit(1) from error
     print(f"WARNING: audit floor for {config.host_id} was reset to epoch {epoch}; the current database is now the baseline.", file=sys.stderr)
-    print(json.dumps({"host_id": config.host_id, "status": "reset", "epoch": epoch}, indent=2))
+    result: dict = {"host_id": config.host_id, "status": "reset", "epoch": epoch}
+    if operator is not None and remote is not None:
+        # EV-013: the local reset above re-verified every chain first, so a tampered chain is never
+        # rebaselined into the witness either.
+        heads = {task_id: {"sequence": sequence, "head_hash": head_hash} for task_id, head_hash, sequence in store.audit_heads_for_host(config.host_id)}
+        if len(heads) > MAX_HEADS:
+            # debt: one rebaseline carries every head; upgrade to a paged rebaseline when a host has more tasks.
+            print(json.dumps({**result, "remote_status": "refused", "reason": f"more than {MAX_HEADS} tasks for one rebaseline"}, indent=2))
+            raise SystemExit(1)
+        registry = {"version": trust.version, "digest": trust.digest} if trust.version else None
+        try:
+            remote_epoch = remote.rebaseline(operator, store, heads, args.reason, registry, int(store.time_floor()))
+        except FloorError as error:
+            print(json.dumps({**result, "remote_status": "refused", "remote_code": error.code, "reason": str(error)}, indent=2))
+            raise SystemExit(1) from error
+        print(f"WARNING: the remote witness for {config.host_id} was rebaselined to epoch {remote_epoch}.", file=sys.stderr)
+        result.update(remote_status="rebaselined", remote_epoch=remote_epoch)
+    print(json.dumps(result, indent=2))
 
 
 def _floor_reader(config, audit_verifier):
@@ -448,6 +503,8 @@ def main() -> None:
     floor_reset.add_argument(
         "--allow-legacy-anchor", action="store_true", help="accept complete pre-Section-10 migration anchors while re-verifying chains"
     )
+    floor_reset.add_argument("--operator-id", help="EV-013: an operator id enrolled with the remote witness (rebaselines it too)")
+    floor_reset.add_argument("--operator-key-file", help="EV-013: that operator's Ed25519 private key file (the host never holds it)")
     store_parser = subparsers.add_parser("store", help="inspect store capacity or prune provably-unneeded rows (Section 12)")
     store_commands = store_parser.add_subparsers(dest="store_command", required=True)
     store_commands.add_parser("stats", help="row counts, oldest pending migration, database size, free space, time floor")
@@ -558,12 +615,14 @@ def main() -> None:
             )
         verification = store.verify_audit_chain_status(args.task_id, allow_legacy_anchor=args.allow_legacy_anchor)
         verification = _apply_audit_floor(parser, config, store, audit_verifier, args.task_id, verification)
+        verification, remote_status = _apply_remote_witness(parser, config, store, verification)
         print(json.dumps({
             "task_id": args.task_id,
             "status": verification.status,
             "head_status": verification.head_status,
             "anchor_status": verification.anchor_status,
             "floor_status": verification.floor_status,
+            "remote_status": remote_status,
             "reason": verification.reason,
         }, indent=2))
         if verification.status == "invalid":
