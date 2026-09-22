@@ -279,6 +279,9 @@ def make_host(
     host.audit_floor = audit_floor
     # Boundary audit DB-01: whether rollback detection is on, on the authenticated /metrics (not /readyz).
     host.metrics.set_gauge("audit_witness_active", 1 if audit_floor is not None else 0)
+    # EV-006 (owner decision D1): checkpoint encryption is optional, so its state is reported here, on
+    # the authenticated /metrics, instead of refusing to start without it.
+    host.metrics.set_gauge("checkpoint_encryption_active", 1 if getattr(configured_store, "checkpoint_codec", None) is not None else 0)
     # Section 12 #6: a forward clock jump beyond the tolerance is also a metric, not only a CRITICAL log.
     clock.on_forward_jump(host.metrics.note_clock_forward_jump)
     return host

@@ -273,6 +273,11 @@ check the clock first. Lower the floor with `time-floor reset` only when the clo
 
 ## Retention And The Time Floor
 
+- **Checkpoint encryption** (see `DEPLOYMENT.md`). To turn it on, or to rotate the key, stop the hosts
+  and run `portmark store encrypt-checkpoints` as a dry run, then with `--apply`. A refusal changes
+  nothing: it names the row that cannot be read. A task that fails with `checkpoint is not encrypted`
+  or `checkpoint is encrypted but no checkpoint keyring is configured` means the host and the store
+  disagree about the keyring; fix the setting, do not edit rows.
 - **Pruning.** Run `portmark store prune --before <cutoff>` first as a dry run. Read the counts and the
   kept rows, then repeat with `--apply`. Each run is recorded in the maintenance log. Pick a cutoff that
   your incident-response process can live with: pruned nonces and delivered outbox rows are gone for

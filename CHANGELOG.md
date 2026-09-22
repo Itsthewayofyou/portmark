@@ -6,6 +6,30 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Preflight conformance kit
+
+- **New command `portmark preflight-conformance --destination <host>`** (library:
+  `run_preflight_conformance`). It runs `PORTMARK_MIGRATION_PREFLIGHT_COMMAND` over two fresh challenges
+  and verifies each answer with `verify_migration_challenge`, like the runtime does, then checks that a
+  destination the command cannot honestly attest is refused. A readiness check, not a new control: the
+  runtime already verifies every preflight answer before it releases state.
+
+### External validation — EV-006 resolved: optional checkpoint encryption
+
+- **Checkpoints can be sealed at the storage boundary** (new module `portmark.checkpoint_crypto`). Set
+  `PORTMARK_CHECKPOINT_KEYS` (`key-id:base64-key[,...]`) or `PORTMARK_CHECKPOINT_KEYS_FILE` (mode 600).
+  The SQLite and Postgres stores then seal each checkpoint with AES-256-GCM, bound to the task id,
+  generation, key id and the `closed` and owner columns; the `status` column is checked against the
+  sealed state. A changed byte, a wrong key, a row moved to another task or generation, a reopened task,
+  a rewritten owner or an edited status is refused, and the run stops before it writes. No schema change.
+- **Optional (owner decision D1).** New gauge `portmark_checkpoint_encryption_active` on the authenticated
+  `/metrics`. Disk or volume encryption remains a valid deployment-level control.
+- **Strict reads and a one-time migration (owner decision D2).** With a keyring a plaintext row is refused;
+  without one a sealed row is refused. `portmark store encrypt-checkpoints [--apply]` seals every
+  plaintext row in one transaction (and re-seals rows under an older key, for rotation). A row that
+  cannot be read aborts the whole run. **Upgrade note:** setting a keyring on a store with existing
+  checkpoints makes those tasks fail until the migration has run.
+
 ### External validation — EV-004 resolved: verifier conformance kit
 
 - **New command `portmark attest-conformance --evidence <file>`** (library: `portmark.verifier_conformance`).

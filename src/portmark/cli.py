@@ -160,6 +160,22 @@ def _run_store(parser: argparse.ArgumentParser, args: argparse.Namespace, config
     if args.store_command == "stats":
         print(json.dumps(store.capacity_report(), indent=2, sort_keys=True))
         return
+    if args.store_command == "encrypt-checkpoints":
+        from .security import SecurityError
+
+        if not hasattr(store, "encrypt_checkpoints"):
+            parser.error("encrypt-checkpoints needs a durable store (sqlite or postgres)")
+        try:
+            report = store.encrypt_checkpoints(apply=args.apply)
+        except ValueError as error:
+            parser.error(str(error))
+        except SecurityError as error:
+            print(json.dumps({"status": "refused", "reason": str(error)}, indent=2))
+            raise SystemExit(1) from error
+        if not args.apply:
+            print("DRY RUN: nothing was written. Re-run with --apply to encrypt the checkpoints.", file=sys.stderr)
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return
     try:
         before = parse_cutoff(args.before)
     except ValueError as error:
@@ -246,6 +262,33 @@ def _run_attest_conformance(parser: argparse.ArgumentParser, args: argparse.Name
     except (OSError, ValueError) as error:
         parser.error(f"--evidence: {error}")
     report = run_conformance(ExternalAttestationVerifier(config.attestation_verifier_command), base)
+    print(json.dumps(report.to_dict(), indent=2))
+    if not report.passed:
+        raise SystemExit(1)
+
+
+def _run_preflight_conformance(parser: argparse.ArgumentParser, args: argparse.Namespace, config: RuntimeConfig) -> None:
+    from .security import AttestationPolicy, ExternalAttestationVerifier, ExternalMigrationPreflight
+    from .verifier_conformance import run_preflight_conformance
+
+    # The same three settings the production profile requires for a host that migrates.
+    missing = [
+        name for name, value in (
+            ("PORTMARK_MIGRATION_PREFLIGHT_COMMAND", config.migration_preflight_command),
+            ("PORTMARK_ATTESTATION_VERIFIER_COMMAND (or --attestation-verifier-command)", config.attestation_verifier_command),
+            ("PORTMARK_ATTESTATION_ALLOWED_MEASUREMENTS", config.attestation_allowed_measurements),
+        ) if not value
+    ]
+    if missing:
+        parser.error("preflight-conformance requires " + ", ".join(missing))
+    policy = AttestationPolicy(
+        allowed_measurements=config.attestation_allowed_measurements,
+        external_verifier=ExternalAttestationVerifier(config.attestation_verifier_command),
+        require_migration_challenge=True,
+    )
+    report = run_preflight_conformance(
+        ExternalMigrationPreflight(config.migration_preflight_command), policy, args.destination, config.host_id or HOST_ID
+    )
     print(json.dumps(report.to_dict(), indent=2))
     if not report.passed:
         raise SystemExit(1)
@@ -377,6 +420,11 @@ def main() -> None:
     prune.add_argument("--before", required=True, help="retention cutoff: epoch seconds or ISO-8601 (UTC if no offset)")
     prune.add_argument("--apply", action="store_true", help="actually delete (default: report only)")
     prune.add_argument("--batch-size", type=int, default=MAX_PRUNE_BATCH, help=f"rows per transaction (1..{MAX_PRUNE_BATCH})")
+    encrypt = store_commands.add_parser(
+        "encrypt-checkpoints",
+        help="EV-006: seal every plaintext checkpoint with the checkpoint keyring in one transaction (stop the host first)",
+    )
+    encrypt.add_argument("--apply", action="store_true", help="actually write (default: report only)")
     time_floor = subparsers.add_parser("time-floor", help="show the durable time floor, or reset it (OPERATOR RECOVERY)")
     time_floor_commands = time_floor.add_subparsers(dest="time_floor_command", required=True)
     time_floor_commands.add_parser("show", help="database floor, mirrored floor, host and database clocks")
@@ -396,6 +444,11 @@ def main() -> None:
         required=True,
         help="a real, known-good verifier request (JSON, the stdin shape of the verifier contract) with a fresh platform quote",
     )
+    preflight_kit = subparsers.add_parser(
+        "preflight-conformance",
+        help="check that PORTMARK_MIGRATION_PREFLIGHT_COMMAND attests a destination the way migration verifies it",
+    )
+    preflight_kit.add_argument("--destination", required=True, help="the destination host id to attest (a real one)")
     verify_audit = subparsers.add_parser("verify-audit")
     verify_audit.add_argument("--task-id", required=True, help="task id whose audit chain should be verified")
     verify_audit.add_argument(
@@ -422,8 +475,14 @@ def main() -> None:
     if args.command == "attest-conformance":
         _run_attest_conformance(parser, args, config)
         return
+    if args.command == "preflight-conformance":
+        _run_preflight_conformance(parser, args, config)
+        return
     audit_verifier = load_trust_registry(config.trust_registry_path) if config.trust_registry_path else None
-    store = create_runtime_store(config.store_backend, config.store_path, audit_verifier) if config.store_path else None
+    try:
+        store = create_runtime_store(config.store_backend, config.store_path, audit_verifier) if config.store_path else None
+    except ValueError as error:
+        parser.error(str(error))
     if args.command == "verify-audit":
         if store is None:
             parser.error("verify-audit requires --store-path or PORTMARK_STORE_PATH")

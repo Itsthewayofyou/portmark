@@ -16,6 +16,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, Callable, Literal, Protocol
 
+from .checkpoint_crypto import CheckpointCodec, CheckpointCryptoError, codec_from_environment, is_sealed, refuse_sealed_without_key
 from .models import AgentState
 from .security import (
     AUDIT_HASH_VERSION,
@@ -1490,10 +1491,18 @@ def _enable_wal(connection: sqlite3.Connection) -> None:
 class SQLiteRuntimeStore:
     is_durable = True
 
-    def __init__(self, path: str | Path, audit_head_verifier: AuditHeadVerifier | None = None, clock: Callable[[], int] | None = None) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        audit_head_verifier: AuditHeadVerifier | None = None,
+        clock: Callable[[], int] | None = None,
+        checkpoint_codec: CheckpointCodec | None = None,
+    ) -> None:
         self.path = str(path)
         self._lock = threading.RLock()
         self._audit_head_verifier = audit_head_verifier
+        # EV-006: optional checkpoint encryption at the storage boundary (None = plaintext rows).
+        self.checkpoint_codec = checkpoint_codec
         # Section 4 #3: lease clock is a construction dependency (see InMemoryRuntimeStore).
         self._clock: Callable[[], int] = clock or _wall_clock
         self._initialize()
@@ -2129,6 +2138,31 @@ class SQLiteRuntimeStore:
             )
         return prior
 
+    def encrypt_checkpoints(self, apply: bool = False) -> dict[str, Any]:
+        """EV-006 (owner decision D2): seal every plaintext checkpoint in ONE write transaction."""
+        if self.checkpoint_codec is None:
+            raise ValueError("encrypt-checkpoints needs a checkpoint keyring (PORTMARK_CHECKPOINT_KEYS or PORTMARK_CHECKPOINT_KEYS_FILE)")
+        with self.transaction() as transaction:
+            connection = transaction._connection
+            # debt: every checkpoint row is held in memory for the one atomic transaction; ceiling is
+            # row count x checkpoint size vs process memory; upgrade to a keyset-paged plan inside the
+            # same transaction when a store's checkpoint table no longer fits in memory.
+            rows = connection.execute(f"SELECT task_id, {_CHECKPOINT_ROW} FROM checkpoints ORDER BY task_id").fetchall()  # nosec B608 -- constant column list
+            updates, report = _plan_checkpoint_encryption(self.checkpoint_codec, rows)
+            if apply:
+                for task_id, generation, old, new in updates:
+                    cursor = connection.execute(
+                        "UPDATE checkpoints SET checkpoint_json = ? WHERE task_id = ? AND generation = ? AND checkpoint_json = ?",
+                        (new, task_id, generation, old),
+                    )
+                    if cursor.rowcount != 1:
+                        raise CheckpointCryptoError(f"checkpoint {task_id!r} changed during the migration, nothing was changed")
+                connection.execute(
+                    "INSERT INTO maintenance_log (at, action, detail_json) VALUES (?, 'checkpoint-encrypt', ?)",
+                    (int(time.time()), json.dumps(report, sort_keys=True)),
+                )
+        return dict(report, applied=apply)
+
     def maintenance_log(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._connection() as connection:
             rows = connection.execute("SELECT id, at, action, detail_json FROM maintenance_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
@@ -2206,15 +2240,15 @@ class SQLiteRuntimeStore:
 
     def load_checkpoint(self, task_id: str) -> dict[str, Any] | None:
         with self._connection() as connection:
-            row = connection.execute("SELECT checkpoint_json FROM checkpoints WHERE task_id = ?", (task_id,)).fetchone()
-            return json.loads(row["checkpoint_json"]) if row is not None else None
+            row = connection.execute(f"SELECT {_CHECKPOINT_ROW} FROM checkpoints WHERE task_id = ?", (task_id,)).fetchone()  # nosec B608 -- constant column list
+        return _decode_row(self.checkpoint_codec, task_id, row) if row is not None else None
 
     def checkpoint_owner(self, task_id: str) -> tuple[str | None, str | None] | None:
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT owner_issuer, owner_subject FROM checkpoints WHERE task_id = ?", (task_id,)
+                f"SELECT {_CHECKPOINT_ROW} FROM checkpoints WHERE task_id = ?", (task_id,)  # nosec B608 -- constant column list
             ).fetchone()
-            return None if row is None else (row["owner_issuer"], row["owner_subject"])
+        return _authenticated_owner(self.checkpoint_codec, task_id, row)
 
     def audit_head(self, task_id: str) -> tuple[str, int] | None:
         with self._connection() as connection:
@@ -2316,9 +2350,12 @@ class PostgresRuntimeStore:
         schema: str = "public",
         clock: Callable[[], int] | None = None,
         timeouts: PostgresTimeouts | None = None,
+        checkpoint_codec: CheckpointCodec | None = None,
     ) -> None:
         if not dsn:
             raise ValueError("Postgres DSN must not be empty")
+        # EV-006: optional checkpoint encryption at the storage boundary (None = plaintext rows).
+        self.checkpoint_codec = checkpoint_codec
         if not schema or "\x00" in schema:
             raise ValueError("Postgres schema must not be empty")
         self.dsn = dsn
@@ -2843,6 +2880,31 @@ class PostgresRuntimeStore:
         with self._connect() as connection:
             return int(connection.execute("SELECT EXTRACT(EPOCH FROM clock_timestamp())::bigint AS now").fetchone()["now"])
 
+    def encrypt_checkpoints(self, apply: bool = False) -> dict[str, Any]:
+        """EV-006 (owner decision D2): seal every plaintext checkpoint in ONE transaction (rows locked)."""
+        if self.checkpoint_codec is None:
+            raise ValueError("encrypt-checkpoints needs a checkpoint keyring (PORTMARK_CHECKPOINT_KEYS or PORTMARK_CHECKPOINT_KEYS_FILE)")
+        with self.transaction() as transaction:
+            connection = transaction._connection
+            # debt: every checkpoint row is held in memory for the one atomic transaction; ceiling is
+            # row count x checkpoint size vs process memory; upgrade to a keyset-paged plan inside the
+            # same transaction when a store's checkpoint table no longer fits in memory.
+            rows = connection.execute(f"SELECT task_id, {_CHECKPOINT_ROW} FROM checkpoints ORDER BY task_id FOR UPDATE").fetchall()  # nosec B608 -- constant column list
+            updates, report = _plan_checkpoint_encryption(self.checkpoint_codec, rows)
+            if apply:
+                for task_id, generation, old, new in updates:
+                    cursor = connection.execute(
+                        "UPDATE checkpoints SET checkpoint_json = %s WHERE task_id = %s AND generation = %s AND checkpoint_json = %s",
+                        (new, task_id, generation, old),
+                    )
+                    if cursor.rowcount != 1:
+                        raise CheckpointCryptoError(f"checkpoint {task_id!r} changed during the migration, nothing was changed")
+                connection.execute(
+                    "INSERT INTO maintenance_log (at, action, detail_json) VALUES (EXTRACT(EPOCH FROM clock_timestamp())::bigint, 'checkpoint-encrypt', %s)",
+                    (json.dumps(report, sort_keys=True),),
+                )
+        return dict(report, applied=apply)
+
     def reset_time_floor(self, floor_at: int, reason: str) -> int:
         _validate_floor_reset(floor_at, reason)
         with self._connect() as connection:
@@ -2932,15 +2994,15 @@ class PostgresRuntimeStore:
 
     def load_checkpoint(self, task_id: str) -> dict[str, Any] | None:
         with self._connect() as connection:
-            row = connection.execute("SELECT checkpoint_json FROM checkpoints WHERE task_id = %s", (task_id,)).fetchone()
-            return json.loads(row["checkpoint_json"]) if row is not None else None
+            row = connection.execute(f"SELECT {_CHECKPOINT_ROW} FROM checkpoints WHERE task_id = %s", (task_id,)).fetchone()  # nosec B608 -- constant column list
+        return _decode_row(self.checkpoint_codec, task_id, row) if row is not None else None
 
     def checkpoint_owner(self, task_id: str) -> tuple[str | None, str | None] | None:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT owner_issuer, owner_subject FROM checkpoints WHERE task_id = %s", (task_id,)
+                f"SELECT {_CHECKPOINT_ROW} FROM checkpoints WHERE task_id = %s", (task_id,)  # nosec B608 -- constant column list
             ).fetchone()
-            return None if row is None else (row["owner_issuer"], row["owner_subject"])
+        return _authenticated_owner(self.checkpoint_codec, task_id, row)
 
     def audit_head(self, task_id: str) -> tuple[str, int] | None:
         with self._connect() as connection:
@@ -3173,7 +3235,7 @@ class _PostgresTransaction:
         if self._connection is None:
             raise RuntimeError("Postgres transaction was not opened")
         row = self._connection.execute(
-            "SELECT generation, closed, owner_issuer, owner_subject FROM checkpoints WHERE task_id = %s", (task_id,)
+            f"SELECT {_CHECKPOINT_ROW} FROM checkpoints WHERE task_id = %s", (task_id,)  # nosec B608 -- constant column list
         ).fetchone()
         if row is None:
             if expected_generation != 0:
@@ -3187,7 +3249,7 @@ class _PostgresTransaction:
                 RETURNING generation
                 """,
                 (
-                    task_id, state.status, self._checkpoint_json(state, new_generation), new_generation,
+                    task_id, state.status, _encode_checkpoint(self._store.checkpoint_codec, task_id, state, new_generation, closed, owner), new_generation,
                     bool(closed), int(time.time()),
                     # PM-001: the owner is recorded on the CREATE, inside the admission transaction.
                     owner[0] if owner else None, owner[1] if owner else None,
@@ -3196,6 +3258,13 @@ class _PostgresTransaction:
             if result is None:
                 raise SecurityError("stale checkpoint generation")
             return new_generation
+        if self._store.checkpoint_codec is not None:
+            # EV-006: with a keyring the closed and owner gates below read AUTHENTICATED values -- an
+            # edited column no longer matches the sealed row and is refused here, and the closed gate
+            # uses the same effective value the seal binds.
+            _decode_row(self._store.checkpoint_codec, task_id, row)
+            if _effective_closed(row["closed"], row["status"]):
+                raise SecurityError("task checkpoint is closed")
         if row["closed"]:
             raise SecurityError("task checkpoint is closed")
         # PM-001: ownership is compared in the same transaction as the generation CAS, and the
@@ -3209,7 +3278,7 @@ class _PostgresTransaction:
             WHERE task_id = %s AND generation = %s AND closed = FALSE
             RETURNING generation
             """,
-            (new_generation, state.status, self._checkpoint_json(state, new_generation), bool(closed), int(time.time()), task_id, expected_generation),
+            (new_generation, state.status, _encode_checkpoint(self._store.checkpoint_codec, task_id, state, new_generation, closed, (row["owner_issuer"], row["owner_subject"])), bool(closed), int(time.time()), task_id, expected_generation),
         ).fetchone()
         if result is None:
             raise SecurityError("stale checkpoint generation")
@@ -3253,23 +3322,117 @@ class _PostgresTransaction:
             (task_id, receipt_json, int(time.time())),
         )
 
-    @staticmethod
-    def _checkpoint_json(state: AgentState, generation: int) -> str:
-        blob = asdict(state)
-        blob["checkpoint_generation"] = generation
-        return json.dumps(blob, sort_keys=True, separators=(",", ":"))
+
+
+_FROM_ENVIRONMENT: Any = object()
 
 
 def create_runtime_store(
     backend: str,
     location: str | Path,
     audit_head_verifier: AuditHeadVerifier | None = None,
+    checkpoint_codec: CheckpointCodec | None = _FROM_ENVIRONMENT,
 ) -> RuntimeStore:
+    # EV-006: every CLI, ASGI and make_host store is built here, so the keyring is loaded here from
+    # PORTMARK_CHECKPOINT_KEYS / PORTMARK_CHECKPOINT_KEYS_FILE unless the caller passes one (or None).
+    codec = codec_from_environment() if checkpoint_codec is _FROM_ENVIRONMENT else checkpoint_codec
     if backend == "sqlite":
-        return SQLiteRuntimeStore(location, audit_head_verifier)
+        return SQLiteRuntimeStore(location, audit_head_verifier, checkpoint_codec=codec)
     if backend == "postgres":
-        return PostgresRuntimeStore(str(location), audit_head_verifier, timeouts=PostgresTimeouts.from_environment())
+        return PostgresRuntimeStore(str(location), audit_head_verifier, timeouts=PostgresTimeouts.from_environment(), checkpoint_codec=codec)
     raise ValueError("store backend must be 'sqlite' or 'postgres'")
+
+
+# Every checkpoint column a read authenticates: the sealed state plus the plaintext columns it gates on.
+_CHECKPOINT_ROW = "checkpoint_json, generation, status, closed, owner_issuer, owner_subject"
+
+
+_TERMINAL_STATUSES = ("completed", "failed")
+
+
+def _effective_closed(closed: Any, status: str) -> bool:
+    # A completed or failed task is closed whatever its `closed` column says: the host always closes
+    # it, and the schema backfill (Postgres runs it on every open) sets the column for any row that is
+    # not. Binding THIS value, not the raw column, lets that backfill leave a sealed row valid while an
+    # edit that opens or closes a task still changes the bound value and is refused.
+    return bool(closed) or status in _TERMINAL_STATUSES
+
+
+def _row_binding(closed: Any, status: str, owner: tuple[str | None, str | None] | None) -> dict[str, Any]:
+    issuer, subject = owner if owner else (None, None)
+    return {"closed": _effective_closed(closed, status), "owner": [issuer, subject]}
+
+
+def _encode_checkpoint(
+    codec: CheckpointCodec | None, task_id: str, state: AgentState, generation: int, closed: Any, owner: tuple[str | None, str | None] | None,
+) -> str:
+    blob = asdict(state)
+    blob["checkpoint_generation"] = generation
+    text = json.dumps(blob, sort_keys=True, separators=(",", ":"))
+    return codec.seal(task_id, generation, text, _row_binding(closed, state.status, owner)) if codec is not None else text
+
+
+def _open_row(codec: CheckpointCodec, task_id: str, row: Any, strict: bool = True) -> str:
+    binding = _row_binding(row["closed"], row["status"], (row["owner_issuer"], row["owner_subject"]))
+    opener = codec.open_stored if strict else codec.open
+    return opener(task_id, int(row["generation"]), row["checkpoint_json"], binding)
+
+
+def _decode_row(codec: CheckpointCodec | None, task_id: str, row: Any) -> dict[str, Any]:
+    # EV-006, strict reads (owner decision D2): a keyring refuses a plaintext row, no keyring refuses a
+    # sealed row, and a wrong key, a changed byte, a moved row or an edited closed/owner/status column
+    # fails. All raise.
+    if codec is None:
+        return json.loads(refuse_sealed_without_key(row["checkpoint_json"]))
+    blob = json.loads(_open_row(codec, task_id, row))
+    _check_sealed_status(task_id, blob, row)
+    return blob
+
+
+def _authenticated_owner(codec: CheckpointCodec | None, task_id: str, row: Any) -> tuple[str | None, str | None] | None:
+    # EV-006: with a keyring the owner columns are returned only after the row authenticates, so an
+    # edited owner is refused here like in load_checkpoint and save_checkpoint.
+    if row is None:
+        return None
+    if codec is not None:
+        _decode_row(codec, task_id, row)
+    return (row["owner_issuer"], row["owner_subject"])
+
+
+def _check_sealed_status(task_id: str, blob: dict[str, Any], row: Any) -> None:
+    if blob.get("status") != row["status"]:
+        raise CheckpointCryptoError(f"checkpoint {task_id!r} status column does not match the sealed state")
+
+
+def _plan_checkpoint_encryption(codec: CheckpointCodec, rows: list[Any]) -> tuple[list[tuple[str, int, str, str]], dict[str, Any]]:
+    """EV-006 migration (owner decision D2): decide the new value of every checkpoint row.
+
+    A plaintext row is sealed with the current key; a row sealed with an older key in the keyring is
+    re-sealed with the current key (rotation); a row sealed with the current key is opened to prove it
+    authenticates. ANY row that cannot be read raises, so the caller's single transaction changes
+    nothing. Returns the (task_id, generation, old, new) updates and the report counts.
+    """
+    updates: list[tuple[str, int, str, str]] = []
+    report = {"encrypted": 0, "rekeyed": 0, "verified": 0, "key_id": codec.current_key_id}
+    for row in rows:
+        task_id, generation, stored = row["task_id"], int(row["generation"]), row["checkpoint_json"]
+        binding = _row_binding(row["closed"], row["status"], (row["owner_issuer"], row["owner_subject"]))
+        try:
+            if not is_sealed(stored):
+                _check_sealed_status(task_id, json.loads(stored), row)
+                updates.append((task_id, generation, stored, codec.seal(task_id, generation, stored, binding)))
+                report["encrypted"] += 1
+            elif codec.key_id_of(stored) != codec.current_key_id:
+                text = _open_row(codec, task_id, row, strict=False)
+                _check_sealed_status(task_id, json.loads(text), row)
+                updates.append((task_id, generation, stored, codec.seal(task_id, generation, text, binding)))
+                report["rekeyed"] += 1
+            else:
+                _check_sealed_status(task_id, json.loads(_open_row(codec, task_id, row, strict=False)), row)
+                report["verified"] += 1
+        except (CheckpointCryptoError, json.JSONDecodeError) as error:
+            raise CheckpointCryptoError(f"checkpoint {task_id!r} cannot be migrated, nothing was changed: {error}") from error
+    return updates, report
 
 
 def _postgres_modules():
@@ -3408,7 +3571,7 @@ class _SQLiteTransaction:
         if self._connection is None:
             raise RuntimeError("SQLite transaction was not opened")
         row = self._connection.execute(
-            "SELECT generation, closed, owner_issuer, owner_subject FROM checkpoints WHERE task_id = ?", (task_id,)
+            f"SELECT {_CHECKPOINT_ROW} FROM checkpoints WHERE task_id = ?", (task_id,)  # nosec B608 -- constant column list
         ).fetchone()
         if row is None:
             if expected_generation != 0:
@@ -3421,7 +3584,7 @@ class _SQLiteTransaction:
                 ON CONFLICT(task_id) DO NOTHING
                 """,
                 (
-                    task_id, state.status, self._checkpoint_json(state, new_generation), new_generation,
+                    task_id, state.status, _encode_checkpoint(self._store.checkpoint_codec, task_id, state, new_generation, closed, owner), new_generation,
                     1 if closed else 0, int(time.time()),
                     # PM-001: the owner is recorded on the CREATE, inside the admission transaction.
                     owner[0] if owner else None, owner[1] if owner else None,
@@ -3430,6 +3593,13 @@ class _SQLiteTransaction:
             if cursor.rowcount != 1:
                 raise SecurityError("stale checkpoint generation")
             return new_generation
+        if self._store.checkpoint_codec is not None:
+            # EV-006: with a keyring the closed and owner gates below read AUTHENTICATED values -- an
+            # edited column no longer matches the sealed row and is refused here, and the closed gate
+            # uses the same effective value the seal binds.
+            _decode_row(self._store.checkpoint_codec, task_id, row)
+            if _effective_closed(row["closed"], row["status"]):
+                raise SecurityError("task checkpoint is closed")
         if row["closed"]:
             raise SecurityError("task checkpoint is closed")
         # PM-001: ownership is compared in the same transaction as the generation CAS, and the
@@ -3442,7 +3612,7 @@ class _SQLiteTransaction:
             SET generation = ?, status = ?, checkpoint_json = ?, closed = ?, updated_at = ?
             WHERE task_id = ? AND generation = ? AND closed = 0
             """,
-            (new_generation, state.status, self._checkpoint_json(state, new_generation), 1 if closed else 0, int(time.time()), task_id, expected_generation),
+            (new_generation, state.status, _encode_checkpoint(self._store.checkpoint_codec, task_id, state, new_generation, closed, (row["owner_issuer"], row["owner_subject"])), 1 if closed else 0, int(time.time()), task_id, expected_generation),
         )
         if cursor.rowcount != 1:
             raise SecurityError("stale checkpoint generation")
@@ -3483,11 +3653,6 @@ class _SQLiteTransaction:
             (task_id, receipt_json, int(time.time())),
         )
 
-    @staticmethod
-    def _checkpoint_json(state: AgentState, generation: int) -> str:
-        blob = asdict(state)
-        blob["checkpoint_generation"] = generation
-        return json.dumps(blob, sort_keys=True, separators=(",", ":"))
 
 
 def _audit_hash(record: dict[str, Any]) -> str:

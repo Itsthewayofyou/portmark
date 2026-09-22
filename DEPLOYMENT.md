@@ -364,6 +364,71 @@ once a minute. Alert on low free space and on a growing oldest-pending age.
 `limit` rows (default 500, maximum 1000) in `task_id` order. Pass the last `task_id` as `after` for the
 next page. `claim_migrations` claims at most 100 rows per call.
 
+## Checkpoint Encryption
+
+A checkpoint row holds the task state as JSON: the goal, tool results and model outputs. By default it is
+plaintext, and only the storage controls protect it. **Checkpoint encryption is optional** (EV-006). Disk
+or volume encryption of the database is still a valid control on its own. Checkpoint encryption adds a
+second layer: a copy of the database file or a database dump shows no task state without the key.
+
+With a keyring, the store seals each checkpoint with AES-256-GCM before it writes the row, and opens it
+when it reads the row. The sealed value also authenticates the task id, the row generation, the key id,
+and the `closed` and owner columns that the store checks before a write. The `status` column is compared
+with the sealed state on every read. So each of these is **refused**:
+
+- a changed byte, or a wrong key;
+- a sealed value moved to another task or generation;
+- a closed task reopened by editing `closed`, or an owner rewritten by editing the owner columns;
+- a `status` column that does not match the sealed state.
+
+The run stops with an error (`CheckpointCryptoError`) before it writes anything. Nothing is guessed.
+A completed or failed task counts as closed whatever its `closed` column says, so the schema step that
+closes such rows leaves them valid, and editing the column cannot reopen them.
+
+Set the keyring with **one** of these (not both):
+
+- `PORTMARK_CHECKPOINT_KEYS`: `key-id:base64-key`, for example `ck-2026-09:<32 random bytes, base64>`.
+- `PORTMARK_CHECKPOINT_KEYS_FILE`: a file with the same text. On POSIX it must not be readable by group or
+  others (`chmod 600`). Mount it from your orchestrator's secret store.
+
+Make a key with `python -c "import portmark.checkpoint_crypto as c; print(c.generate_key())"`. Keep a copy
+in your secret store: **a lost key makes every sealed checkpoint unreadable.** The CLI, the ASGI app and
+`make_host` all read the same settings.
+
+**Reads are strict.** With a keyring, a plaintext row is refused. Without a keyring, a sealed row is
+refused. There is no setting that reads both. To turn encryption on for a store that already has
+checkpoints, stop every host that uses the store, then run the one-time migration with the keyring set:
+
+```bash
+PORTMARK_CHECKPOINT_KEYS=... portmark --store-path <db> store encrypt-checkpoints            # dry run: counts only
+PORTMARK_CHECKPOINT_KEYS=... portmark --store-path <db> store encrypt-checkpoints --apply    # seal every row
+```
+
+It works in **one** transaction. It seals every plaintext row, re-seals a row sealed with an older key,
+and opens every other row to prove it. If any row cannot be read, it changes nothing and exits 1. Each
+applied run is recorded in the maintenance log as `checkpoint-encrypt`. Then start the hosts with the
+same keyring.
+
+**Key rotation.** Put the new key first and keep the old key after it
+(`PORTMARK_CHECKPOINT_KEYS=new:...,old:...`). New writes use the first key, and reads accept both. Run
+`store encrypt-checkpoints --apply` to re-seal every row with the new key, and then remove the old key.
+Each write uses a random 96-bit nonce, so rotate a key well before 2^32 checkpoint writes.
+
+`portmark_checkpoint_encryption_active` on the authenticated `/metrics` is `1` when the keyring is set and
+`0` when it is not. `checkpoint_encryption_active` never blocks startup. Alert on `0` if your policy
+requires this control.
+
+**Residual risk:** these points are not covered by checkpoint encryption.
+
+- The `status`, `generation`, `closed` and owner columns stay **readable** (the store queries them).
+  They are authenticated, not hidden. The audit log, the migration outbox and receipts are not sealed
+  by this key.
+- A restore of a whole older row (its old sealed value **and** its old generation) still authenticates.
+  That is a rollback, which the audit floor and a future remote witness (EV-013) address.
+- A process that holds the key (the host) can read every checkpoint. The key must not be stored with the
+  database or its backups.
+- `verify-audit` stays an integrity check and does not need the key.
+
 ## Metrics
 
 `GET /metrics` requires the same bearer token as `/message:send`. Without an
@@ -396,6 +461,7 @@ Dockerfile. Common configuration:
 - `PORTMARK_TRUST_REGISTRY_PATH`: mounted trust registry JSON
 - `PORTMARK_STORE_BACKEND`: `sqlite` by default, or `postgres` when the image includes `portmark[postgres]`
 - `PORTMARK_STORE_PATH`: SQLite runtime store path or Postgres DSN
+- `PORTMARK_CHECKPOINT_KEYS` or `PORTMARK_CHECKPOINT_KEYS_FILE`: optional checkpoint keyring (see "Checkpoint Encryption")
 - `PORTMARK_TOOLS`: optional custom tool registry loader, `module:function`
 - `PORTMARK_CLOCK_TOLERANCE_SECONDS`: see "Clock And The Durable Time Floor"
 - `PORTMARK_SHUTDOWN_GRACE_SECONDS`, `PORTMARK_A2A_BODY_READ_TIMEOUT_SECONDS`, and the
@@ -440,7 +506,9 @@ Preflight command contract: it is run without a shell and with an empty environm
 and a 64 KiB output limit. It receives `{"destination", "relying_party", "challenge"}` as JSON on stdin
 and must print the destination's `AttestationEvidence` object (the fields in `ATTESTATION.md`) as JSON
 on stdout, and exit 0. How it reaches the destination (for example an authenticated call to the
-destination's attestation agent) is deployment-supplied, like the verifier command.
+destination's attestation agent) is deployment-supplied, like the verifier command. Before production
+use, check the whole chain with `portmark preflight-conformance --destination <host>` (see
+[ATTESTATION.md](ATTESTATION.md#preflight-conformance-kit)).
 
 `PORTMARK_REQUIRE_ATTESTATION=1` is not needed with the preflight. It also sets
 `required_for_execution`, which a destination that receives challenge migrations must not set (see the
