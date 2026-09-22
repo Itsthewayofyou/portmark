@@ -1,11 +1,35 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
 
 Json = dict[str, Any]
+
+# A tool name is an IDENTIFIER, not free text. It names authority: it is compared against grants,
+# registered in the tool registry, written into the audit chain, exported to a SIEM, and (from the MCP
+# work) supplied by another organization's server. Letters, digits, and inner `.`, `_`, `-` only, 1 to 64
+# characters, starting and ending on a letter or digit. That excludes control characters, whitespace,
+# look-alike Unicode, path and URL separators, and the empty string -- all of which are indistinguishable
+# from a legitimate name once they reach a log line or an operator's screen. The runtime cannot know
+# which odd name was intended, so it refuses one at the door instead of guessing.
+MAX_TOOL_NAME_LENGTH = 64
+# \Z, not $: in Python `$` also matches just BEFORE a final newline, so "catalog.search\n" -- a log
+# injection carrying its own line break -- would have passed as a valid name.
+_TOOL_NAME = re.compile(r"\A[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?\Z")
+
+
+def validate_tool_name(name: Any, label: str = "tool name") -> str:
+    """Return `name` when it is a well-formed tool name, else raise ValueError."""
+    if not isinstance(name, str) or not _TOOL_NAME.match(name):
+        shown = name if isinstance(name, str) and len(name) <= 80 else type(name).__name__
+        raise ValueError(
+            f"{label} {shown!r} is not a valid tool name: 1 to {MAX_TOOL_NAME_LENGTH} characters, "
+            "letters, digits and inner '.', '_' or '-', starting and ending on a letter or digit"
+        )
+    return name
 
 
 @dataclass(frozen=True)
@@ -15,6 +39,9 @@ class ToolGrant:
     output_projection: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
+        # Every grant passes through here -- the A2A decode of an incoming permit, the policy loader, the
+        # envelope builder, and each intersection -- so this is the one door for grant names.
+        validate_tool_name(self.name, "grant")
         if self.output_projection is not None:
             object.__setattr__(self, "output_projection", tuple(self.output_projection))
 
@@ -40,6 +67,11 @@ class AgentManifest:
     provider: str
     requested_tools: tuple[str, ...]
     component_digest: str = "python:reference-agent-v1"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "requested_tools", tuple(self.requested_tools))
+        for name in self.requested_tools:
+            validate_tool_name(name, "requested tool")
 
 
 @dataclass(frozen=True)

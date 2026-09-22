@@ -14,7 +14,7 @@ from enum import Enum
 from typing import Any
 
 from . import _windows_job, safe_paths
-from .models import Permit
+from .models import Permit, validate_tool_name
 from .security import SecurityError, canonical_json, check_constraints
 
 
@@ -314,6 +314,7 @@ class ToolRegistry:
             return self._overdue_threads
 
     def register(self, name: str, tool: Tool, timeout: float | None = None, side_effecting: bool = False) -> None:
+        validate_tool_name(name, "registered tool")
         if side_effecting:
             # Section 7 PR 2b: refuse a side-effecting tool on the thread path AT REGISTRATION, not
             # (as before) only at the first invoke. The thread + queue-timeout path cannot cancel a
@@ -373,6 +374,7 @@ class ToolRegistry:
         deployment's job (see THREAT_MODEL.md); this flag only requires that SOME
         tree-termination primitive exists on the platform.
         """
+        validate_tool_name(name, "registered tool")
         module_name, separator, object_path = target.partition(":")
         if not separator or not module_name or not object_path:
             raise ValueError("register_isolated target must use module:function syntax")

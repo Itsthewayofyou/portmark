@@ -14,6 +14,13 @@ arguments, enforces budgets, and decides what output a remote provider may see.
 
 ## Register A Tool
 
+A tool name must be 1 to 64 characters, letters, digits and inner `.`, `_` or `-`, starting and ending on a
+letter or digit (for example `catalog.search`, `payments.reserve`, `mcp.files.read_file`). A name is an
+identifier, not free text: it is compared against grants, written into the audit chain and exported to a
+SIEM, so whitespace, control characters, look-alike Unicode, path or URL separators, and the empty string
+are refused where authority is defined -- in a permit grant, a manifest's `requested_tools`, a policy tool
+entry, and `register` / `register_isolated`.
+
 Create a Python module that returns a `ToolRegistry`:
 
 ```python
