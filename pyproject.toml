@@ -33,8 +33,8 @@ Issues = "https://github.com/Itsthewayofyou/portmark/issues"
 Changelog = "https://github.com/Itsthewayofyou/portmark/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
-a2a = ["a2a-sdk==1.1.2"]
-postgres = ["psycopg[binary]==3.3.5"]
+a2a = ["a2a-sdk==1.1.4"]
+postgres = ["psycopg[binary]==3.3.6"]
 wasmtime = ["wasmtime==48.0.0"]
 
 [dependency-groups]
@@ -43,7 +43,7 @@ wasmtime = ["wasmtime==48.0.0"]
 # release install them with `pip install --require-hashes --no-deps`. Not part of the package metadata.
 bootstrap = ["pip==26.2.1", "setuptools==84.0.0"]
 ci = ["bandit==1.9.4", "coverage==7.16.1", "pip-audit==2.10.1"]
-release = ["build==1.6.1", "twine==7.0.0", "uv==0.12.15"]
+release = ["build==1.6.1", "twine==7.0.0", "uv==0.12.17"]
 
 [project.scripts]
 portmark = "portmark.cli:main"
