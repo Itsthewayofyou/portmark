@@ -493,7 +493,8 @@ that does not start with `conformance:`, because it moves that host's chain.
 
 ```bash
 portmark witness conformance --url https://witness.internal:8443 --host-id conformance:ci \
-  --host-key-file ./conformance.key --witness-public-key <public_key_b64 of witness.key>
+  --host-key-file ./conformance.key --witness-public-key=<public_key_b64 of witness.key>
+# Use the `=` form: a base64url key can start with "-", which a separate argument would read as an option.
 # exit 0: pass; exit 1: fail (the JSON names the failing case); exit 2: usage error
 ```
 

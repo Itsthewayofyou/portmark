@@ -231,18 +231,21 @@ class WitnessCliTests(unittest.TestCase):
                     self.assertLess(time.monotonic(), deadline, "the witness never became healthy")
                     time.sleep(0.1)
             argv = ["witness", "conformance", "--url", base, "--host-id", "conformance:ci",
-                    "--host-key-file", str(self.root / "conformance.key"), "--witness-public-key", witness["public_key_b64"]]
+                    "--host-key-file", str(self.root / "conformance.key"), f"--witness-public-key={witness['public_key_b64']}"]
             for _ in range(2):
                 code, out, _ = run_cli(argv)
                 self.assertEqual(code, 0, out)
                 self.assertEqual(json.loads(out)["status"], "pass")
             # Pinned to the wrong key: every answer is refused, and the kit fails (exit 1).
-            wrong = _b64url_encode(public_key_bytes(Ed25519PrivateKey.generate()))
-            code, out, _ = run_cli(argv[:-1] + [wrong])
+            # A base64url key may start with "-"; the `--flag=value` form keeps argparse from reading it as
+            # an option. Find such a wrong key, so this case always covers that shape.
+            wrong = next(key for key in (_b64url_encode(public_key_bytes(Ed25519PrivateKey.generate())) for _ in range(10_000))
+                         if key.startswith("-"))
+            code, out, _ = run_cli(argv[:-1] + [f"--witness-public-key={wrong}"])
             self.assertEqual((code, json.loads(out)["status"]), (1, "fail"))
             # A real host's id is refused before anything is sent.
             code, _, err = run_cli(["witness", "conformance", "--url", base, "--host-id", "host:prod",
-                                    "--host-key-file", str(self.root / "conformance.key"), "--witness-public-key", witness["public_key_b64"]])
+                                    "--host-key-file", str(self.root / "conformance.key"), f"--witness-public-key={witness['public_key_b64']}"])
             self.assertEqual(code, 2)
             self.assertIn("conformance:", err)
         finally:
