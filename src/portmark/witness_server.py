@@ -512,9 +512,13 @@ def serve_witness(database: str, key_file: str, enrolment_path: str, bind: str, 
     # The key and enrolment first: a bad one must not leave a new, empty witness database behind.
     private_key = load_private_key_file(key_file)
     enrolment = Enrolment.from_path(enrolment_path)
-    service = WitnessService(WitnessLog(database), private_key, enrolment)
-    config = uvicorn.Config(
-        make_witness_app(service), host=bind, port=port, proxy_headers=False, server_header=False, lifespan="on", log_level="info",
-        limit_concurrency=MAX_CONNECTIONS, timeout_keep_alive=KEEP_ALIVE_SECONDS,
-    )
-    uvicorn.Server(config).run()
+    log = WitnessLog(database)
+    try:
+        config = uvicorn.Config(
+            make_witness_app(WitnessService(log, private_key, enrolment)), host=bind, port=port, proxy_headers=False,
+            server_header=False, lifespan="on", log_level="info",
+            limit_concurrency=MAX_CONNECTIONS, timeout_keep_alive=KEEP_ALIVE_SECONDS,
+        )
+        uvicorn.Server(config).run()
+    finally:
+        log.close()  # a clean stop closes the database (on Windows an open file cannot be removed)

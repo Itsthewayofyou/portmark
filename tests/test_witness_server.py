@@ -476,8 +476,17 @@ class DeadlineTests(WitnessCase, unittest.TestCase):
 
         key = os.path.join(self._dir.name, "w.key")
         generate_key_file(key)
-        with patch("uvicorn.Server", FakeServer):
-            witness_server.serve_witness(os.path.join(self._dir.name, "x.sqlite"), key, str(self.w.enrolment_path), "127.0.0.1", 0, None)
+        closed = []
+        real_close = WitnessLog.close
+
+        def recording_close(log):
+            closed.append(log.path)
+            real_close(log)
+
+        database = os.path.join(self._dir.name, "x.sqlite")
+        with patch("uvicorn.Server", FakeServer), patch.object(WitnessLog, "close", recording_close):
+            witness_server.serve_witness(database, key, str(self.w.enrolment_path), "127.0.0.1", 0, None)
+        self.assertEqual(closed, [database])  # the database is closed when the server stops
         config = captured["config"]
         self.assertEqual((config.limit_concurrency, config.timeout_keep_alive), (256, 5))
         self.assertFalse(config.proxy_headers)
