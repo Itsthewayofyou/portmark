@@ -12,6 +12,7 @@ import os
 import subprocess  # nosec B404 - launches this test's own fake MCP server
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -37,6 +38,17 @@ def permit_for(*names):
         issuer="user:a", subject="agent:a", audience=HOST, expires_at=2 ** 40, nonce="n",
         grants=tuple(ToolGrant(name) for name in names),
     )
+
+
+def _alive(pid):
+    """Whether that process still exists (POSIX signal 0 probe; on Windows, via the tasklist-free API)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:  # pragma: no cover - a permission error means it is still there
+        return True
+    return True
 
 
 def launch(mode):
@@ -121,6 +133,14 @@ class ClientTests(unittest.TestCase):
         with self.assertRaises(McpError) as raised:
             client.list_tools()
         self.assertEqual(raised.exception.code, "mcp_protocol_error")
+
+    def test_an_unsupported_counter_offer_is_refused(self):
+        # The 2025-11-25 schema says a client that cannot support the answered revision MUST disconnect.
+        client = self.client("bad_version")
+        with self.assertRaises(McpError) as raised:
+            client.connect()
+        self.assertEqual(raised.exception.code, "mcp_protocol_error")
+        self.assertIn("1999-01-01", str(raised.exception))
 
     def test_a_silent_server_times_out_instead_of_hanging(self):
         client = self.client("hang", timeout=1.0)
@@ -344,6 +364,34 @@ class EndToEndTests(unittest.TestCase):
         with self.assertRaises(ToolExecutionError) as raised:
             registry.invoke(permit_for("allowed"), "allowed", {})
         self.assertEqual(tool_error_code(raised.exception), "mcp_pin_drift")
+
+    def test_a_legacy_server_that_exits_on_the_probe_still_works(self):
+        # The probe is a pre-`initialize` request, and some legacy servers exit on one. The second attempt
+        # gets a FRESH process and skips the probe (Codex review R2).
+        config = self.approved_config()
+        pin = config.servers["files"].tools["read_file"].pin
+        exiting = load_config(str(self.write_config("legacy_exit", pins={"read_file": pin})))
+        registry = self.registry(exiting)
+        result = registry.invoke(permit_for("mcp.files.read_file"), "mcp.files.read_file", {"path": "sample.txt"})
+        self.assertEqual(result["content"][0]["text"], 'read_file:{"path": "sample.txt"}')
+
+    def test_a_probe_that_times_out_takes_the_server_with_it(self):
+        # Killing only the probe process would leave the MCP server it started running with nobody to stop it.
+        marker = self.root / "server.json"
+        self.write_config("sleeper")
+        document = json.loads(self.config_path.read_text())
+        document["servers"]["files"]["secret_env"] = ["FAKE_MCP_MARKER_FILE"]
+        self.config_path.write_text(json.dumps(document), encoding="utf-8")
+        with patch.dict(os.environ, {"FAKE_MCP_MARKER_FILE": str(marker)}):
+            with self.assertRaises(McpStartupError) as raised:
+                probe_server(str(self.config_path), "files", timeout=3)
+        self.assertIn("timed out", str(raised.exception))
+        pid = json.loads(marker.read_text())["pid"]
+        for _ in range(100):  # the kill is asynchronous; wait briefly for the process to disappear
+            if not _alive(pid):
+                break
+            time.sleep(0.05)
+        self.assertFalse(_alive(pid), "the MCP server outlived the probe that started it")
 
     def test_failure_codes_reach_the_caller(self):
         for mode, code in (("tool_error", "mcp_tool_error"), ("hang", "mcp_transport_error"), ("server_request", "mcp_protocol_error")):

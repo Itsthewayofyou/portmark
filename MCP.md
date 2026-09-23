@@ -25,7 +25,10 @@ An MCP server is a **remote party**, even when it runs as a local subprocess. No
   Only the operator's own `read_only: true` marks a tool as free of side effects.
 - **Descriptions never reach the model.** Portmark's providers receive tool **names** only
   (`decide(view, available_tools)`), so a poisoned description or schema cannot steer the model.
-- **The server gets no credentials** beyond the environment variables the operator names in `secret_env`.
+- **The server gets no credential** the operator did not name in `secret_env`. It does inherit a small
+  baseline so an ordinary program can run at all: `PATH`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TMPDIR`, `TEMP`,
+  `HOME`, `USERPROFILE`, `SYSTEMROOT`. Nothing else of Portmark's environment reaches it — not its store path,
+  its keys, or even the pin it is being checked against.
 - **A tool result is data, not instructions.** It is capped, encoded, and handed back exactly like any
   other tool's output.
 
@@ -55,7 +58,12 @@ every request; a missing field is answered with `-32602`.
 - a `DiscoverResult` → the server is modern; Portmark picks a version from `supportedVersions`;
 - `UnsupportedProtocolVersionError` (`-32022`) → modern; Portmark retries with a version from `data.supported`;
 - any other error, or no answer in time → legacy; Portmark falls back to `initialize` +
-  `notifications/initialized`.
+  `notifications/initialized`;
+- **the server exits** (some legacy servers do, on an unknown pre-`initialize` request) → Portmark starts a
+  **fresh** process and goes straight to `initialize`, because the dead one cannot answer anything.
+
+If the server answers `initialize` with a revision Portmark does not speak, Portmark disconnects rather than
+continue — the 2025-11-25 schema requires exactly that.
 
 The fallback is never keyed to one error code, because legacy servers answer an unknown pre-`initialize`
 method with whatever they like. A result with no `resultType` is treated as `"complete"`, which is what the
@@ -79,7 +87,7 @@ Streamable HTTP servers are **not** in this release; see "Not included" below.
 A stdio MCP server is launched **per call, inside Portmark's isolated tool worker**, so the existing
 deadline and process-tree kill cover the server process too. The worker:
 
-1. reads the operator config and the approved pin from its environment;
+1. reads the operator config, the approved pin and the approved launch digest from its environment;
 2. launches the server, probes the era, and calls `tools/list`;
 3. re-checks the pin of the tool it is about to call, and refuses on any drift;
 4. calls `tools/call`, maps the result, and exits.
@@ -137,6 +145,9 @@ A name that collides with a tool already registered is refused too, so a server 
 }
 ```
 
+`portmark mcp pin` and the start-up check both run the probe in a **killable process tree**, so a server that
+never answers is stopped with the probe instead of being left behind.
+
 - `pin` is the SHA-256 of the tool's canonical definition: the WHOLE definition object the server reports,
   minus protocol `_meta`. Not a chosen list of fields, because a list would silently ignore any field a
   later MCP revision adds -- which is the drift a pin exists to catch. A cosmetic change (a description, an
@@ -145,7 +156,8 @@ A name that collides with a tool already registered is refused too, so a server 
   tool is a human act.
 - `read_only: true` is the operator's own statement, never the server's annotation.
 - `reconcile` names a `module:function` (see "Side effects"). It is required unless `read_only` is true.
-- `secret_env` names host environment variables to pass to the server process. Nothing else is inherited.
+- `secret_env` names host environment variables to pass to the server process, on top of the small baseline
+  listed under "What Portmark trusts". Nothing else of Portmark's environment is inherited.
 - A tool that is not listed is not registered. There is no "expose everything" switch.
 
 ## Audit and export

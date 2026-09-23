@@ -118,18 +118,50 @@ def _shutdown(process: subprocess.Popen[bytes]) -> None:
         pass
 
 
+def _connect(server: McpServerConfig) -> tuple[subprocess.Popen[bytes], McpClient]:
+    """Launch the server and agree a protocol version, restarting it once if the probe killed it.
+
+    The stdio binding's own fallback rules assume the probe may be answered by silence or an error -- but some
+    legacy servers simply EXIT on an unknown pre-`initialize` request. Talking `initialize` to that dead
+    process would report a transport failure for a server that is merely old, so the second attempt gets a
+    fresh process and skips the probe (Codex review R2)."""
+    process = _launch(server)
+    if process.stdin is None or process.stdout is None:
+        _shutdown(process)
+        raise _fail(TRANSPORT_ERROR, "the MCP server has no usable standard streams")
+    version = os.environ.get(VERSION_ENV, "")
+    client = McpClient(process.stdin, process.stdout, request_timeout(server.timeout_seconds), version)
+    try:
+        client.connect()
+        return process, client
+    except McpError as error:
+        exited = process.poll() is not None
+        _shutdown(process)
+        if not (exited or client.peer_closed):
+            # Carry the code out of the connect phase too: a silent or malformed server must reach the host
+            # as `mcp_transport_error`/`mcp_protocol_error`, not as an unlabelled failure.
+            raise _WorkerError(error.code, str(error)) from error
+    process = _launch(server)
+    if process.stdin is None or process.stdout is None:
+        _shutdown(process)
+        raise _fail(TRANSPORT_ERROR, "the MCP server has no usable standard streams")
+    client = McpClient(process.stdin, process.stdout, request_timeout(server.timeout_seconds), version)
+    try:
+        client.connect_legacy()
+    except McpError as error:
+        _shutdown(process)
+        raise _WorkerError(error.code, str(error)) from error
+    return process, client
+
+
 def call(arguments: dict[str, Any], effect_id: str | None = None) -> Any:
     """Call the configured MCP tool once. `effect_id` is accepted (and deliberately not sent).
 
     MCP has no idempotency key, so passing Portmark's would invent a meaning the server does not have. The
     ledger still records the effect as `unknown` on a failure, and the operator's reconcile settles it."""
     server, tool = _settings()
-    process = _launch(server)
+    process, client = _connect(server)
     try:
-        if process.stdin is None or process.stdout is None:
-            raise _fail(TRANSPORT_ERROR, "the MCP server has no usable standard streams")
-        client = McpClient(process.stdin, process.stdout, request_timeout(server.timeout_seconds), os.environ.get(VERSION_ENV, ""))
-        client.connect()
         definitions = client.list_tools()
         definition = definitions.get(tool.tool)
         if definition is None:
@@ -159,12 +191,9 @@ def discover(arguments: dict[str, Any]) -> Any:
     server = config.servers.get(server_name)
     if server is None:
         raise _fail(PROTOCOL_ERROR, f"the MCP config has no server {server_name!r}")
-    process = _launch(server)
+    process, client = _connect(server)
     try:
-        if process.stdin is None or process.stdout is None:
-            raise _fail(TRANSPORT_ERROR, "the MCP server has no usable standard streams")
-        client = McpClient(process.stdin, process.stdout, request_timeout(server.timeout_seconds))
-        version = client.connect()
+        version = client.version
         definitions = client.list_tools()
         return {
             "server": server_name,
@@ -191,7 +220,13 @@ def tool_environment(config_path: str, server: McpServerConfig, tool: McpToolCon
     return environment
 
 
-if __name__ == "__main__":  # pragma: no cover - `python -m portmark.mcp_worker <config> <server>`
+if __name__ == "__main__":  # `python -m portmark.mcp_worker <config> <server>`
     import json
 
-    print(json.dumps(discover({"config": sys.argv[1], "server": sys.argv[2]}), indent=2, sort_keys=True))
+    # Both outcomes are JSON on STDOUT: the caller launches this through the tree launcher, which discards
+    # stderr, so a failure reported there would reach nobody (Codex review R2).
+    try:
+        print(json.dumps(discover({"config": sys.argv[1], "server": sys.argv[2]}), indent=2, sort_keys=True))
+    except BaseException as failure:  # noqa: BLE001 - the probe reports every failure the same way
+        print(json.dumps({"error": f"{type(failure).__name__}: {failure}"[:500]}))
+        sys.exit(1)

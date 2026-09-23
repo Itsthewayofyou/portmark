@@ -26,7 +26,11 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   only the codes its registration allows (`register_isolated(error_codes=...)`), so no other tool can forge one.
   The host records it in `tool.failed`: `mcp_tool_error` (the server said `isError`), `mcp_transport_error`
   (effect unknown), `mcp_pin_drift`, `mcp_config_drift`, `mcp_protocol_error`.
-- **`portmark mcp pin`** prints what each server offers now, with the pin to approve it. It never approves.
+- **`portmark mcp pin`** prints what each server offers now, with the pin to approve it. It never approves. The
+  probe runs in a killable process tree, so a server that never answers dies with the probe rather than being
+  orphaned, and it reports both outcomes as JSON on stdout.
+- A legacy server that **exits** on the modern probe (some do) is restarted and handshaken on a fresh process,
+  and an `initialize` answer naming a revision Portmark does not speak is refused instead of accepted.
 - Not included: Streamable HTTP (and therefore OAuth servers), MCP resources/prompts/sampling, and Portmark as
   an MCP server.
 

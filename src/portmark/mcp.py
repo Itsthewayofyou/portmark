@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess  # nosec B404 - runs THIS interpreter to probe a server inside a bounded child
+import subprocess  # nosec B404 - runs THIS interpreter to probe a server inside a bounded child tree
 import sys
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,7 +20,7 @@ from .json_guard import StrictJSONError, strict_json_loads
 from .mcp_client import ERROR_CODES
 from .mcp_config import McpConfig, McpConfigError, McpServerConfig, McpToolConfig, load_config
 from .mcp_worker import tool_environment
-from .tools import ToolRegistry
+from .tools import ToolRegistry, _launch_process_tree
 
 CALL_TARGET = "portmark.mcp_worker:call"
 # The per-call worker deadline: the server has to start, agree a protocol version, list its tools and answer.
@@ -29,6 +30,8 @@ CALL_TARGET = "portmark.mcp_worker:call"
 # this would turn a finished call into `tool.killed` while the worker was still closing down (Codex R1).
 STARTUP_ALLOWANCE_SECONDS = 10.0
 PIN_CHECK_TIMEOUT_SECONDS = 60.0
+MAX_PROBE_BYTES = 1 << 20
+PROBE_CHUNK_BYTES = 1 << 16
 
 
 class McpStartupError(McpConfigError):
@@ -85,27 +88,53 @@ def _worker_environment(path: str, server: McpServerConfig, tool: McpToolConfig,
 
 
 def probe_server(config_path: str, server: str, timeout: float = PIN_CHECK_TIMEOUT_SECONDS) -> PinReport:
-    """List one server's tools and their digests, in a bounded child process.
+    """List one server's tools and their digests, in a bounded child process TREE.
 
     The probe never runs in the host process: starting an MCP server means running the operator's configured
-    program, and that belongs behind the same boundary a tool call has (Codex review R1)."""
-    command = [sys.executable, "-m", "portmark.mcp_worker", config_path, server]
+    program, and that belongs behind the same boundary a tool call has (Codex review R1). It runs through the
+    same tree launcher a tool does, so a probe that has to be killed takes the MCP server with it -- killing
+    only the probe process would leave the server it started running with nobody to stop it (Codex review R2).
+    """
+    tree = _launch_process_tree([sys.executable, "-m", "portmark.mcp_worker", config_path, server], dict(os.environ))
+    buffer = bytearray()
+
+    def drain() -> None:
+        stream = tree.stdout
+        while stream is not None:
+            chunk = stream.read(PROBE_CHUNK_BYTES)
+            if not chunk:
+                return
+            if len(buffer) < MAX_PROBE_BYTES:
+                buffer.extend(chunk)
+
+    reader = threading.Thread(target=drain, daemon=True)
     try:
-        completed = subprocess.run(  # nosec B603 - this interpreter, fixed module, no shell
-            command, capture_output=True, timeout=timeout, check=False, env=dict(os.environ)
-        )
-    except subprocess.TimeoutExpired as error:
-        raise McpStartupError(f"probing MCP server {server!r} timed out after {timeout:g}s") from error
-    except OSError as error:
-        raise McpStartupError(f"could not probe MCP server {server!r}: {error.strerror}") from error
-    if completed.returncode != 0:
-        detail = completed.stderr.decode("utf-8", "replace").strip().splitlines()
-        raise McpStartupError(f"probing MCP server {server!r} failed: {detail[-1] if detail else 'no output'}")
+        if tree.stdin is not None:
+            tree.stdin.close()
+        reader.start()
+        try:
+            tree.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            raise McpStartupError(f"probing MCP server {server!r} timed out after {timeout:g}s") from error
+        reader.join(timeout=2.0)
+    finally:
+        try:
+            tree.terminate_tree()
+        except OSError:  # pragma: no cover - the process is already gone
+            pass
+        tree.close()
+    return _probe_report(server, bytes(buffer), tree.returncode)
+
+
+def _probe_report(server: str, raw: bytes, returncode: int | None) -> PinReport:
+    """The worker reports both success and failure as JSON on stdout: the tree launcher discards stderr."""
     try:
-        report = strict_json_loads(completed.stdout, max_bytes=1 << 20)
+        report = strict_json_loads(raw, max_bytes=MAX_PROBE_BYTES)
     except StrictJSONError as error:
         raise McpStartupError(f"the probe of MCP server {server!r} produced no usable report") from error
-    if not isinstance(report, dict) or not isinstance(report.get("tools"), dict):
+    if isinstance(report, dict) and isinstance(report.get("error"), str):
+        raise McpStartupError(f"probing MCP server {server!r} failed: {report['error'][:300]}")
+    if returncode != 0 or not isinstance(report, dict) or not isinstance(report.get("tools"), dict):
         raise McpStartupError(f"the probe of MCP server {server!r} produced no usable report")
     return PinReport(server, str(report.get("protocol_version", "")), dict(report["tools"]))
 

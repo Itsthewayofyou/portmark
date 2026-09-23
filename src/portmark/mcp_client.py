@@ -24,6 +24,7 @@ MODERN_VERSION = "2026-07-28"
 NEWEST_LEGACY_VERSION = "2025-11-25"
 LEGACY_VERSION = "2025-06-18"
 SUPPORTED_VERSIONS = (MODERN_VERSION, NEWEST_LEGACY_VERSION, LEGACY_VERSION)
+LEGACY_VERSIONS = (NEWEST_LEGACY_VERSION, LEGACY_VERSION)
 CLIENT_NAME = "portmark"
 META_PREFIX = "io.modelcontextprotocol/"
 UNSUPPORTED_PROTOCOL_VERSION = -32022
@@ -124,6 +125,7 @@ class McpClient:
         self._version: str | None = None
         self._legacy = False
         self._client_version = client_version
+        self.peer_closed = False
 
     # -- framing ------------------------------------------------------------------------------------------
 
@@ -156,6 +158,7 @@ class McpClient:
         while True:
             line = self._reader.read(self._timeout)
             if line is None:
+                self.peer_closed = True
                 raise McpError(TRANSPORT_ERROR, "the MCP server closed its output before answering")
             try:
                 message = strict_json_loads(line, max_bytes=MAX_MESSAGE_BYTES)
@@ -176,6 +179,11 @@ class McpClient:
                     continue
                 raise McpError(PROTOCOL_ERROR, "the MCP server answered with the wrong request id")
             return message
+
+    @property
+    def version(self) -> str:
+        """The protocol version in use, once connected."""
+        return self._version or ""
 
     def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         """Send one request and return its `result`, or raise McpError (JSON-RPC errors included)."""
@@ -237,6 +245,10 @@ class McpClient:
             f"the MCP server supports {list(supported)}, and Portmark speaks {list(SUPPORTED_VERSIONS)}",
         )
 
+    def connect_legacy(self, version: str = NEWEST_LEGACY_VERSION) -> str:
+        """The legacy handshake on a FRESH connection, for a server that exited on the modern probe."""
+        return self._initialize(version)
+
     def _initialize(self, version: str = NEWEST_LEGACY_VERSION) -> str:
         """The legacy handshake. `version` is the revision the server advertised, or -- when the probe told us
         nothing -- the NEWEST legacy revision Portmark speaks, because asking for the oldest would settle for
@@ -254,6 +266,13 @@ class McpClient:
         agreed = result.get("protocolVersion")
         if not isinstance(agreed, str) or not agreed:
             raise McpError(PROTOCOL_ERROR, "the MCP server's initialize answer has no protocolVersion")
+        if agreed not in LEGACY_VERSIONS:
+            # The 2025-11-25 schema is explicit: a client that cannot support the revision the server answers
+            # with MUST disconnect. Carrying on would speak a protocol neither side agreed (Codex review R2).
+            raise McpError(
+                PROTOCOL_ERROR,
+                f"the MCP server answered initialize with {agreed!r}; Portmark speaks {list(LEGACY_VERSIONS)}",
+            )
         self._version = agreed
         self.notify("notifications/initialized")
         return agreed

@@ -56,11 +56,14 @@ def tool_list(mode):
 
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "modern"
-    modern = mode not in ("legacy", "legacy_new")
+    modern = mode not in ("legacy", "legacy_new", "legacy_exit", "bad_version")
     marker = os.environ.get("FAKE_MCP_MARKER_FILE")
-    if marker:  # proves which environment variables reached the server process
+    if marker:  # proves which environment variables reached the server process, and that it ran at all
         with open(marker, "w", encoding="utf-8") as handle:
-            json.dump({key: os.environ.get(key, "") for key in ("FAKE_MCP_SECRET", "PORTMARK_MCP_PIN", "HOME")}, handle)
+            json.dump({
+                "pid": os.getpid(),
+                **{key: os.environ.get(key, "") for key in ("FAKE_MCP_SECRET", "PORTMARK_MCP_PIN", "HOME")},
+            }, handle)
     while True:
         # readline(), not `for line in sys.stdin`: the iterator reads ahead, so a server that answers one
         # request at a time would wait for input that the client is waiting for the answer to.
@@ -77,6 +80,12 @@ def main():
             continue  # a notification: notifications/initialized
         if mode == "hang":
             time.sleep(3600)
+        if mode == "sleeper":
+            # Never answers anything: the client's deadline, and the caller's tree-kill, are all that stop it.
+            time.sleep(3600)
+        if mode == "legacy_exit" and method == "server/discover":
+            # Some legacy servers simply exit on an unknown pre-`initialize` request.
+            sys.exit(0)
         if mode == "server_request" and method == "tools/call":
             # Forbidden by the stdio binding: a server request written to stdout.
             send({"jsonrpc": "2.0", "id": 9001, "method": "elicitation/create", "params": {}})
@@ -98,7 +107,7 @@ def main():
             sys.stdout.flush()
             continue
         if method == "server/discover":
-            if mode in ("legacy", "legacy_new"):
+            if mode in ("legacy", "legacy_new", "bad_version"):
                 error(request_id, -32601, "Method not found")  # a legacy server's answer to an unknown method
             elif mode == "unsupported":
                 error(request_id, -32022, "Unsupported protocol version", {"supported": [LEGACY], "requested": MODERN})
@@ -116,6 +125,12 @@ def main():
                 if asked != LEGACY:
                     error(request_id, -32602, f"this server speaks {LEGACY}, not {asked}")
                     continue
+            if mode == "bad_version":
+                send({"jsonrpc": "2.0", "id": request_id, "result": {
+                    "protocolVersion": "1999-01-01", "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "fake", "version": "1"},
+                }})
+                continue
             if mode == "legacy_new":
                 asked = (request.get("params") or {}).get("protocolVersion")
                 if asked != "2025-11-25":
