@@ -79,8 +79,9 @@ def resolve_endpoint_address(host: str, port: int, allow_private: bool) -> str:
         if address.is_multicast or address.is_unspecified or address.is_link_local:
             raise McpError(TRANSPORT_ERROR, f"the MCP endpoint host {host!r} resolves to {answer}, which is never allowed")
         # Loopback is checked BEFORE `is_reserved`, because Python reports the IPv6 loopback `::1` as
-        # reserved -- it sits inside a reserved block. Refusing it would break `https://localhost` on any
-        # machine whose resolver answers IPv6 first, which is most of them. Reserved still refuses a
+        # reserved -- it sits inside a reserved block. Refusing it would break `https://localhost` wherever
+        # the resolver answers IPv6 first: observed 2026-09-23, where this project's GitHub runners resolved
+        # `localhost` to `::1` while the development machine answered `127.0.0.1`. Reserved still refuses a
         # non-loopback address such as 240.0.0.1.
         if address.is_loopback:
             continue
