@@ -13,6 +13,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
 
 from .json_guard import StrictJSONError, strict_json_loads
 from .models import MAX_TOOL_NAME_LENGTH, validate_tool_name
@@ -33,8 +34,15 @@ _SERVER_TOOL_NAME = re.compile(r"\A[A-Za-z0-9._-]{1,128}\Z")
 _ENV_NAME = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
 _PIN = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
 
-SERVER_FIELDS = ("command", "args", "secret_env", "timeout_seconds", "tools")
+# A server is reached EITHER by launching a program (stdio) OR over Streamable HTTP. The two sets of keys are
+# mutually exclusive, so a config can never describe a server that is half one and half the other, and the
+# error can name the transport it decided on.
+STDIO_FIELDS = ("command", "args", "secret_env")
+HTTP_FIELDS = ("url", "bearer_env", "allow_private")
+SERVER_FIELDS = (*STDIO_FIELDS, *HTTP_FIELDS, "timeout_seconds", "tools")
 TOOL_FIELDS = ("pin", "read_only", "reconcile", "alias")
+STDIO = "stdio"
+HTTP = "http"
 
 
 class McpConfigError(ValueError):
@@ -42,16 +50,29 @@ class McpConfigError(ValueError):
 
 
 def server_digest(server: "McpServerConfig") -> str:
-    """The launch configuration of one server: what program runs, with which arguments and which secrets.
+    """How one server is REACHED: which program runs, or which endpoint is called, and under what terms.
 
-    The host records this at start-up and the worker re-checks it, so editing `command` in the config file
-    after approval cannot make an approved pin launch a different program (Codex review R1)."""
-    body = {
-        "command": server.command,
-        "args": list(server.args),
-        "secret_env": sorted(server.secret_env),
-        "timeout_seconds": server.timeout_seconds,
-    }
+    The host records this at start-up and the worker re-checks it, so editing the config file after approval
+    cannot make an approved pin talk to a different program (Codex review R1) -- or, now, to a different
+    endpoint. The `transport` discriminator is part of the body so a stdio and an HTTP binding can never
+    produce the same digest. The bearer token's VALUE is deliberately absent: rotating the secret must not
+    invalidate an approved pin, while repointing the config at a different variable must."""
+    if server.transport == HTTP:
+        body = {
+            "transport": HTTP,
+            "url": server.url,
+            "bearer_env": server.bearer_env,
+            "allow_private": server.allow_private,
+            "timeout_seconds": server.timeout_seconds,
+        }
+    else:
+        body = {
+            "transport": STDIO,
+            "command": server.command,
+            "args": list(server.args),
+            "secret_env": sorted(server.secret_env),
+            "timeout_seconds": server.timeout_seconds,
+        }
     return "sha256:" + hashlib.sha256(canonical_json(body)).hexdigest()
 
 
@@ -97,11 +118,19 @@ class McpToolConfig:
 @dataclass(frozen=True)
 class McpServerConfig:
     name: str
-    command: str
+    command: str = ""
     args: tuple[str, ...] = ()
     secret_env: tuple[str, ...] = ()
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
     tools: Mapping[str, McpToolConfig] = field(default_factory=dict)
+    url: str = ""
+    bearer_env: str = ""
+    allow_private: bool = False
+
+    @property
+    def transport(self) -> str:
+        """`http` or `stdio`. The loader guarantees exactly one of `url` and `command` is set."""
+        return HTTP if self.url else STDIO
 
 
 @dataclass(frozen=True)
@@ -180,19 +209,32 @@ def _server_from_spec(name: str, value: Any) -> McpServerConfig:
     if not isinstance(value, dict):
         raise McpConfigError(f"{label} must be an object")
     _reject_unknown(value, SERVER_FIELDS, label)
-    command = value.get("command")
-    if not isinstance(command, str) or not command:
-        raise McpConfigError(f"{label}.command must be a non-empty string")
-    if not os.path.isabs(command):
-        # An absolute path only: a name resolved through PATH lets whoever can change PATH decide which
-        # program speaks for this server.
-        raise McpConfigError(f"{label}.command must be an absolute path, not a name resolved through PATH")
-    args = value.get("args", [])
-    if not isinstance(args, list) or not all(isinstance(item, str) for item in args):
-        raise McpConfigError(f"{label}.args must be a list of strings")
-    secret_env = value.get("secret_env", [])
-    if not isinstance(secret_env, list) or not all(isinstance(item, str) and _ENV_NAME.match(item) for item in secret_env):
-        raise McpConfigError(f"{label}.secret_env must be a list of environment variable NAMES, not values")
+    transport = _transport_of(value, label)
+    _reject_foreign_keys(value, transport, label)
+    command, args, secret_env = "", [], []
+    url, bearer_env, allow_private = "", "", False
+    if transport == STDIO:
+        command = value.get("command")
+        if not isinstance(command, str) or not command:
+            raise McpConfigError(f"{label}.command must be a non-empty string")
+        if not os.path.isabs(command):
+            # An absolute path only: a name resolved through PATH lets whoever can change PATH decide which
+            # program speaks for this server.
+            raise McpConfigError(f"{label}.command must be an absolute path, not a name resolved through PATH")
+        args = value.get("args", [])
+        if not isinstance(args, list) or not all(isinstance(item, str) for item in args):
+            raise McpConfigError(f"{label}.args must be a list of strings")
+        secret_env = value.get("secret_env", [])
+        if not isinstance(secret_env, list) or not all(isinstance(item, str) and _ENV_NAME.match(item) for item in secret_env):
+            raise McpConfigError(f"{label}.secret_env must be a list of environment variable NAMES, not values")
+    else:
+        allow_private = value.get("allow_private", False)
+        if not isinstance(allow_private, bool):
+            raise McpConfigError(f"{label}.allow_private must be true or false")
+        url = _checked_url(value.get("url"), allow_private, label)
+        bearer_env = value.get("bearer_env", "")
+        if not isinstance(bearer_env, str) or (bearer_env and not _ENV_NAME.match(bearer_env)):
+            raise McpConfigError(f"{label}.bearer_env must be the NAME of an environment variable, not a token")
     timeout = value.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= MAX_TIMEOUT_SECONDS:
         raise McpConfigError(f"{label}.timeout_seconds must be a number from 0 (exclusive) to {MAX_TIMEOUT_SECONDS}")
@@ -200,7 +242,59 @@ def _server_from_spec(name: str, value: Any) -> McpServerConfig:
     if not isinstance(raw_tools, dict) or not raw_tools:
         raise McpConfigError(f"{label}.tools must name at least one tool; there is no expose-everything switch")
     tools = {tool: _tool_from_spec(name, tool, spec) for tool, spec in raw_tools.items()}
-    return McpServerConfig(name, command, tuple(args), tuple(secret_env), float(timeout), tools)
+    return McpServerConfig(
+        name, command, tuple(args), tuple(secret_env), float(timeout), tools, url, bearer_env, allow_private
+    )
+
+
+def _transport_of(value: Mapping[str, Any], label: str) -> str:
+    """Exactly one of `command` and `url`. Neither is not a default, and both is not a preference order."""
+    has_command, has_url = "command" in value, "url" in value
+    if has_command and has_url:
+        raise McpConfigError(f"{label} sets both `command` and `url`: a server is reached one way, not two")
+    if not has_command and not has_url:
+        raise McpConfigError(f"{label} must set `command` (a program to launch) or `url` (a Streamable HTTP endpoint)")
+    return STDIO if has_command else HTTP
+
+
+def _reject_foreign_keys(value: Mapping[str, Any], transport: str, label: str) -> None:
+    """A key that belongs to the OTHER transport is refused, never ignored: silently dropping `allow_private`
+    from a stdio server, or `secret_env` from an HTTP one, would read as a setting that is in force."""
+    foreign = HTTP_FIELDS if transport == STDIO else STDIO_FIELDS
+    for key in foreign:
+        if key in value:
+            raise McpConfigError(f"{label} is a {transport} server, so it cannot set `{key}`")
+
+
+def _checked_url(url: Any, allow_private: bool, label: str) -> str:
+    """The MCP endpoint. HTTPS unless the operator has explicitly allowed a private address.
+
+    The MCP specification states no TLS requirement for this endpoint -- HTTPS is mandated only for OAuth
+    endpoints -- so this rule is Portmark's, not the specification's. A query or fragment is refused because
+    the endpoint is a destination, not a request; the request is the POST body."""
+    if not isinstance(url, str) or not url:
+        raise McpConfigError(f"{label}.url must be a non-empty string")
+    if any(character.isspace() or ord(character) < 0x20 for character in url):
+        raise McpConfigError(f"{label}.url must not contain whitespace or control characters")
+    try:
+        split = urlsplit(url)
+        port = split.port
+    except ValueError as error:
+        raise McpConfigError(f"{label}.url is not a usable URL: {error}") from error
+    if split.scheme == "http":
+        if not allow_private:
+            raise McpConfigError(f"{label}.url must be https; plain http needs an explicit `allow_private: true`")
+    elif split.scheme != "https":
+        raise McpConfigError(f"{label}.url must be an https URL")
+    if split.username is not None or split.password is not None:
+        raise McpConfigError(f"{label}.url must not carry a username or password; use `bearer_env`")
+    if split.query or split.fragment:
+        raise McpConfigError(f"{label}.url must not carry a query string or fragment")
+    if not split.hostname:
+        raise McpConfigError(f"{label}.url must name a host")
+    if port is not None and not 0 < port < 65536:
+        raise McpConfigError(f"{label}.url has an out-of-range port")
+    return url
 
 
 def config_from_bytes(raw: bytes, path: str = "") -> McpConfig:

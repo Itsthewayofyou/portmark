@@ -11,6 +11,7 @@ handful of methods, and the official SDK would add 28 packages to a runtime that
 
 from __future__ import annotations
 
+import base64
 import queue
 import threading
 from collections.abc import Mapping
@@ -37,6 +38,12 @@ MAX_CONTENT_BLOCKS = 64
 MAX_TEXT_BYTES = 1 << 18
 
 # The machine codes the host records in `tool.failed` details. An unlisted code never reaches the audit.
+# The body fields the Streamable HTTP binding mirrors into an `Mcp-Name` header, by method.
+NAMED_METHODS = {"tools/call": "name", "resources/read": "uri", "prompts/get": "name"}
+# The marker that says "this header value is Base64 of UTF-8". Lower-case and exact, per the specification.
+SENTINEL_PREFIX = "=?base64?"
+SENTINEL_SUFFIX = "?="
+
 TOOL_ERROR = "mcp_tool_error"
 TRANSPORT_ERROR = "mcp_transport_error"
 PROTOCOL_ERROR = "mcp_protocol_error"
@@ -114,18 +121,94 @@ class _LineReader:
         raise McpError(TRANSPORT_ERROR, f"reading from the MCP server failed: {value}")
 
 
-class McpClient:
-    """One connection to one MCP server, over an already-open pair of streams."""
+def header_value(value: str) -> str:
+    """One body value, safe to put in an HTTP header.
 
-    def __init__(self, stdin: BinaryIO, stdout: BinaryIO, timeout: float, client_version: str = "") -> None:
+    RFC 9110 allows visible ASCII, space and horizontal tab in a field value, and a field value may not begin
+    or end with whitespace. Anything outside that -- and any plain value that would itself READ as the marker
+    -- is carried as `=?base64?<base64 of the UTF-8 bytes>?=`. This is what stops a value from injecting a
+    header or a request line, and the server undoes it before comparing the header to the body."""
+    if _is_plain_header_ascii(value):
+        return value
+    return SENTINEL_PREFIX + base64.b64encode(value.encode("utf-8")).decode("ascii") + SENTINEL_SUFFIX
+
+
+def _is_plain_header_ascii(value: str) -> bool:
+    if value != value.strip():  # a field value may not begin or end with whitespace
+        return False
+    if value.startswith(SENTINEL_PREFIX) and value.endswith(SENTINEL_SUFFIX):
+        return False  # a literal that looks like the marker must be encoded, or it would decode as one
+    return all(0x21 <= ord(character) <= 0x7E or character in (" ", "\t") for character in value)
+
+
+class Transport:
+    """How one message reaches a server and how the answers come back.
+
+    Two methods, because that is all the protocol above needs. `headers` is the HTTP request metadata the
+    specification requires; the stdio transport ignores it, so the client can compute it once for both.
+    `peer_closed` exists for the stdio worker, which relaunches a server that exited on the era probe."""
+
+    peer_closed = False
+
+    def send(self, encoded: bytes, headers: Mapping[str, str]) -> None:
+        raise NotImplementedError
+
+    def read(self, timeout: float) -> bytes | None:
+        """The next message, or None when the peer is finished."""
+        raise NotImplementedError
+
+    def close(self) -> None:
+        pass
+
+
+class _StdioTransport(Transport):
+    """Newline-delimited JSON-RPC over a pair of open streams, as the stdio binding prescribes."""
+
+    def __init__(self, stdin: BinaryIO, stdout: BinaryIO, max_bytes: int = MAX_MESSAGE_BYTES) -> None:
         self._stdin = stdin
-        self._reader = _LineReader(stdout)
+        self._reader = _LineReader(stdout, max_bytes)
+        self.peer_closed = False
+
+    def send(self, encoded: bytes, headers: Mapping[str, str]) -> None:
+        if b"\n" in encoded:  # canonical_json escapes newlines; this is the framing invariant, asserted
+            raise McpError(PROTOCOL_ERROR, "a request would break the one-message-per-line framing")
+        try:
+            self._stdin.write(encoded + b"\n")
+            self._stdin.flush()
+        except OSError as error:
+            raise McpError(TRANSPORT_ERROR, f"writing to the MCP server failed: {error}") from error
+
+    def read(self, timeout: float) -> bytes | None:
+        line = self._reader.read(timeout)
+        if line is None:
+            self.peer_closed = True
+        return line
+
+
+class McpClient:
+    """One connection to one MCP server, over a transport that is already open."""
+
+    def __init__(self, transport: Transport, timeout: float, client_version: str = "") -> None:
+        self._transport = transport
         self._timeout = timeout
         self._next_id = 0
         self._version: str | None = None
         self._legacy = False
+        # A legacy server is told the agreed version on every request AFTER the handshake, never on
+        # `initialize` itself -- that request is what decides the version.
+        self._legacy_ready = False
         self._client_version = client_version
-        self.peer_closed = False
+
+    @classmethod
+    def over_streams(cls, stdin: BinaryIO, stdout: BinaryIO, timeout: float, client_version: str = "") -> "McpClient":
+        return cls(_StdioTransport(stdin, stdout), timeout, client_version)
+
+    @property
+    def peer_closed(self) -> bool:
+        return self._transport.peer_closed
+
+    def close(self) -> None:
+        self._transport.close()
 
     # -- framing ------------------------------------------------------------------------------------------
 
@@ -140,25 +223,42 @@ class McpClient:
             f"{META_PREFIX}clientCapabilities": {},
         }
 
-    def _send(self, message: Mapping[str, Any]) -> None:
+    def _message_headers(self, message: Mapping[str, Any], extra: Mapping[str, str] = {}) -> dict[str, str]:
+        """The request metadata the Streamable HTTP binding requires, mirrored from the body.
+
+        Built for every message and ignored by the stdio transport, so there is ONE place that decides what a
+        header says and it cannot drift from the body it was copied from -- which is exactly what a server
+        rejects with `HeaderMismatch`. The version header is omitted before a legacy handshake has agreed
+        one, because that request is what agrees it."""
+        headers: dict[str, str] = {}
+        method = message.get("method")
+        if isinstance(method, str):
+            headers["Mcp-Method"] = method
+        if not self._legacy:
+            headers["MCP-Protocol-Version"] = self._version or MODERN_VERSION
+        elif self._legacy_ready and self._version:
+            headers["MCP-Protocol-Version"] = self._version
+        params = message.get("params")
+        key = NAMED_METHODS.get(method) if isinstance(method, str) else None
+        if key and isinstance(params, Mapping):
+            name = params.get(key)
+            if isinstance(name, str):
+                headers["Mcp-Name"] = header_value(name)
+        headers.update(extra)
+        return headers
+
+    def _send(self, message: Mapping[str, Any], headers: Mapping[str, str] = {}) -> None:
         try:
             encoded = canonical_json(message)
         except ValueError as error:
             raise McpError(PROTOCOL_ERROR, f"cannot encode a request for the MCP server: {error}") from error
-        if b"\n" in encoded:  # canonical_json escapes newlines; this is the framing invariant, asserted
-            raise McpError(PROTOCOL_ERROR, "a request would break the one-message-per-line framing")
-        try:
-            self._stdin.write(encoded + b"\n")
-            self._stdin.flush()
-        except OSError as error:
-            raise McpError(TRANSPORT_ERROR, f"writing to the MCP server failed: {error}") from error
+        self._transport.send(encoded, self._message_headers(message, headers))
 
     def _receive(self, request_id: int) -> dict[str, Any]:
         """The response to `request_id`. Notifications are skipped; a server REQUEST is refused."""
         while True:
-            line = self._reader.read(self._timeout)
+            line = self._transport.read(self._timeout)
             if line is None:
-                self.peer_closed = True
                 raise McpError(TRANSPORT_ERROR, "the MCP server closed its output before answering")
             try:
                 message = strict_json_loads(line, max_bytes=MAX_MESSAGE_BYTES)
@@ -185,14 +285,16 @@ class McpClient:
         """The protocol version in use, once connected."""
         return self._version or ""
 
-    def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    def request(
+        self, method: str, params: dict[str, Any] | None = None, headers: Mapping[str, str] = {}
+    ) -> dict[str, Any]:
         """Send one request and return its `result`, or raise McpError (JSON-RPC errors included)."""
         self._next_id += 1
         request_id = self._next_id
         body: dict[str, Any] = dict(params or {})
         if not self._legacy:
             body["_meta"] = {**body.get("_meta", {}), **self._meta()}
-        self._send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": body})
+        self._send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": body}, headers)
         message = self._receive(request_id)
         if "error" in message:
             raise _error_from(message["error"], method)
@@ -274,6 +376,7 @@ class McpClient:
                 f"the MCP server answered initialize with {agreed!r}; Portmark speaks {list(LEGACY_VERSIONS)}",
             )
         self._version = agreed
+        self._legacy_ready = True
         self.notify("notifications/initialized")
         return agreed
 

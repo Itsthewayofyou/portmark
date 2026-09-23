@@ -74,7 +74,7 @@ class ClientTests(unittest.TestCase):
     def client(self, mode, timeout=5.0):
         process = launch(mode)
         self.addCleanup(self._stop, process)
-        return McpClient(process.stdin, process.stdout, timeout)
+        return McpClient.over_streams(process.stdin, process.stdout, timeout)
 
     def _stop(self, process):
         # Kill first, close after: closing stdout while the client's reader thread is blocked on it would

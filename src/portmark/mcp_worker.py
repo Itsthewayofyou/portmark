@@ -130,7 +130,7 @@ def _connect(server: McpServerConfig) -> tuple[subprocess.Popen[bytes], McpClien
         _shutdown(process)
         raise _fail(TRANSPORT_ERROR, "the MCP server has no usable standard streams")
     version = os.environ.get(VERSION_ENV, "")
-    client = McpClient(process.stdin, process.stdout, request_timeout(server.timeout_seconds), version)
+    client = McpClient.over_streams(process.stdin, process.stdout, request_timeout(server.timeout_seconds), version)
     try:
         client.connect()
         return process, client
@@ -145,7 +145,7 @@ def _connect(server: McpServerConfig) -> tuple[subprocess.Popen[bytes], McpClien
     if process.stdin is None or process.stdout is None:
         _shutdown(process)
         raise _fail(TRANSPORT_ERROR, "the MCP server has no usable standard streams")
-    client = McpClient(process.stdin, process.stdout, request_timeout(server.timeout_seconds), version)
+    client = McpClient.over_streams(process.stdin, process.stdout, request_timeout(server.timeout_seconds), version)
     try:
         client.connect_legacy()
     except McpError as error:
