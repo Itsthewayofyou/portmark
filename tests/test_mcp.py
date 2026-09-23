@@ -152,7 +152,7 @@ class ClientTests(unittest.TestCase):
 class ConfigTests(unittest.TestCase):
     BASE = {
         "schema": "portmark.mcp.config.v1",
-        "servers": {"files": {"command": "/usr/bin/true", "tools": {"read_file": {"pin": "sha256:" + "a" * 64, "read_only": True}}}},
+        "servers": {"files": {"command": sys.executable, "tools": {"read_file": {"pin": "sha256:" + "a" * 64, "read_only": True}}}},
     }
 
     def load(self, document):
@@ -202,7 +202,7 @@ class ConfigTests(unittest.TestCase):
             "alias is not a valid tool name": with_tool(alias="files read"),
             "server name too long": {"schema": "portmark.mcp.config.v1", "servers": {"s" * 40: self.BASE["servers"]["files"]}},
             "server tool name with a space": {"schema": "portmark.mcp.config.v1", "servers": {"files": {
-                "command": "/usr/bin/true", "tools": {"read file": {"pin": "sha256:" + "a" * 64, "read_only": True}}}}},
+                "command": sys.executable, "tools": {"read file": {"pin": "sha256:" + "a" * 64, "read_only": True}}}}},
         }
         for label, document in cases.items():
             with self.subTest(label):
@@ -212,7 +212,7 @@ class ConfigTests(unittest.TestCase):
         # MCP allows a tool name to start or end on punctuation; Portmark does not, and it will not quietly
         # trim one. (Length never reaches here: a 32-character server plus a 128-character tool fits in 192.)
         document = {"schema": "portmark.mcp.config.v1", "servers": {"files": {
-            "command": "/usr/bin/true", "tools": {"hidden.": {"pin": "sha256:" + "a" * 64, "read_only": True}}}}}
+            "command": sys.executable, "tools": {"hidden.": {"pin": "sha256:" + "a" * 64, "read_only": True}}}}}
         with self.assertRaises(McpConfigError) as raised:
             self.load(document)
         self.assertIn("alias", str(raised.exception))
@@ -222,7 +222,7 @@ class ConfigTests(unittest.TestCase):
     def test_two_servers_cannot_claim_one_registered_name(self):
         document = json.loads(json.dumps(self.BASE))
         document["servers"]["other"] = {
-            "command": "/usr/bin/true",
+            "command": sys.executable,
             "tools": {"x": {"pin": "sha256:" + "b" * 64, "read_only": True, "alias": "mcp.files.read_file"}},
         }
         with self.assertRaises(McpConfigError):
