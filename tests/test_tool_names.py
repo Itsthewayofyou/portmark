@@ -26,6 +26,12 @@ VALID = (
     "mcp.files.read_file",
     "a-b_c.d9",
     "A" * MAX_TOOL_NAME_LENGTH,
+    # MCP's own examples (specification 2026-07-28, "Tool Names") must be accepted as-is.
+    "getUser",
+    "DATA_EXPORT_v2",
+    "admin.tools.list",
+    # A 128-character MCP name under Portmark's `mcp.<server>.` prefix still fits.
+    "mcp.files." + "n" * 128,
 )
 INVALID = {
     "empty": "",

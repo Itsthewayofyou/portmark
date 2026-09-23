@@ -8,8 +8,11 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
 
 ### Tool names are identifiers, checked where authority is defined
 
-- **A tool name must now be 1 to 64 characters**, letters, digits and inner `.`, `_` or `-`, starting and
-  ending on a letter or digit (`portmark.models.validate_tool_name`). Whitespace, control characters (a
+- **A tool name must now be 1 to 192 characters**, letters, digits and inner `.`, `_` or `-`, starting and
+  ending on a letter or digit (`portmark.models.validate_tool_name`). The character set is the one the MCP
+  specification (revision 2026-07-28) says SHOULD be the only allowed one; the length leaves room for the
+  `mcp.<server>.` prefix on top of a 128-character MCP tool name. The limit applies to the final registered
+  name, after namespacing (owner decision, 2026-09-22): a generated name over the limit is refused, never shortened. Whitespace, control characters (a
   newline in a name is log injection), look-alike Unicode, path and URL separators, and the empty string are
   refused. Before this, any non-empty string was accepted.
 - The check runs at every door that **defines** tool authority: a permit grant (so an incoming A2A envelope is
