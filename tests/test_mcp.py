@@ -856,9 +856,17 @@ class HttpAddressTests(unittest.TestCase):
 
     def test_allow_private_does_not_permit_a_public_address(self):
         # `allow_private` widens the rule to loopback and private answers, not to the internet.
-        with self.assertRaises(McpError) as raised:
-            resolve_endpoint_address("93.184.215.14", 443, allow_private=True)
-        self.assertIn("public", str(raised.exception))
+        for host in ("93.184.215.14", "2606:2800:21f:cb07:6820:80da:af6b:8b2c", "240.0.0.1"):
+            with self.subTest(host):
+                with self.assertRaises(McpError) as raised:
+                    resolve_endpoint_address(host, 443, allow_private=True)
+                self.assertIn("not a loopback or private", str(raised.exception))
+
+    def test_the_ipv6_loopback_is_allowed_like_the_ipv4_one(self):
+        # Python reports `::1` as RESERVED as well as loopback. Checking reserved first would refuse
+        # `https://localhost` on every machine whose resolver answers IPv6 first.
+        self.assertEqual(resolve_endpoint_address("::1", 443, allow_private=True), "::1")
+        self.assertEqual(resolve_endpoint_address("fd00::1", 443, allow_private=True), "fd00::1")
 
     def test_addresses_that_are_never_allowed_are_refused_even_with_allow_private(self):
         for host in ("224.0.0.1", "0.0.0.0", "169.254.1.1"):  # noqa: S104  # nosec B104 - refusing it is the point
@@ -1066,7 +1074,8 @@ class HttpTlsTests(unittest.TestCase):
         context = ssl.create_default_context()
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
-        transport = HttpTransport("https://localhost:1/mcp", 5.0, 5.0, allow_private=True, context=context)
+        # A literal, so this test turns only on the context: no name is resolved on the way.
+        transport = HttpTransport("https://127.0.0.1:1/mcp", 5.0, 5.0, allow_private=True, context=context)
         with self.assertRaises(McpError) as raised:
             transport.send(b'{"jsonrpc":"2.0","id":1,"method":"x","params":{}}', {})
         self.assertIn("verify", str(raised.exception))
