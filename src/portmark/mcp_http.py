@@ -144,8 +144,17 @@ class HttpTransport(Transport):
         request_headers = self._request_headers(encoded, headers)
         connection = self._open()
         try:
+            # Re-armed here, and again before the answer is read, because the socket timeout set in `_open`
+            # was computed BEFORE the TCP connect and the TLS handshake: without this, the time those took is
+            # never deducted and reading the status line and headers gets a whole fresh allowance.
+            self._arm()
             connection.request("POST", self._path, body=encoded, headers=request_headers)
+            self._arm()
             response = connection.getresponse()
+            # `getresponse()` reads the status line and headers itself, each read bounded by the timeout armed
+            # above. The budget is checked again HERE so an answer is never accepted after the deadline has
+            # passed, whatever the individual reads cost.
+            self._remaining()
             self._absorb(response, expects_reply)
         except (OSError, http.client.HTTPException) as error:
             raise McpError(TRANSPORT_ERROR, f"the MCP endpoint could not be reached: {type(error).__name__}") from None
@@ -163,7 +172,9 @@ class HttpTransport(Transport):
 
     def _request_headers(self, encoded: bytes, headers: Mapping[str, str]) -> dict[str, str]:
         host = f"[{self._host}]" if ":" in self._host else self._host
-        if self._port not in (443, 80):
+        # The default port belongs to the SCHEME, not to a list of well-known ports: 80 is the default for
+        # http and NOT for https, so `https://host:80/` must say `:80` or the server is told 443.
+        if self._port != (443 if self._scheme == "https" else 80):
             host += f":{self._port}"
         built = {
             "Host": host,

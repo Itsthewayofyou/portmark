@@ -886,6 +886,105 @@ class HttpAddressTests(unittest.TestCase):
             resolve_endpoint_address("::ffff:127.0.0.1", 443, allow_private=False)
 
 
+class HttpBudgetAndHostTests(unittest.TestCase):
+    """Two things `send` owes that no live server can prove: the Host port, and the total budget."""
+
+    def transport(self, url, total=2.0, request_timeout=30.0):
+        return HttpTransport(url, request_timeout, total, allow_private=True)
+
+    def test_the_host_port_is_judged_against_the_scheme_not_a_list(self):
+        # 80 is the default for http and NOT for https. Treating both as "default" tells an https server on
+        # port 80 that it is on 443, and a server that validates the Host header rejects the request.
+        cases = {
+            "https://mcp.test/mcp": "mcp.test",
+            "https://mcp.test:443/mcp": "mcp.test",
+            "https://mcp.test:80/mcp": "mcp.test:80",
+            "https://mcp.test:8443/mcp": "mcp.test:8443",
+            "http://mcp.test/mcp": "mcp.test",
+            "http://mcp.test:80/mcp": "mcp.test",
+            "http://mcp.test:443/mcp": "mcp.test:443",
+            "https://[::1]:443/mcp": "[::1]",
+            "https://[::1]:80/mcp": "[::1]:80",
+        }
+        for url, expected in cases.items():
+            with self.subTest(url):
+                built = self.transport(url)._request_headers(b"{}", {})
+                self.assertEqual(built["Host"], expected)
+
+    # -- a connection that answers on command, so the budget can be observed ---------------------------
+
+    class Socket:
+        def __init__(self):
+            self.armed = []
+
+        def settimeout(self, value):
+            self.armed.append(value)
+
+    class Response:
+        def __init__(self, status=200, body=b'{"jsonrpc":"2.0","id":1,"result":{}}'):
+            self.status = status
+            self._body = body
+
+        def getheader(self, name, default=None):
+            return {"Content-Type": "application/json"}.get(name, default) if self._body else default
+
+        def read(self, size=-1):
+            body, self._body = self._body[:size], self._body[size:]
+            return body
+
+    def connection_for(self, transport, sock, before_request=0.0, before_response=0.0, response=None):
+        outer = self
+        seen = {}
+
+        class Connection:
+            def request(self, *args, **kwargs):
+                time.sleep(before_request)
+
+            def getresponse(self):
+                # What the socket's timeout was AT THIS MOMENT. Arming that happens later, while the body is
+                # read, must not be able to satisfy an assertion about the header phase.
+                seen["armed"] = list(sock.armed)
+                time.sleep(before_response)
+                return response or outer.Response()
+
+            def close(self):
+                seen["closed"] = True
+
+        def open_it():
+            transport._sock = sock
+            return Connection()
+
+        return open_it, seen
+
+    def test_the_budget_is_re_armed_before_the_answer_is_read(self):
+        # The socket timeout set while opening was computed BEFORE the connect and the TLS handshake. If it
+        # is not re-armed, reading the status line and headers gets a whole fresh allowance and the call can
+        # run for the budget twice over. Measured AT `getresponse`, because `_read_bounded` arms again later.
+        transport = self.transport("https://mcp.test/mcp", total=4.0, request_timeout=30.0)
+        sock = self.Socket()
+        open_it, seen = self.connection_for(transport, sock, before_request=0.4)
+        with patch.object(transport, "_open", open_it):
+            transport.send(b'{"jsonrpc":"2.0","id":1,"method":"x","params":{}}', {})
+        armed = seen["armed"]
+        self.assertGreaterEqual(len(armed), 2)
+        self.assertLessEqual(max(armed), 4.0)  # never the 30 s per-message timeout
+        self.assertLess(armed[-1], armed[0] - 0.2)  # the time already spent was deducted
+
+    def test_an_accepted_notification_that_arrives_after_the_budget_is_refused(self):
+        # A `202` is answered without reading a body, so nothing else re-checks the clock on that path: only
+        # the check after `getresponse` can refuse an acknowledgement that came back too late.
+        transport = self.transport("https://mcp.test/mcp", total=0.5, request_timeout=30.0)
+        sock = self.Socket()
+        open_it, _ = self.connection_for(
+            transport, sock, before_response=0.8, response=self.Response(202, b"")
+        )
+        with patch.object(transport, "_open", open_it):
+            with self.assertRaises(McpError) as raised:
+                transport.send(b'{"jsonrpc":"2.0","method":"notifications/x","params":{}}', {}, expects_reply=False)
+        self.assertEqual(raised.exception.code, "mcp_transport_error")
+        self.assertIn("budget", str(raised.exception))
+
+
 class HeaderValueTests(unittest.TestCase):
     def test_encoding(self):
         cases = {
