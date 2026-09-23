@@ -10,6 +10,7 @@ import datetime
 import io
 import json
 import os
+import socket
 import ssl
 import subprocess  # nosec B404 - launches this test's own fake MCP server
 import sys
@@ -914,11 +915,22 @@ class HttpBudgetAndHostTests(unittest.TestCase):
     # -- a connection that answers on command, so the budget can be observed ---------------------------
 
     class Socket:
+        """A stand-in for the connected socket. It answers everything the transport asks of one.
+
+        `shutdown` is not decoration: the deadline watchdog calls it, and a double without it raised
+        AttributeError inside the watchdog's own thread -- where nothing catches it and nothing joins it.
+        The tests still passed, because the budget flag is set before the shutdown is attempted, which is
+        exactly how a double that does not behave like the real thing hides a whole code path."""
+
         def __init__(self):
             self.armed = []
+            self.shutdowns = []
 
         def settimeout(self, value):
             self.armed.append(value)
+
+        def shutdown(self, how):
+            self.shutdowns.append(how)
 
     class Response:
         def __init__(self, status=200, body=b'{"jsonrpc":"2.0","id":1,"result":{}}'):
@@ -983,6 +995,9 @@ class HttpBudgetAndHostTests(unittest.TestCase):
                 transport.send(b'{"jsonrpc":"2.0","method":"notifications/x","params":{}}', {}, expects_reply=False)
         self.assertEqual(raised.exception.code, "mcp_transport_error")
         self.assertIn("budget", str(raised.exception))
+        # The watchdog did not merely set a flag: it shut the socket down, which is what releases a reader
+        # that a per-operation timeout would never have interrupted.
+        self.assertEqual(sock.shutdowns, [socket.SHUT_RDWR])
 
 
 class HttpDripTests(unittest.TestCase):
