@@ -17,7 +17,7 @@ from .projection import project_state_for_migration, provider_view
 from .providers import ModelProvider
 from .security import _MIGRATION_RECEIPT_FIELDS, _OPTIONAL_MIGRATION_RECEIPT_FIELDS, AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, MigrationAttesterProtocol, MigrationPreflightProtocol, PermitExpiredError, SecurityError, arguments_hash, audit_head_payload, canonical_json, effect_id, migration_envelope_digest, migration_receipt_payload, require_unexpired, verified_approval_token
 from .storage import InMemoryRuntimeStore, RuntimeStore
-from .tools import ToolExecutionError, ToolKilledError, ToolRegistry
+from .tools import ToolExecutionError, ToolKilledError, ToolRegistry, tool_error_code
 
 logger = logging.getLogger(__name__)
 
@@ -875,6 +875,11 @@ class AgentHost:
                         "cause": type(error.__cause__).__name__ if error.__cause__ is not None else None,
                         "cause_message": str(error.__cause__) if error.__cause__ is not None else "",
                     }
+                    # PR 2: the machine code an isolated tool reported (an MCP tool separates "the server
+                    # said isError" from "the connection failed"). Shape-checked in tools.tool_error_code, so
+                    # only a short identifier can reach the audit chain -- never the tool's own message.
+                    if (code := tool_error_code(error)) is not None:
+                        failed_details["error_code"] = code
                     # Section 7 PR 2b: for a side-effecting tool this settled the ledger `unknown`, so
                     # record effect_status:"unknown" (round 2 -- self-contained with tool.killed) AND the
                     # claimed containment, on the same eid-present condition.

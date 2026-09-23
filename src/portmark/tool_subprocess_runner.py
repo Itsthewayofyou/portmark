@@ -26,7 +26,9 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import functools
 import json
+import re
 import os
 import signal
 import sys
@@ -157,9 +159,9 @@ def main() -> None:
         # it is not -- report which caps failed (observable), never silently run under weaker caps.
         unapplied = _apply_resource_limits(request.get("rlimits"))
         if unapplied:
-            ok, value = False, "worker could not apply resource limits: " + ", ".join(unapplied)
+            ok, value, code = False, "worker could not apply resource limits: " + ", ".join(unapplied), None
         else:
-            ok, value = _import_and_run(module_name, object_path, arguments, sink, effect_id)
+            ok, value, code = _import_and_run(module_name, object_path, arguments, sink, effect_id)
     finally:
         sink.close()
 
@@ -169,7 +171,7 @@ def main() -> None:
     # up leaks today; the sweep must cover it too. (The pre-tool early returns above cannot have
     # spawned anything, so they neither reach here nor need the sweep.)
     if not ok:
-        _finish(_respond_error, value, real_stdout)
+        _finish(functools.partial(_respond_error, code=code), value, real_stdout)
         return
     try:
         encoded_size = len(canonical_json(value))
@@ -251,9 +253,22 @@ def _accepts_effect_id(fn: Any) -> bool:
     return positional >= 2
 
 
+# A tool may attach a machine-readable failure code to the exception it raises (PR 2: an MCP tool
+# distinguishes "the server said isError" from "the connection failed", which the host records and an
+# operator alerts on). The runner stays generic: it copies an ALLOWLISTED-SHAPE code and nothing else --
+# never the exception's message, which could carry tool or user data into the audit chain.
+_ERROR_CODE_ATTRIBUTE = "portmark_error_code"
+_ERROR_CODE = re.compile(r"\A[a-z][a-z0-9_]{0,31}\Z")
+
+
+def _error_code_of(error: BaseException) -> str | None:
+    code = getattr(error, _ERROR_CODE_ATTRIBUTE, None)
+    return code if isinstance(code, str) and _ERROR_CODE.match(code) else None
+
+
 def _import_and_run(
     module_name: str, object_path: str, arguments: dict[str, Any], sink: Any, effect_id: str | None = None
-) -> tuple[bool, Any]:
+) -> tuple[bool, Any, str | None]:
     """Import the untrusted tool and run it, with Python stdout redirected to a discard sink.
 
     Returns ``(True, result)`` or ``(False, error_message)``. It NEVER writes the protocol reply
@@ -272,20 +287,20 @@ def _import_and_run(
                     raise AttributeError
                 loaded = getattr(loaded, part)
         except (ImportError, AttributeError):
-            return False, "could not import tool target"
+            return False, "could not import tool target", None
         except BaseException as error:  # noqa: BLE001 - module-scope code failed; fail closed
-            return False, f"tool import raised {type(error).__name__}"
+            return False, f"tool import raised {type(error).__name__}", _error_code_of(error)
         if not callable(loaded):
-            return False, "tool target is not callable"
+            return False, "tool target is not callable", None
         if effect_id is not None and not _accepts_effect_id(loaded):
             # Contract violation for a side-effecting tool: fail closed with a controlled reply,
             # never call it (a call without the key, or a double call, could mis-apply the effect).
-            return False, "tool does not accept effect_id"
+            return False, "tool does not accept effect_id", None
         try:
             result = loaded(arguments, effect_id) if effect_id is not None else loaded(arguments)
-            return True, result
+            return True, result, None
         except BaseException as error:  # noqa: BLE001 - any tool failure fails closed
-            return False, f"tool raised {type(error).__name__}"
+            return False, f"tool raised {type(error).__name__}", _error_code_of(error)
 
 
 def _respond_ok(result: Any, stream: Any = None) -> None:
@@ -299,9 +314,12 @@ def _respond_ok(result: Any, stream: Any = None) -> None:
     out.flush()
 
 
-def _respond_error(message: str, stream: Any = None) -> None:
+def _respond_error(message: str, stream: Any = None, code: str | None = None) -> None:
     out = sys.stdout if stream is None else stream
-    out.write(json.dumps({"ok": False, "error": message}))
+    reply: dict[str, Any] = {"ok": False, "error": message}
+    if code is not None and _ERROR_CODE.match(code):
+        reply["error_code"] = code
+    out.write(json.dumps(reply))
     out.flush()
 
 

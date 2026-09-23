@@ -53,6 +53,8 @@ class RuntimeConfig:
     store_backend: str = "sqlite"
     store_path: str | None = None
     policy_path: str | None = None
+    # MCP.md: the operator's MCP servers and the tools they may expose, each approved by its pin.
+    mcp_config_path: str | None = None
     trust_registry_path: str | None = None
     audit_floor_path: str | None = None
     reload_policy: bool = False
@@ -95,6 +97,7 @@ class RuntimeConfig:
             store_backend=os.environ.get("PORTMARK_STORE_BACKEND", "sqlite"),
             store_path=os.environ.get("PORTMARK_STORE_PATH"),
             policy_path=os.environ.get("PORTMARK_POLICY_PATH"),
+            mcp_config_path=os.environ.get("PORTMARK_MCP_CONFIG"),
             trust_registry_path=os.environ.get("PORTMARK_TRUST_REGISTRY_PATH"),
             audit_floor_path=os.environ.get("PORTMARK_AUDIT_FLOOR_PATH"),
             reload_policy=os.environ.get("PORTMARK_RELOAD_POLICY") == "1",
@@ -139,6 +142,7 @@ class RuntimeConfig:
             store_backend=getattr(args, "store_backend", None) or self.store_backend,
             store_path=args.store_path or self.store_path,
             policy_path=args.policy_path or self.policy_path,
+            mcp_config_path=getattr(args, "mcp_config", None) or self.mcp_config_path,
             trust_registry_path=args.trust_registry_path or self.trust_registry_path,
             audit_floor_path=getattr(args, "audit_floor_path", None) or self.audit_floor_path,
             reload_policy=bool(args.reload_policy or self.reload_policy),

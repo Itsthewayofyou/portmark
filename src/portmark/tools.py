@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import os
 import queue
 import secrets
@@ -195,6 +196,18 @@ DEFAULT_MAX_INFLIGHT_THREADED_TOOLS = 64
 _CAN_KILL_PROCESS_GROUP = hasattr(os, "killpg") and hasattr(os, "getpgid")
 
 
+# The attribute an isolated worker's failure code is carried on, and the shape it must have. Kept in step
+# with tool_subprocess_runner._ERROR_CODE (the two sides of one pipe).
+TOOL_ERROR_CODE = "portmark_error_code"
+TOOL_ERROR_CODE_PATTERN = re.compile(r"\A[a-z][a-z0-9_]{0,31}\Z")
+
+
+def tool_error_code(error: BaseException) -> str | None:
+    """The machine-readable failure code an isolated tool reported, when it reported one."""
+    code = getattr(error, TOOL_ERROR_CODE, None)
+    return code if isinstance(code, str) and TOOL_ERROR_CODE_PATTERN.match(code) else None
+
+
 class ToolExecutionError(SecurityError):
     pass
 
@@ -259,6 +272,7 @@ class ToolRegistry:
             self._filesystem_root_identity = (root_stat.st_dev, root_stat.st_ino)
         self._tools: dict[str, Tool] = {}
         self._isolated: dict[str, _IsolatedSpec] = {}
+        self._error_codes: dict[str, frozenset[str]] = {}
         self._timeouts: dict[str, float] = {}
         self._max_output: dict[str, int] = {}
         self._side_effecting: set[str] = set()
@@ -330,6 +344,7 @@ class ToolRegistry:
             )
         self._tools[name] = tool
         self._isolated.pop(name, None)
+        self._error_codes.pop(name, None)
         # A registration REPLACES the tool completely: a limit it does not name is the registry default,
         # never a leftover from the tool it replaces (register() has no output-cap override at all).
         self._set_override(self._timeouts, name, timeout)
@@ -356,6 +371,7 @@ class ToolRegistry:
         side_effecting: bool = False,
         env: dict[str, str] | None = None,
         reconcile: str | None = None,
+        error_codes: tuple[str, ...] = (),
     ) -> None:
         """Register a tool that runs in a separate, deadline-terminated subprocess (EV-002).
 
@@ -424,6 +440,13 @@ class ToolRegistry:
             # only the module:function SYNTAX check and the tool!=reconcile distinctness check (both pure,
             # no import). Semantic/read-only correctness of the reconcile is the operator's own integration
             # test, run in a credential-free, egress-denied environment -- not a runtime import.
+        for code in error_codes:
+            if not TOOL_ERROR_CODE_PATTERN.match(code):
+                raise ValueError(f"error code {code!r} must match {TOOL_ERROR_CODE_PATTERN.pattern}")
+        # Codex review R1: the codes this tool may report, declared at REGISTRATION. Without an allowlist any
+        # isolated tool could raise with `portmark_error_code="mcp_pin_drift"` and forge another tool's
+        # security classification in the audit chain and in whatever alerts on it. The default is none.
+        self._error_codes[name] = frozenset(error_codes)
         self._isolated[name] = _IsolatedSpec(target=target, env=dict(env or {}), reconcile=reconcile)
         self._tools.pop(name, None)
         # Complete replacement, as in register(): an omitted limit reverts to the registry default.
@@ -589,7 +612,9 @@ class ToolRegistry:
         reconcile_spec = _IsolatedSpec(target=spec.reconcile, env=dict(spec.env))
         timeout = self._timeouts.get(name, self.default_timeout)
         cap = self._max_output.get(name, self.max_output_bytes)
-        return self._invoke_isolated(reconcile_spec, arguments, timeout, cap, effect_id=effect_id)
+        return self._invoke_isolated(
+            reconcile_spec, arguments, timeout, cap, effect_id=effect_id, error_codes=self._error_codes.get(name, frozenset())
+        )
 
     def names(self) -> tuple[str, ...]:
         return tuple(sorted(set(self._tools) | set(self._isolated)))
@@ -645,7 +670,9 @@ class ToolRegistry:
                 del self._armed[launch_capability]  # one-use: consume on the exact match
 
         if is_isolated:
-            return self._invoke_isolated(self._isolated[name], arguments, timeout, cap, effect_id=effect_id)
+            return self._invoke_isolated(
+                self._isolated[name], arguments, timeout, cap, effect_id=effect_id, error_codes=self._error_codes.get(name, frozenset())
+            )
 
         if name in self._side_effecting:
             # Finding #3 / EV-002: the thread + queue-timeout path below cannot
@@ -709,7 +736,8 @@ class ToolRegistry:
         return self._checked_output(value, cap)
 
     def _invoke_isolated(
-        self, spec: _IsolatedSpec, arguments: dict[str, Any], timeout: float, cap: int, effect_id: str | None = None
+        self, spec: _IsolatedSpec, arguments: dict[str, Any], timeout: float, cap: int, effect_id: str | None = None,
+        error_codes: frozenset[str] = frozenset(),
     ) -> Any:
         # Section 7 #6: hand the worker its resource caps. cpu_seconds is a kernel backstop for the
         # wall-clock deadline (a CPU-bound tool that ignores the clock still dies), set a little
@@ -853,7 +881,13 @@ class ToolRegistry:
         if not isinstance(response, dict) or "ok" not in response:
             raise ToolExecutionError("isolated tool produced invalid output")
         if not response["ok"]:
-            raise ToolExecutionError(f"isolated tool failed: {response.get('error', 'unknown')}")
+            failure = ToolExecutionError(f"isolated tool failed: {response.get('error', 'unknown')}")
+            # The worker's machine code, checked against the same shape rule on this side of the pipe: the
+            # host branches on the CODE, never on the message text.
+            code = response.get("error_code")
+            if isinstance(code, str) and code in error_codes:
+                setattr(failure, TOOL_ERROR_CODE, code)
+            raise failure
         return self._checked_output(response.get("result"), cap)
 
     def _checked_output(self, result: Any, cap: int) -> Any:

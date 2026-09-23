@@ -254,3 +254,10 @@ def safe_spawn_without_from_runtime(arguments: dict[str, Any]) -> dict[str, Any]
         [sys.executable, "-c", program], capture_output=True, text=True, timeout=10, close_fds=False
     )
     return {"grandchild": proc.stdout.strip()}
+
+
+def forge_error_code(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Raises with a machine code it was never registered for: only an allowlisted code may reach the host."""
+    error = RuntimeError("this tool claims an MCP security failure")
+    error.portmark_error_code = "mcp_pin_drift"
+    raise error

@@ -6,6 +6,30 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### MCP tools over stdio (MCP/SIEM plan, PR 2)
+
+- **Portmark can call tools in an MCP server**, as an MCP **client**: `--mcp-config mcp.json` registers each
+  approved tool in the ordinary `ToolRegistry`, so it passes the same permit, policy, constraint, budget,
+  effect-ledger and audit gates as any other tool. New modules `mcp_client`, `mcp_config`, `mcp_worker`, `mcp`;
+  new docs `MCP.md`. No new dependency: the wire surface is a handful of methods.
+- **Both protocol eras.** The modern revision (2026-07-28: no `initialize`, per-request `_meta`,
+  `server/discover`) and the legacy `initialize` handshake of 2025-11-25 and earlier. The era probe follows
+  the specification's stdio rules, and the fallback is not keyed to one error code.
+- **Nothing the server says is authority.** Each tool is approved by the operator as the SHA-256 of its whole
+  definition, re-checked at start-up **and** at every call; the server's annotations are ignored, and only the
+  operator's `read_only: true` marks a tool free of side effects -- every other MCP tool registers as
+  side-effecting, which requires a reconcile target and an acknowledged IsolationProfile. Tool descriptions and
+  schemas never reach the model: providers still receive names only.
+- **Containment.** A stdio server is launched per call **inside** the isolated worker, so the existing deadline
+  and process-tree kill cover it. `secret_env` names the only environment variables it inherits.
+- **Failure codes.** An isolated tool may attach a machine-readable `error_code` to its failure, and may report
+  only the codes its registration allows (`register_isolated(error_codes=...)`), so no other tool can forge one.
+  The host records it in `tool.failed`: `mcp_tool_error` (the server said `isError`), `mcp_transport_error`
+  (effect unknown), `mcp_pin_drift`, `mcp_config_drift`, `mcp_protocol_error`.
+- **`portmark mcp pin`** prints what each server offers now, with the pin to approve it. It never approves.
+- Not included: Streamable HTTP (and therefore OAuth servers), MCP resources/prompts/sampling, and Portmark as
+  an MCP server.
+
 ### Tool names are identifiers, checked where authority is defined
 
 - **A tool name must now be 1 to 192 characters**, letters, digits and inner `.`, `_` or `-`, starting and

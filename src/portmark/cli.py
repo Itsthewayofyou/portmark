@@ -262,6 +262,37 @@ def _floor_reader(config, audit_verifier):
     return LocalFloorWitness(config.audit_floor_path, config.host_id, None, audit_verifier)
 
 
+def _run_mcp(parser: argparse.ArgumentParser, args: argparse.Namespace, config) -> None:
+    """`portmark mcp pin`: what each server offers right now, and the pin that would approve it."""
+    from .mcp import dumps, pin_report
+    from .mcp_config import McpConfigError
+
+    if not config.mcp_config_path:
+        parser.error("mcp pin requires --mcp-config or PORTMARK_MCP_CONFIG")
+    try:
+        print(dumps(pin_report(config.mcp_config_path, args.server)))
+    except McpConfigError as error:
+        parser.error(str(error))
+
+
+def _install_mcp_tools(parser: argparse.ArgumentParser, path: str, tools):
+    """Check every pin against the live servers, then register the approved tools. Fails closed on drift."""
+    from .mcp import check_pins, register_mcp_tools
+    from .mcp_config import McpConfigError, load_config
+    from .security import SecurityError
+    from .tools import ToolRegistry
+
+    registry = tools if tools is not None else ToolRegistry()
+    try:
+        mcp_config = load_config(path)
+        check_pins(mcp_config)
+        names = register_mcp_tools(registry, mcp_config)
+    except (McpConfigError, SecurityError) as error:
+        parser.error(str(error))
+    print(f"MCP tools registered: {', '.join(names)}", file=sys.stderr)
+    return registry
+
+
 def _run_audit(parser: argparse.ArgumentParser, args: argparse.Namespace, store, audit_verifier) -> None:
     """`portmark audit export` and `portmark audit verify-export` (MCP/SIEM plan PR 1, owner decision D3c).
 
@@ -638,6 +669,10 @@ def main() -> None:
     parser.add_argument("--store-path", help="SQLite path or Postgres DSN for durable nonces, checkpoints, and audit heads")
     parser.add_argument("--policy-path", help="JSON host policy path")
     parser.add_argument("--tools", dest="tools_loader", help="load installed tools from module:function returning a ToolRegistry")
+    parser.add_argument(
+        "--mcp-config",
+        help="JSON file naming the MCP servers and the tools they may expose, each approved by its pin (MCP.md)",
+    )
     parser.add_argument("--trust-registry-path", help="JSON trust registry path for envelope signing keys")
     parser.add_argument(
         "--audit-floor-path",
@@ -755,6 +790,12 @@ def main() -> None:
     witness_kit.add_argument("--host-key-file", required=True, help="that host id's Ed25519 private key file")
     witness_kit.add_argument("--witness-public-key", required=True, help="the witness's public key (base64url), pinned for every answer")
     witness_kit.add_argument("--timeout", type=float, default=5.0, help="seconds per request (default 5)")
+    mcp_parser = subparsers.add_parser("mcp", help="inspect the tools an MCP server offers, and their pins")
+    mcp_commands = mcp_parser.add_subparsers(dest="mcp_command", required=True)
+    mcp_pin = mcp_commands.add_parser(
+        "pin", help="print each tool an MCP server offers now, with the pin to approve it (it never approves)"
+    )
+    mcp_pin.add_argument("--server", help="one server from the config (default: every server)")
     audit_parser = subparsers.add_parser("audit", help="export the audit chains for a SIEM, or verify an export")
     audit_commands = audit_parser.add_subparsers(dest="audit_command", required=True)
     export_parser = audit_commands.add_parser(
@@ -842,6 +883,9 @@ def main() -> None:
         if verification.status == "unverifiable":
             raise SystemExit(2)
         return
+    if args.command == "mcp":
+        _run_mcp(parser, args, config)
+        return
     if args.command == "audit":
         _run_audit(parser, args, store, audit_verifier)
         return
@@ -856,10 +900,14 @@ def main() -> None:
         return
     if args.tools_loader and not config.policy_path:
         parser.error("--tools requires --policy-path or PORTMARK_POLICY_PATH")
+    if config.mcp_config_path and not config.policy_path:
+        parser.error("--mcp-config requires --policy-path or PORTMARK_POLICY_PATH: an MCP tool needs a host grant")
     try:
         tools = load_tools(args.tools_loader)
     except ToolLoaderError as exc:
         parser.error(str(exc))
+    if config.mcp_config_path:
+        tools = _install_mcp_tools(parser, config.mcp_config_path, tools)
     host = make_host(
         config.provider_endpoint,
         host_id=config.host_id,
