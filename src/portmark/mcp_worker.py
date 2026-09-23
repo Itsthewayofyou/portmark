@@ -18,7 +18,15 @@ import sys
 from typing import Any
 
 from .mcp_client import CONFIG_DRIFT, PIN_DRIFT, PROTOCOL_ERROR, TRANSPORT_ERROR, McpClient, McpError
-from .mcp_config import McpServerConfig, McpToolConfig, definition_digest, load_config, request_timeout, server_digest
+from .mcp_config import (
+    HTTP,
+    McpServerConfig,
+    McpToolConfig,
+    definition_digest,
+    load_config,
+    request_timeout,
+    server_digest,
+)
 
 CONFIG_ENV = "PORTMARK_MCP_CONFIG"
 LAUNCH_ENV = "PORTMARK_MCP_LAUNCH"
@@ -118,13 +126,40 @@ def _shutdown(process: subprocess.Popen[bytes]) -> None:
         pass
 
 
-def _connect(server: McpServerConfig) -> tuple[subprocess.Popen[bytes], McpClient]:
-    """Launch the server and agree a protocol version, restarting it once if the probe killed it.
+def _connect_http(server: McpServerConfig) -> tuple[None, McpClient]:
+    """One MCP endpoint over Streamable HTTP. No process, and deliberately NO restart of any kind.
+
+    The stdio path relaunches a server that exited on the era probe. There is nothing to relaunch here, and a
+    second POST after an ambiguous first one is a replay: the server may already have acted on it. Era
+    selection is decided entirely by what the endpoint answered."""
+    from .mcp_http import HttpTransport  # noqa: PLC0415 - only an HTTP server pays for http.client and ssl
+
+    transport = HttpTransport(
+        server.url,
+        request_timeout(server.timeout_seconds),
+        server.timeout_seconds,
+        server.bearer_env,
+        os.environ.get(server.bearer_env) if server.bearer_env else None,
+        server.allow_private,
+    )
+    client = McpClient(transport, request_timeout(server.timeout_seconds), os.environ.get(VERSION_ENV, ""))
+    try:
+        client.connect_http()
+    except McpError as error:
+        client.close()
+        raise _WorkerError(error.code, str(error)) from error
+    return None, client
+
+
+def _connect(server: McpServerConfig) -> tuple[subprocess.Popen[bytes] | None, McpClient]:
+    """Reach the server and agree a protocol version, restarting a LAUNCHED one if the probe killed it.
 
     The stdio binding's own fallback rules assume the probe may be answered by silence or an error -- but some
     legacy servers simply EXIT on an unknown pre-`initialize` request. Talking `initialize` to that dead
     process would report a transport failure for a server that is merely old, so the second attempt gets a
     fresh process and skips the probe (Codex review R2)."""
+    if server.transport == HTTP:
+        return _connect_http(server)
     process = _launch(server)
     if process.stdin is None or process.stdout is None:
         _shutdown(process)
@@ -154,6 +189,13 @@ def _connect(server: McpServerConfig) -> tuple[subprocess.Popen[bytes], McpClien
     return process, client
 
 
+def _release(process: "subprocess.Popen[bytes] | None", client: McpClient) -> None:
+    """Let go of whatever was opened. An HTTP endpoint has no process to stop."""
+    client.close()
+    if process is not None:
+        _shutdown(process)
+
+
 def call(arguments: dict[str, Any], effect_id: str | None = None) -> Any:
     """Call the configured MCP tool once. `effect_id` is accepted (and deliberately not sent).
 
@@ -165,6 +207,10 @@ def call(arguments: dict[str, Any], effect_id: str | None = None) -> Any:
         definitions = client.list_tools()
         definition = definitions.get(tool.tool)
         if definition is None:
+            reason = client.rejected.get(tool.tool)
+            if reason:
+                # Excluded, not missing. Saying so points the operator at the definition, not at the pin.
+                raise _fail(PROTOCOL_ERROR, f"the MCP server's definition of {tool.tool!r} is unusable: {reason}")
             raise _fail(PIN_DRIFT, f"the MCP server no longer offers {tool.tool!r}")
         digest = definition_digest(definition)
         if digest != tool.pin:
@@ -178,7 +224,7 @@ def call(arguments: dict[str, Any], effect_id: str | None = None) -> Any:
     except McpError as error:
         raise _WorkerError(error.code, str(error)) from error
     finally:
-        _shutdown(process)
+        _release(process, client)
 
 
 def discover(arguments: dict[str, Any]) -> Any:
@@ -199,11 +245,13 @@ def discover(arguments: dict[str, Any]) -> Any:
             "server": server_name,
             "protocol_version": version,
             "tools": {name: definition_digest(definition) for name, definition in sorted(definitions.items())},
+            # Carried so `check_pins` can say an annotation is invalid, rather than "the tool is gone".
+            "rejected": dict(sorted(client.rejected.items())),
         }
     except McpError as error:
         raise _WorkerError(error.code, str(error)) from error
     finally:
-        _shutdown(process)
+        _release(process, client)
 
 
 def tool_environment(config_path: str, server: McpServerConfig, tool: McpToolConfig, version: str = "") -> dict[str, str]:

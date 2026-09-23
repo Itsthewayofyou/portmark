@@ -235,6 +235,9 @@ def _server_from_spec(name: str, value: Any) -> McpServerConfig:
         bearer_env = value.get("bearer_env", "")
         if not isinstance(bearer_env, str) or (bearer_env and not _ENV_NAME.match(bearer_env)):
             raise McpConfigError(f"{label}.bearer_env must be the NAME of an environment variable, not a token")
+        if bearer_env and url.startswith("http://"):
+            # A token on a plaintext connection is a token anyone on the path can read and reuse.
+            raise McpConfigError(f"{label} cannot send `bearer_env` over plain http; use https")
     timeout = value.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= MAX_TIMEOUT_SECONDS:
         raise McpConfigError(f"{label}.timeout_seconds must be a number from 0 (exclusive) to {MAX_TIMEOUT_SECONDS}")

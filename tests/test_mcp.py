@@ -6,9 +6,11 @@ that approves a tool definition, and the rule that nothing the server says is au
 """
 
 import base64
+import datetime
 import io
 import json
 import os
+import ssl
 import subprocess  # nosec B404 - launches this test's own fake MCP server
 import sys
 import tempfile
@@ -21,8 +23,26 @@ from unittest.mock import patch
 from portmark.cli import main as cli_main
 from portmark.factory import build_envelope, make_host
 from portmark.mcp import CALL_TARGET, McpStartupError, check_pins, pin_report, probe_server, register_mcp_tools
-from portmark.mcp_client import LEGACY_VERSION, MODERN_VERSION, McpClient, McpError
-from portmark.mcp_config import McpConfigError, config_from_bytes, definition_digest, load_config
+from portmark.mcp_client import (
+    LEGACY_VERSION,
+    MODERN_VERSION,
+    AnnotationError,
+    McpClient,
+    McpError,
+    header_value,
+    mirror_annotations,
+)
+from portmark.mcp_http import HttpTransport, resolve_endpoint_address
+from portmark import mcp_worker
+from portmark.mcp_config import (
+    McpConfigError,
+    config_from_bytes,
+    definition_digest,
+    load_config,
+    server_digest,
+)
+
+import mcp_http_server
 from portmark.models import Permit, ToolGrant
 from portmark.providers import ProviderDecision
 from portmark.security import EnvelopeSigner
@@ -197,6 +217,63 @@ class ConfigTests(unittest.TestCase):
         document = json.loads(json.dumps(self.BASE))
         document["servers"]["files"]["tools"]["read_file"]["alias"] = "files.read"
         self.assertEqual([tool.name for tool in self.load(document).tools()], ["files.read"])
+
+    def http(self, **server_changes):
+        tools = {"read_file": {"pin": "sha256:" + "a" * 64, "read_only": True}}
+        return {
+            "schema": "portmark.mcp.config.v1",
+            "servers": {"files": {"url": "https://mcp.example.com/mcp", "tools": tools, **server_changes}},
+        }
+
+    def test_an_http_server_loads_and_reports_its_transport(self):
+        config = self.load(self.http(bearer_env="MCP_TOKEN", allow_private=False))
+        server = config.servers["files"]
+        self.assertEqual(server.transport, "http")
+        self.assertEqual(server.bearer_env, "MCP_TOKEN")
+        self.assertEqual([tool.name for tool in config.tools()], ["mcp.files.read_file"])
+
+    def test_http_refusals(self):
+        cases = {
+            "both transports": {**self.http(), "servers": {"files": {
+                "command": sys.executable, "url": "https://x.test/mcp",
+                "tools": {"read_file": {"pin": "sha256:" + "a" * 64, "read_only": True}},
+            }}},
+            "neither transport": {**self.http(), "servers": {"files": {
+                "tools": {"read_file": {"pin": "sha256:" + "a" * 64, "read_only": True}},
+            }}},
+            "plain http without allow_private": self.http(url="http://mcp.example.com/mcp"),
+            "a bearer over plain http": self.http(url="http://127.0.0.1:9/mcp", allow_private=True, bearer_env="T"),
+            "a stdio key on an http server": self.http(secret_env=["T"]),
+            "a token instead of a variable name": self.http(bearer_env="sk-live-abc"),
+            "userinfo in the url": self.http(url="https://user:pw@mcp.example.com/mcp"),
+            "a query string": self.http(url="https://mcp.example.com/mcp?a=1"),
+            "a fragment": self.http(url="https://mcp.example.com/mcp#x"),
+            "a non-http scheme": self.http(url="ftp://mcp.example.com/mcp"),
+            "whitespace in the url": self.http(url="https://mcp.example.com/m cp"),
+            "allow_private is not a string": self.http(allow_private="yes"),
+        }
+        for label, document in cases.items():
+            with self.subTest(label):
+                with self.assertRaises(McpConfigError):
+                    self.load(document)
+
+    def test_an_http_key_on_a_stdio_server_is_refused(self):
+        document = json.loads(json.dumps(self.BASE))
+        document["servers"]["files"]["allow_private"] = True
+        with self.assertRaises(McpConfigError):
+            self.load(document)
+
+    def test_the_launch_digest_binds_the_endpoint_not_the_token(self):
+        # Rotating the secret must not invalidate an approved pin; repointing the config must.
+        base = self.load(self.http(bearer_env="MCP_TOKEN")).servers["files"]
+        same = self.load(self.http(bearer_env="MCP_TOKEN")).servers["files"]
+        moved = self.load(self.http(url="https://other.example.com/mcp", bearer_env="MCP_TOKEN")).servers["files"]
+        renamed = self.load(self.http(bearer_env="OTHER_TOKEN")).servers["files"]
+        self.assertEqual(server_digest(base), server_digest(same))
+        self.assertNotEqual(server_digest(base), server_digest(moved))
+        self.assertNotEqual(server_digest(base), server_digest(renamed))
+        # A stdio server and an http server can never collide, whatever their fields.
+        self.assertNotEqual(server_digest(base), server_digest(self.load(self.BASE).servers["files"]))
 
     def test_the_digest_ignores_protocol_meta_only(self):
         definition = {"name": "t", "description": "d", "inputSchema": {"type": "object"}}
@@ -580,3 +657,416 @@ class RegistrationContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HttpTransportTests(unittest.TestCase):
+    """The Streamable HTTP transport, against a fake server on loopback."""
+
+    def client(self, mode, timeout=5.0, bearer_name="", bearer_value=None):
+        server, port = mcp_http_server.start(mode)
+        self.addCleanup(server.server_close)  # cleanups run last-added-first: release, shutdown, then close
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.release.set)
+        self.server = server
+        transport = HttpTransport(
+            f"http://127.0.0.1:{port}/mcp", timeout, timeout, bearer_name, bearer_value, allow_private=True
+        )
+        return McpClient(transport, timeout, "9.9")
+
+    def headers_of(self, index=0):
+        return {name.lower(): value for name, value in self.server.seen[index][0].items()}
+
+    def test_a_modern_server_round_trips_over_json(self):
+        client = self.client("modern")
+        self.assertEqual(client.connect(), MODERN_VERSION)
+        self.assertIn("read_file", client.list_tools())
+        result = client.call_tool("read_file", {"path": "a.txt"})
+        self.assertEqual(result.value["content"][0]["text"], 'read_file:{"path": "a.txt"}')
+
+    def test_every_post_carries_the_headers_the_binding_requires(self):
+        # Mcp-Method, Mcp-Name and MCP-Protocol-Version are REQUIRED for compliance, and the version header
+        # must equal the body -- a server answers 400 with `HeaderMismatch` when it does not.
+        client = self.client("modern")
+        client.connect()
+        client.call_tool("read_file", {"path": "a.txt"})
+        headers, raw = self.server.seen[-1]
+        sent = {name.lower(): value for name, value in headers.items()}
+        body = json.loads(raw)
+        self.assertEqual(sent["mcp-method"], "tools/call")
+        self.assertEqual(sent["mcp-name"], "read_file")
+        self.assertEqual(sent["mcp-protocol-version"], MODERN_VERSION)
+        self.assertEqual(sent["mcp-protocol-version"], body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"])
+        self.assertIn("application/json", sent["accept"])
+        self.assertIn("text/event-stream", sent["accept"])
+
+    def test_an_event_stream_answer_is_read(self):
+        # A keep-alive comment line and a progress notification both precede the real answer.
+        client = self.client("sse")
+        client.connect()
+        result = client.call_tool("read_file", {"path": "a.txt"})
+        self.assertEqual(result.value["content"][0]["text"], 'read_file:{"path": "a.txt"}')
+
+    def test_a_stream_held_open_after_the_answer_does_not_hang(self):
+        # A server is only ADVISED to close the stream after the final response. Reading to end-of-stream
+        # would spend the whole deadline on a call that already succeeded (Codex review of the plan, #10).
+        client = self.client("sse_then_hang", timeout=8.0)
+        client.connect()
+        started = time.monotonic()
+        result = client.call_tool("read_file", {"path": "a.txt"})
+        self.assertEqual(result.value["content"][0]["text"], 'read_file:{"path": "a.txt"}')
+        self.assertLess(time.monotonic() - started, 5.0)
+
+    def test_an_endless_event_line_is_bounded(self):
+        # Named in the message on purpose: a LINE that never ends must be cut by the line bound, not merely
+        # by the whole-stream bound after megabytes have been read.
+        client = self.client("sse_endless")
+        client.connect()
+        with self.assertRaises(McpError) as raised:
+            client.call_tool("read_file", {"path": "a.txt"})
+        self.assertEqual(raised.exception.code, "mcp_transport_error")
+        self.assertIn("line", str(raised.exception))
+
+    def test_too_many_events_are_refused(self):
+        client = self.client("sse_flood")
+        client.connect()
+        with self.assertRaises(McpError) as raised:
+            client.call_tool("read_file", {"path": "a.txt"})
+        self.assertIn("events", str(raised.exception))
+
+    def test_a_legacy_server_falls_back_to_initialize(self):
+        # An empty-bodied 400 is not a recognised modern error, so the server is old.
+        client = self.client("legacy")
+        self.assertEqual(client.connect_http(), "2025-11-25")
+        self.assertIn("read_file", client.list_tools())
+
+    def test_a_legacy_session_id_is_echoed_on_later_requests(self):
+        client = self.client("legacy_session")
+        client.connect_http()
+        client.list_tools()
+        self.assertEqual(self.headers_of(-1).get("mcp-session-id"), "session-1")
+
+    def test_a_modern_server_without_discover_stays_modern(self):
+        # `404` + `-32601` is a recognised modern error: the specification lets a client call inline.
+        client = self.client("no_discover")
+        self.assertEqual(client.connect_http(), MODERN_VERSION)
+        self.assertEqual(len(self.server.seen), 1)  # no `initialize` was sent
+
+    def test_a_header_mismatch_fails_closed_instead_of_falling_back(self):
+        # -32020 proves the server IS modern. Falling back would send a second POST to a modern server.
+        client = self.client("header_mismatch")
+        with self.assertRaises(McpError) as raised:
+            client.connect_http()
+        self.assertEqual(raised.exception.code, "mcp_protocol_error")
+        self.assertEqual(len(self.server.seen), 1)
+
+    def test_an_unsupported_version_picks_one_the_server_offers(self):
+        client = self.client("unsupported")
+        self.assertEqual(client.connect_http(), "2025-11-25")
+
+    def test_an_unsupported_version_without_a_list_is_refused(self):
+        client = self.client("unsupported_bare")
+        with self.assertRaises(McpError) as raised:
+            client.connect_http()
+        self.assertEqual(raised.exception.code, "mcp_protocol_error")
+
+    def test_a_202_to_a_request_is_a_protocol_error(self):
+        client = self.client("wrong_202")
+        with self.assertRaises(McpError) as raised:
+            client.connect_http()
+        self.assertEqual(raised.exception.code, "mcp_protocol_error")
+        self.assertIn("202", str(raised.exception))
+
+    def test_a_redirect_is_not_followed(self):
+        client = self.client("redirect")
+        with self.assertRaises(McpError) as raised:
+            client.connect_http()
+        self.assertIn("redirect", str(raised.exception))
+
+    def test_a_compressed_answer_is_refused(self):
+        # The byte caps are counted on the wire, so a compressed body could expand straight past them.
+        client = self.client("gzip")
+        with self.assertRaises(McpError) as raised:
+            client.connect_http()
+        self.assertIn("Content-Encoding", str(raised.exception))
+
+    def test_a_bearer_token_travels_and_a_missing_one_fails_closed(self):
+        client = self.client("modern", bearer_name="MCP_TOKEN", bearer_value="abc123")
+        client.connect()
+        self.assertEqual(self.headers_of(0).get("authorization"), "Bearer abc123")
+        with self.assertRaises(McpError) as raised:
+            self.client("modern", bearer_name="MCP_TOKEN", bearer_value=None)
+        self.assertIn("MCP_TOKEN", str(raised.exception))
+
+    def test_a_malformed_token_is_refused_without_printing_it(self):
+        # `http.client` puts the rejected VALUE in its own error text, and the worker forwards error text.
+        with self.assertRaises(McpError) as raised:
+            self.client("modern", bearer_name="MCP_TOKEN", bearer_value="secret\r\nX: y")
+        self.assertNotIn("secret", str(raised.exception))
+        self.assertIn("MCP_TOKEN", str(raised.exception))
+
+    def test_an_annotated_argument_is_mirrored_into_a_header(self):
+        client = self.client("mirror")
+        client.connect()
+        client.list_tools()
+        client.call_tool("query", {"region": "us-west1", "sql": "SELECT 1"})
+        self.assertEqual(self.headers_of(-1).get("mcp-param-region"), "us-west1")
+
+    def test_a_mirrored_value_that_is_not_safe_ascii_is_encoded(self):
+        client = self.client("mirror")
+        client.connect()
+        client.list_tools()
+        client.call_tool("query", {"region": "Hello, 世界"})
+        sent = self.headers_of(-1)["mcp-param-region"]
+        self.assertTrue(sent.startswith("=?base64?"))
+        self.assertEqual(mcp_http_server.decode_header(sent), "Hello, 世界")
+
+    def test_a_tool_annotated_where_the_specification_forbids_is_excluded(self):
+        client = self.client("bad_mirror")
+        client.connect()
+        tools = client.list_tools()
+        self.assertNotIn("query", tools)
+        self.assertIn("read_file", tools)
+        self.assertIn("properties", client.rejected["query"])
+
+
+class HttpAddressTests(unittest.TestCase):
+    """Where the transport is allowed to connect."""
+
+    def test_a_socket_connected_elsewhere_is_refused(self):
+        # The address was checked, but the socket must actually BE on it: a connection that ended up
+        # somewhere else -- a second lookup, a stale reuse -- defeats the whole point of pinning.
+        transport = HttpTransport("https://mcp.example.com/mcp", 5.0, 5.0)
+
+        class Elsewhere:
+            def __init__(self):
+                self.sock = self
+                self.closed = False
+
+            def getpeername(self):
+                return ("10.9.9.9", 443)
+
+            def close(self):
+                self.closed = True
+
+        connection = Elsewhere()
+        with self.assertRaises(McpError) as raised:
+            transport._confirm_peer(connection, "93.184.215.14")
+        self.assertIn("10.9.9.9", str(raised.exception))
+        self.assertTrue(connection.closed)
+
+    def test_allow_private_does_not_permit_a_public_address(self):
+        # `allow_private` widens the rule to loopback and private answers, not to the internet.
+        with self.assertRaises(McpError) as raised:
+            resolve_endpoint_address("93.184.215.14", 443, allow_private=True)
+        self.assertIn("public", str(raised.exception))
+
+    def test_addresses_that_are_never_allowed_are_refused_even_with_allow_private(self):
+        for host in ("224.0.0.1", "0.0.0.0", "169.254.1.1"):  # noqa: S104  # nosec B104 - refusing it is the point
+            with self.subTest(host):
+                with self.assertRaises(McpError) as raised:
+                    resolve_endpoint_address(host, 443, allow_private=True)
+                self.assertIn("never allowed", str(raised.exception))
+
+    def test_a_private_address_is_allowed_only_when_the_operator_asked(self):
+        self.assertEqual(resolve_endpoint_address("127.0.0.1", 443, allow_private=True), "127.0.0.1")
+        with self.assertRaises(McpError):
+            resolve_endpoint_address("127.0.0.1", 443, allow_private=False)
+
+    def test_an_ipv4_mapped_loopback_is_classified_as_loopback(self):
+        # The classic bypass: ::ffff:127.0.0.1 sidesteps a naive is_loopback check.
+        with self.assertRaises(McpError):
+            resolve_endpoint_address("::ffff:127.0.0.1", 443, allow_private=False)
+
+
+class HeaderValueTests(unittest.TestCase):
+    def test_encoding(self):
+        cases = {
+            "us-west1": "us-west1",
+            "Hello, 世界": "=?base64?SGVsbG8sIOS4lueVjA==?=",
+            " padded ": "=?base64?IHBhZGRlZCA=?=",
+            "line1\nline2": "=?base64?bGluZTEKbGluZTI=?=",
+            "=?base64?literal?=": "=?base64?PT9iYXNlNjQ/bGl0ZXJhbD89?=",
+        }
+        for original, expected in cases.items():
+            with self.subTest(original):
+                self.assertEqual(header_value(original), expected)
+
+
+class MirrorAnnotationTests(unittest.TestCase):
+    def schema(self, properties):
+        return {"name": "t", "inputSchema": {"type": "object", "properties": properties}}
+
+    def test_refusals(self):
+        cases = {
+            "not a token": {"a": {"type": "string", "x-mcp-header": "bad name"}},
+            "empty": {"a": {"type": "string", "x-mcp-header": ""}},
+            "duplicate": {
+                "a": {"type": "string", "x-mcp-header": "R"},
+                "b": {"type": "string", "x-mcp-header": "r"},
+            },
+            "number is not allowed": {"a": {"type": "number", "x-mcp-header": "R"}},
+            "unreachable through items": {"a": {"type": "array", "items": {"type": "string", "x-mcp-header": "R"}}},
+            "unreachable through anyOf": {"a": {"anyOf": [{"type": "string", "x-mcp-header": "R"}]}},
+        }
+        for label, properties in cases.items():
+            with self.subTest(label):
+                with self.assertRaises(AnnotationError):
+                    mirror_annotations(self.schema(properties))
+
+    def test_a_nested_properties_chain_is_reachable(self):
+        schema = self.schema({"outer": {"type": "object", "properties": {"inner": {"type": "string", "x-mcp-header": "R"}}}})
+        self.assertEqual(mirror_annotations(schema), ((("outer", "inner"), "R"),))
+
+
+class HttpEndToEndTests(unittest.TestCase):
+    """An MCP tool over HTTP, through the real isolated worker and the real registry."""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.root = Path(self._dir.name)
+        self.config_path = self.root / "mcp.json"
+
+    def tearDown(self):
+        self._dir.cleanup()
+
+    def serve(self, mode="modern"):
+        server, port = mcp_http_server.start(mode)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.release.set)
+        self.server = server
+        return port
+
+    def write_config(self, port, pins=None, **server_changes):
+        tools = {"read_file": {"pin": (pins or {}).get("read_file", "sha256:" + "a" * 64), "read_only": True}}
+        document = {
+            "schema": "portmark.mcp.config.v1",
+            "servers": {"files": {
+                "url": f"http://127.0.0.1:{port}/mcp", "allow_private": True,
+                "timeout_seconds": 10, "tools": tools, **server_changes,
+            }},
+        }
+        self.config_path.write_text(json.dumps(document), encoding="utf-8")
+        return self.config_path
+
+    def test_an_http_tool_is_probed_pinned_and_called(self):
+        port = self.serve("modern")
+        self.write_config(port)
+        report = probe_server(str(self.config_path), "files", timeout=30)
+        self.assertEqual(report.protocol_version, MODERN_VERSION)
+        config = load_config(str(self.write_config(port, pins={"read_file": report.tools["read_file"]})))
+        registry = ToolRegistry()
+        register_mcp_tools(registry, config)
+        result = registry.invoke(permit_for("mcp.files.read_file"), "mcp.files.read_file", {"path": "a.txt"})
+        self.assertEqual(result["content"][0]["text"], 'read_file:{"path": "a.txt"}')
+
+    def test_a_changed_definition_fails_the_start_up_check(self):
+        port = self.serve("modern")
+        self.write_config(port)
+        report = probe_server(str(self.config_path), "files", timeout=30)
+        drifted = load_config(str(self.write_config(port, pins={"read_file": report.tools["read_file"]})))
+        self.server.state["mode"] = "drift"
+        with self.assertRaises(McpStartupError):
+            check_pins(drifted, timeout=30)
+
+    def test_a_tool_with_an_invalid_annotation_is_named_as_such(self):
+        # Excluded, not vanished. The message must point at the definition, not at a missing tool.
+        port = self.serve("bad_mirror")
+        document = {
+            "schema": "portmark.mcp.config.v1",
+            "servers": {"files": {
+                "url": f"http://127.0.0.1:{port}/mcp", "allow_private": True, "timeout_seconds": 10,
+                "tools": {"query": {"pin": "sha256:" + "a" * 64, "read_only": True}},
+            }},
+        }
+        self.config_path.write_text(json.dumps(document), encoding="utf-8")
+        report = probe_server(str(self.config_path), "files", timeout=30)
+        self.assertNotIn("query", report.tools)
+        self.assertIn("properties", report.rejected["query"])
+        with self.assertRaises(McpStartupError) as raised:
+            check_pins(load_config(str(self.config_path)), timeout=30)
+        self.assertIn("unusable", str(raised.exception))
+
+
+class HttpTlsTests(unittest.TestCase):
+    """The composition that carries the secret: a verifying context, SNI on the name, the pinned address.
+
+    Driven through `mcp_worker.call` in this process, because the isolated worker inherits only Portmark's
+    own variables (tools.py:177) and so cannot be handed a test trust anchor."""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.root = Path(self._dir.name)
+        self.addCleanup(self._dir.cleanup)
+
+    def certificate(self):
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.x509.oid import NameOID
+
+        key = ec.generate_private_key(ec.SECP256R1())
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+        now = datetime.datetime.now(datetime.timezone.utc)
+        certificate = (
+            x509.CertificateBuilder()
+            .subject_name(name).issuer_name(name).public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(minutes=5))
+            .not_valid_after(now + datetime.timedelta(hours=1))
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost")]), critical=False)
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+            .sign(key, hashes.SHA256())
+        )
+        certificate_path = self.root / "cert.pem"
+        key_path = self.root / "key.pem"
+        certificate_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+        key_path.write_bytes(key.private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+        ))
+        return certificate_path, key_path
+
+    def test_a_call_over_real_tls_carries_the_bearer_to_the_pinned_address(self):
+        certificate_path, key_path = self.certificate()
+        address = resolve_endpoint_address("localhost", 0, allow_private=True)
+        server, port = mcp_http_server.start("modern", str(certificate_path), str(key_path), host=address)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        config_path = self.root / "mcp.json"
+        document = {
+            "schema": "portmark.mcp.config.v1",
+            "servers": {"files": {
+                "url": f"https://localhost:{port}/mcp", "allow_private": True, "bearer_env": "MCP_TOKEN",
+                "timeout_seconds": 20,
+                "tools": {"read_file": {"pin": "sha256:" + "a" * 64, "read_only": True}},
+            }},
+        }
+        config_path.write_text(json.dumps(document), encoding="utf-8")
+        environment = {
+            "SSL_CERT_FILE": str(certificate_path), "MCP_TOKEN": "tok-123",  # nosec B105 - a fake token
+            "PORTMARK_MCP_CONFIG": str(config_path), "PORTMARK_MCP_SERVER": "files",
+            "PORTMARK_MCP_TOOL": "read_file",
+        }
+        with patch.dict(os.environ, environment):
+            pin = definition_digest(mcp_http_server.TOOLS["read_file"])
+            document["servers"]["files"]["tools"]["read_file"]["pin"] = pin
+            config_path.write_text(json.dumps(document), encoding="utf-8")
+            server_config = load_config(str(config_path)).servers["files"]
+            with patch.dict(os.environ, {
+                "PORTMARK_MCP_PIN": pin, "PORTMARK_MCP_LAUNCH": server_digest(server_config)
+            }):
+                value = mcp_worker.call({"path": "a.txt"})
+        self.assertEqual(value["content"][0]["text"], 'read_file:{"path": "a.txt"}')
+        headers = {name.lower(): item for name, item in server.seen[-1][0].items()}
+        self.assertEqual(headers["authorization"], "Bearer tok-123")
+        self.assertEqual(headers["host"], f"localhost:{port}")  # the NAME, not the pinned address
+
+    def test_a_context_that_does_not_verify_is_refused(self):
+        # Address pinning without certificate verification LOOKS secure while any certificate is accepted.
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        transport = HttpTransport("https://localhost:1/mcp", 5.0, 5.0, allow_private=True, context=context)
+        with self.assertRaises(McpError) as raised:
+            transport.send(b'{"jsonrpc":"2.0","id":1,"method":"x","params":{}}', {})
+        self.assertIn("verify", str(raised.exception))

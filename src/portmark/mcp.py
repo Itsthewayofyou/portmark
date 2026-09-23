@@ -9,12 +9,13 @@ and refuses everything the operator did not approve. See MCP.md.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import signal
 import subprocess  # nosec B404 - runs THIS interpreter to probe a server inside a bounded child tree
 import sys
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .json_guard import StrictJSONError, strict_json_loads
@@ -22,6 +23,8 @@ from .mcp_client import ERROR_CODES
 from .mcp_config import McpConfig, McpConfigError, McpServerConfig, McpToolConfig, load_config
 from .mcp_worker import tool_environment
 from .tools import ToolRegistry, _launch_process_tree
+
+logger = logging.getLogger(__name__)
 
 CALL_TARGET = "portmark.mcp_worker:call"
 # The per-call worker deadline: the server has to start, agree a protocol version, list its tools and answer.
@@ -50,6 +53,9 @@ class PinReport:
     server: str
     protocol_version: str
     tools: dict[str, str]
+    # Tools the server offered but the client refused to use, with the reason. A refused tool is NOT a
+    # missing one, and an operator told the wrong story looks in the wrong place.
+    rejected: dict[str, str] = field(default_factory=dict)
 
 
 def register_mcp_tools(registry: ToolRegistry, config: McpConfig, client_version: str = "") -> tuple[str, ...]:
@@ -88,7 +94,8 @@ def _worker_environment(path: str, server: McpServerConfig, tool: McpToolConfig,
     not have is simply absent, so a missing credential surfaces as the server's own failure, not as a
     Portmark error about a variable the operator can see for themselves."""
     environment = tool_environment(path, server, tool, version)
-    for name in server.secret_env:
+    names = (*server.secret_env, server.bearer_env) if server.bearer_env else server.secret_env
+    for name in names:
         if name in os.environ:
             environment[name] = os.environ[name]
     return environment
@@ -143,16 +150,33 @@ def _probe_report(server: str, raw: bytes, returncode: int | None) -> PinReport:
         raise McpStartupError(f"probing MCP server {server!r} failed: {report['error'][:300]}")
     if returncode not in _CLEAN_PROBE_EXITS or not isinstance(report, dict) or not isinstance(report.get("tools"), dict):
         raise McpStartupError(f"the probe of MCP server {server!r} produced no usable report")
-    return PinReport(server, str(report.get("protocol_version", "")), dict(report["tools"]))
+    rejected = report.get("rejected")
+    return PinReport(
+        server,
+        str(report.get("protocol_version", "")),
+        dict(report["tools"]),
+        {str(name): str(reason) for name, reason in rejected.items()} if isinstance(rejected, dict) else {},
+    )
 
 
 def check_pins(config: McpConfig, timeout: float = PIN_CHECK_TIMEOUT_SECONDS) -> tuple[PinReport, ...]:
     """Fail closed when any approved tool is missing or its definition changed. Used at host start-up."""
     reports = []
     for name, server in config.servers.items():
+        if server.allow_private:
+            # A loosening the operator chose, recorded where an audit of the start-up will find it.
+            logger.warning(
+                "MCP server %r allows private addresses for %s: loopback and private answers are accepted",
+                name, server.url,
+            )
         report = probe_server(config.path, name, timeout)
         for tool in server.tools.values():
             current = report.tools.get(tool.tool)
+            if current is None and tool.tool in report.rejected:
+                raise McpStartupError(
+                    f"MCP server {name!r} offers {tool.tool!r}, but its definition is unusable: "
+                    f"{report.rejected[tool.tool]}"
+                )
             if current is None:
                 raise McpStartupError(f"MCP server {name!r} no longer offers the approved tool {tool.tool!r}")
             if current != tool.pin:

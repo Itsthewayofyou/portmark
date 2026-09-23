@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import queue
+import re
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -29,6 +30,15 @@ LEGACY_VERSIONS = (NEWEST_LEGACY_VERSION, LEGACY_VERSION)
 CLIENT_NAME = "portmark"
 META_PREFIX = "io.modelcontextprotocol/"
 UNSUPPORTED_PROTOCOL_VERSION = -32022
+METHOD_NOT_FOUND = -32601
+# Errors only a MODERN server produces. Seeing one in a 400 body proves the server is not legacy, so the
+# `initialize` fallback must NOT fire -- the request has to be corrected instead.
+MODERN_ONLY_CODES = frozenset({-32020, -32021})
+# `x-mcp-header`: the schema annotation that asks a client to mirror one argument into an HTTP header.
+X_MCP_HEADER = "x-mcp-header"
+MIRROR_TYPES = ("string", "integer", "boolean")
+MAX_SAFE_INTEGER = (1 << 53) - 1
+_HEADER_TOKEN = re.compile(r"\A[!#$%&'*+\-.^_`|~0-9A-Za-z]+\Z")
 
 MAX_MESSAGE_BYTES = 1 << 20
 _CHUNK_BYTES = 1 << 16
@@ -58,6 +68,22 @@ class McpError(Exception):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code if code in ERROR_CODES else PROTOCOL_ERROR
+
+
+class HttpStatusError(McpError):
+    """An HTTP answer the transport could not turn into JSON-RPC frames, with the status and parsed body.
+
+    Era detection reads those: over Streamable HTTP a `400` may be how a MODERN server reports a bad request,
+    so the body has to be inspected before concluding the server is legacy."""
+
+    def __init__(self, status: int, body: Any, code: str, message: str) -> None:
+        super().__init__(code, message)
+        self.status = status
+        self.body = body
+
+
+class AnnotationError(ValueError):
+    """A tool definition whose `x-mcp-header` annotations break the rules: the tool is excluded, not used."""
 
 
 @dataclass(frozen=True)
@@ -133,12 +159,23 @@ def header_value(value: str) -> str:
     return SENTINEL_PREFIX + base64.b64encode(value.encode("utf-8")).decode("ascii") + SENTINEL_SUFFIX
 
 
-def _is_plain_header_ascii(value: str) -> bool:
+def is_header_safe(value: str) -> bool:
+    """Whether this text may travel in an HTTP header field value AS IT IS.
+
+    Deliberately says nothing about the Base64 marker: an ALREADY-encoded value starts with it and is
+    perfectly safe to send. Asking "is this safe to send" and "does this need encoding" are two questions,
+    and answering them with one predicate refuses every value that was just encoded."""
     if value != value.strip():  # a field value may not begin or end with whitespace
         return False
-    if value.startswith(SENTINEL_PREFIX) and value.endswith(SENTINEL_SUFFIX):
-        return False  # a literal that looks like the marker must be encoded, or it would decode as one
     return all(0x21 <= ord(character) <= 0x7E or character in (" ", "\t") for character in value)
+
+
+def _is_plain_header_ascii(value: str) -> bool:
+    """Whether this text can be sent WITHOUT encoding. A literal that looks like the marker cannot: it
+    would arrive and be decoded as one."""
+    if value.startswith(SENTINEL_PREFIX) and value.endswith(SENTINEL_SUFFIX):
+        return False
+    return is_header_safe(value)
 
 
 class Transport:
@@ -150,7 +187,7 @@ class Transport:
 
     peer_closed = False
 
-    def send(self, encoded: bytes, headers: Mapping[str, str]) -> None:
+    def send(self, encoded: bytes, headers: Mapping[str, str], expects_reply: bool = True) -> None:
         raise NotImplementedError
 
     def read(self, timeout: float) -> bytes | None:
@@ -169,7 +206,7 @@ class _StdioTransport(Transport):
         self._reader = _LineReader(stdout, max_bytes)
         self.peer_closed = False
 
-    def send(self, encoded: bytes, headers: Mapping[str, str]) -> None:
+    def send(self, encoded: bytes, headers: Mapping[str, str], expects_reply: bool = True) -> None:
         if b"\n" in encoded:  # canonical_json escapes newlines; this is the framing invariant, asserted
             raise McpError(PROTOCOL_ERROR, "a request would break the one-message-per-line framing")
         try:
@@ -198,6 +235,10 @@ class McpClient:
         # `initialize` itself -- that request is what decides the version.
         self._legacy_ready = False
         self._client_version = client_version
+        self._mirrors: dict[str, tuple[tuple[tuple[str, ...], str], ...]] = {}
+        # Tools excluded because their annotations are invalid, with the reason. Carried out of the client so
+        # the worker can say WHY a tool is unusable instead of reporting it as a vanished tool.
+        self.rejected: dict[str, str] = {}
 
     @classmethod
     def over_streams(cls, stdin: BinaryIO, stdout: BinaryIO, timeout: float, client_version: str = "") -> "McpClient":
@@ -252,7 +293,7 @@ class McpClient:
             encoded = canonical_json(message)
         except ValueError as error:
             raise McpError(PROTOCOL_ERROR, f"cannot encode a request for the MCP server: {error}") from error
-        self._transport.send(encoded, self._message_headers(message, headers))
+        self._transport.send(encoded, self._message_headers(message, headers), "id" in message)
 
     def _receive(self, request_id: int) -> dict[str, Any]:
         """The response to `request_id`. Notifications are skipped; a server REQUEST is refused."""
@@ -347,6 +388,46 @@ class McpClient:
             f"the MCP server supports {list(supported)}, and Portmark speaks {list(SUPPORTED_VERSIONS)}",
         )
 
+    def connect_http(self) -> str:
+        """Agree a protocol version over Streamable HTTP, whose fallback rules differ from stdio's.
+
+        There is deliberately no shared catch-all here. Over HTTP a `400` is also how a MODERN server reports
+        a bad request, so falling back on any error -- a timeout, a truncated body, a reset -- would send a
+        second POST to a server that is not legacy at all."""
+        self._version = MODERN_VERSION
+        try:
+            result = self.request("server/discover")
+        except HttpStatusError as error:
+            return self._http_era(error)
+        except McpError as error:
+            if getattr(error, "unsupported_versions", None):
+                return self._select_modern(error.unsupported_versions)  # type: ignore[attr-defined]
+            raise
+        supported = result.get("supportedVersions")
+        if not isinstance(supported, list) or not all(isinstance(item, str) for item in supported):
+            raise McpError(PROTOCOL_ERROR, "server/discover did not list supportedVersions")
+        return self._select_modern(tuple(supported))
+
+    def _http_era(self, error: HttpStatusError) -> str:
+        body = error.body
+        failure = body.get("error") if isinstance(body, Mapping) else None
+        code = failure.get("code") if isinstance(failure, Mapping) else None
+        if code == UNSUPPORTED_PROTOCOL_VERSION:
+            data = failure.get("data") if isinstance(failure, Mapping) else None
+            supported = data.get("supported") if isinstance(data, Mapping) else None
+            if isinstance(supported, list) and all(isinstance(item, str) for item in supported):
+                return self._select_modern(tuple(supported))
+            raise McpError(PROTOCOL_ERROR, "the MCP endpoint answered -32022 without a list of supported versions")
+        if code == METHOD_NOT_FOUND:
+            # A modern server that does not implement `server/discover`. The specification lets a client skip
+            # discovery and call inline, handling an unsupported version if one comes back.
+            return MODERN_VERSION
+        if code in MODERN_ONLY_CODES:
+            raise McpError(PROTOCOL_ERROR, f"the MCP endpoint rejected Portmark's request metadata (JSON-RPC {code})")
+        if error.status in (400, 404, 405):
+            return self._initialize()
+        raise error
+
     def connect_legacy(self, version: str = NEWEST_LEGACY_VERSION) -> str:
         """The legacy handshake on a FRESH connection, for a server that exited on the modern probe."""
         return self._initialize(version)
@@ -385,6 +466,7 @@ class McpClient:
     def list_tools(self) -> dict[str, dict[str, Any]]:
         """Every tool the server reports, by name. Bounded in pages and in count."""
         tools: dict[str, dict[str, Any]] = {}
+        self.rejected = {}
         cursor: str | None = None
         for _ in range(MAX_TOOL_PAGES):
             params = {"cursor": cursor} if cursor else {}
@@ -395,6 +477,13 @@ class McpClient:
             for definition in page:
                 if not isinstance(definition, dict) or not isinstance(definition.get("name"), str):
                     raise McpError(PROTOCOL_ERROR, "tools/list returned a tool without a name")
+                try:
+                    self._mirrors[definition["name"]] = mirror_annotations(definition)
+                except AnnotationError as error:
+                    # The specification says a client MUST exclude such a tool from the result. Keeping the
+                    # reason means an operator is told the annotation is wrong, not that the tool vanished.
+                    self.rejected[definition["name"]] = str(error)
+                    continue
                 tools[definition["name"]] = definition
                 if len(tools) > MAX_TOOLS:
                     raise McpError(PROTOCOL_ERROR, f"the MCP server reported more than {MAX_TOOLS} tools")
@@ -404,8 +493,96 @@ class McpClient:
         raise McpError(PROTOCOL_ERROR, f"tools/list did not finish within {MAX_TOOL_PAGES} pages")
 
     def call_tool(self, name: str, arguments: Mapping[str, Any]) -> ToolResult:
-        result = self.request("tools/call", {"name": name, "arguments": dict(arguments)})
+        headers = self._mirror_headers(name, arguments)
+        result = self.request("tools/call", {"name": name, "arguments": dict(arguments)}, headers)
         return ToolResult(_tool_value(result), bool(result.get("isError", False)))
+
+    def _mirror_headers(self, name: str, arguments: Mapping[str, Any]) -> dict[str, str]:
+        """The `Mcp-Param-*` headers this call owes, from the annotations the server published.
+
+        An annotated argument value is DUPLICATED into an HTTP header, so anything between Portmark and the
+        server that reads headers sees it. The annotation is part of the pinned definition, so this cannot be
+        switched on for an approved tool without the operator approving it again."""
+        headers: dict[str, str] = {}
+        for path, header in self._mirrors.get(name, ()):
+            value: Any = arguments
+            for key in path:
+                if not isinstance(value, Mapping) or key not in value:
+                    value = None
+                    break
+                value = value[key]
+            if value is None:
+                continue  # absent or null: the specification says omit the header
+            if isinstance(value, bool):
+                text = "true" if value else "false"
+            elif isinstance(value, int):
+                if not -MAX_SAFE_INTEGER <= value <= MAX_SAFE_INTEGER:
+                    raise McpError(PROTOCOL_ERROR, f"the header parameter {header!r} is outside the safe integer range")
+                text = str(value)
+            elif isinstance(value, str):
+                text = value
+            else:
+                continue  # the argument does not match the annotated type; the server rejects the body itself
+            headers[f"Mcp-Param-{header}"] = header_value(text)
+        return headers
+
+
+def mirror_annotations(definition: Mapping[str, Any]) -> tuple[tuple[tuple[str, ...], str], ...]:
+    """Every `x-mcp-header` annotation in one tool definition, as (property path, header name).
+
+    Raises AnnotationError if any of them breaks the rules, which makes the whole TOOL unusable -- the
+    specification is explicit that an annotation anywhere it is not statically reachable invalidates the
+    definition. Only chains of `properties` keys are reachable, so the walk never follows `items`, a
+    composition or conditional keyword, or a `$ref` -- which is also why it cannot be led off to a network
+    reference."""
+    schema = definition.get("inputSchema")
+    if not isinstance(schema, Mapping):
+        return ()
+    reachable: dict[int, tuple[str, ...]] = {}
+    _walk_properties(schema, (), reachable)
+    annotated: list[Mapping[str, Any]] = []
+    _find_annotations(schema, annotated)
+    mirrors: list[tuple[tuple[str, ...], str]] = []
+    taken: set[str] = set()
+    for node in annotated:
+        path = reachable.get(id(node))
+        if path is None:
+            raise AnnotationError("an x-mcp-header annotation is not reachable through `properties` alone")
+        name = node.get(X_MCP_HEADER)
+        if not isinstance(name, str) or not _HEADER_TOKEN.match(name):
+            raise AnnotationError(f"x-mcp-header {name!r} is not a usable HTTP header name")
+        if name.lower() in taken:
+            raise AnnotationError(f"two parameters both ask for the header {name!r}")
+        taken.add(name.lower())
+        if node.get("type") not in MIRROR_TYPES:
+            raise AnnotationError(
+                f"the header parameter {name!r} is typed {node.get('type')!r}; only {', '.join(MIRROR_TYPES)} may be mirrored"
+            )
+        mirrors.append((path, name))
+    return tuple(mirrors)
+
+
+def _walk_properties(node: Any, path: tuple[str, ...], reachable: dict[int, tuple[str, ...]]) -> None:
+    if not isinstance(node, Mapping):
+        return
+    properties = node.get("properties")
+    if not isinstance(properties, Mapping):
+        return
+    for key, child in properties.items():
+        if isinstance(key, str) and isinstance(child, Mapping):
+            reachable[id(child)] = (*path, key)
+            _walk_properties(child, (*path, key), reachable)
+
+
+def _find_annotations(node: Any, out: list[Mapping[str, Any]]) -> None:
+    if isinstance(node, Mapping):
+        if X_MCP_HEADER in node:
+            out.append(node)
+        for child in node.values():
+            _find_annotations(child, out)
+    elif isinstance(node, list):
+        for child in node:
+            _find_annotations(child, out)
 
 
 def _error_from(error: Any, method: str) -> McpError:

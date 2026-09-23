@@ -80,12 +80,66 @@ specification requires for older servers.
   side channel to a human.
 - Shutdown is the specification's: close stdin, wait, then terminate the process tree.
 
-Streamable HTTP servers are **not** in this release; see "Not included" below.
+## Transport: Streamable HTTP
+
+One JSON-RPC message is **one HTTP POST**, on its own connection. A POST that fails is **never sent again**:
+once any byte of a `tools/call` may have reached the server, resending it could double a real side effect.
+No transport, session, authorization or version-recovery path may resend one.
+
+**Where Portmark will connect.** The host name is resolved **once**, every answer is checked, and the
+connection goes to the literal that was checked -- so DNS cannot be re-pointed between the check and the
+connect. After connecting, the socket's actual peer is compared with that literal. By default every answer
+must be a public address. `allow_private: true` widens the allowed class to **loopback and private answers
+only**; link-local, multicast, reserved and unspecified stay refused, and an IPv4-mapped IPv6 address is
+normalised before it is classified. If any answer is outside the allowed class the whole lookup fails, so
+resolver ordering never decides where Portmark connects. Turning `allow_private` on is logged at start-up.
+
+**TLS.** `https` is required unless `allow_private` is set, and the certificate is verified against the URL's
+host name while the connection goes to the pinned address. Portmark refuses to connect if the TLS context
+does not verify certificates. Note that the MCP specification states **no** TLS requirement for an MCP
+endpoint -- HTTPS is mandated only for OAuth endpoints -- so this is Portmark's rule, not the
+specification's.
+
+**Authorization.** A static bearer token, named by `bearer_env` and read from the host's environment. A
+configured variable that is missing or empty is a **failure**, not a silent unauthenticated request, which
+could otherwise reach a different anonymous service behind the same URL. A bearer token with plain `http` is
+refused by the config loader. The token is checked before it reaches `http.client`, whose own error message
+would print the rejected value.
+
+**Answers.** Either one JSON object or a Server-Sent Events stream scoped to that request. Portmark reads the
+stream only until the response to its own request arrives, then stops: a server is merely advised to close
+the stream afterwards, and reading on would spend the deadline on keep-alives -- or let a reset arriving
+after a valid result discard it. Keep-alive comment lines are ignored. A redirect is refused. A
+`Content-Encoding` other than `identity` is refused, because the byte caps are counted on the wire. Every
+body is read bounded, error bodies included: a line, an event, the whole stream, and the event count all
+have limits, each enforced while the bytes arrive.
+
+**Era.** Over HTTP a `400` is also how a modern server reports a bad request, so the body decides. A
+recognised modern error means the server is modern: `-32022` retries with a version it advertised, `-32601`
+on `server/discover` means a modern server without discovery (Portmark calls inline instead), and `-32020`
+or `-32021` fail closed. Only a `400`, `404` or `405` whose body is empty or unrecognised falls back to the
+`initialize` handshake. A legacy server's `Mcp-Session-Id` is captured and returned on later requests; if
+that session ends, the request is **not** replayed on a new one.
+
+**Request metadata.** Every POST carries `MCP-Protocol-Version`, `Mcp-Method` and, where the method calls for
+it, `Mcp-Name`, each mirrored from the body by the one piece of code that builds them, so a header cannot
+drift from the body it was copied from.
+
+**Mirrored arguments.** When a server's tool schema marks a parameter with `x-mcp-header`, the specification
+requires a client to copy that argument's value into an `Mcp-Param-<name>` header. Portmark does. Be aware
+of what it means: **that argument value is duplicated into an HTTP header**, so anything on the path that
+reads headers can see it. The annotation is part of the pinned definition, so it cannot be switched on for an
+approved tool without the operator approving the tool again. A value that is not safe plain ASCII is carried
+as `=?base64?<base64 of the UTF-8 bytes>?=`, which is what prevents a value from injecting a header. A tool
+whose annotations break the specification's rules -- an unusable header name, a duplicate, a non-primitive
+type, or an annotation anywhere that is not reachable through `properties` alone -- is **excluded**, and the
+start-up check says the definition is unusable rather than that the tool is missing.
 
 ## How an MCP tool runs
 
 A stdio MCP server is launched **per call, inside Portmark's isolated tool worker**, so the existing
-deadline and process-tree kill cover the server process too. The worker:
+deadline and process-tree kill cover the server process too. An HTTP endpoint has no process to launch, and
+the same worker, deadline and kill still bound the call. The worker:
 
 1. reads the operator config, the approved pin and the approved launch digest from its environment;
 2. launches the server, probes the era, and calls `tools/list`;
@@ -140,6 +194,14 @@ A name that collides with a tool already registered is refused too, so a server 
         "read_file": {"pin": "sha256:…", "read_only": true},
         "write_file": {"pin": "sha256:…", "reconcile": "my_adapters:file_written", "alias": "files.write"}
       }
+    },
+    "remote": {
+      "url": "https://mcp.example.com/mcp",
+      "bearer_env": "REMOTE_MCP_TOKEN",
+      "timeout_seconds": 30,
+      "tools": {
+        "search": {"pin": "sha256:…", "read_only": true}
+      }
     }
   }
 }
@@ -160,6 +222,9 @@ to a group of its own and escapes. Real containment of a hostile program is the 
   tool is a human act.
 - `read_only: true` is the operator's own statement, never the server's annotation.
 - `reconcile` names a `module:function` (see "Side effects"). It is required unless `read_only` is true.
+- `url` is the Streamable HTTP endpoint, `bearer_env` names the variable holding a static bearer token, and
+  `allow_private` permits a loopback or private answer (and, with it, plain `http`). A server sets either
+  `command` or `url`, never both, and a key belonging to the other transport is refused rather than ignored.
 - `secret_env` names host environment variables to pass to the server process, on top of the small baseline
   listed under "What Portmark trusts". Nothing else of Portmark's environment is inherited.
 - A tool that is not listed is not registered. There is no "expose everything" switch.
@@ -193,9 +258,16 @@ projection policy: argument names of a foreign tool are as model-chosen as the v
 
 ## Not included in this release
 
-- **Streamable HTTP servers** (and therefore OAuth-protected remote servers). The native client covers
-  stdio first; HTTP with a static bearer token follows, and OAuth only through the official SDK as an
-  optional extra (owner decision D1).
+- **OAuth-protected servers.** Portmark speaks HTTP with no authorization or with a static bearer token.
+  A server that answers `401` with an OAuth challenge is reported as a transport failure. Full OAuth stays
+  out of the native client and would arrive only through the official SDK as an optional extra (owner
+  decision D1).
+- The deprecated **HTTP+SSE** transport of `2024-11-05`; the specification says new implementations should
+  not adopt it.
+- The legacy standalone **GET** stream and `Last-Event-ID` **resumption**. Both are optional for a client,
+  and the current revision removed them.
+- `subscriptions/listen`, and multi-round-trip requests: an `input_required` result is a tool failure,
+  because a mediated call has no side channel to a human.
 - MCP resources, prompts, sampling, subscriptions, and `notifications/tools/list_changed`: a pin is
   re-checked at every call, so a changed list is an error rather than an event to follow.
 - Portmark as an MCP **server**.

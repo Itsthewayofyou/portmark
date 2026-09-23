@@ -26,6 +26,16 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   only the codes its registration allows (`register_isolated(error_codes=...)`), so no other tool can forge one.
   The host records it in `tool.failed`: `mcp_tool_error` (the server said `isError`), `mcp_transport_error`
   (effect unknown), `mcp_pin_drift`, `mcp_config_drift`, `mcp_protocol_error`.
+- **MCP tools over Streamable HTTP.** A server is configured with `url` instead of `command`. One message is
+  one POST on its own connection, and a failed POST is never resent -- resending a `tools/call` could double a
+  real effect. The endpoint's host is resolved once and the connection goes to the literal that was checked,
+  with the certificate verified against the name; `allow_private: true` widens that to loopback and private
+  answers only and is logged at start-up. A static bearer token is named by `bearer_env`; a configured
+  variable that is missing fails closed, and a bearer over plain `http` is refused outright. Both protocol
+  eras are spoken, with the era decided by the body of a `400` rather than by the status alone. An event
+  stream is read only until the answer to the request arrives. Per the specification, an argument a server
+  annotates with `x-mcp-header` is mirrored into an HTTP header -- see MCP.md for what that exposes -- and a
+  tool whose annotations break the rules is excluded with a reason.
 - **`portmark mcp pin`** prints what each server offers now, with the pin to approve it. It never approves. The
   probe runs in a killable process tree, so a server that never answers dies with the probe rather than being
   orphaned, and it reports both outcomes as JSON on stdout. A probe that ends NORMALLY sweeps its own process
