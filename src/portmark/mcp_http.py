@@ -16,6 +16,7 @@ import ipaddress
 import json
 import socket
 import ssl
+import threading
 import time
 from collections import deque
 from collections.abc import Mapping
@@ -136,6 +137,9 @@ class HttpTransport(Transport):
         self._session_id = ""
         self._frames: deque[bytes] = deque()
         self._sock: socket.socket | None = None
+        # Set by the watchdog when the absolute deadline passes, so every exit path can report the budget
+        # rather than the shutdown it caused.
+        self._out_of_budget = False
 
     # -- Transport ----------------------------------------------------------------------------------------
 
@@ -143,6 +147,7 @@ class HttpTransport(Transport):
         self._frames.clear()
         request_headers = self._request_headers(encoded, headers)
         connection = self._open()
+        watchdog = self._watchdog()
         try:
             # Re-armed here, and again before the answer is read, because the socket timeout set in `_open`
             # was computed BEFORE the TCP connect and the TLS handshake: without this, the time those took is
@@ -157,10 +162,16 @@ class HttpTransport(Transport):
             self._remaining()
             self._absorb(response, expects_reply)
         except (OSError, http.client.HTTPException) as error:
+            self._refuse_if_out_of_budget()
             raise McpError(TRANSPORT_ERROR, f"the MCP endpoint could not be reached: {type(error).__name__}") from None
+        except McpError:
+            self._refuse_if_out_of_budget()
+            raise
         finally:
+            watchdog.cancel()
             connection.close()
             self._sock = None
+        self._refuse_if_out_of_budget()
 
     def read(self, timeout: float) -> bytes | None:
         return self._frames.popleft() if self._frames else None
@@ -342,6 +353,38 @@ class HttpTransport(Transport):
         return isinstance(message, dict) and "id" in message and ("result" in message or "error" in message)
 
     # -- budget -------------------------------------------------------------------------------------------
+
+    def _watchdog(self) -> threading.Timer:
+        """Shut the socket down when the absolute deadline passes, so a DRIPPED answer is interrupted.
+
+        A socket timeout is per operation: it restarts on every byte that arrives, so a server sending one
+        header byte just inside the timeout, over and over, is never cut off by it -- and `getresponse()`
+        reads many times while parsing. Re-arming before each phase deducts time already spent but still
+        cannot bound a phase from the inside; a check after the phase only notices an overrun that has
+        already happened. Only something outside the read can END it.
+
+        `shutdown` rather than `close`: it unblocks the read immediately without freeing the descriptor,
+        which another thread is using. The reader then fails or sees end of stream, and every exit path asks
+        `_refuse_if_out_of_budget` so the answer is the budget, not the shutdown it caused. Nothing is
+        abandoned -- the blocked reader is this same call, and it is released rather than left running."""
+        sock = self._sock
+
+        def fire() -> None:
+            self._out_of_budget = True
+            try:
+                if sock is not None:
+                    sock.shutdown(socket.SHUT_RDWR)
+            except OSError:  # pragma: no cover - already closed, or never connected
+                pass
+
+        watchdog = threading.Timer(max(0.0, self._deadline - time.monotonic()), fire)
+        watchdog.daemon = True
+        watchdog.start()
+        return watchdog
+
+    def _refuse_if_out_of_budget(self) -> None:
+        if self._out_of_budget:
+            raise McpError(TRANSPORT_ERROR, "the MCP endpoint did not finish within the call's budget")
 
     def _remaining(self) -> float:
         remaining = self._deadline - time.monotonic()

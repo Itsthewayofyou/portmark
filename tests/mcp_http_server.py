@@ -7,10 +7,14 @@ worker. Every mode is something a real server could put on the wire.
 import base64
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MODERN = "2026-07-28"
 LEGACY = "2025-11-25"
+# A drip: 12 steps of half a second is six seconds of answer, every gap far inside any socket timeout.
+DRIP_STEPS = 12
+DRIP_GAP = 0.5
 
 TOOLS = {
     "read_file": {
@@ -138,6 +142,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        if mode in ("drip_headers", "drip_body"):
+            self._drip(mode, request_id)
+            return
         if mode == "gzip":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -163,6 +170,35 @@ class Handler(BaseHTTPRequestHandler):
             self._call(request_id, request, mode, modern)
             return
         self._json(404, self._error(request_id, -32601, "no such method"))
+
+    def _drip(self, mode, request_id):
+        """Answer one byte at a time, with gaps SHORTER than any sane socket timeout.
+
+        A per-operation timeout never fires against this, because every gap is well inside it. Only a
+        wall-clock watchdog stops it. The drip is finite so a calibration run cannot hang: without the
+        watchdog the caller waits the whole DRIP_SECONDS and the test's time assertion is what fails."""
+        self.close_connection = True
+        body = json.dumps(self._result(request_id, {"supportedVersions": [MODERN], "capabilities": {}})).encode()
+        if mode == "drip_headers":
+            self.wfile.write(b"HTTP/1.1 200 OK\r\n")
+            self.wfile.flush()
+            for index in range(DRIP_STEPS):
+                time.sleep(DRIP_GAP)
+                self.wfile.write(b"X-Pad-%d: 1\r\n" % index)
+                self.wfile.flush()
+            self.wfile.write(b"Content-Type: application/json\r\n")
+            self.wfile.write(b"Content-Length: %d\r\n\r\n" % len(body))
+            self.wfile.write(body)
+            self.wfile.flush()
+            return
+        # drip_body: the headers arrive at once, then the body trickles.
+        self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n")
+        self.wfile.write(b"Content-Length: %d\r\n\r\n" % len(body))
+        self.wfile.flush()
+        for index in range(len(body)):
+            time.sleep(DRIP_GAP if index < DRIP_STEPS else 0)
+            self.wfile.write(body[index:index + 1])
+            self.wfile.flush()
 
     def _discover(self, request_id, mode):
         if mode in ("legacy", "legacy_session"):

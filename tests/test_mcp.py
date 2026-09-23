@@ -985,6 +985,44 @@ class HttpBudgetAndHostTests(unittest.TestCase):
         self.assertIn("budget", str(raised.exception))
 
 
+class HttpDripTests(unittest.TestCase):
+    """A server that answers one byte at a time must still be cut off at the absolute deadline.
+
+    Every gap is far inside the socket timeout, which restarts on each byte, so the per-operation bound
+    never fires and `getresponse()` keeps reading. Re-arming before a phase deducts time already spent but
+    cannot bound a phase from inside it, and a check after the phase only notices an overrun that already
+    happened. Only the watchdog ends it."""
+
+    BUDGET = 1.5
+
+    def drip(self, mode):
+        server, port = mcp_http_server.start(mode)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        # A generous per-message timeout on purpose: the point is that the BUDGET is what stops this.
+        transport = HttpTransport(
+            f"http://127.0.0.1:{port}/mcp", 30.0, self.BUDGET, allow_private=True
+        )
+        return McpClient(transport, 30.0)
+
+    def assert_cut_off_at_the_budget(self, client):
+        drip_seconds = mcp_http_server.DRIP_STEPS * mcp_http_server.DRIP_GAP
+        started = time.monotonic()
+        with self.assertRaises(McpError) as raised:
+            client.connect_http()
+        elapsed = time.monotonic() - started
+        self.assertEqual(raised.exception.code, "mcp_transport_error")
+        self.assertIn("budget", str(raised.exception))
+        # Well before the drip would have finished on its own: waiting it out is the defect.
+        self.assertLess(elapsed, drip_seconds / 2)
+
+    def test_dripped_response_headers_are_cut_off(self):
+        self.assert_cut_off_at_the_budget(self.drip("drip_headers"))
+
+    def test_a_dripped_body_is_cut_off(self):
+        self.assert_cut_off_at_the_budget(self.drip("drip_body"))
+
+
 class HeaderValueTests(unittest.TestCase):
     def test_encoding(self):
         cases = {
