@@ -41,7 +41,18 @@ def permit_for(*names):
 
 
 def _alive(pid):
-    """Whether that process still exists (POSIX signal 0 probe; on Windows, via the tasklist-free API)."""
+    """Whether that process is still RUNNING.
+
+    A killed child whose parent is gone is reparented, and in a container with no init it is never reaped, so
+    it stays as a zombie -- and a zombie answers signal 0 exactly like a live process. On Linux the process
+    state is authoritative, so read it; elsewhere fall back to the signal probe."""
+    status = Path(f"/proc/{pid}/stat")
+    if status.exists():
+        try:
+            fields = status.read_text(encoding="utf-8", errors="replace").rsplit(") ", 1)[-1].split()
+            return bool(fields) and fields[0] != "Z"
+        except OSError:  # pragma: no cover - it exited between the check and the read
+            return False
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -375,6 +386,7 @@ class EndToEndTests(unittest.TestCase):
         result = registry.invoke(permit_for("mcp.files.read_file"), "mcp.files.read_file", {"path": "sample.txt"})
         self.assertEqual(result["content"][0]["text"], 'read_file:{"path": "sample.txt"}')
 
+    @unittest.skipUnless(os.name == "posix", "os.kill(pid, 0) TERMINATES a process on Windows")
     def test_a_probe_that_times_out_takes_the_server_with_it(self):
         # Killing only the probe process would leave the MCP server it started running with nobody to stop it.
         marker = self.root / "server.json"
