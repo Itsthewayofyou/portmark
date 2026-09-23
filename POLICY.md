@@ -4,6 +4,16 @@ Host policy can be loaded from a JSON file instead of being hard-coded in proces
 
 ## Policy Format
 
+A tool name must be 1 to 192 characters, letters, digits and inner `.`, `_` or `-`, starting and ending on a
+letter or digit (for example `catalog.search`, `payments.reserve`, `mcp.files.read_file`). A name is an
+identifier, not free text: it is compared against grants, written into the audit chain and exported to a
+SIEM, so whitespace, control characters, look-alike Unicode, path or URL separators, and the empty string
+are refused where authority is defined -- in a permit grant, a manifest's `requested_tools`, a policy tool
+entry, and `register` / `register_isolated`. The character set is MCP's; the length leaves room for the
+`mcp.<server>.` prefix on top of a 128-character MCP tool name. The limit applies to the FINAL registered
+name, after any namespacing: a generated name that would exceed it is refused, not shortened. An operator
+alias stays optional, for a collision or for readability, not as routine setup.
+
 ```json
 {
   "version": "policy-v1",

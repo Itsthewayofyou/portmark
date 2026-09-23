@@ -6,6 +6,22 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Tool names are identifiers, checked where authority is defined
+
+- **A tool name must now be 1 to 192 characters**, letters, digits and inner `.`, `_` or `-`, starting and
+  ending on a letter or digit (`portmark.models.validate_tool_name`). The character set is the one the MCP
+  specification (revision 2026-07-28) says SHOULD be the only allowed one; the length leaves room for the
+  `mcp.<server>.` prefix on top of a 128-character MCP tool name. The limit applies to the final registered
+  name, after namespacing (owner decision, 2026-09-22): a generated name over the limit is refused, never shortened. Whitespace, control characters (a
+  newline in a name is log injection), look-alike Unicode, path and URL separators, and the empty string are
+  refused. Before this, any non-empty string was accepted.
+- The check runs at every door that **defines** tool authority: a permit grant (so an incoming A2A envelope is
+  refused at decode with `invalid params`), a manifest's `requested_tools`, a policy tool entry, and
+  `ToolRegistry.register` / `register_isolated`. A name a provider merely **proposes** needs no new check: it
+  matches no grant, so the existing refusal path closes the run.
+- **Compatibility:** a deployment whose policy, permits or registry use a tool name outside this set now fails
+  closed at load, decode or registration. Every name Portmark ships or documents already fits.
+
 ### Audit export to a SIEM (MCP/SIEM plan, PR 1)
 
 - **`portmark audit export`** appends the audit chains to a JSON Lines file for a log shipper (Vector,
