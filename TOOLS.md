@@ -56,6 +56,22 @@ The loader is a Python import path, not a shell command. The named object may be
 a `ToolRegistry` or a zero-argument function that returns one. Anything else is
 rejected before the host starts.
 
+## Tools From An MCP Server
+
+Portmark can call tools that live in an MCP server. They are registered like any other isolated tool, keep the
+same gates, and are approved one by one by their pinned definition. See **MCP.md** for the wire contract, the
+trust model, the configuration file and `portmark mcp pin`.
+
+## Reporting A Machine-Readable Failure Code
+
+An isolated tool may attach a short code to the exception it raises, as `error.portmark_error_code`
+(`[a-z][a-z0-9_]{0,31}`). The worker passes it to the host, which records it as `error_code` in the
+`tool.failed` audit event — but only if the tool's own registration allowed that code
+(`register_isolated(..., error_codes=("my_code",))`). The default is none, so one tool can never report
+another's classification. Only the code travels, never the exception's message, so an operator can alert on a
+class of failure without tool or user data entering the audit chain. An MCP tool uses it to separate "the
+server reported an error" from "the connection failed", which decides whether an effect is unknown.
+
 ## Example HTTP Fetch Tool
 
 Portmark includes one opt-in side-effecting example:

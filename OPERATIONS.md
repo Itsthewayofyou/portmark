@@ -158,6 +158,30 @@ portmark --store-backend postgres --store-path postgresql://user:pass@db/portmar
 
 The command prints `{"status": "valid"}` and exits 0 for an intact chain whose stored audit head is signed by a trusted host key. It prints `{"status": "invalid"}` and exits 1 when the task is missing or when event sequence, previous hash, event hash, stored audit-head validation, missing signature material, trust-registry rejection, or audit-head signature validation fails. It prints `{"status": "unverifiable"}` and exits 2 when the local verifier cannot prove the signed head because no trust registry is configured. Treat invalid results as tampered or corrupted task history; treat unverifiable results as an operator configuration failure and re-run with `--trust-registry-path`.
 
+## MCP Servers
+
+`--mcp-config mcp.json` (or `PORTMARK_MCP_CONFIG`) names the MCP servers this host may call and the tools each
+may expose. Every tool is approved by its pin, and the file needs a host policy too: an MCP tool is a tool, so
+it needs a grant like any other.
+
+```bash
+# 1. list what a server offers now, with the pin that would approve each tool
+portmark --mcp-config mcp.json mcp pin --server files
+# 2. paste the pins into mcp.json, then start the host
+portmark --mcp-config mcp.json --policy-path policy.json --store-path runtime.sqlite serve --port 8080
+```
+
+- **Start-up fails closed.** Every server is probed in a bounded child process and every pin is compared. A
+  changed or missing definition stops the host with the tool that changed. The same check runs again inside
+  the worker on every call.
+- `mcp pin` **never approves anything**: it prints `approved`, `CHANGED` or `not-configured` per tool, and the
+  operator edits the file.
+- A tool without `read_only: true` is side-effecting: it needs a `reconcile` target and an acknowledged
+  `IsolationProfile` on the registry (TOOLS.md), because MCP cannot say whether a tool changes the world.
+- A failed MCP call records `error_code` in its `tool.failed` audit event. Alert on `mcp_pin_drift` (a server
+  changed a tool under you) and on `mcp_transport_error` (the effect state is unknown and needs reconciling).
+- Only the variables named in `secret_env` reach the server process.
+
 ## Audit Export To A SIEM
 
 `portmark audit export` copies the audit chains into a JSON Lines file. A log shipper (Vector, Fluent Bit,

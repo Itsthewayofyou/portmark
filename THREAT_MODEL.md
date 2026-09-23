@@ -261,6 +261,7 @@ flowchart LR
 | TM-007 | Weak attestation verifier | External verifier configured incorrectly | Accept wrong quote, stale measurement, or wrong subject | Migration to untrusted host | Checkpoints, attestation roots | Subject, audience, expiry, measurement, nonce, signature/external verifier checks (`security.py`, `ATTESTATION.md`) | No shipped platform verifier. The conformance harness exists: `portmark attest-conformance` (EV-004) | Add at least one real platform verifier integration | Log and alert on attestation rejection reasons | Medium | High | High |
 | TM-008 | Approval token attacker | Token leaked into checkpoint or operator channel | Replay or mutate approval token | High-impact tool misuse | Approval tokens, tools | Token binds tool, subject, audience, task, nonce, args hash, policy hash; replay list (`security.py`, `host.py`) | Used approvals live in checkpoint state, not a dedicated durable table | Add task for durable approval-use index independent of mutable checkpoint content | Alert on approval denied/replayed events | Low | High | Medium |
 | TM-009 | SIEM reader or SIEM tamperer | Read or write access to the exported audit copy | Read sensitive arguments or model output from the SIEM; guess small values from digests; change exported values | Data leak outside the host boundary; a false SIEM record | Tool arguments, model output, audit export | Export is a default-deny projection per event kind; digests are HMAC-SHA-256 with a dedicated keyring; the exporter re-checks every hash and link before copying; `verify-export` Level 1 (links + signed heads) and Level 2 (values against the store) (`audit_export.py`) | Level 1 cannot prove projected values; equal values give equal digests under one key | Run Level 2 on a schedule; rotate or scope keyrings if equality is too revealing | Alert on export-control `integrity_failure` records and a non-zero `audit export` exit | Medium | Medium | Medium |
+| TM-010 | Malicious or compromised MCP server | The operator configured that server | Change a tool's definition after approval, poison a description or schema, claim to be read-only, send a server-to-client request, or hang | Unintended tool behaviour, an unreconciled effect, prompt injection of the model | Tools, effects, model context | Definition AND launch configuration (command, args, secret_env, timeout) pinned by SHA-256 and re-checked at start-up and every call; annotations  ignored (only the operator's `read_only`); descriptions and schemas never reach the provider (names only); the server runs inside the deadline-bounded, tree-killed worker; `secret_env` allowlist; bounded messages, pages and content blocks (`mcp_client.py`, `mcp_worker.py`, `mcp_config.py`) | A server that answers correctly and acts differently is out of reach of any client-side check; an effect that lands after a transport failure still needs the operator's reconcile | Prefer read-only tools; keep reconcile adapters honest; review a pin change before approving it | Alert on `error_code` `mcp_pin_drift` and `mcp_transport_error` in `tool.failed` | Medium | High | High |
 
 ## Criticality Calibration
 
@@ -440,6 +441,28 @@ all heads by `task_id` and trusts no clock, because `audit_heads.updated_at` is 
 seconds and a late commit could fall behind a time cursor.
 
 **Enforcement:** `tests/test_audit_export.py`.
+
+
+### MCP is a client, not a gateway (MCP/SIEM plan, PR 2)
+
+**Decision (owner, 2026-09-22, built 2026-09-23): an MCP tool is an ordinary isolated tool.** The alternative
+-- a proxy in front of MCP servers -- would have created a second enforcement path beside the host's, and the
+host's one gate is the product. So an MCP tool is registered in the same `ToolRegistry`, with the same permit,
+policy, constraint, budget, effect-ledger and audit gates, and the MCP-specific code only decides what may be
+registered.
+
+**What is not trusted:** the tool definition (pinned by SHA-256 over the whole definition, re-checked at
+start-up and at every call), the annotations (ignored: the specification itself says a client MUST treat them
+as untrusted), the description and schema (never shown to the model, which sees names only), and the answer
+(bounded, re-encoded, and handed back as data).
+
+**Why per-call launch:** a long-lived server process would outlive the deadline that makes a side-effecting
+tool safe to run. The cost is one start plus one handshake per call, recorded as a `debt:` marker with the
+condition for pooling.
+
+**Enforcement:** `tests/test_mcp.py` (29 tests), with a fake server that speaks both protocol eras and
+misbehaves on demand: pin drift, a vanished tool, an `isError` answer, a hang, a server-to-client request, a
+wrong response id, an oversized message, malformed JSON, and `input_required`.
 
 ## Quality Check
 
