@@ -223,10 +223,21 @@ def tool_environment(config_path: str, server: McpServerConfig, tool: McpToolCon
 if __name__ == "__main__":  # `python -m portmark.mcp_worker <config> <server>`
     import json
 
+    from .tool_subprocess_runner import _sweep_own_process_group
+
     # Both outcomes are JSON on STDOUT: the caller launches this through the tree launcher, which discards
     # stderr, so a failure reported there would reach nobody (Codex review R2).
+    status = 0
     try:
         print(json.dumps(discover({"config": sys.argv[1], "server": sys.argv[2]}), indent=2, sort_keys=True))
     except BaseException as failure:  # noqa: BLE001 - the probe reports every failure the same way
         print(json.dumps({"error": f"{type(failure).__name__}: {failure}"[:500]}))
-        sys.exit(1)
+        status = 1
+    # The report must be in the pipe BEFORE the sweep, because the sweep kills this process (Codex R3).
+    sys.stdout.flush()
+    # A tool CALL runs inside tool_subprocess_runner, which sweeps its own process group before exiting; this
+    # probe is launched directly, so it has to do the same. Without it, a background child the MCP server left
+    # behind survives a NORMAL probe exit: the parent's killpg is skipped once the probe process is reaped.
+    # The sweep exits this process by SIGKILL, which is why `_probe_report` accepts that as a clean end.
+    _sweep_own_process_group()
+    sys.exit(status)

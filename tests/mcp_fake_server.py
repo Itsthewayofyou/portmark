@@ -57,11 +57,24 @@ def tool_list(mode):
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "modern"
     modern = mode not in ("legacy", "legacy_new", "legacy_exit", "bad_version")
+    child = 0
+    if mode == "spawner":
+        # A background child the server leaves running, in the same process group. A real server does this
+        # whenever it starts a helper; only a group sweep collects it.
+        import subprocess  # noqa: PLC0415 - only this mode needs it  # nosec B404 - this test's own sleeper
+
+        # Closed streams, so it does not hold this server's stdio open; same process GROUP, which is the
+        # only thing the sweep under test depends on.
+        child = subprocess.Popen(  # noqa: S603  # nosec B603 - a fixed argv of this interpreter
+            [sys.executable, "-c", "import time; time.sleep(3600)"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ).pid
     marker = os.environ.get("FAKE_MCP_MARKER_FILE")
     if marker:  # proves which environment variables reached the server process, and that it ran at all
         with open(marker, "w", encoding="utf-8") as handle:
             json.dump({
                 "pid": os.getpid(),
+                "child": child,
                 **{key: os.environ.get(key, "") for key in ("FAKE_MCP_SECRET", "PORTMARK_MCP_PIN", "HOME")},
             }, handle)
     while True:

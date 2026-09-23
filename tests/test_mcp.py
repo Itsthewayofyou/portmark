@@ -405,6 +405,28 @@ class EndToEndTests(unittest.TestCase):
             time.sleep(0.05)
         self.assertFalse(_alive(pid), "the MCP server outlived the probe that started it")
 
+    @unittest.skipUnless(os.name == "posix", "os.kill(pid, 0) TERMINATES a process on Windows")
+    def test_a_normal_probe_sweeps_the_server_background_children(self):
+        # The TIMEOUT path is covered above. This is the NORMAL path: the probe answered, the worker exited by
+        # itself, and the parent's group signal is then skipped because that pid is already reaped. A child the
+        # MCP server left behind would survive, so the probe worker sweeps its own group before exiting
+        # (Codex review R3) -- the same thing tool_subprocess_runner does for an ordinary isolated tool.
+        marker = self.root / "server.json"
+        self.write_config("spawner")
+        document = json.loads(self.config_path.read_text())
+        document["servers"]["files"]["secret_env"] = ["FAKE_MCP_MARKER_FILE"]
+        self.config_path.write_text(json.dumps(document), encoding="utf-8")
+        with patch.dict(os.environ, {"FAKE_MCP_MARKER_FILE": str(marker)}):
+            report = probe_server(str(self.config_path), "files", timeout=30)
+        self.assertIn("read_file", report.tools)  # the probe really did succeed the ordinary way
+        child = json.loads(marker.read_text())["child"]
+        self.assertTrue(child)
+        for _ in range(100):  # the kill is asynchronous; wait briefly for the process to disappear
+            if not _alive(child):
+                break
+            time.sleep(0.05)
+        self.assertFalse(_alive(child), "a background child of the MCP server outlived the probe")
+
     def test_failure_codes_reach_the_caller(self):
         for mode, code in (("tool_error", "mcp_tool_error"), ("hang", "mcp_transport_error"), ("server_request", "mcp_protocol_error")):
             with self.subTest(mode):

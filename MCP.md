@@ -146,7 +146,11 @@ A name that collides with a tool already registered is refused too, so a server 
 ```
 
 `portmark mcp pin` and the start-up check both run the probe in a **killable process tree**, so a server that
-never answers is stopped with the probe instead of being left behind.
+never answers is stopped with the probe instead of being left behind. A probe that ENDS normally is a second
+case: the tree signal is skipped once the probe process is reaped, so the probe sweeps its own process group
+before it exits, and a background child the MCP server left behind goes with it. That is the same sweep an
+ordinary isolated tool worker does, and it has the same POSIX limit: a descendant that calls `setsid()` moves
+to a group of its own and escapes. Real containment of a hostile program is the deployment substrate's job.
 
 - `pin` is the SHA-256 of the tool's canonical definition: the WHOLE definition object the server reports,
   minus protocol `_meta`. Not a chosen list of fields, because a list would silently ignore any field a

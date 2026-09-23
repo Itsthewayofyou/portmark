@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess  # nosec B404 - runs THIS interpreter to probe a server inside a bounded child tree
 import sys
 import threading
@@ -32,6 +33,12 @@ STARTUP_ALLOWANCE_SECONDS = 10.0
 PIN_CHECK_TIMEOUT_SECONDS = 60.0
 MAX_PROBE_BYTES = 1 << 20
 PROBE_CHUNK_BYTES = 1 << 16
+# The probe worker sweeps its OWN process group before exiting, to take the MCP server's background children
+# with it, and that sweep kills the worker by SIGKILL (Codex R3). So a finished probe ends one of two ways:
+# 0 where there is no sweep (Windows, or a launch that did not make the worker its own group leader), or
+# -SIGKILL where the sweep ran. The report itself is read from the PIPE, never from the exit status; this
+# check only refuses an exit that means the worker died before it could report.
+_CLEAN_PROBE_EXITS = frozenset({0, -getattr(signal, "SIGKILL", 9)})
 
 
 class McpStartupError(McpConfigError):
@@ -134,7 +141,7 @@ def _probe_report(server: str, raw: bytes, returncode: int | None) -> PinReport:
         raise McpStartupError(f"the probe of MCP server {server!r} produced no usable report") from error
     if isinstance(report, dict) and isinstance(report.get("error"), str):
         raise McpStartupError(f"probing MCP server {server!r} failed: {report['error'][:300]}")
-    if returncode != 0 or not isinstance(report, dict) or not isinstance(report.get("tools"), dict):
+    if returncode not in _CLEAN_PROBE_EXITS or not isinstance(report, dict) or not isinstance(report.get("tools"), dict):
         raise McpStartupError(f"the probe of MCP server {server!r} produced no usable report")
     return PinReport(server, str(report.get("protocol_version", "")), dict(report["tools"]))
 
