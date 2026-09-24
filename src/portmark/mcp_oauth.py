@@ -327,7 +327,7 @@ def refresh(
         response_types_supported=["code"],
     )
     network = _Network(total_seconds, request_timeout, allow_private, context)
-    asyncio.run(_renew(provider, httpx2.Request("POST", server_url), network, storage, server_url, stored))
+    _run_flow(_renew(provider, httpx2.Request("POST", server_url), network, storage, server_url, stored))
     renewed = _harvest(provider, storage, client_id, scopes or stored.scopes)
     return Authorization(
         renewed.issuer,
@@ -385,8 +385,26 @@ def authorize(
         callback_handler=read_callback or _no_callback,
     )
     network = _Network(total_seconds, request_timeout, allow_private, context)
-    asyncio.run(_drive(provider, httpx2.Request("POST", server_url), network, storage))
+    _run_flow(_drive(provider, httpx2.Request("POST", server_url), network, storage))
     return _harvest(provider, storage, client_id, scopes)
+
+
+def _run_flow(flow: Any) -> None:
+    """Run one flow, turning the SDK's own exceptions into this module's.
+
+    `OAuthFlowError` and `OAuthTokenError` under it are how the SDK reports a refused exchange, a `state`
+    that did not compare equal, or metadata claiming an issuer it was not served from. Those are ordinary
+    outcomes of talking to a real authorization server, not faults -- so an operator should read a sentence,
+    not a traceback, and no caller should have to import the SDK's exception types to catch them."""
+    from mcp.client.auth.exceptions import OAuthFlowError  # noqa: PLC0415 - part of the optional extra
+
+    try:
+        asyncio.run(flow)
+    except McpOAuthError:
+        raise
+    except OAuthFlowError as error:
+        # Truncated, and it is the FAILED exchange's body: a refusal carries no token to leak.
+        raise McpOAuthError(f"the authorization server did not complete the flow: {str(error)[:300]}") from error
 
 
 async def _drive(provider: Any, request: Any, network: _Network, storage: _Storage) -> None:

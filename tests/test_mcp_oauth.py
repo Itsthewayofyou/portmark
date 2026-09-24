@@ -20,6 +20,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from urllib.parse import parse_qs, quote, urlsplit
 
@@ -36,7 +37,7 @@ from portmark.mcp_oauth import (
 )
 from portmark.security import canonical_json
 from portmark import mcp_worker
-from portmark.cli import _install_mcp_tools
+from portmark.cli import _finite_seconds, _install_mcp_tools, _run_mcp
 from portmark.mcp import McpStartupError, probe_server, refresh_oauth_tokens
 from portmark.mcp_http import HttpTransport, resolve_endpoint_address
 from portmark.mcp_login import DEFAULT_REDIRECT, _Loopback, login, logout, result_from_redirect
@@ -595,6 +596,9 @@ class OauthDriverTests(unittest.TestCase):
 
     def test_metadata_claiming_an_issuer_it_was_not_served_from_is_refused(self):
         # The specification's own worked example: a document from one origin claiming to be another.
+        # DEPENDENCY-CONTRACT: what is asserted is that the SDK still refuses, not how the refusal is
+        # typed. Pinning the type here would make it rest on Portmark's translation as well, and then one
+        # mutation would fail this and the refused-exchange test and prove neither.
         with FakeAuthorizationServer("wrong_issuer") as server:
             with self.assertRaises(Exception) as caught:
                 self.authorize(server)
@@ -608,10 +612,17 @@ class OauthDriverTests(unittest.TestCase):
                 self.authorize(server, allow_private=False)
         self.assertIn("not usable", str(caught.exception))
 
-    def test_a_refused_token_exchange_is_reported_and_stores_nothing(self):
+    def test_a_refused_token_exchange_is_reported_as_this_module_s_own_error(self):
+        """An authorization server that refuses is an ordinary outcome, not a Portmark fault.
+
+        The SDK raises `OAuthTokenError` for it. Letting that out would put a traceback in front of an
+        operator and would force every caller to import the SDK's exception types to catch a refusal --
+        the coupling this module exists to prevent.
+        """
         with FakeAuthorizationServer("token_refused") as server:
-            with self.assertRaises(Exception):
+            with self.assertRaises(McpOAuthError) as caught:
                 self.authorize(server)
+        self.assertIn("did not complete the flow", str(caught.exception))
 
     def test_a_server_that_issues_no_refresh_token_still_authorizes(self):
         with FakeAuthorizationServer("no_refresh_token") as server:
@@ -1046,3 +1057,111 @@ class LoginCommandTests(unittest.TestCase):
                 with self.assertRaises(McpConfigError) as caught:
                     login(path, "files")
         self.assertIn("EXAMPLE_CLIENT_ID", str(caught.exception))
+
+
+class LoginTimeoutTests(unittest.TestCase):
+    """`--timeout` sets a deadline, so a value that cannot BE a deadline has to be refused at the edge."""
+
+    def test_a_timeout_that_is_not_a_finite_number_is_refused(self):
+        """`nan` and `inf` both switch the deadline off rather than set it.
+
+        `now >= nan` is false for ever and `now >= inf` never becomes true, so a login given either would
+        wait for a redirect that never comes, with nothing left to stop it.
+        """
+        for value in ("nan", "inf", "-inf", "NaN", "Infinity"):
+            with self.subTest(value=value):
+                with self.assertRaises(argparse.ArgumentTypeError):
+                    _finite_seconds(value)
+        # And through the REAL parser, because a check nothing calls is decorative. argparse refuses while
+        # parsing, so nothing is loaded and no network is touched.
+        from portmark import cli
+
+        with patch.object(sys, "argv", ["portmark", "mcp", "login", "files", "--timeout", "nan"]):
+            with contextlib.redirect_stderr(io.StringIO()) as complaint:
+                with self.assertRaises(SystemExit):
+                    cli.main()
+        self.assertIn("finite positive", complaint.getvalue())
+
+    def test_a_timeout_that_is_zero_or_negative_is_refused(self):
+        # A deadline already in the past gives up before the operator has seen the url.
+        for value in ("0", "-1", "-0.5"):
+            with self.subTest(value=value):
+                with self.assertRaises(argparse.ArgumentTypeError):
+                    _finite_seconds(value)
+
+    def test_an_ordinary_timeout_is_accepted(self):
+        self.assertEqual(_finite_seconds("90"), 90.0)
+
+
+class PinRenewalScopeTests(unittest.TestCase):
+    """`mcp pin --server X` talks to one server, so it must not be stopped by a different one."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.path = self.root / "mcp.json"
+        self.path.write_text(json.dumps({
+            "schema": "portmark.mcp.config.v1",
+            "servers": {
+                "plain": dict(HTTP_SERVER, bearer_env="MCP_TOKEN"),
+                "delegated": dict(HTTP_SERVER, url="https://other.example.com/mcp", oauth=OAUTH),
+            },
+        }), encoding="utf-8")
+
+    def test_renewing_can_be_limited_to_one_server(self):
+        """The unrelated OAuth server here would fail: its client id variable is unset.
+
+        Without the limit, pinning `plain` -- which needs no authorization at all -- would stop on it.
+        """
+        with patch.dict(os.environ, {"EXAMPLE_CLIENT_ID": ""}):
+            self.assertEqual(refresh_oauth_tokens(load_config(str(self.path)), only="plain"), ())
+
+    def test_pinning_one_server_renews_only_that_one(self):
+        # The wiring, not the helper: `_run_mcp` has to pass the selection on.
+        seen = {}
+
+        def renew(config, only=None):
+            seen["only"] = only
+            return ()
+
+        arguments = argparse.Namespace(mcp_command="pin", server="plain")
+        settings = SimpleNamespace(mcp_config_path=str(self.path))
+        with patch("portmark.mcp.refresh_oauth_tokens", side_effect=renew):
+            with patch("portmark.mcp.pin_report", return_value={}):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    _run_mcp(argparse.ArgumentParser(), arguments, settings)
+        self.assertEqual(seen["only"], "plain")
+
+
+class McpCommandErrorTests(unittest.TestCase):
+    """A store that cannot be written is an operator's problem to fix, not a traceback to decipher."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.path = self.root / "mcp.json"
+        self.path.write_text(json.dumps({
+            "schema": "portmark.mcp.config.v1",
+            "servers": {"files": dict(HTTP_SERVER, oauth=OAUTH)},
+        }), encoding="utf-8")
+
+    def test_a_token_store_failure_is_reported_as_an_error_and_not_a_traceback(self):
+        if not sdk_available():
+            self.skipTest("requires portmark[mcp-oauth]")
+        arguments = argparse.Namespace(mcp_command="logout", server="files")
+        settings = SimpleNamespace(mcp_config_path=str(self.path))
+        broken = TokenStoreError("the token store is a directory")
+        with patch("portmark.mcp_login.clear_tokens", side_effect=broken):
+            with contextlib.redirect_stderr(io.StringIO()) as complaint:
+                with self.assertRaises(SystemExit):
+                    _run_mcp(argparse.ArgumentParser(), arguments, settings)
+        self.assertIn("the token store is a directory", complaint.getvalue())
+
+    def test_a_token_store_failure_at_start_up_is_reported_as_an_error_too(self):
+        """The same gap on the other entry point: start-up renews, and renewing reads the store."""
+        broken = TokenStoreError("the token store is group readable")
+        with patch("portmark.mcp_oauth.sdk_available", return_value=True):
+            with patch("portmark.mcp_oauth.read_tokens", side_effect=broken):
+                with patch.dict(os.environ, {"EXAMPLE_CLIENT_ID": "cid"}):
+                    with contextlib.redirect_stderr(io.StringIO()) as complaint:
+                        with self.assertRaises(SystemExit):
+                            _install_mcp_tools(argparse.ArgumentParser(), str(self.path), None)
+        self.assertIn("group readable", complaint.getvalue())

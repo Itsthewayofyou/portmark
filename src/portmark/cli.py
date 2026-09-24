@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import errno
 import json
+import math
 import os
 import secrets
 import shlex
@@ -263,11 +264,26 @@ def _floor_reader(config, audit_verifier):
     return LocalFloorWitness(config.audit_floor_path, config.host_id, None, audit_verifier)
 
 
+def _finite_seconds(value: str) -> float:
+    """A finite, POSITIVE number of seconds.
+
+    `type=float` accepts `nan` and `inf`, and a deadline built from either is never reached: `now >= nan`
+    is false for ever, and `now >= inf` never becomes true. The flag would then switch off the one thing it
+    exists to set. A non-number is left to argparse, whose own message already names the option."""
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError(
+            f"must be a finite positive number of seconds, not {value!r}"
+        )
+    return parsed
+
+
 def _run_mcp(parser: argparse.ArgumentParser, args: argparse.Namespace, config) -> None:
     """`portmark mcp pin | login | logout`."""
     from .mcp import dumps, pin_report, refresh_oauth_tokens
     from .mcp_config import McpConfigError, load_config
     from .mcp_oauth import McpOAuthError
+    from .mcp_token_store import TokenStoreError
 
     if not config.mcp_config_path:
         parser.error(f"mcp {args.mcp_command} requires --mcp-config or PORTMARK_MCP_CONFIG")
@@ -287,9 +303,12 @@ def _run_mcp(parser: argparse.ArgumentParser, args: argparse.Namespace, config) 
         # `pin` probes each server, and an OAuth server's probe carries the stored access token. Renewing it
         # first is what makes `mcp pin` usable an hour after logging in; it is a convenience and not a
         # guard, because a stale token makes the worker refuse rather than send an unauthenticated request.
-        refresh_oauth_tokens(load_config(path))
+        # SCOPED to what is about to be probed. Renewing every server would let one unrelated OAuth
+        # server -- never logged in to, or with its client id unset -- stop the operator pinning a server
+        # that is perfectly well configured.
+        refresh_oauth_tokens(load_config(path), only=args.server)
         print(dumps(pin_report(path, args.server)))
-    except (McpConfigError, McpOAuthError) as error:
+    except (McpConfigError, McpOAuthError, TokenStoreError) as error:
         parser.error(str(error))
 
 
@@ -298,6 +317,7 @@ def _install_mcp_tools(parser: argparse.ArgumentParser, path: str, tools):
     from .mcp import check_pins, refresh_oauth_tokens, register_mcp_tools
     from .mcp_config import McpConfigError, load_config
     from .mcp_oauth import McpOAuthError
+    from .mcp_token_store import TokenStoreError
     from .security import SecurityError
     from .tools import ToolRegistry
 
@@ -310,7 +330,7 @@ def _install_mcp_tools(parser: argparse.ArgumentParser, path: str, tools):
         refresh_oauth_tokens(mcp_config)
         check_pins(mcp_config)
         names = register_mcp_tools(registry, mcp_config)
-    except (McpConfigError, SecurityError, McpOAuthError) as error:
+    except (McpConfigError, SecurityError, McpOAuthError, TokenStoreError) as error:
         parser.error(str(error))
     print(f"MCP tools registered: {', '.join(names)}", file=sys.stderr)
     return registry
@@ -846,7 +866,7 @@ def main() -> None:
              "without --manual it must be a loopback http address, which is what is listened on",
     )
     mcp_login.add_argument(
-        "--timeout", type=float, default=MCP_LOGIN_SECONDS,
+        "--timeout", type=_finite_seconds, default=MCP_LOGIN_SECONDS,
         help=f"seconds for the WHOLE login, including your time in the browser (default {MCP_LOGIN_SECONDS:g})",
     )
     mcp_logout = mcp_commands.add_parser("logout", help="delete the stored authorization for one server")

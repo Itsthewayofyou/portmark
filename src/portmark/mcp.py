@@ -58,12 +58,14 @@ class PinReport:
     rejected: dict[str, str] = field(default_factory=dict)
 
 
-def refresh_oauth_tokens(config: McpConfig) -> tuple[str, ...]:
+def refresh_oauth_tokens(config: McpConfig, only: str | None = None) -> tuple[str, ...]:
     """Make every `oauth` server's stored access token usable, BEFORE anything tries to use it.
 
     This is the host half of the separation: renewing drives the `mcp` SDK, so it happens here and never in
     the isolated worker, which only ever reads the resulting string out of the store. Returns the servers
-    whose store was made current, in configuration order.
+    whose store was made current, in configuration order. `only` limits it to one server, for a command
+    that is going to talk to one server: renewing the rest would let an unrelated OAuth server that has
+    never been logged in to stop a perfectly good one being pinned.
 
     It is not a guard, and it is deliberately not written as one. A caller that skips it does not produce an
     unauthenticated request -- the worker refuses a stale token itself. Skipping it only turns a start-up
@@ -72,6 +74,8 @@ def refresh_oauth_tokens(config: McpConfig) -> tuple[str, ...]:
 
     made_current: list[str] = []
     for name, server in config.servers.items():
+        if only is not None and name != only:
+            continue
         if server.oauth is None:
             continue
         if not sdk_available():
