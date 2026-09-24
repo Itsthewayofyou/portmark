@@ -34,6 +34,9 @@ Changelog = "https://github.com/Itsthewayofyou/portmark/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 a2a = ["a2a-sdk==1.1.4"]
+# The official MCP SDK, used ONLY to know the OAuth protocol -- Portmark performs every request itself
+# (src/portmark/mcp_oauth.py). Pinned exactly, never a range: a range breaks `lock_requirements.py --check`.
+mcp-oauth = ["mcp==2.2.0"]
 postgres = ["psycopg[binary]==3.3.6"]
 wasmtime = ["wasmtime==48.0.0"]
 

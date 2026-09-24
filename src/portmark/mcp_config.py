@@ -38,8 +38,9 @@ _PIN = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
 # mutually exclusive, so a config can never describe a server that is half one and half the other, and the
 # error can name the transport it decided on.
 STDIO_FIELDS = ("command", "args", "secret_env")
-HTTP_FIELDS = ("url", "bearer_env", "allow_private")
+HTTP_FIELDS = ("url", "bearer_env", "allow_private", "oauth")
 SERVER_FIELDS = (*STDIO_FIELDS, *HTTP_FIELDS, "timeout_seconds", "tools")
+OAUTH_FIELDS = ("client_id_env", "client_secret_env", "token_store", "scopes")
 TOOL_FIELDS = ("pin", "read_only", "reconcile", "alias")
 STDIO = "stdio"
 HTTP = "http"
@@ -47,6 +48,22 @@ HTTP = "http"
 
 class McpConfigError(ValueError):
     """A malformed or unsafe MCP configuration: the host does not start (CLI exit 2)."""
+
+
+@dataclass(frozen=True)
+class McpOAuthConfig:
+    """How ONE server is authorized: names of variables and a path, never a secret.
+
+    The operator registers an OAuth client with the service themselves and puts the resulting identifiers in
+    the environment. Dynamic Client Registration is out of scope, which is also where the specification now
+    points -- it marks DCR deprecated and puts pre-registered client information FIRST in its own priority
+    order. Client ID Metadata Documents are out of scope too: they would require Portmark to HOST a public
+    HTTPS document whose URL is the client id, which a self-hosted runtime generally cannot do."""
+
+    client_id_env: str
+    token_store: str
+    client_secret_env: str = ""
+    scopes: tuple[str, ...] = ()
 
 
 def server_digest(server: "McpServerConfig") -> str:
@@ -65,6 +82,18 @@ def server_digest(server: "McpServerConfig") -> str:
             "allow_private": server.allow_private,
             "timeout_seconds": server.timeout_seconds,
         }
+        if server.oauth is not None:
+            # Added ONLY when the server is actually OAuth-authorized, so every pin approved before this
+            # feature existed keeps exactly the digest it was approved under. A key carrying `null` for the
+            # servers that do not use it would re-digest all of them and read as drift on the next start-up.
+            # Names and a path, never a token: rotating a credential must not invalidate an approved pin,
+            # while repointing the config at a different variable, store or scope set must.
+            body["oauth"] = {
+                "client_id_env": server.oauth.client_id_env,
+                "client_secret_env": server.oauth.client_secret_env,
+                "token_store": server.oauth.token_store,
+                "scopes": list(server.oauth.scopes),
+            }
     else:
         body = {
             "transport": STDIO,
@@ -126,6 +155,7 @@ class McpServerConfig:
     url: str = ""
     bearer_env: str = ""
     allow_private: bool = False
+    oauth: McpOAuthConfig | None = None
 
     @property
     def transport(self) -> str:
@@ -213,6 +243,7 @@ def _server_from_spec(name: str, value: Any) -> McpServerConfig:
     _reject_foreign_keys(value, transport, label)
     command, args, secret_env = "", [], []
     url, bearer_env, allow_private = "", "", False
+    oauth: McpOAuthConfig | None = None
     if transport == STDIO:
         command = value.get("command")
         if not isinstance(command, str) or not command:
@@ -238,6 +269,15 @@ def _server_from_spec(name: str, value: Any) -> McpServerConfig:
         if bearer_env and url.startswith("http://"):
             # A token on a plaintext connection is a token anyone on the path can read and reuse.
             raise McpConfigError(f"{label} cannot send `bearer_env` over plain http; use https")
+        if "oauth" in value:
+            if bearer_env:
+                # Two answers to one question. Which token travels would be decided by reading the code.
+                raise McpConfigError(f"{label} sets both `bearer_env` and `oauth`: a server is authorized one way, not two")
+            if not url.startswith("https://"):
+                # Unlike the MCP endpoint, the specification DOES mandate https for the OAuth endpoints, and
+                # an authorization code or refresh token on a plaintext hop is a durable credential in clear.
+                raise McpConfigError(f"{label} cannot use `oauth` over plain http; the OAuth endpoints must be https")
+            oauth = _oauth_from_spec(value["oauth"], f"{label}.oauth")
     timeout = value.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= MAX_TIMEOUT_SECONDS:
         raise McpConfigError(f"{label}.timeout_seconds must be a number from 0 (exclusive) to {MAX_TIMEOUT_SECONDS}")
@@ -246,8 +286,40 @@ def _server_from_spec(name: str, value: Any) -> McpServerConfig:
         raise McpConfigError(f"{label}.tools must name at least one tool; there is no expose-everything switch")
     tools = {tool: _tool_from_spec(name, tool, spec) for tool, spec in raw_tools.items()}
     return McpServerConfig(
-        name, command, tuple(args), tuple(secret_env), float(timeout), tools, url, bearer_env, allow_private
+        name, command, tuple(args), tuple(secret_env), float(timeout), tools, url, bearer_env, allow_private, oauth
     )
+
+
+def _oauth_from_spec(value: Any, label: str) -> McpOAuthConfig:
+    """The `oauth` block: variable NAMES, a store path, and the scopes to ask for."""
+    if not isinstance(value, dict):
+        raise McpConfigError(f"{label} must be an object")
+    _reject_unknown(value, OAUTH_FIELDS, label)
+    client_id_env = value.get("client_id_env")
+    if not isinstance(client_id_env, str) or not _ENV_NAME.match(client_id_env):
+        raise McpConfigError(f"{label}.client_id_env must be the NAME of an environment variable, not a client id")
+    client_secret_env = value.get("client_secret_env", "")
+    if not isinstance(client_secret_env, str) or (client_secret_env and not _ENV_NAME.match(client_secret_env)):
+        raise McpConfigError(f"{label}.client_secret_env must be the NAME of an environment variable, not a secret")
+    token_store = value.get("token_store")
+    if not isinstance(token_store, str) or not token_store:
+        raise McpConfigError(f"{label}.token_store must be a non-empty path")
+    if "\x00" in token_store or any(character.isspace() and character != " " for character in token_store):
+        raise McpConfigError(f"{label}.token_store must not contain NUL or control characters")
+    if not os.path.isabs(token_store):
+        # The host, the CLI and the worker each resolve this path from a different working directory. A
+        # relative path would name a different file in each, and the one that mattered would be whichever
+        # process wrote last.
+        raise McpConfigError(f"{label}.token_store must be an absolute path")
+    scopes = value.get("scopes", [])
+    if not isinstance(scopes, list) or not all(isinstance(item, str) for item in scopes):
+        raise McpConfigError(f"{label}.scopes must be a list of strings")
+    for scope in scopes:
+        # RFC 6749 scope-token: visible ASCII except space, double quote and backslash. Scopes travel
+        # space-separated in a query string, so one containing a space would silently become two.
+        if not scope or not all(0x21 <= ord(character) <= 0x7E and character not in '"\\' for character in scope):
+            raise McpConfigError(f"{label}.scopes has an entry that is not a usable OAuth scope: {scope!r}")
+    return McpOAuthConfig(client_id_env, token_store, client_secret_env, tuple(scopes))
 
 
 def _transport_of(value: Mapping[str, Any], label: str) -> str:

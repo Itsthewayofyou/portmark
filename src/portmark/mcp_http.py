@@ -20,6 +20,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Mapping
+from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 from .json_guard import StrictJSONError, strict_json_loads
@@ -45,6 +46,8 @@ MAX_EVENT_BYTES = MAX_MESSAGE_BYTES
 MAX_STREAM_BYTES = 8 << 20
 MAX_SSE_EVENTS = 256
 MAX_ERROR_BODY_BYTES = 1 << 16
+# An OAuth metadata document or token response is a small JSON object. A megabyte of one is not.
+MAX_METADATA_BYTES = 1 << 20
 
 
 def resolve_endpoint_address(host: str, port: int, allow_private: bool) -> str:
@@ -127,6 +130,9 @@ class HttpTransport(Transport):
         self._host = split.hostname or ""
         self._port = split.port or (443 if split.scheme == "https" else 80)
         self._path = split.path or "/"
+        # The MCP endpoint may not carry a query string (the config refuses one), but an OAuth metadata or
+        # token url routinely does, so the one-shot path keeps it. `_path` stays exactly as it was.
+        self._target = self._path + (f"?{split.query}" if split.query else "")
         self._timeout = request_timeout
         self._deadline = time.monotonic() + total_seconds
         self._allow_private = allow_private
@@ -176,19 +182,63 @@ class HttpTransport(Transport):
     def read(self, timeout: float) -> bytes | None:
         return self._frames.popleft() if self._frames else None
 
+    def one_shot(self, method: str, headers: Mapping[str, str], body: bytes, max_bytes: int) -> "Fetched":
+        """A single request/response on its own connection, for `checked_fetch`.
+
+        Separate from `send`/`read`, which implement the MCP framing -- the session id, the SSE stream and
+        the era rules have no meaning at an OAuth endpoint. What IS shared is every protection: `_open`
+        resolves and confirms the address, `_watchdog` bounds the whole exchange from outside the read,
+        `_read_bounded` caps the answer, and `_checked_headers` keeps a credential out of an exception."""
+        connection = self._open()
+        watchdog = self._watchdog()
+        try:
+            sent = self._checked_headers({"Host": self._host_header(), "Accept": JSON_TYPE, **dict(headers)})
+            if body:
+                sent.setdefault("Content-Type", "application/x-www-form-urlencoded")
+                sent["Content-Length"] = str(len(body))
+            connection.request(method, self._target, body or None, sent)
+            self._arm()
+            response = connection.getresponse()
+            answer = Fetched(
+                response.status,
+                {name.lower(): value for name, value in response.getheaders()},
+                self._read_bounded(response, max_bytes),
+            )
+        except (OSError, http.client.HTTPException) as error:
+            self._refuse_if_out_of_budget()
+            raise McpError(TRANSPORT_ERROR, f"the OAuth endpoint could not be read: {type(error).__name__}") from None
+        finally:
+            watchdog.cancel()
+            connection.close()
+        self._refuse_if_out_of_budget()
+        return answer
+
     def close(self) -> None:
         self._frames.clear()
 
     # -- request ------------------------------------------------------------------------------------------
 
-    def _request_headers(self, encoded: bytes, headers: Mapping[str, str]) -> dict[str, str]:
+    def _host_header(self) -> str:
+        """The `Host` value for this endpoint, shared by the MCP framing and the one-shot OAuth path.
+
+        The default port belongs to the SCHEME, not to a list of well-known ports: 80 is the default for
+        http and NOT for https, so `https://host:80/` must say `:80` or the server is told 443."""
         host = f"[{self._host}]" if ":" in self._host else self._host
-        # The default port belongs to the SCHEME, not to a list of well-known ports: 80 is the default for
-        # http and NOT for https, so `https://host:80/` must say `:80` or the server is told 443.
         if self._port != (443 if self._scheme == "https" else 80):
             host += f":{self._port}"
+        return host
+
+    def _checked_headers(self, built: dict[str, str]) -> dict[str, str]:
+        for name, value in built.items():
+            # Checked HERE so `http.client` never refuses one: its own message prints the offending VALUE,
+            # and a mirrored tool argument, a bearer token or an access token would travel out with it.
+            if not is_header_safe(value):
+                raise McpError(PROTOCOL_ERROR, f"the {name} header value is not usable in an HTTP header")
+        return built
+
+    def _request_headers(self, encoded: bytes, headers: Mapping[str, str]) -> dict[str, str]:
         built = {
-            "Host": host,
+            "Host": self._host_header(),
             "Accept": ACCEPT,
             "Content-Type": JSON_TYPE,
             "Content-Length": str(len(encoded)),
@@ -198,12 +248,7 @@ class HttpTransport(Transport):
             built["Mcp-Session-Id"] = self._session_id
         if self._bearer:
             built["Authorization"] = f"Bearer {self._bearer}"
-        for name, value in built.items():
-            # Checked HERE so `http.client` never refuses one: its own message prints the offending VALUE,
-            # and a mirrored tool argument or a bearer token would travel out with it.
-            if not is_header_safe(value):
-                raise McpError(PROTOCOL_ERROR, f"the {name} header value is not usable in an HTTP header")
-        return built
+        return self._checked_headers(built)
 
     def _open(self) -> http.client.HTTPConnection:
         address = resolve_endpoint_address(self._host, self._port, self._allow_private)
@@ -404,3 +449,52 @@ class HttpTransport(Transport):
                 self._sock.settimeout(min(self._timeout, remaining))
             except OSError:  # pragma: no cover - the socket may already be released
                 pass
+
+
+@dataclass(frozen=True)
+class Fetched:
+    """One answer from `checked_fetch`. Header names are lowercased because HTTP header names are
+    case-insensitive and the OAuth rules key off `WWW-Authenticate`, which servers spell every way there is."""
+
+    status: int
+    headers: Mapping[str, str]
+    body: bytes
+
+
+def checked_fetch(
+    method: str,
+    url: str,
+    *,
+    total_seconds: float,
+    request_timeout: float,
+    headers: Mapping[str, str] | None = None,
+    body: bytes = b"",
+    allow_private: bool = False,
+    max_bytes: int = MAX_METADATA_BYTES,
+    context: ssl.SSLContext | None = None,
+) -> Fetched:
+    """One request to ONE url, under every rule the MCP endpoint itself is held to.
+
+    This exists for OAuth. Authorization makes a client fetch urls the SERVER chooses -- the metadata url
+    arrives in a `WWW-Authenticate` header, and the authorization server's url arrives inside that document
+    -- so those fetches are a server-controlled request surface. The specification says nothing about
+    restraining it, so routing them through here is Portmark's rule rather than the specification's: the
+    address is resolved once and checked, the socket is confirmed to be connected to the address that was
+    checked, TLS verifies, the answer is capped, and the same wall-clock watchdog ends a dripped one.
+
+    **Redirects are not followed, and there is no option to follow them.** `http.client` does not follow
+    them, so a 3xx is returned as it stands and the caller decides. Following one would reach an address that
+    was never checked -- the whole defence undone in a single hop. The official SDK's own auth flow DOES
+    follow redirects on its internal requests, which is exactly why Portmark performs them instead of letting
+    the SDK perform them."""
+    split = urlsplit(url)
+    if split.scheme != "https":
+        # No exception, and deliberately not one that `allow_private` can open. `allow_private` says WHICH
+        # ADDRESSES may be reached; it is not a statement about encryption, and letting it disable TLS here
+        # would mean a discovered private token endpoint could receive a client secret, an authorization
+        # code or a refresh token in clear. The specification mandates https for the OAuth endpoints --
+        # unlike the MCP endpoint itself, where Portmark's rule is its own. The tests reach a loopback
+        # authorization server over real TLS with a test trust anchor rather than by weakening this.
+        raise McpError(TRANSPORT_ERROR, f"an OAuth endpoint must be https, not {split.scheme!r}")
+    transport = HttpTransport(url, request_timeout, total_seconds, allow_private=allow_private, context=context)
+    return transport.one_shot(method, headers or {}, body, max_bytes)
