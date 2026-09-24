@@ -278,6 +278,21 @@ def _finite_seconds(value: str) -> float:
     return parsed
 
 
+def _mcp_token_refresher(config):
+    """A background refresher for the configured MCP servers, or None when there is nothing to renew.
+
+    Only `serve` gets one: it is the only launcher that runs a host for longer than one call AND installs
+    MCP tools. `portmark.asgi:create_app` -- the other long-lived entry point -- does not touch MCP at all,
+    and `demo` is a single run. Starting a thread for a one-shot command would be noise."""
+    if not config.mcp_config_path:
+        return None
+    from .mcp import TokenRefresher  # noqa: PLC0415 - only a host with MCP servers pays for this
+    from .mcp_config import load_config  # noqa: PLC0415 - as above
+
+    refresher = TokenRefresher(load_config(config.mcp_config_path))
+    return refresher if refresher.wanted else None
+
+
 def _run_mcp(parser: argparse.ArgumentParser, args: argparse.Namespace, config) -> None:
     """`portmark mcp pin | login | logout`."""
     from .mcp import dumps, pin_report, refresh_oauth_tokens
@@ -1013,6 +1028,12 @@ def main() -> None:
         result = host.run(make_demo_envelope(host, args.goal, provider))
         print(json.dumps(asdict(result), indent=2))
     else:
+        # Started BEFORE `serve` blocks and stopped in `finally`, so an interrupt out of `serve` -- which is
+        # how a host normally ends -- still goes through the stop. The daemon flag is a backstop for a hard
+        # exit, not a way of saying the thread was shut down.
+        refresher = _mcp_token_refresher(config)
+        if refresher is not None:
+            refresher.start()
         try:
             serve(
                 host=host,
@@ -1034,6 +1055,9 @@ def main() -> None:
             )
         except ValueError as exc:
             parser.error(str(exc))
+        finally:
+            if refresher is not None:
+                refresher.stop()
 
 
 if __name__ == "__main__":

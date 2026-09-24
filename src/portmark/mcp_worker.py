@@ -134,10 +134,9 @@ def _stored_access_token(server: McpServerConfig) -> str:
     sandbox is why the token logic lives in the host at all. The worker reads a string -- exactly as
     `bearer_env` gives it one -- and refuses a stale one rather than sending it.
 
-    # debt: a host running longer than one access-token lifetime sees calls start to fail closed, because
-    # the store is refreshed at start-up and not again; upgrade when an operator reports it, or when a
-    # host-side background refresher lands.
-    """
+    The store is kept current by `mcp.TokenRefresher` in the host, which renews further ahead of expiry than
+    the margin this refusal uses -- so under a running host a stale token here means the renewal itself is
+    failing, and this refusal is the report of that."""
     from .mcp_token_store import TokenStoreError, client_mismatch, read_tokens  # noqa: PLC0415 - oauth only
 
     oauth = server.oauth

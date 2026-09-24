@@ -30,6 +30,7 @@ from oauth_server import ACCESS_TOKEN, AUTHORIZATION_CODE, REFRESH_TOKEN, FakeAu
 
 from portmark.mcp_oauth import (
     McpOAuthError,
+    McpOAuthRefused,
     authorize,
     current_access_token,
     refresh,
@@ -39,7 +40,15 @@ from portmark.mcp_oauth import (
 from portmark.security import canonical_json
 from portmark import mcp_worker
 from portmark.cli import _finite_seconds, _install_mcp_tools, _run_mcp
-from portmark.mcp import McpStartupError, probe_server, refresh_oauth_tokens
+from portmark.mcp import (
+    MIN_REFRESH_SLEEP_SECONDS,
+    REFRESH_AHEAD_SECONDS,
+    REFRESH_RETRY_SECONDS,
+    McpStartupError,
+    TokenRefresher,
+    probe_server,
+    refresh_oauth_tokens,
+)
 from portmark.mcp_http import HttpTransport, resolve_endpoint_address
 from portmark.mcp_login import DEFAULT_REDIRECT, _Loopback, login, logout, result_from_redirect
 from portmark.mcp_client import McpError
@@ -1234,3 +1243,132 @@ class McpCommandErrorTests(unittest.TestCase):
                         with self.assertRaises(SystemExit):
                             _install_mcp_tools(argparse.ArgumentParser(), str(self.path), None)
         self.assertIn("group readable", complaint.getvalue())
+
+
+class TokenRefresherTests(unittest.TestCase):
+    """Renewing on a timer, in the host. The clock is passed in, so each decision is tested at an instant.
+
+    A test that started the thread and slept would be measuring the scheduler, not the rule.
+    """
+
+    NOW = 1_800_000_000
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.store = str(self.root / "tokens.json")
+        self.path = self.root / "mcp.json"
+        self.write_config(dict(HTTP_SERVER, oauth=dict(OAUTH, token_store=self.store)))
+
+    def write_config(self, server):
+        self.path.write_text(json.dumps({
+            "schema": "portmark.mcp.config.v1", "servers": {"files": server},
+        }), encoding="utf-8")
+
+    def refresher(self):
+        return TokenRefresher(load_config(str(self.path)))
+
+    def store_expiring_in(self, seconds):
+        write_tokens(self.store, StoredTokens(
+            "https://issuer.example", "cid", "tok", self.NOW + seconds, "a-refresh-token"))
+
+    def test_a_config_with_no_oauth_server_has_nothing_to_renew(self):
+        self.write_config(dict(HTTP_SERVER, bearer_env="MCP_TOKEN"))
+        refresher = self.refresher()
+        self.assertFalse(refresher.wanted)
+        refresher.start()
+        self.addCleanup(refresher.stop)
+        self.assertEqual(refresher.live(), ())
+        # And no thread at all: a timer that can never have anything to do is pure cost.
+        self.assertIsNone(refresher._thread)
+
+    def test_a_token_with_plenty_of_life_left_is_not_renewed(self):
+        self.store_expiring_in(3600)
+        refresher = self.refresher()
+        with patch("portmark.mcp_oauth.current_access_token") as renew:
+            slept = refresher.tick(self.NOW)
+        renew.assert_not_called()
+        self.assertGreater(slept, MIN_REFRESH_SLEEP_SECONDS)
+
+    def test_a_token_is_renewed_while_the_worker_would_still_accept_it(self):
+        """The load-bearing one: the refresher has to run AHEAD of the refuser, not beside it.
+
+        This token has 120 seconds left. The worker's own margin is 60, so it would still send this token
+        happily -- nothing is failing yet. That is exactly when the renewal has to happen. If the refresher
+        used the worker's margin instead of its own wider one, renewal and refusal would begin at the same
+        instant and there would be a window in which calls fail and nothing has renewed.
+        """
+        self.assertLess(120, REFRESH_AHEAD_SECONDS, "the fixture must sit inside the refresher's margin")
+        self.store_expiring_in(120)
+        refresher = self.refresher()
+        with patch("portmark.mcp_oauth.current_access_token") as renew:
+            refresher.tick(self.NOW)
+        renew.assert_called_once()
+        self.assertEqual(renew.call_args.kwargs["margin"], REFRESH_AHEAD_SECONDS)
+
+    def test_a_refusal_from_the_authorization_server_stops_that_server_being_asked_again(self):
+        """Many authorization servers rotate the refresh token on use.
+
+        So repeating a refused refresh spends a credential that is already dead and hammers the server with
+        it. Only a person can fix this, and the worker's own refusal is what tells them to.
+        """
+        self.store_expiring_in(0)
+        refresher = self.refresher()
+        with patch("portmark.mcp_oauth.current_access_token", side_effect=McpOAuthRefused("no")) as renew:
+            refresher.tick(self.NOW)
+            self.assertEqual(refresher.live(), ())
+            refresher.tick(self.NOW)
+        renew.assert_called_once()
+
+    def test_a_failure_that_might_pass_is_retried(self):
+        # A network blip is not an answer from the authorization server, so it is worth asking again.
+        self.store_expiring_in(0)
+        refresher = self.refresher()
+        with patch("portmark.mcp_oauth.current_access_token", side_effect=McpOAuthError("blip")):
+            slept = refresher.tick(self.NOW)
+        self.assertEqual(refresher.live(), ("files",))
+        self.assertEqual(slept, REFRESH_RETRY_SECONDS)
+
+    def test_an_unexpected_failure_does_not_bring_the_host_down(self):
+        """`tick` runs on a background thread. An exception escaping it would end the renewals silently."""
+        self.store_expiring_in(0)
+        refresher = self.refresher()
+        with patch("portmark.mcp_oauth.current_access_token", side_effect=RuntimeError("boom")):
+            slept = refresher.tick(self.NOW)
+        self.assertEqual(slept, REFRESH_RETRY_SECONDS)
+        self.assertEqual(refresher.live(), ("files",))
+
+    def test_an_unreadable_store_is_retried_rather_than_treated_as_an_answer(self):
+        refresher = self.refresher()
+        with patch("portmark.mcp.read_tokens", side_effect=TokenStoreError("group readable")):
+            with patch("portmark.mcp_oauth.current_access_token") as renew:
+                slept = refresher.tick(self.NOW)
+        renew.assert_not_called()
+        self.assertEqual(slept, REFRESH_RETRY_SECONDS)
+
+    def test_a_server_never_logged_in_to_is_left_for_the_worker_to_report(self):
+        """There is nothing to renew from, and nothing to say that the worker will not say better.
+
+        The worker names the server and the exact command, at the moment a call actually needs the token.
+        """
+        refresher = self.refresher()
+        with patch("portmark.mcp_oauth.current_access_token") as renew:
+            refresher.tick(self.NOW)
+        renew.assert_not_called()
+
+    def test_the_wait_never_becomes_a_spin(self):
+        # An expiry already long past makes every gap negative; without a floor the loop would busy-wait.
+        self.store_expiring_in(-100_000)
+        refresher = self.refresher()
+        with patch("portmark.mcp_oauth.current_access_token", side_effect=McpOAuthError("blip")):
+            with patch.object(TokenRefresher, "_renew", return_value=0.0):
+                slept = refresher.tick(self.NOW)
+        self.assertEqual(slept, MIN_REFRESH_SLEEP_SECONDS)
+
+    def test_the_thread_starts_and_stops(self):
+        self.store_expiring_in(3600)
+        refresher = self.refresher()
+        refresher.start()
+        self.addCleanup(refresher.stop)
+        self.assertTrue(refresher._thread is not None and refresher._thread.is_alive())
+        refresher.stop()
+        self.assertIsNone(refresher._thread)

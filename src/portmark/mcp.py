@@ -15,12 +15,14 @@ import signal
 import subprocess  # nosec B404 - runs THIS interpreter to probe a server inside a bounded child tree
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from .json_guard import StrictJSONError, strict_json_loads
 from .mcp_client import ERROR_CODES
 from .mcp_config import McpConfig, McpConfigError, McpServerConfig, McpToolConfig, load_config
+from .mcp_token_store import TokenStoreError, read_tokens
 from .mcp_worker import tool_environment
 from .tools import ToolRegistry, _launch_process_tree
 
@@ -34,6 +36,16 @@ CALL_TARGET = "portmark.mcp_worker:call"
 # this would turn a finished call into `tool.killed` while the worker was still closing down (Codex R1).
 STARTUP_ALLOWANCE_SECONDS = 10.0
 PIN_CHECK_TIMEOUT_SECONDS = 60.0
+# How long before expiry the background refresher renews. It MUST be wider than the worker's own
+# `REFRESH_MARGIN_SECONDS` (60): the worker starts refusing at that boundary, so renewing at the same
+# instant would leave a window in which calls already fail and the renewal has not happened yet. The
+# refresher has to run ahead of the refuser, not beside it.
+REFRESH_AHEAD_SECONDS = 300
+# A renewal that failed for a reason that might pass -- a network blip, a store briefly unreadable.
+REFRESH_RETRY_SECONDS = 30.0
+# Never spin, and never sleep so long that a token bought with a short lifetime expires unnoticed.
+MIN_REFRESH_SLEEP_SECONDS = 5.0
+MAX_REFRESH_SLEEP_SECONDS = 300.0
 MAX_PROBE_BYTES = 1 << 20
 PROBE_CHUNK_BYTES = 1 << 16
 # The probe worker sweeps its OWN process group before exiting, to take the MCP server's background children
@@ -154,6 +166,127 @@ def _worker_environment(path: str, server: McpServerConfig, tool: McpToolConfig,
         if name in os.environ:
             environment[name] = os.environ[name]
     return environment
+
+
+class TokenRefresher:
+    """Keeps every `oauth` server's stored access token usable for as long as the host runs.
+
+    This is the host half of the separation, running on a timer instead of only at start-up. Renewing drives
+    the SDK, so it happens here and never in the isolated worker, which only reads the string this leaves in
+    the store.
+
+    It is deliberately not a guard and cannot become one: if it stops, or never starts, the worker still
+    refuses a stale token rather than sending it. The worst a broken refresher can do is turn a renewal into
+    an operator having to log in again.
+
+    Two failures are handled oppositely, which is the whole reason `McpOAuthRefused` exists. A transport
+    failure is worth trying again shortly. A refusal from the authorization server is not: many servers
+    rotate the refresh token on use, so repeating a refused refresh spends a credential that is already dead
+    and hammers the server with it. A refused server is dropped for the life of this process, and the
+    worker's own refusal is what tells the operator to log in."""
+
+    def __init__(self, config: McpConfig, ahead: int = REFRESH_AHEAD_SECONDS) -> None:
+        self._config = config
+        self._ahead = ahead
+        self._names = tuple(name for name, server in config.servers.items() if server.oauth is not None)
+        self._given_up: set[str] = set()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def wanted(self) -> bool:
+        """Whether there is anything to refresh at all. A config with no `oauth` server starts no thread."""
+        return bool(self._names)
+
+    def live(self) -> tuple[str, ...]:
+        """The servers still being renewed: those not refused by their authorization server."""
+        return tuple(name for name in self._names if name not in self._given_up)
+
+    def tick(self, now: int) -> float:
+        """Renew whatever is due at `now`, and answer how long to wait before asking again.
+
+        Takes the clock as an argument so the decision can be tested at chosen instants rather than by
+        sleeping and hoping. Never raises: a host must not fall over because an authorization server did."""
+        soonest = MAX_REFRESH_SLEEP_SECONDS
+        for name in self.live():
+            server = self._config.servers[name]
+            assert server.oauth is not None  # nosec B101 - `_names` holds only servers that have one
+            try:
+                stored = read_tokens(server.oauth.token_store)
+            except TokenStoreError as error:
+                # Unreadable now, perhaps readable after the operator fixes the mode. Nothing to renew from.
+                logger.warning("MCP server %r: the OAuth token store cannot be read: %s", name, error)
+                soonest = min(soonest, REFRESH_RETRY_SECONDS)
+                continue
+            if stored is None:
+                # Never logged in. There is nothing to renew and nothing to say that the worker will not
+                # say better, with the command to run, at the moment a call actually needs the token.
+                continue
+            due = stored.expires_at - self._ahead - now
+            if due > 0:
+                soonest = min(soonest, float(due))
+                continue
+            soonest = min(soonest, self._renew(name, server, now))
+        return max(MIN_REFRESH_SLEEP_SECONDS, soonest)
+
+    def _renew(self, name: str, server: McpServerConfig, now: int) -> float:
+        from .mcp_oauth import McpOAuthError, McpOAuthRefused, current_access_token  # noqa: PLC0415
+
+        assert server.oauth is not None  # nosec B101 - as in `tick`
+        try:
+            current_access_token(
+                server_url=server.url,
+                token_store=server.oauth.token_store,
+                client_id=os.environ.get(server.oauth.client_id_env, ""),
+                client_secret=os.environ.get(server.oauth.client_secret_env, "")
+                if server.oauth.client_secret_env
+                else "",
+                scopes=server.oauth.scopes,
+                allow_private=server.allow_private,
+                now=now,
+                margin=self._ahead,
+            )
+        except McpOAuthRefused as error:
+            # ANSWERED, and the answer was no. Retrying cannot help and can make it worse.
+            self._given_up.add(name)
+            logger.error(
+                "MCP server %r: the authorization server refused to renew, and it will not be asked again "
+                "in this process; run `portmark mcp login %s`: %s", name, name, error,
+            )
+            return MAX_REFRESH_SLEEP_SECONDS
+        except (McpOAuthError, TokenStoreError) as error:
+            logger.warning("MCP server %r: renewing the access token failed, will retry: %s", name, error)
+            return REFRESH_RETRY_SECONDS
+        except Exception:  # noqa: BLE001 - a host must not fall over because a renewal did
+            logger.exception("MCP server %r: renewing the access token raised unexpectedly", name)
+            return REFRESH_RETRY_SECONDS
+        return MAX_REFRESH_SLEEP_SECONDS
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            wait = self.tick(int(time.time()))
+            self._stop.wait(wait)
+
+    def start(self) -> None:
+        """Start renewing in the background. A config with no `oauth` server starts nothing."""
+        if not self.wanted or self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._loop, name="portmark-mcp-oauth-refresh", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop and wait. `Event.wait` is what the loop sleeps on, so this returns promptly."""
+        self._stop.set()
+        thread, self._thread = self._thread, None
+        if thread is not None:
+            thread.join(timeout=10.0)
+
+    def __enter__(self) -> TokenRefresher:
+        self.start()
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self.stop()
 
 
 def probe_server(config_path: str, server: str, timeout: float = PIN_CHECK_TIMEOUT_SECONDS) -> PinReport:
@@ -282,6 +415,7 @@ __all__ = [
     "CALL_TARGET",
     "McpStartupError",
     "PinReport",
+    "TokenRefresher",
     "check_pins",
     "pin_report",
     "probe_server",

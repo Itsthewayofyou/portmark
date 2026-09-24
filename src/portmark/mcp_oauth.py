@@ -36,7 +36,14 @@ from typing import Any
 
 from .mcp_client import McpError
 from .mcp_http import MAX_METADATA_BYTES, checked_fetch
-from .mcp_token_store import StoredTokens, client_mismatch, issuer_mismatch, read_tokens, write_tokens
+from .mcp_token_store import (
+    REFRESH_MARGIN_SECONDS,
+    StoredTokens,
+    client_mismatch,
+    issuer_mismatch,
+    read_tokens,
+    write_tokens,
+)
 
 # `pip install "portmark[mcp-oauth]"`. Named once so the advice cannot drift between messages.
 EXTRA_HINT = 'OAuth for MCP needs the official SDK: install the optional extra, `pip install "portmark[mcp-oauth]"`'
@@ -53,6 +60,15 @@ REFRESH_PLACEHOLDER_REDIRECT = "http://127.0.0.1/portmark-refresh-has-no-redirec
 
 class McpOAuthError(Exception):
     """Authorization could not be completed. Always actionable by the operator, and never carries a token."""
+
+
+class McpOAuthRefused(McpOAuthError):
+    """The authorization server ANSWERED, and the answer was no.
+
+    Kept apart from the rest because the two need opposite handling by anything that retries. A transport
+    failure is worth trying again; a refusal is not, and many authorization servers rotate the refresh token
+    on use -- so repeating a refused refresh spends a credential that is already dead and hammers the server
+    with it. Only a person can fix this one, by logging in again."""
 
 
 @dataclass(frozen=True)
@@ -198,8 +214,14 @@ def current_access_token(
     allow_private: bool = False,
     context: Any = None,
     now: int | None = None,
+    margin: int = REFRESH_MARGIN_SECONDS,
 ) -> str:
     """An access token that is usable right now, refreshing it if it is not.
+
+    `margin` is how long the token must still have left to count as usable. The default is what a CALLER
+    needs: a token that expires during the request it authorizes has already failed. A background refresher
+    passes a wider one, because it has to renew before the worker starts refusing rather than at the same
+    instant -- otherwise there is a window in which calls fail and the renewal has not happened yet.
 
     Called OUTSIDE the isolated worker -- by the host before it dispatches, or by the CLI. That placement is
     the reason the SDK's 28-package dependency tree never enters the sandboxed worker process: the worker
@@ -223,7 +245,7 @@ def current_access_token(
     mismatch = client_mismatch(stored, client_id)
     if mismatch:
         raise McpOAuthError(mismatch)
-    if stored.fresh(now):
+    if stored.fresh(now, margin):
         return stored.access_token
     if not stored.refresh_token:
         raise McpOAuthError(
@@ -432,7 +454,9 @@ def _run_flow(flow: Any) -> None:
         raise
     except OAuthFlowError as error:
         # Truncated, and it is the FAILED exchange's body: a refusal carries no token to leak.
-        raise McpOAuthError(f"the authorization server did not complete the flow: {str(error)[:300]}") from error
+        raise McpOAuthRefused(
+            f"the authorization server did not complete the flow: {str(error)[:300]}"
+        ) from error
     finally:
         oauth2.logger.removeFilter(quiet)
 
@@ -596,6 +620,7 @@ __all__ = [
     "EXTRA_HINT",
     "Authorization",
     "McpOAuthError",
+    "McpOAuthRefused",
     "authorize",
     "current_access_token",
     "redact",
