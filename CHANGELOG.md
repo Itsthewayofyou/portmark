@@ -38,8 +38,11 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   push-notification URLs, which Portmark does not rely on but does not lose by taking.
 - **That check is now a gate, not a habit.** New CI job `official-a2a-sdk` installs the `[a2a]` extra at its
   hash-locked pin on the oldest and newest supported Python (3.11 and 3.14; `requires-python` is `>=3.11`)
-  and runs the runtime suite with the SDK present. The extra had no hash-pinned export at all, so
+  and runs every A2A test with the SDK present, since importing it switches which branch of
+  `src/portmark/official_a2a.py` executes. The extra had no hash-pinned export at all, so
   `requirements/a2a.txt` is new and `scripts/lock_requirements.py` now generates it like every other set.
+  The lane is scoped to A2A deliberately: it installs no Node and no Wasmtime, so the capsule tests living
+  in the same file would measure its cold start rather than the SDK. The `test` lanes own those.
 - **A skip fails that lane.** A skipped test still reports `OK (skipped=n)`, so a lane whose install quietly
   failed would have gone green having proved nothing -- which is precisely how the gap stayed invisible. The
   job asserts the SDK is importable, that exactly two tests were selected, and that the final line is a bare

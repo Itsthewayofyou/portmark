@@ -177,10 +177,18 @@ jobs:
           grep -q '^Ran 2 tests' sdk.log || { echo 'expected exactly 2 tests to be selected'; exit 1; }
           # A skipped run still prints a final "OK (skipped=n)". Only a bare OK line means both really ran.
           grep -qx 'OK' sdk.log || { echo 'a test skipped; that is a failure in this lane'; exit 1; }
-      - name: Run the runtime suite with the SDK present
-        # Importing the SDK switches which branch of src/portmark/official_a2a.py runs, so the whole file
-        # that uses it is exercised in that configuration, not only the two conformance tests.
-        run: python -m unittest discover -s tests -p test_runtime.py
+      - name: Run every A2A test with the SDK present
+        # Importing the SDK switches which branch of src/portmark/official_a2a.py runs, so the whole A2A
+        # surface is exercised in that configuration, not only the two conformance tests. Scoped to A2A on
+        # purpose: this lane installs no Node and no Wasmtime, so the capsule tests in the same file would
+        # be measuring this job's cold start rather than anything about the SDK. The `test` lanes own those.
+        run: |
+          set -euo pipefail
+          python -m unittest discover -s tests -p test_runtime.py -k a2a 2>&1 | tee a2a.log
+          COUNT=$(sed -n 's/^Ran \([0-9]*\) test.*/\1/p' a2a.log)
+          # `unittest` exits 0 when a selector matches NOTHING, so the count is the real guard: a rename
+          # that silently empties this step must fail it, not pass it.
+          [ "${COUNT:-0}" -ge 10 ] || { echo "only ${COUNT:-0} A2A tests selected; expected the full set"; exit 1; }
 
   postgres-store:
     runs-on: ubuntu-latest
