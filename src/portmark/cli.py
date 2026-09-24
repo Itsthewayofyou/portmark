@@ -8,6 +8,7 @@ import secrets
 import shlex
 import stat
 import sys
+import time
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -300,8 +301,9 @@ def _run_audit(parser: argparse.ArgumentParser, args: argparse.Namespace, store,
     from ._durable_file import sidecar_lock
     from .audit_export import (
         ExportConfigError, ExportCursor, Keyring, ProjectionPolicy, Projector, VerifyReport,
-        read_export, run_export, verify_against_store, verify_records,
+        encode_record, ocsf_encoder, read_export, run_export, verify_against_store, verify_records,
     )
+    from .ocsf import product_version
 
     try:
         if args.audit_command == "export":
@@ -313,7 +315,10 @@ def _run_audit(parser: argparse.ArgumentParser, args: argparse.Namespace, store,
                 # A cursor may advance only past records that are durably written; a pipe cannot confirm that.
                 parser.error("audit export needs --out FILE and --cursor-file FILE (or --no-cursor to print all history)")
             projector = Projector(ProjectionPolicy.load(args.projection_policy), Keyring.load(args.projection_keyring))
-            report = _export_with_cursor(args, store, audit_verifier, projector, run_export, ExportCursor, sidecar_lock)
+            encode = encode_record if args.format == "native" else ocsf_encoder(product_version(), int(time.time()))
+            report = _export_with_cursor(
+                args, store, audit_verifier, projector, run_export, ExportCursor, sidecar_lock, encode
+            )
             print(json.dumps({
                 "events": report.events, "heads": report.heads, "tasks_completed": report.tasks,
                 "integrity_failures": report.integrity_failures,
@@ -344,21 +349,27 @@ def _run_audit(parser: argparse.ArgumentParser, args: argparse.Namespace, store,
         raise SystemExit(2)
 
 
-def _export_with_cursor(args, store, audit_verifier, projector, run_export, cursor_type, sidecar_lock):
+def _export_with_cursor(args, store, audit_verifier, projector, run_export, cursor_type, sidecar_lock, encode):
     if args.no_cursor:
         cursor = cursor_type(None)
         if args.out:
             with _open_append(args.out) as out:
-                return run_export(store, cursor, projector, out, verifier=audit_verifier, page_size=args.page_size, max_events=args.max_events)
+                return run_export(
+                    store, cursor, projector, out, verifier=audit_verifier, page_size=args.page_size,
+                    max_events=args.max_events, encode=encode,
+                )
         return run_export(
             store, cursor, projector, sys.stdout.buffer, verifier=audit_verifier, durable=False,
-            page_size=args.page_size, max_events=args.max_events,
+            page_size=args.page_size, max_events=args.max_events, encode=encode,
         )
     # One exporter per cursor: a second concurrent run would export the same records and race the cursor.
     with sidecar_lock(args.cursor_file):
         cursor = cursor_type.load(args.cursor_file)
         with _open_append(args.out) as out:
-            return run_export(store, cursor, projector, out, verifier=audit_verifier, page_size=args.page_size, max_events=args.max_events)
+            return run_export(
+                store, cursor, projector, out, verifier=audit_verifier, page_size=args.page_size,
+                max_events=args.max_events, encode=encode,
+            )
 
 
 def _open_append(path: str):
@@ -807,6 +818,10 @@ def main() -> None:
     export_parser.add_argument("--projection-policy", help="JSON projection policy (default: built-in, host-written fields only)")
     export_parser.add_argument(
         "--projection-keyring", required=True, help="dedicated HMAC keyring for digests (mode 600; never a signing key)"
+    )
+    export_parser.add_argument(
+        "--format", choices=("native", "ocsf"), default="native",
+        help="record shape: Portmark's own, or OCSF 1.9.0 class 6003 (verify-export reads either)",
     )
     export_parser.add_argument("--page-size", type=int, default=DEFAULT_ADMIN_PAGE_SIZE, help="task heads per page")
     export_parser.add_argument("--max-events", type=int, default=DEFAULT_EXPORT_EVENTS, help="events per page")

@@ -4,6 +4,16 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 ## Unreleased
 
+### Added
+
+- **`portmark audit export --format ocsf`** writes each exported record as OCSF 1.9.0 class `api_activity`
+  (`class_uid` 6003), read from the live schema on 2026-09-23, so a SIEM can read an export without a custom
+  parser. `verify-export` reads either shape without being told which, and both verification levels are
+  unchanged: the native record travels intact under `unmapped.portmark`, and the round trip is exact.
+  `attestation_list` is deliberately left empty — OCSF defines its fingerprint as covering the OCSF record,
+  while Portmark's hash covers the original audit event, so filling it would state something false. See
+  OPERATIONS.md.
+
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
 ### MCP tools over stdio (MCP/SIEM plan, PR 2)
