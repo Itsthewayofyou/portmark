@@ -43,7 +43,12 @@ HTTP_SERVER = {
     "url": "https://mcp.example.com/mcp",
     "tools": {"read_file": {"pin": "sha256:" + "a" * 64, "read_only": True}},
 }
-OAUTH = {"client_id_env": "EXAMPLE_CLIENT_ID", "token_store": "/var/lib/portmark/example.json"}  # nosec B105 - a file PATH, not a token
+# `token_store` must be absolute, and what "absolute" MEANS is platform-native. Python 3.13 changed
+# `ntpath.isabs` so a single leading slash is no longer absolute on Windows, which is why a POSIX path here
+# passed the Windows 3.11 and 3.12 lanes and failed 3.13 and 3.14. The fixture follows the platform rather
+# than the config rule following the fixture.
+ABSOLUTE_STORE = "C:\\portmark\\example.json" if os.name == "nt" else "/var/lib/portmark/example.json"
+OAUTH = {"client_id_env": "EXAMPLE_CLIENT_ID", "token_store": ABSOLUTE_STORE}  # nosec B105 - a file PATH, not a token
 
 
 class OauthConfigTests(unittest.TestCase):
@@ -64,7 +69,7 @@ class OauthConfigTests(unittest.TestCase):
         oauth = config.servers["example"].oauth
         self.assertEqual(
             (oauth.client_id_env, oauth.client_secret_env, oauth.token_store, oauth.scopes),
-            ("EXAMPLE_CLIENT_ID", "EXAMPLE_SECRET", "/var/lib/portmark/example.json", ("files:read",)),
+            ("EXAMPLE_CLIENT_ID", "EXAMPLE_SECRET", ABSOLUTE_STORE, ("files:read",)),
         )
 
     def test_a_credential_shaped_like_a_credential_is_refused(self):
