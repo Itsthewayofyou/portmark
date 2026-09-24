@@ -18,6 +18,28 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Tooling and dependency updates (supersedes Dependabot #120)
+
+- **Five transitive pins raised:** `anyio` 4.14.2 -> 4.15.1, `google-api-core` 2.34.0 -> 2.38.0, `google-auth`
+  2.57.0 -> 2.58.0, `googleapis-common-protos` 1.75.2 -> 1.75.3, `pyparsing` 3.3.2 -> 3.3.3. All are
+  transitive, so they moved with `uv lock --upgrade-package` rather than a change to `pyproject.toml`.
+- **Two of the seven were refused, by the resolver rather than by preference.** `a2a-sdk` 1.1.4 declares
+  `protobuf>=5.29.5,<7`, so the proposed protobuf 7.36.2 cannot be installed beside it; `pydantic` 2.13.5
+  pins `pydantic-core` to exactly 2.46.5, so 2.49.0 cannot be either. Dependabot proposed both anyway,
+  because it edits the exported requirements files directly and never resolves them against the packages
+  that depend on them.
+- **That is worth stating plainly: the bot's proposal was not merely incomplete, it was unsatisfiable.**
+  Every install path uses `pip --require-hashes --no-deps`, and `--no-deps` means pip would have installed a
+  protobuf its own sibling forbids without a word. What catches it is `pip check` in the `official-a2a-sdk`
+  lane added above -- the gate earned its place on the first Dependabot PR after it landed.
+- **One new transitive dependency arrives:** `google-api-core` 2.38.0 now requires
+  `opentelemetry-api>=1.44.0,<2.0.0` (the official package, from `open-telemetry/opentelemetry-python`). It
+  enters `requirements/a2a.txt` only -- the optional `[a2a]` extra -- so the default install, the runtime
+  export and the Docker image are untouched.
+- **Verified the way the lane will:** the regenerated `requirements/a2a.txt` was installed under
+  `pip --require-hashes`, `pip check` reported no broken requirements, and the 23 A2A tests plus the two
+  official-SDK conformance tests ran and passed with no skips.
+
 ### Tooling and dependency updates (supersedes Dependabot #112)
 
 - **Pins raised, with the lock and the hash exports regenerated together:** `a2a-sdk` 1.1.2 -> 1.1.4,
