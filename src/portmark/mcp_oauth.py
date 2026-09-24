@@ -28,6 +28,7 @@ Three hazards live in the SDK, and all three are hazards of letting the SDK DRIV
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -389,6 +390,26 @@ def authorize(
     return _harvest(provider, storage, client_id, scopes)
 
 
+class _OwnReportIsEnough(logging.Filter):
+    """Lower the SDK's own report of a refusal, so the sentence is not buried under a traceback.
+
+    Before re-raising, the SDK calls `logger.exception(...)`. That prints a full traceback AND the failed
+    token response body, and it happens inside the flow -- before Portmark holds the exception at all, so
+    neither the translation below nor its truncation can reach it. A refused exchange is an ordinary answer
+    from a real authorization server, and Portmark already turns it into one sentence.
+
+    Nothing is discarded, and the traceback is deliberately LEFT ON the record: only its level changes. A
+    handler at the usual level then drops the record entirely, and a handler at DEBUG prints all of it. An
+    earlier version also cleared `exc_info`, which made the traceback unreachable at any level -- that would
+    have been hiding it rather than filing it, and the docstring would have been untrue."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno >= logging.ERROR:
+            record.levelno = logging.DEBUG
+            record.levelname = logging.getLevelName(logging.DEBUG)
+        return True
+
+
 def _run_flow(flow: Any) -> None:
     """Run one flow, turning the SDK's own exceptions into this module's.
 
@@ -396,8 +417,15 @@ def _run_flow(flow: Any) -> None:
     that did not compare equal, or metadata claiming an issuer it was not served from. Those are ordinary
     outcomes of talking to a real authorization server, not faults -- so an operator should read a sentence,
     not a traceback, and no caller should have to import the SDK's exception types to catch them."""
-    from mcp.client.auth.exceptions import OAuthFlowError  # noqa: PLC0415 - part of the optional extra
+    from mcp.client.auth import oauth2  # noqa: PLC0415 - part of the optional extra
+    from mcp.client.auth.exceptions import OAuthFlowError  # noqa: PLC0415 - as above
 
+    # Attached to the SDK's OWN logger object rather than a name spelled out here. A filter set on a parent
+    # logger is not applied to records made on a child, so a name would have to match exactly -- and if the
+    # SDK moved its logger, a name would attach to something nobody uses and the tracebacks would quietly
+    # come back. This import is the same one `_sdk()` already depends on, so it cannot drift silently.
+    quiet = _OwnReportIsEnough()
+    oauth2.logger.addFilter(quiet)
     try:
         asyncio.run(flow)
     except McpOAuthError:
@@ -405,6 +433,8 @@ def _run_flow(flow: Any) -> None:
     except OAuthFlowError as error:
         # Truncated, and it is the FAILED exchange's body: a refusal carries no token to leak.
         raise McpOAuthError(f"the authorization server did not complete the flow: {str(error)[:300]}") from error
+    finally:
+        oauth2.logger.removeFilter(quiet)
 
 
 async def _drive(provider: Any, request: Any, network: _Network, storage: _Storage) -> None:

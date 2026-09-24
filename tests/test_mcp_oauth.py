@@ -10,6 +10,7 @@ import argparse
 import contextlib
 import io
 import json
+import logging
 import os
 import re
 import socket as socket_module
@@ -623,6 +624,74 @@ class OauthDriverTests(unittest.TestCase):
             with self.assertRaises(McpOAuthError) as caught:
                 self.authorize(server)
         self.assertIn("did not complete the flow", str(caught.exception))
+
+    def logged_at(self, level, mode="token_refused"):
+        """What a terminal configured at `level` would actually show while a flow is refused."""
+        captured = io.StringIO()
+        handler = logging.StreamHandler(captured)
+        handler.setLevel(level)
+        root = logging.getLogger()
+        previous = root.level
+        root.addHandler(handler)
+        root.setLevel(level)
+        try:
+            with FakeAuthorizationServer(mode) as server:
+                with self.assertRaises(McpOAuthError):
+                    self.authorize(server)
+        finally:
+            root.removeHandler(handler)
+            root.setLevel(previous)
+        return captured.getvalue()
+
+    def test_an_expected_refusal_does_not_put_a_traceback_in_front_of_the_operator(self):
+        """The SDK calls `logger.exception(...)` BEFORE re-raising, from inside the flow.
+
+        So the traceback -- and the failed token response body with it -- reach the terminal before Portmark
+        holds the exception at all: neither the translation nor its truncation can reach them, and nor can a
+        `try`. What an operator should read is the one sentence Portmark raises.
+        """
+        shown = self.logged_at(logging.WARNING)
+        self.assertNotIn("Traceback", shown)
+        self.assertNotIn("invalid_grant", shown)
+
+    def test_the_sdk_s_own_report_is_filed_rather_than_hidden(self):
+        """Lowered to DEBUG, not discarded. Anyone who turns DEBUG on gets all of it back.
+
+        Keeping this honest is the point: an earlier version also cleared `exc_info`, which put the
+        traceback beyond reach at ANY level while the docstring said it was still available.
+        """
+        shown = self.logged_at(logging.DEBUG)
+        self.assertIn("Traceback", shown)
+        self.assertIn("invalid_grant", shown)
+
+    def test_the_quietening_lasts_only_as_long_as_the_flow(self):
+        """A filter left attached would quieten the SDK's logger for the rest of the process.
+
+        That is the difference between filing the report of ONE expected refusal and switching a
+        dependency's error reporting off altogether -- including for the failures nobody expected. Found by
+        mutating the `finally` away and seeing that nothing failed.
+        """
+        from mcp.client.auth import oauth2
+
+        from portmark.mcp_oauth import _OwnReportIsEnough
+
+        before = len(oauth2.logger.filters)
+        with FakeAuthorizationServer("token_refused") as server:
+            with self.assertRaises(McpOAuthError):
+                self.authorize(server)
+        self.assertEqual([f for f in oauth2.logger.filters if isinstance(f, _OwnReportIsEnough)], [])
+        self.assertEqual(len(oauth2.logger.filters), before)
+
+    def test_the_sdk_still_keeps_its_logger_where_portmark_quietens_it(self):
+        """DEPENDENCY-CONTRACT, like the three above: no mutation of Portmark can fail it.
+
+        A filter set on a parent logger is NOT applied to records made on a child, so Portmark attaches to
+        the SDK's own logger object rather than to a name written here. If the SDK moved or renamed it, a
+        name would attach to a logger nobody uses, the tracebacks would come back, and nothing would fail.
+        """
+        from mcp.client.auth import oauth2
+
+        self.assertIsInstance(oauth2.logger, logging.Logger)
 
     def test_a_server_that_issues_no_refresh_token_still_authorizes(self):
         with FakeAuthorizationServer("no_refresh_token") as server:
