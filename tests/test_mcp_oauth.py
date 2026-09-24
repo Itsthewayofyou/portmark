@@ -6,6 +6,9 @@ a credential that outlives the process -- is stored in a way that refuses to be 
 the authorization server that issued it is no longer the one being talked to.
 """
 
+import argparse
+import contextlib
+import io
 import json
 import os
 import stat
@@ -27,7 +30,8 @@ from portmark.mcp_oauth import (
     sdk_available,
 )
 from portmark.security import canonical_json
-from portmark.mcp import register_mcp_tools
+from portmark.cli import _install_mcp_tools
+from portmark.mcp import pin_report, probe_server, register_mcp_tools
 from portmark.mcp_client import McpError
 from portmark.mcp_config import McpConfigError, McpOAuthConfig, McpServerConfig, config_from_bytes, server_digest
 from portmark.mcp_http import checked_fetch
@@ -127,23 +131,66 @@ class OauthConfigTests(unittest.TestCase):
 
 
 class OauthNotYetWiredTests(unittest.TestCase):
-    """Until the call path reads `oauth`, a server that sets it must not start."""
+    """Until the call path reads `oauth`, a server that sets it must not start -- or be CONTACTED.
+
+    Refusing late is not refusing. The start-up sequence probes every server before it registers anything,
+    so a guard that sat only at registration would let the refusal message claim something already untrue:
+    the server would have received unauthenticated requests before the host decided not to start.
+    """
+
+    def setUp(self):
+        document = {
+            "schema": "portmark.mcp.config.v1",
+            "servers": {"example": dict(HTTP_SERVER, oauth=OAUTH)},
+        }
+        self.path = Path(tempfile.mkdtemp()) / "mcp.json"
+        self.path.write_text(json.dumps(document), encoding="utf-8")
 
     def test_the_host_refuses_to_register_a_server_whose_oauth_would_be_ignored(self):
         # Accepting a setting that is not in force is the failure this whole codebase refuses elsewhere:
         # the operator would read the config, believe the server is authorized, and it would be contacted
         # with no token at all. Failing at start-up is the honest answer until the wiring lands.
-        document = {
-            "schema": "portmark.mcp.config.v1",
-            "servers": {"example": dict(HTTP_SERVER, oauth=OAUTH)},
-        }
-        path = Path(tempfile.mkdtemp()) / "mcp.json"
-        path.write_text(json.dumps(document), encoding="utf-8")
-        config = config_from_bytes(path.read_bytes(), str(path))
+        config = config_from_bytes(self.path.read_bytes(), str(self.path))
         with self.assertRaises(McpConfigError) as caught:
             register_mcp_tools(ToolRegistry(), config)
         self.assertIn("not built yet", str(caught.exception))
         self.assertIn("unauthenticated", str(caught.exception))
+
+    def test_start_up_refuses_before_any_server_has_been_probed(self):
+        """The real start-up sequence, not the registration step alone.
+
+        `_install_mcp_tools` runs `check_pins` FIRST, and a probe starts the server and talks to it. The
+        observable that matters is therefore not the refusal -- it is that the probe was never attempted.
+        `probe_server` is patched so that only a check placed ahead of the loop can keep the count at zero.
+        """
+        with patch("portmark.mcp.probe_server") as probe:
+            with contextlib.redirect_stderr(io.StringIO()) as complaint:
+                # argparse turns the refusal into its own exit; the message still has to be the real one.
+                with self.assertRaises(SystemExit):
+                    _install_mcp_tools(argparse.ArgumentParser(), str(self.path), None)
+        self.assertEqual(probe.call_count, 0)
+        self.assertIn("unauthenticated", complaint.getvalue())
+
+    def test_probing_a_server_that_sets_oauth_is_refused_by_the_probe_itself(self):
+        """`probe_server` is exported and called directly, so the guard has to live in it.
+
+        Nothing is patched here. If this raises, no process was launched and no request was sent, which is
+        the property the refusal message asserts.
+        """
+        with self.assertRaises(McpConfigError) as caught:
+            probe_server(str(self.path), "example", timeout=1)
+        self.assertIn("unauthenticated", str(caught.exception))
+
+    def test_mcp_pin_refuses_the_same_configuration_without_probing(self):
+        """`portmark mcp pin` probes too, and pinning is not a reason to contact a server unauthenticated.
+
+        The way out is in the message rather than in a flag: pin with the `oauth` block removed.
+        """
+        with patch("portmark.mcp.probe_server") as probe:
+            with self.assertRaises(McpConfigError) as caught:
+                pin_report(str(self.path), "example", timeout=1)
+        self.assertEqual(probe.call_count, 0)
+        self.assertIn("Remove the `oauth` block", str(caught.exception))
 
 
 class OauthTransportTests(unittest.TestCase):

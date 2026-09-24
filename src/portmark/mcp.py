@@ -15,6 +15,7 @@ import signal
 import subprocess  # nosec B404 - runs THIS interpreter to probe a server inside a bounded child tree
 import sys
 import threading
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -58,6 +59,23 @@ class PinReport:
     rejected: dict[str, str] = field(default_factory=dict)
 
 
+def refuse_unwired_oauth(servers: Iterable[McpServerConfig]) -> None:
+    """Refuse any server whose `oauth` block would be accepted and then ignored.
+
+    The call path does not read `oauth` yet: `mcp_worker._connect_http` takes its bearer from `bearer_env`
+    and nothing else, so such a server would be contacted with NO token while the operator read the config
+    and believed otherwise. A setting accepted but not in force is the failure this codebase refuses
+    everywhere else. Removed by the commit that wires `current_access_token` in and adds `portmark mcp
+    login`."""
+    for server in servers:
+        if server is not None and server.oauth is not None:
+            raise McpConfigError(
+                f"server {server.name!r} sets `oauth`, and the OAuth call path is not built yet: the token "
+                "would never be sent and the server would be contacted unauthenticated. Remove the `oauth` "
+                "block while you pin and start, use `bearer_env`, or wait for `portmark mcp login`."
+            )
+
+
 def register_mcp_tools(registry: ToolRegistry, config: McpConfig, client_version: str = "") -> tuple[str, ...]:
     """Register every approved tool. Returns the registered names, in configuration order.
 
@@ -68,18 +86,8 @@ def register_mcp_tools(registry: ToolRegistry, config: McpConfig, client_version
         raise McpConfigError("the MCP config must be loaded from a file: the worker re-reads it by path")
     existing = set(registry.names())
     names: list[str] = []
+    refuse_unwired_oauth(config.servers.values())
     for server in config.servers.values():
-        if server.oauth is not None:
-            # The call path does not read `oauth` yet: `mcp_worker._connect_http` takes its bearer from
-            # `bearer_env` and nothing else, so registering these tools would produce a server that is
-            # configured for OAuth and contacted WITHOUT a token. A setting that is accepted but not in
-            # force is the failure mode Portmark refuses everywhere else, so the host does not start.
-            # Removed by the commit that wires `current_access_token` in and adds `portmark mcp login`.
-            raise McpConfigError(
-                f"server {server.name!r} sets `oauth`, and the OAuth call path is not built yet: the token "
-                "would never be sent and the server would be contacted unauthenticated. Use `bearer_env`, "
-                "or wait for `portmark mcp login`."
-            )
         for tool in server.tools.values():
             if tool.name in existing:
                 # A server must never shadow a tool that is already installed.
@@ -120,6 +128,11 @@ def probe_server(config_path: str, server: str, timeout: float = PIN_CHECK_TIMEO
     same tree launcher a tool does, so a probe that has to be killed takes the MCP server with it -- killing
     only the probe process would leave the server it started running with nobody to stop it (Codex review R2).
     """
+    # HERE, and not only in the callers below. This is the function that starts the server and sends it a
+    # request, it is exported, and it is called directly. A guard that sits only in `check_pins` would leave
+    # the claim "the server is not contacted unauthenticated" resting on a check somewhere else, which is
+    # the one thing a guard may never do.
+    refuse_unwired_oauth([load_config(config_path).servers.get(server)])
     tree = _launch_process_tree([sys.executable, "-m", "portmark.mcp_worker", config_path, server], dict(os.environ))
     buffer = bytearray()
 
@@ -172,6 +185,9 @@ def _probe_report(server: str, raw: bytes, returncode: int | None) -> PinReport:
 
 def check_pins(config: McpConfig, timeout: float = PIN_CHECK_TIMEOUT_SECONDS) -> tuple[PinReport, ...]:
     """Fail closed when any approved tool is missing or its definition changed. Used at host start-up."""
+    # Before the loop, so a config with an `oauth` block reaches no server at all. Refusing inside the loop
+    # would still have probed -- unauthenticated -- every server listed ahead of it.
+    refuse_unwired_oauth(config.servers.values())
     reports = []
     for name, server in config.servers.items():
         if server.allow_private:
@@ -205,6 +221,7 @@ def pin_report(config_path: str, server: str | None = None, timeout: float = PIN
     names = [server] if server is not None else list(config.servers)
     if server is not None and server not in config.servers:
         raise McpStartupError(f"the MCP config has no server {server!r}")
+    refuse_unwired_oauth([config.servers[name] for name in names if name in config.servers])
     out: dict[str, Any] = {}
     for name in names:
         report = probe_server(config_path, name, timeout)
@@ -241,6 +258,7 @@ __all__ = [
     "check_pins",
     "pin_report",
     "probe_server",
+    "refuse_unwired_oauth",
     "register_mcp_tools",
     "dumps",
 ]
