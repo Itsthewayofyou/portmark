@@ -13,7 +13,12 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
+from oauth_server import ACCESS_TOKEN, AUTHORIZATION_CODE, REFRESH_TOKEN, FakeAuthorizationServer
+
+from portmark.mcp_oauth import McpOAuthError, authorize, refuse_sync_use, sdk_available
 from portmark.security import canonical_json
 from portmark.mcp_config import McpConfigError, McpOAuthConfig, McpServerConfig, config_from_bytes, server_digest
 from portmark.mcp_token_store import (
@@ -222,6 +227,147 @@ class TokenStoreTests(unittest.TestCase):
         self.assertEqual((renewed.issuer, renewed.client_id), (self.tokens.issuer, self.tokens.client_id))
         self.assertEqual(renewed.refresh_token, "REFRESH-SECRET")
         self.assertEqual(renewed.renewed("N", 1, "ROTATED").refresh_token, "ROTATED")
+
+
+class OauthDriverTests(unittest.TestCase):
+    """Phase 2: Portmark drives the SDK's flow, and performs every request itself.
+
+    Skipped without the optional extra. The CI lane that owns this file installs it and treats a SKIP as a
+    failure, because a lane that can skip its way to green is not a gate.
+
+    Three tests here are DEPENDENCY-CONTRACT tests, not tests of Portmark's own code: the PKCE and `resource`
+    parameters, the refusal of metadata claiming an issuer it was not served from, and the handling of a
+    refused token exchange are all performed by the SDK. No mutation of Portmark can make them fail, so they
+    are calibrated by a different thing entirely -- raising the SDK pin. They are worth keeping precisely
+    because of that: they are what notices if an SDK upgrade quietly stops meeting a specification MUST."""
+
+    def setUp(self):
+        if not sdk_available():
+            self.skipTest("requires portmark[mcp-oauth]")
+        self.opened = {}
+
+    def open_authorization(self):
+        async def handler(url: str) -> None:
+            self.opened["url"] = url
+        return handler
+
+    def read_callback(self, server, code=AUTHORIZATION_CODE, issuer=None):
+        async def handler():
+            from mcp.shared.auth import AuthorizationCodeResult
+
+            query = parse_qs(urlsplit(self.opened["url"]).query)
+            return AuthorizationCodeResult(code=code, state=query.get("state", [""])[0],
+                                           iss=server.origin if issuer is None else issuer)
+        return handler
+
+    def authorize(self, server, **changes):
+        settings = dict(
+            server_url=server.url,
+            client_id="portmark-test-client",
+            client_secret="portmark-test-secret",  # nosec B106 - a fixture for a loopback server
+            scopes=("files:read",),
+            redirect_uri="http://127.0.0.1:0/callback",
+            open_authorization=self.open_authorization(),
+            read_callback=self.read_callback(server),
+            allow_private=True,
+            total_seconds=30,
+        )
+        settings.update(changes)
+        return authorize(**settings)
+
+    def test_a_whole_flow_runs_over_portmarks_transport_and_never_sends_the_retry(self):
+        # The flow ends by yielding the ORIGINAL request again, now carrying the token. Performing it would
+        # invoke whatever that request was -- during `login`, a tool call nobody asked for.
+        with FakeAuthorizationServer() as server:
+            result = self.authorize(server)
+            self.assertEqual(result.access_token, ACCESS_TOKEN)
+            self.assertEqual(result.refresh_token, REFRESH_TOKEN)
+            self.assertEqual(result.issuer, server.origin)
+            self.assertEqual(result.scopes, ("files:read",))
+            self.assertEqual(len(server.mcp_requests), 1)  # the unauthorized probe, and nothing after it
+
+    def test_pkce_and_the_resource_parameter_are_on_both_requests(self):
+        # Two specification MUSTs that are invisible when they work: `resource` (RFC 8707) must be on the
+        # authorization AND the token request, and the code must be bound by PKCE.
+        with FakeAuthorizationServer() as server:
+            self.authorize(server)
+            authorization = parse_qs(urlsplit(self.opened["url"]).query)
+            self.assertEqual(authorization["code_challenge_method"], ["S256"])
+            self.assertEqual(authorization["resource"], [server.url])
+            token = server.token_requests[0]
+            self.assertEqual(token["resource"], [server.url])
+            self.assertIn("code_verifier", token)
+
+    def test_the_access_token_never_appears_in_the_repr(self):
+        with FakeAuthorizationServer() as server:
+            text = repr(self.authorize(server))
+        self.assertNotIn(ACCESS_TOKEN, text)
+        self.assertNotIn(REFRESH_TOKEN, text)
+
+    def test_a_redirecting_oauth_endpoint_is_refused_rather_than_followed(self):
+        # The SDK's own flow WOULD follow this. The destination has been checked by nobody, and the next
+        # request would carry the client's credentials to it.
+        with FakeAuthorizationServer("redirecting_metadata") as server:
+            with self.assertRaises(McpOAuthError) as caught:
+                self.authorize(server)
+        self.assertIn("redirect", str(caught.exception))
+        self.assertNotIn("169.254.169.254", str(caught.exception).split("answered")[0])
+
+    def test_metadata_claiming_an_issuer_it_was_not_served_from_is_refused(self):
+        # The specification's own worked example: a document from one origin claiming to be another.
+        with FakeAuthorizationServer("wrong_issuer") as server:
+            with self.assertRaises(Exception) as caught:
+                self.authorize(server)
+        self.assertNotIsInstance(caught.exception, AssertionError)
+
+    def test_an_oauth_endpoint_on_a_private_address_is_refused_without_allow_private(self):
+        # The address checks that protect the MCP endpoint protect these server-chosen urls too. Nothing in
+        # the specification asks for this; it is Portmark's rule.
+        with FakeAuthorizationServer() as server:
+            with self.assertRaises(McpOAuthError) as caught:
+                self.authorize(server, allow_private=False)
+        self.assertIn("https", str(caught.exception))
+
+    def test_a_refused_token_exchange_is_reported_and_stores_nothing(self):
+        with FakeAuthorizationServer("token_refused") as server:
+            with self.assertRaises(Exception):
+                self.authorize(server)
+
+    def test_a_server_that_issues_no_refresh_token_still_authorizes(self):
+        with FakeAuthorizationServer("no_refresh_token") as server:
+            result = self.authorize(server)
+        self.assertEqual(result.access_token, ACCESS_TOKEN)
+        self.assertEqual(result.refresh_token, "")
+
+    def test_the_sdk_still_has_no_synchronous_auth_path(self):
+        """The single most dangerous property of this dependency, asserted rather than assumed.
+
+        The SDK overrides only `async_auth_flow`. `httpx2`'s base `auth_flow` yields the request unchanged,
+        so a SYNCHRONOUS client with this provider attached sends an UNAUTHENTICATED request and raises
+        nothing -- authorization silently becomes a no-op. Portmark never builds an httpx2 client, but a
+        future SDK that grows a `sync_auth_flow` changes what this module reasons about, and that has to be
+        noticed on purpose instead of inherited."""
+        import httpx2
+        from mcp.client.auth.oauth2 import OAuthClientProvider
+
+        self.assertIs(OAuthClientProvider.sync_auth_flow, httpx2.Auth.sync_auth_flow)
+        refuse_sync_use(OAuthClientProvider)
+
+        # A guard whose refusal path never runs is decoration. Feed it the shape it exists to catch -- a
+        # future SDK that grows its own synchronous path -- and it must refuse.
+        class WithASyncPath(OAuthClientProvider):
+            def sync_auth_flow(self, request):  # pragma: no cover - never called, only inspected
+                raise NotImplementedError
+
+        with self.assertRaises(McpOAuthError) as caught:
+            refuse_sync_use(WithASyncPath)
+        self.assertIn("sync_auth_flow", str(caught.exception))
+
+    def test_without_the_extra_the_error_says_how_to_install_it(self):
+        with patch.dict(sys.modules, {"mcp.client.auth.oauth2": None}):
+            with self.assertRaises(McpOAuthError) as caught:
+                authorize(server_url="https://example.com/mcp", client_id="c")
+        self.assertIn("portmark[mcp-oauth]", str(caught.exception))
 
 
 if __name__ == "__main__":
