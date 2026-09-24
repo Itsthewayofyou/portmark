@@ -14,13 +14,13 @@ import os
 import re
 import socket as socket_module
 import stat
-import subprocess
+import subprocess  # nosec B404 - runs THIS interpreter to prove what the worker imports
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from urllib.parse import parse_qs, quote, urlsplit
 
 import mcp_http_server
@@ -37,14 +37,20 @@ from portmark.mcp_oauth import (
 from portmark.security import canonical_json
 from portmark import mcp_worker
 from portmark.cli import _install_mcp_tools
-from portmark.mcp import pin_report, probe_server, refresh_oauth_tokens, register_mcp_tools
-from portmark.mcp_config import definition_digest, load_config, server_digest
+from portmark.mcp import refresh_oauth_tokens
 from portmark.mcp_http import HttpTransport, resolve_endpoint_address
 from portmark.mcp_login import DEFAULT_REDIRECT, _Loopback, login, logout, result_from_redirect
 from portmark.mcp_client import McpError
-from portmark.mcp_config import McpConfigError, McpOAuthConfig, McpServerConfig, config_from_bytes, server_digest
+from portmark.mcp_config import (
+    McpConfigError,
+    McpOAuthConfig,
+    McpServerConfig,
+    config_from_bytes,
+    definition_digest,
+    load_config,
+    server_digest,
+)
 from portmark.mcp_http import checked_fetch
-from portmark.tools import ToolRegistry
 from portmark.mcp_token_store import (
     SCHEMA,
     STORE_VERSION,
@@ -142,17 +148,6 @@ class OauthConfigTests(unittest.TestCase):
 class OauthBearerDeliveryTests(unittest.TestCase):
     """A token read from the STORE has no environment-variable name, and the transport is keyed on one."""
 
-    def test_a_token_with_no_environment_variable_name_is_still_sent(self):
-        """The failure this guards against is silent and fails OPEN.
-
-        `checked_bearer` is reached only when `bearer_name` is set, so an access token handed in as the
-        value alone would be dropped and the request sent with no `Authorization` header at all -- to a
-        server the operator configured precisely because it needs one.
-        """
-        transport = HttpTransport("https://mcp.example.com/mcp", 5.0, 5.0, bearer_token="tok-from-store")  # nosec B106
-        headers = transport._request_headers(b"{}", {})
-        self.assertEqual(headers["Authorization"], "Bearer tok-from-store")
-
     def test_a_token_from_the_store_and_one_from_the_environment_together_are_refused(self):
         # The config refuses `oauth` beside `bearer_env`, but the transport is reachable on its own and
         # would otherwise pick one silently. Which one it picked would decide who the request authenticates
@@ -200,8 +195,8 @@ class OauthWorkerTests(unittest.TestCase):
         }), encoding="utf-8")
 
     def stored(self, **changes):
-        fields = {"issuer": "https://issuer.example", "client_id": "cid", "access_token": "store-tok",
-                  "expires_at": int(time.time()) + 3600, "refresh_token": "r"}
+        fields = {"issuer": "https://issuer.example", "client_id": "cid", "access_token": "store-tok",  # nosec B105 - a fixture, not a credential
+                  "expires_at": int(time.time()) + 3600, "refresh_token": "r"}  # nosec B105 - as above
         fields.update(changes)
         write_tokens(self.store, StoredTokens(**fields))
 
@@ -216,6 +211,14 @@ class OauthWorkerTests(unittest.TestCase):
         }
 
     def test_the_worker_sends_the_access_token_it_read_from_the_store(self):
+        """The whole path, and the proof of the fail-open the transport change exists to close.
+
+        `checked_bearer` is reached only when `bearer_env` names a variable, so a token from the store
+        handed in as the value alone would be DROPPED and this request sent with no `Authorization` header
+        at all -- to a server the operator configured precisely because it needs one. A unit test of that
+        could not be told apart from this one: any mutation that drops the token is visible to both. This
+        test owns it, because it exercises the real path rather than a constructed transport.
+        """
         self.stored()
         with patch.dict(os.environ, self.environment()):
             value = mcp_worker.call({"path": "a.txt"})
@@ -307,16 +310,26 @@ class OauthHostRefreshTests(unittest.TestCase):
     def test_start_up_refreshes_the_store_before_it_probes_anything(self):
         """A probe of an OAuth server carries the stored access token, so the order is load, renew, probe.
 
-        `probe_server` is patched, so the only way the count stays at zero is a renewal that ran first and
-        refused. The refusal itself is not the observable: a probe that happened is.
+        Both steps are recorded rather than made to fail. An earlier version stopped the run by removing the
+        SDK, which meant this test and the one about the missing extra both rested on the same check and
+        neither mutant proved its own thing. What is asserted here is the ORDER and nothing else.
         """
-        with patch("portmark.mcp.probe_server") as probe:
-            with patch("portmark.mcp_oauth.sdk_available", return_value=False):
-                with contextlib.redirect_stderr(io.StringIO()) as complaint:
-                    with self.assertRaises(SystemExit):
+        order = []
+
+        def renew(config):
+            order.append("renew")
+            return ()
+
+        def probe(*_, **__):
+            order.append("probe")
+            return MagicMock()
+
+        with patch("portmark.mcp.refresh_oauth_tokens", side_effect=renew):
+            with patch("portmark.mcp.probe_server", side_effect=probe):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with contextlib.suppress(SystemExit):
                         _install_mcp_tools(argparse.ArgumentParser(), str(self.path), None)
-        self.assertEqual(probe.call_count, 0)
-        self.assertIn("portmark[mcp-oauth]", complaint.getvalue())
+        self.assertEqual(order[:2], ["renew", "probe"])
 
     def test_the_worker_is_given_the_client_id_and_never_the_client_secret(self):
         """The worker compares the stored client against the configured one, so it needs the id.
@@ -329,13 +342,14 @@ class OauthHostRefreshTests(unittest.TestCase):
         document = {
             "schema": "portmark.mcp.config.v1",
             "servers": {"example": dict(HTTP_SERVER, oauth=dict(
-                OAUTH, client_secret_env="EXAMPLE_CLIENT_SECRET"))},
+                OAUTH, client_secret_env="EXAMPLE_CLIENT_SECRET"))},  # nosec B106 - a variable NAME
         }
         path = self.root / "secret.json"
         path.write_text(json.dumps(document), encoding="utf-8")
         config = config_from_bytes(path.read_bytes(), str(path))
         server = config.servers["example"]
-        with patch.dict(os.environ, {"EXAMPLE_CLIENT_ID": "cid", "EXAMPLE_CLIENT_SECRET": "shh"}):
+        secrets = {"EXAMPLE_CLIENT_ID": "cid", "EXAMPLE_CLIENT_SECRET": "shh"}  # nosec B105 - a fixture
+        with patch.dict(os.environ, secrets):
             environment = _worker_environment(str(path), server, server.tools["read_file"], "")
         self.assertEqual(environment.get("EXAMPLE_CLIENT_ID"), "cid")
         self.assertNotIn("EXAMPLE_CLIENT_SECRET", environment)
@@ -836,6 +850,10 @@ class RedirectParsingTests(unittest.TestCase):
         A parser that quietly dropped it would turn that comparison into a no-op -- and every test that
         only looked at the resulting token would still pass, which is exactly why this one looks at `iss`.
         """
+        # SHARED INVARIANT, stated here and in `test_a_manual_login_...`: a login cannot complete without
+        # this, because the authorization server advertises `authorization_response_iss_parameter_supported`
+        # and the SDK then requires the parameter. One mutation therefore fails both, and rather than weaken
+        # either test both say why.
         result = result_from_redirect(
             "http://127.0.0.1:3000/callback?code=abc&state=xyz&iss=https%3A%2F%2Fissuer.example"
         )
@@ -901,20 +919,33 @@ class LoopbackListenerTests(unittest.TestCase):
             caller.join(timeout=5)
         self.assertEqual(result.code, "the-code")
         self.assertEqual(result.state, "the-state")
-        self.assertEqual(result.iss, "https://issuer.example")
 
     def test_a_login_nobody_completes_gives_the_terminal_back(self):
         """The flow's budget is spent by REQUESTS, and waiting for a human performs none of them.
 
-        Without its own deadline the listener would hold the terminal for ever.
+        Without its own deadline the listener holds the terminal for ever. The test therefore bounds
+        ITSELF rather than trusting the code under test to stop: a test that hangs when the deadline is
+        missing cannot be used to prove the deadline is there -- it just stops the run.
         """
         import asyncio
+        import threading
 
         collector = _Loopback(f"http://127.0.0.1:{_free_loopback_port()}/callback", io.StringIO(), 0.0)
-        with collector:
-            with self.assertRaises(McpOAuthError) as caught:
+        outcome = []
+
+        def wait():
+            try:
                 asyncio.run(collector.collect())
-        self.assertIn("--manual", str(caught.exception))
+            except BaseException as stopped:  # noqa: BLE001 - what it raised matters less than THAT it did
+                outcome.append(stopped)
+
+        with collector:
+            waiter = threading.Thread(target=wait, daemon=True)
+            waiter.start()
+            waiter.join(timeout=15)
+        self.assertFalse(waiter.is_alive(), "the listener never gave up, so it has no deadline of its own")
+        self.assertIsInstance(outcome[0], McpOAuthError)
+        self.assertIn("--manual", str(outcome[0]))
 
 
 class LoginCommandTests(unittest.TestCase):
@@ -927,7 +958,7 @@ class LoginCommandTests(unittest.TestCase):
         self.store = str(self.root / "tokens.json")
 
     def config(self, server, **oauth_changes):
-        oauth = {"client_id_env": "EXAMPLE_CLIENT_ID", "client_secret_env": "EXAMPLE_CLIENT_SECRET",
+        oauth = {"client_id_env": "EXAMPLE_CLIENT_ID", "client_secret_env": "EXAMPLE_CLIENT_SECRET",  # nosec B105 - a variable NAME
                  "token_store": self.store, "scopes": ["files:read"]}
         oauth.update(oauth_changes)
         path = self.root / "mcp.json"
@@ -949,7 +980,7 @@ class LoginCommandTests(unittest.TestCase):
         class _Stdin:
             def readline(self, limit=-1):
                 shown = re.search(r"(https://\S+/authorize\?\S+)", transcript.getvalue())
-                assert shown is not None, transcript.getvalue()
+                assert shown is not None, transcript.getvalue()  # nosec B101 - a test helper
                 query = parse_qs(urlsplit(shown.group(1)).query)
                 return (f"{redirect}?code={AUTHORIZATION_CODE}&state={query['state'][0]}"
                         f"&iss={quote(issuer, safe='')}\n")
@@ -957,6 +988,8 @@ class LoginCommandTests(unittest.TestCase):
         return _Stdin()
 
     def test_a_manual_login_stores_what_was_granted_and_prints_no_token(self):
+        # SHARED INVARIANT with `test_the_issuer_is_carried_through`: this flow completes only because the
+        # RFC 9207 `iss` reaches the SDK, since the fake authorization server advertises support for it.
         with FakeAuthorizationServer() as server:
             path = self.config(server)
             transcript = io.StringIO()

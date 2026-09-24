@@ -106,6 +106,46 @@ could otherwise reach a different anonymous service behind the same URL. A beare
 refused by the config loader. The token is checked before it reaches `http.client`, whose own error message
 would print the rejected value.
 
+**Authorization: OAuth.** For a server that delegates the operator's own access -- GitHub, Linear, Notion
+-- an `oauth` block replaces `bearer_env`; setting both is refused, and `oauth` over plain `http` is refused
+whatever `allow_private` says, because `allow_private` decides which ADDRESSES may be reached and is not
+permission to drop TLS.
+
+Portmark does not implement OAuth. The official `mcp` SDK knows the protocol, and it is an exactly pinned
+optional extra: `pip install 'portmark[mcp-oauth]'` (owner decision D1). What Portmark decides is who
+performs the network, and the answer is Portmark, so every OAuth request gets the same resolve-once address
+pinning, verified TLS, byte caps and wall-clock deadline an MCP request gets. A redirect from an OAuth
+endpoint is refused rather than followed: the destination was checked by nobody, and the next request would
+carry the client's credentials to it.
+
+Three processes, deliberately separated:
+
+| Step | Runs in | Needs the SDK |
+| --- | --- | --- |
+| `portmark mcp login <server>` -- the whole authorization-code flow | your terminal | yes |
+| renewing a near-expiry access token | the host, at start-up | yes |
+| reading the token and sending `Authorization: Bearer` | the **isolated worker** | **no** |
+
+The worker reads the token store and gets a string, exactly as `bearer_env` gives it one. That is why the
+extra's 28 packages -- which include `starlette` and `uvicorn` -- never enter the sandboxed process. The
+worker cannot renew anything, so an expired token there is a **refusal**, never an unauthenticated call.
+Restarting the host renews it. A host running longer than one access-token lifetime will therefore start
+refusing until it is restarted; that ceiling is marked in the source and a background refresher is the
+upgrade.
+
+`portmark mcp login <server>` opens a browser by printing the url, and collects the redirect on a one-shot
+listener bound to a literal loopback address -- no other address is accepted, because an authorization code
+arrives in that url's query string. `--manual` prints the url and reads the redirect you paste instead,
+which is the path for a machine reached over SSH with no browser. `portmark mcp logout <server>` deletes the
+stored authorization. The token store is written `0600`, and Portmark refuses to read one that anyone else
+can read.
+
+Tokens are bound to the authorization server that issued them and to the client they were issued to. On
+every renewal Portmark re-reads the resource's protected-resource metadata and refuses if it now names a
+different authorization server, and the token and authorization endpoints discovered at login are pinned in
+the store -- the SDK's own refresh path falls back to `{MCP server origin}/token`, which would post the
+refresh token to the resource server.
+
 **Answers.** Either one JSON object or a Server-Sent Events stream scoped to that request. Portmark reads the
 stream only until the response to its own request arrives, then stops: a server is merely advised to close
 the stream afterwards, and reading on would spend the deadline on keep-alives -- or let a reset arriving
@@ -258,10 +298,12 @@ projection policy: argument names of a foreign tool are as model-chosen as the v
 
 ## Not included in this release
 
-- **OAuth-protected servers.** Portmark speaks HTTP with no authorization or with a static bearer token.
-  A server that answers `401` with an OAuth challenge is reported as a transport failure. Full OAuth stays
-  out of the native client and would arrive only through the official SDK as an optional extra (owner
-  decision D1).
+- **Dynamic Client Registration**, and **Client ID Metadata Documents**. Pre-registration is the
+  specification's own first choice; DCR is deprecated there, and a metadata document would require Portmark
+  to host a public HTTPS document whose url is the client id. Register the client with the provider and name
+  the environment variables in `oauth`.
+- **OAuth for stdio servers.** The specification says stdio clients should not use it -- their credentials
+  come from the environment -- and `oauth` on a stdio server is refused.
 - The deprecated **HTTP+SSE** transport of `2024-11-05`; the specification says new implementations should
   not adopt it.
 - The legacy standalone **GET** stream and `Last-Event-ID` **resumption**. Both are optional for a client,

@@ -131,7 +131,7 @@ class HttpTransport(Transport):
         bearer_name: str = "",
         bearer_value: str | None = None,
         allow_private: bool = False,
-        bearer_token: str = "",
+        bearer_token: str = "",  # nosec B107 - the DEFAULT is empty: no token, not a hardcoded one
         context: ssl.SSLContext | None = None,
     ) -> None:
         split = urlsplit(url)
