@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import socket
 import ssl
 import tempfile
 import threading
@@ -157,11 +158,23 @@ class FakeAuthorizationServer:
     def __init__(self, mode: str = "ok") -> None:
         self._dir = tempfile.TemporaryDirectory()
         certificate_path, key_path = _trust_anchor(Path(self._dir.name))
-        self._http = HTTPServer(("127.0.0.1", 0), _Handler)
+        # BIND WHERE THE CLIENT WILL CONNECT, rather than assuming IPv4. The certificate names `localhost`,
+        # and what `localhost` resolves to is not the same everywhere: this project's GitHub runners answer
+        # `::1` while the development machine answers `127.0.0.1` (observed 2026-09-23). Binding 127.0.0.1
+        # and connecting to `localhost` therefore passes locally and fails in CI with ConnectionRefused.
+        from portmark.mcp_http import resolve_endpoint_address  # noqa: PLC0415 - a test helper, not runtime
+
+        host = resolve_endpoint_address("localhost", 0, allow_private=True)
+
+        class _Server(HTTPServer):
+            address_family = socket.AF_INET6 if ":" in host else socket.AF_INET
+
+        self._http = _Server((host, 0), _Handler)
         server_side = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         server_side.load_cert_chain(str(certificate_path), str(key_path))
         self._http.socket = server_side.wrap_socket(self._http.socket, server_side=True)
-        # The certificate names `localhost`, and the address it resolves to is what the transport pins.
+        # The client is given the NAME, so TLS verifies against the certificate; the transport resolves it
+        # to the same address this server is bound to and pins that.
         self._http.origin = f"https://localhost:{self._http.server_address[1]}"
         self._http.mode = mode
         self._http.token_requests = []
