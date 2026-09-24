@@ -49,12 +49,18 @@ class StoredTokens:
     expires_at: int
     refresh_token: str = ""
     scopes: tuple[str, ...] = ()
+    # The endpoints DISCOVERED and validated at login, pinned here on purpose. See `mcp_oauth.refresh`: the
+    # SDK falls back to `{MCP server origin}/token` when it has no discovered metadata, which would send the
+    # refresh token to the RESOURCE server instead of the authorization server that issued it.
+    token_endpoint: str = ""
+    authorization_endpoint: str = ""
 
     def __repr__(self) -> str:
         """Redacted on purpose. The default dataclass repr would print both tokens, and this object travels
         through exceptions and log records where a repr is exactly what gets written."""
         held = ",".join(name for name, value in (("access", self.access_token), ("refresh", self.refresh_token)) if value)
-        return f"StoredTokens(issuer={self.issuer!r}, client_id={self.client_id!r}, expires_at={self.expires_at}, held={held or 'none'})"
+        return (f"StoredTokens(issuer={self.issuer!r}, client_id={self.client_id!r}, "
+                f"expires_at={self.expires_at}, held={held or 'none'})")
 
     def fresh(self, now: int | None = None, margin: int = REFRESH_MARGIN_SECONDS) -> bool:
         """Whether the access token can still be used. `margin` is subtracted, never added: a token that
@@ -112,6 +118,8 @@ def read_tokens(path: str) -> StoredTokens | None:
         _whole(document, "expires_at", path),
         _text(document, "refresh_token", path, required=False),
         tuple(_scopes(document, path)),
+        _text(document, "token_endpoint", path, required=False),
+        _text(document, "authorization_endpoint", path, required=False),
     )
 
 
@@ -130,6 +138,8 @@ def write_tokens(path: str, tokens: StoredTokens) -> None:
         "refresh_token": tokens.refresh_token,
         "expires_at": tokens.expires_at,
         "scopes": list(tokens.scopes),
+        "token_endpoint": tokens.token_endpoint,
+        "authorization_endpoint": tokens.authorization_endpoint,
     }
     body = json.dumps(document, indent=2, sort_keys=True).encode("utf-8") + b"\n"
     if len(body) > MAX_STORE_BYTES:

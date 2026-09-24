@@ -35,7 +35,7 @@ from typing import Any
 
 from .mcp_client import McpError
 from .mcp_http import MAX_METADATA_BYTES, checked_fetch
-from .mcp_token_store import StoredTokens
+from .mcp_token_store import StoredTokens, binding_error, read_tokens, write_tokens
 
 # `pip install "portmark[mcp-oauth]"`. Named once so the advice cannot drift between messages.
 EXTRA_HINT = 'OAuth for MCP needs the official SDK: install the optional extra, `pip install "portmark[mcp-oauth]"`'
@@ -45,6 +45,9 @@ MAX_FLOW_STEPS = 12
 # What the authorization server is told this client is. `token_endpoint_auth_method` is decided per server:
 # a client with a secret is confidential, one without is public and rests on PKCE.
 CLIENT_NAME = "Portmark"
+# A refresh makes no authorization request, so it has no redirect -- but the SDK's client metadata model
+# requires the field. This value is never sent anywhere: see the comment at its only use.
+REFRESH_PLACEHOLDER_REDIRECT = "http://127.0.0.1/portmark-refresh-has-no-redirect"
 
 
 class McpOAuthError(Exception):
@@ -61,13 +64,15 @@ class Authorization:
     expires_at: int
     refresh_token: str = ""
     scopes: tuple[str, ...] = ()
+    token_endpoint: str = ""
+    authorization_endpoint: str = ""
 
     def __repr__(self) -> str:
         return f"Authorization(issuer={self.issuer!r}, client_id={self.client_id!r}, expires_at={self.expires_at})"
 
     def stored(self) -> StoredTokens:
         return StoredTokens(self.issuer, self.client_id, self.access_token, self.expires_at,
-                            self.refresh_token, self.scopes)
+                            self.refresh_token, self.scopes, self.token_endpoint, self.authorization_endpoint)
 
 
 def sdk_available() -> bool:
@@ -174,6 +179,163 @@ def _safe(url: str) -> str:
     return url.split("?", 1)[0]
 
 
+def current_access_token(
+    *,
+    server_url: str,
+    token_store: str,
+    client_id: str,
+    client_secret: str = "",
+    scopes: tuple[str, ...] = (),
+    total_seconds: float = 120.0,
+    request_timeout: float = 30.0,
+    allow_private: bool = False,
+    context: Any = None,
+    now: int | None = None,
+) -> str:
+    """An access token that is usable right now, refreshing it if it is not.
+
+    Called OUTSIDE the isolated worker -- by the host before it dispatches, or by the CLI. That placement is
+    the reason the SDK's 28-package dependency tree never enters the sandboxed worker process: the worker
+    keeps receiving a token STRING, exactly as `bearer_env` gives it one today.
+
+    **When the issuer binding is checked.** On every refresh and every login, because those are the moments
+    discovery actually happens and there is something new to compare against. A call that uses a still-valid
+    cached token does not re-discover: doing so would add two network round trips to every tool call to
+    re-read facts that have not been fetched again. The window is therefore one access-token lifetime, and
+    the config's own url is covered separately by the server pin, which refuses a changed endpoint at
+    start-up."""
+    stored = read_tokens(token_store)
+    if stored is None:
+        raise McpOAuthError(
+            f"no stored authorization for this server; run `portmark mcp login` (store: {token_store})"
+        )
+    mismatch = binding_error(stored, stored.issuer, client_id)
+    if mismatch:
+        raise McpOAuthError(mismatch)
+    if stored.fresh(now):
+        return stored.access_token
+    if not stored.refresh_token:
+        raise McpOAuthError(
+            "the stored access token has expired and the authorization server issued no refresh token; "
+            "run `portmark mcp login` again"
+        )
+    renewed = refresh(
+        server_url=server_url,
+        stored=stored,
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes=scopes,
+        total_seconds=total_seconds,
+        request_timeout=request_timeout,
+        allow_private=allow_private,
+        context=context,
+    )
+    write_tokens(token_store, renewed.stored())
+    return renewed.access_token
+
+
+def refresh(
+    *,
+    server_url: str,
+    stored: StoredTokens,
+    client_id: str,
+    client_secret: str = "",
+    scopes: tuple[str, ...] = (),
+    total_seconds: float = 120.0,
+    request_timeout: float = 30.0,
+    allow_private: bool = False,
+    context: Any = None,
+) -> Authorization:
+    """Exchange the stored refresh token for a new access token, and re-check the binding.
+
+    No browser is involved, so this is what makes an authorized server usable unattended. If the refresh
+    token has been revoked the SDK would fall back to a full authorization, which needs a browser -- and
+    there is none here, so that path raises and tells the operator to log in again. Failing to a clear
+    instruction is the point: silently continuing unauthenticated is what must never happen."""
+    if not stored.token_endpoint:
+        # Checked HERE, in the function that actually sends the refresh token, rather than only on the path
+        # that happens to call it. Without a pinned endpoint the SDK derives `{MCP server origin}/token`,
+        # which posts a durable credential to the resource server instead of the authorization server that
+        # issued it -- and for any real service those are different hosts.
+        raise McpOAuthError(
+            "the stored authorization does not record which token endpoint issued it; "
+            "run `portmark mcp login` again so the endpoint is pinned"
+        )
+    httpx2, provider_class, metadata_class, client_class = _sdk()
+    from mcp.shared.auth import OAuthToken  # noqa: PLC0415 - part of the optional extra
+
+    client_info = client_class(
+        client_id=client_id,
+        client_secret=client_secret or None,
+        grant_types=["authorization_code", "refresh_token"],
+        token_endpoint_auth_method="client_secret_post" if client_secret else "none",
+    )
+    # The access token is deliberately left EMPTY, and this is load-bearing rather than tidy.
+    #
+    # The SDK's `_initialize` loads tokens from storage but never computes their expiry, so
+    # `token_expiry_time` stays None and `is_token_valid()` reads `not self.token_expiry_time` as "valid".
+    # A stored token therefore looks valid to the SDK FOREVER, whatever `expires_in` said -- seed a real one
+    # here and no refresh ever happens, and an expired token is sent for as long as the file exists. Expiry
+    # is Portmark's to decide, and it is decided before this function is called, by `StoredTokens.fresh`
+    # against the `expires_at` in the store. Handing the SDK a refresh token and no access token states the
+    # situation in the only terms it reads: nothing usable, something to renew with.
+    storage = _Storage(client_info, OAuthToken(
+        access_token="",  # nosec B106 - the EMPTY access token is the point: see the comment above
+        token_type="Bearer",
+        scope=" ".join(stored.scopes) if stored.scopes else None,
+        refresh_token=stored.refresh_token,
+    ))
+    provider = provider_class(
+        server_url=server_url,
+        client_metadata=metadata_class(
+            client_name=CLIENT_NAME,
+            # Required by the model, and never used on this path: a refresh makes no authorization request,
+            # so there is no redirect. If the SDK ever fell back to a full authorization the browser handler
+            # refuses first, so this placeholder can never reach an authorization server.
+            redirect_uris=[REFRESH_PLACEHOLDER_REDIRECT],
+            grant_types=["authorization_code", "refresh_token"],
+            response_types=["code"],
+            scope=" ".join(scopes) if scopes else None,
+            token_endpoint_auth_method="client_secret_post" if client_secret else "none",
+        ),
+        storage=storage,
+        redirect_handler=_no_browser,
+        callback_handler=_no_callback,
+    )
+    # Hand the SDK the endpoints that were DISCOVERED AND VALIDATED at login, so the refresh goes to the
+    # authorization server these credentials belong to. Without this the SDK derives
+    # `{MCP server origin}/token` -- and for any real service the resource server and the authorization
+    # server are different hosts, so a durable credential would be posted to the wrong party. This is also
+    # the specification's binding requirement in practice: credentials are keyed by issuer, so they must be
+    # renewed at that issuer and nowhere else.
+    from mcp.shared.auth import OAuthMetadata  # noqa: PLC0415 - part of the optional extra
+
+    provider.context.oauth_metadata = OAuthMetadata(
+        issuer=stored.issuer,
+        authorization_endpoint=stored.authorization_endpoint or stored.token_endpoint,
+        token_endpoint=stored.token_endpoint,
+        response_types_supported=["code"],
+    )
+    network = _Network(total_seconds, request_timeout, allow_private, context)
+    asyncio.run(_drive(provider, httpx2.Request("POST", server_url), network, storage))
+    renewed = _harvest(provider, storage, client_id, scopes or stored.scopes)
+    mismatch = binding_error(stored, renewed.issuer, client_id)
+    if mismatch:
+        # The specification's MUST, enforced at the one moment there is fresh evidence: discovery just ran,
+        # and it named a different authorization server than the one these credentials belong to.
+        raise McpOAuthError(mismatch)
+    return Authorization(
+        renewed.issuer,
+        client_id,
+        renewed.access_token,
+        renewed.expires_at,
+        renewed.refresh_token or stored.refresh_token,
+        renewed.scopes or stored.scopes,
+        stored.token_endpoint,
+        stored.authorization_endpoint,
+    )
+
+
 def authorize(
     *,
     server_url: str,
@@ -272,6 +434,7 @@ def _harvest(provider: Any, storage: _Storage, client_id: str, scopes: tuple[str
         raise McpOAuthError("the authorization server did not identify itself; refusing to store unbound credentials")
     granted = getattr(tokens, "scope", None)
     expires_in = getattr(tokens, "expires_in", None)
+    metadata = getattr(getattr(provider, "context", None), "oauth_metadata", None)
     return Authorization(
         issuer,
         client_id,
@@ -279,7 +442,14 @@ def _harvest(provider: Any, storage: _Storage, client_id: str, scopes: tuple[str
         int(time.time()) + int(expires_in if isinstance(expires_in, int) else 3600),
         getattr(tokens, "refresh_token", "") or "",
         tuple(granted.split()) if isinstance(granted, str) and granted else scopes,
+        _endpoint(metadata, "token_endpoint"),
+        _endpoint(metadata, "authorization_endpoint"),
     )
+
+
+def _endpoint(metadata: Any, name: str) -> str:
+    value = getattr(metadata, name, None)
+    return str(value) if value else ""
 
 
 def _issuer_of(provider: Any) -> str:
@@ -330,7 +500,9 @@ __all__ = [
     "Authorization",
     "McpOAuthError",
     "authorize",
+    "current_access_token",
     "redact",
+    "refresh",
     "refuse_sync_use",
     "sdk_available",
 ]

@@ -18,7 +18,14 @@ from urllib.parse import parse_qs, urlsplit
 
 from oauth_server import ACCESS_TOKEN, AUTHORIZATION_CODE, REFRESH_TOKEN, FakeAuthorizationServer
 
-from portmark.mcp_oauth import McpOAuthError, authorize, refuse_sync_use, sdk_available
+from portmark.mcp_oauth import (
+    McpOAuthError,
+    authorize,
+    current_access_token,
+    refresh,
+    refuse_sync_use,
+    sdk_available,
+)
 from portmark.security import canonical_json
 from portmark.mcp_config import McpConfigError, McpOAuthConfig, McpServerConfig, config_from_bytes, server_digest
 from portmark.mcp_token_store import (
@@ -278,6 +285,11 @@ class OauthDriverTests(unittest.TestCase):
     def test_a_whole_flow_runs_over_portmarks_transport_and_never_sends_the_retry(self):
         # The flow ends by yielding the ORIGINAL request again, now carrying the token. Performing it would
         # invoke whatever that request was -- during `login`, a tool call nobody asked for.
+        #
+        # This invariant is one line in `_drive`, and THREE tests rest on it: this one and the two refresh
+        # tests, which assert that renewing a token calls the MCP server not at all. A mutant that removes
+        # it therefore fails all three. That overlap is deliberate and stated rather than engineered away:
+        # it is the shape of a single guard protecting more than one path, not a sign the tests overlap.
         with FakeAuthorizationServer() as server:
             result = self.authorize(server)
             self.assertEqual(result.access_token, ACCESS_TOKEN)
@@ -368,6 +380,169 @@ class OauthDriverTests(unittest.TestCase):
             with self.assertRaises(McpOAuthError) as caught:
                 authorize(server_url="https://example.com/mcp", client_id="c")
         self.assertIn("portmark[mcp-oauth]", str(caught.exception))
+
+
+class OauthRefreshTests(unittest.TestCase):
+    """Phase 3: using a stored authorization, and renewing it without a browser."""
+
+    def setUp(self):
+        if not sdk_available():
+            self.skipTest("requires portmark[mcp-oauth]")
+        self._dir = tempfile.TemporaryDirectory()
+        self.store = str(Path(self._dir.name) / "tokens.json")
+
+    def tearDown(self):
+        self._dir.cleanup()
+
+    def settings(self, server, **changes):
+        base = dict(
+            server_url=server.url, token_store=self.store, client_id="portmark-test-client",
+            client_secret="portmark-test-secret", allow_private=True,  # nosec B106 - a loopback fixture
+        )
+        base.update(changes)
+        return base
+
+    def stored(self, server, **changes):
+        base = dict(issuer=server.origin, client_id="portmark-test-client", access_token="STORED-ACCESS",  # nosec B106 - a loopback fixture, not a credential
+                    expires_at=4_000_000_000, token_endpoint=f"{server.origin}/token")
+        base.update(changes)
+        return StoredTokens(**base)
+
+    def test_a_still_valid_token_is_used_without_touching_the_network(self):
+        # A tool call must not pay for two discovery round trips to learn what the store already says.
+        with FakeAuthorizationServer() as server:
+            write_tokens(self.store, self.stored(server))
+            self.assertEqual(current_access_token(**self.settings(server)), "STORED-ACCESS")
+            self.assertEqual(server.token_requests, [])
+
+    def test_an_expired_token_is_refreshed_and_the_store_is_updated(self):
+        with FakeAuthorizationServer() as server:
+            write_tokens(self.store, self.stored(server, expires_at=1, refresh_token="a-refresh-token"))  # nosec B106 - a loopback fixture, not a credential
+            token = current_access_token(**self.settings(server))
+            self.assertEqual(token, ACCESS_TOKEN)
+            self.assertEqual(server.token_requests[-1]["grant_type"], ["refresh_token"])
+            self.assertEqual(read_tokens(self.store).access_token, token)
+            # Renewing a token must not call the MCP server at all. Asserted here as well as in the
+            # authorize test because both rest on the same one line in `_drive`.
+            self.assertEqual(server.mcp_requests, [])
+
+    def test_the_refresh_goes_to_the_pinned_endpoint_not_one_derived_from_the_server_url(self):
+        """The refresh token must reach the authorization server that issued it, and nothing else.
+
+        With no discovered metadata the SDK builds the token url as `{MCP server origin}/token`. For any real
+        service the resource server and the authorization server are different hosts, so that fallback posts
+        a durable credential to the wrong party. The endpoints discovered and validated at login are pinned
+        in the store for exactly this reason, and this test is what proves they are honoured."""
+        with FakeAuthorizationServer() as server:
+            write_tokens(self.store, self.stored(
+                server, expires_at=1, refresh_token="a-refresh-token",  # nosec B106 - a loopback fixture, not a credential
+                token_endpoint=f"{server.origin}/elsewhere/token",
+            ))
+            current_access_token(**self.settings(server))
+            self.assertEqual(server.token_paths, ["/elsewhere/token"])
+            self.assertEqual(server.mcp_requests, [])
+
+    def test_a_refresh_without_a_pinned_endpoint_is_refused_rather_than_guessed_at(self):
+        with FakeAuthorizationServer() as server:
+            with self.assertRaises(McpOAuthError) as caught:
+                refresh(server_url=server.url, stored=self.stored(server, token_endpoint="", refresh_token="r"),  # nosec B106 - a loopback fixture, not a credential
+                        client_id="portmark-test-client", allow_private=True)
+        self.assertIn("token endpoint", str(caught.exception))
+
+    def test_an_expired_token_with_nothing_to_renew_it_says_what_to_do(self):
+        with FakeAuthorizationServer() as server:
+            write_tokens(self.store, self.stored(server, expires_at=1))
+            with self.assertRaises(McpOAuthError) as caught:
+                current_access_token(**self.settings(server))
+        self.assertIn("no refresh token", str(caught.exception))
+        self.assertIn("mcp login", str(caught.exception))
+
+    def test_credentials_belonging_to_another_client_are_refused_before_they_are_used(self):
+        with FakeAuthorizationServer() as server:
+            write_tokens(self.store, self.stored(server, client_id="a-different-client"))
+            with self.assertRaises(McpOAuthError) as caught:
+                current_access_token(**self.settings(server))
+        self.assertIn("log in again", str(caught.exception))
+
+    def test_no_stored_authorization_says_to_log_in_rather_than_proceeding_unauthenticated(self):
+        with FakeAuthorizationServer() as server:
+            with self.assertRaises(McpOAuthError) as caught:
+                current_access_token(**self.settings(server))
+        self.assertIn("mcp login", str(caught.exception))
+
+    def test_logging_in_records_the_endpoints_it_discovered(self):
+        # Without this, the refresh above would have nothing to pin to.
+        opened = {}
+
+        async def open_authorization(url):
+            opened["url"] = url
+
+        async def read_callback():
+            from mcp.shared.auth import AuthorizationCodeResult
+
+            query = parse_qs(urlsplit(opened["url"]).query)
+            return AuthorizationCodeResult(code=AUTHORIZATION_CODE, state=query.get("state", [""])[0],
+                                           iss=self.origin)
+
+        with FakeAuthorizationServer() as server:
+            self.origin = server.origin
+            result = authorize(
+                server_url=server.url, client_id="portmark-test-client",
+                client_secret="portmark-test-secret",  # nosec B106 - a loopback fixture
+                redirect_uri="http://127.0.0.1:0/callback",
+                open_authorization=open_authorization, read_callback=read_callback,
+                allow_private=True, total_seconds=30,
+            )
+        self.assertEqual(result.token_endpoint, f"{server.origin}/token")
+        self.assertEqual(result.authorization_endpoint, f"{server.origin}/authorize")
+        self.assertEqual(result.stored().token_endpoint, result.token_endpoint)
+
+
+class SdkContractTests(unittest.TestCase):
+    """What the SDK must keep doing, asserted so that raising its pin cannot quietly drop a MUST.
+
+    These are not tests of Portmark's code and no mutation of Portmark can fail them. They exist because the
+    alternative -- reimplementing the checks Portmark deliberately delegated -- is how two implementations of
+    one rule start to disagree."""
+
+    def setUp(self):
+        if not sdk_available():
+            self.skipTest("requires portmark[mcp-oauth]")
+
+    def metadata(self, issuer):
+        from mcp.shared.auth import OAuthMetadata
+
+        return OAuthMetadata(issuer=issuer, authorization_endpoint=f"{issuer}/authorize",
+                             token_endpoint=f"{issuer}/token", response_types_supported=["code"],
+                             authorization_response_iss_parameter_supported=True)
+
+    def test_the_iss_comparison_does_not_normalise_the_url(self):
+        # The specification is explicit: no case folding, no default-port elision, no trailing-slash and no
+        # percent-encoding normalisation before comparing. A trailing slash is a MISMATCH, not a match.
+        from mcp.client.auth.utils import validate_authorization_response_iss
+
+        metadata = self.metadata("https://as.example")
+        validate_authorization_response_iss("https://as.example", metadata)
+        for nearly in ("https://as.example/", "https://AS.example", "https://as.example:443"):
+            with self.subTest(nearly=nearly):
+                with self.assertRaises(Exception):
+                    validate_authorization_response_iss(nearly, metadata)
+
+    def test_an_absent_iss_is_refused_only_when_the_server_advertised_it(self):
+        from mcp.client.auth.utils import validate_authorization_response_iss
+
+        with self.assertRaises(Exception):
+            validate_authorization_response_iss(None, self.metadata("https://as.example"))
+        quiet = self.metadata("https://as.example")
+        quiet.authorization_response_iss_parameter_supported = False
+        validate_authorization_response_iss(None, quiet)  # proceeds, per the specification's table
+
+    def test_metadata_is_refused_when_its_issuer_is_not_the_one_it_was_fetched_for(self):
+        from mcp.client.auth.utils import validate_metadata_issuer
+
+        validate_metadata_issuer(self.metadata("https://as.example"), "https://as.example")
+        with self.assertRaises(Exception):
+            validate_metadata_issuer(self.metadata("https://honest.example"), "https://attacker.example")
 
 
 if __name__ == "__main__":

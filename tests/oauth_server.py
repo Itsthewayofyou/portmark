@@ -71,8 +71,9 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length else b""
-        if self.path.startswith("/token"):
+        if self.path.startswith("/token") or self.path.startswith("/elsewhere/token"):
             self.server.token_requests.append(parse_qs(body.decode()))
+            self.server.token_paths.append(self.path)
             if self.server.mode == "token_refused":
                 self.json(400, {"error": "invalid_grant"})
                 return
@@ -113,6 +114,7 @@ class FakeAuthorizationServer:
         self._http = HTTPServer(("127.0.0.1", 0), _Handler)
         self._http.mode = mode
         self._http.token_requests = []
+        self._http.token_paths = []
         self._http.mcp_requests = []
         self._thread = threading.Thread(target=self._http.serve_forever, daemon=True)
 
@@ -137,6 +139,10 @@ class FakeAuthorizationServer:
     @property
     def token_requests(self) -> list:
         return self._http.token_requests
+
+    @property
+    def token_paths(self) -> list:
+        return self._http.token_paths
 
     @property
     def mcp_requests(self) -> list:
