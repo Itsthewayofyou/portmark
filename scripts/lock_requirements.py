@@ -29,6 +29,7 @@ EXPORTS = {
     "bootstrap": ["--only-group", "bootstrap"],  # pip + setuptools, installed first
     "runtime": ["--no-default-groups"],  # the package's own dependencies (the Docker image)
     "ci": ["--no-default-groups", "--group", "ci"],  # runtime + test/scan tooling
+    "a2a": ["--no-default-groups", "--extra", "a2a"],  # the official A2A SDK, for the conformance lane
     "postgres": ["--no-default-groups", "--extra", "postgres"],
     "wasmtime": ["--no-default-groups", "--extra", "wasmtime"],
     "release": ["--only-group", "release"],  # build, twine, uv (for the SBOM)
