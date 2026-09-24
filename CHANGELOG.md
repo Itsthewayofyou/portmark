@@ -18,6 +18,25 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.
 
+### Tooling and dependency updates (supersedes Dependabot #112)
+
+- **Pins raised, with the lock and the hash exports regenerated together:** `a2a-sdk` 1.1.2 -> 1.1.4,
+  `psycopg[binary]` 3.3.5 -> 3.3.6, `uv` 0.12.15 -> 0.12.17, and the transitive `idna` 3.19 -> 3.20.
+  Dependabot cannot do this on its own -- it edits `pyproject.toml` and the exports but cannot run `uv lock`,
+  so its PR fails the `lockfile` gate by design. `uv lock` and `scripts/lock_requirements.py` were run and all
+  five files committed together, which is what that gate exists to require.
+- **The new export was proved, not assumed.** The regenerated `requirements/release.txt` was used to install
+  uv 0.12.17 under `pip --require-hashes`, and that uv then re-ran `lock_requirements.py --check`: the hashes
+  verify against the real artifacts, and the files agree with the lock under the exact version CI will use.
+  CI's negative control was run too -- a copy with every hash replaced is refused by the hash check, and the
+  untampered export still installs.
+- **The a2a-sdk bump was actually exercised.** `tests/test_runtime.py` gates two tests on the real SDK being
+  importable, and neither CI nor the default install has it, so both normally skip. The SDK was installed at
+  1.1.4 and the file run against it: `test_local_agent_card_parses_under_strict_official_schema` and
+  `test_local_and_sdk_agent_cards_are_identical` ran and passed, so the strict-schema agent card still parses
+  and both adapters still serve the same card. 1.1.4 also carries upstream SSRF hardening on
+  push-notification URLs, which Portmark does not rely on but does not lose by taking.
+
 ### MCP tools over stdio (MCP/SIEM plan, PR 2)
 
 - **Portmark can call tools in an MCP server**, as an MCP **client**: `--mcp-config mcp.json` registers each
