@@ -194,6 +194,7 @@ replaces every other field with a keyed digest of the original value.
 
 ```bash
 portmark --store-path runtime.sqlite --trust-registry-path trust.json audit export \
+  --format ocsf \
   --out /var/log/portmark/audit.jsonl --cursor-file /var/lib/portmark/export-cursor.json \
   --projection-policy siem-projection.json --projection-keyring /etc/portmark/siem-keyring.json
 ```
@@ -305,7 +306,47 @@ portmark --store-path runtime.sqlite --trust-registry-path trust.json audit veri
 - `audit export` exits 0 when all is exported, 1 when it wrote an `integrity_failure` record, and 2 when a
   policy, keyring, cursor, or argument is refused (then nothing is written).
 
-`audit export` writes Portmark's own record format. An OCSF mapping is not included yet.
+### Record format
+
+`audit export` writes Portmark's own record shape by default. `--format ocsf` writes the same records as
+**OCSF 1.9.0**, class `api_activity` (`class_uid` 6003, category "Application Activity"), read from
+`https://schema.ocsf.io/` on 2026-09-23. `verify-export` reads either shape without being told which, so
+turning the flag on changes nothing about how an export is checked.
+
+What the mapping does, and what it deliberately does not:
+
+- A Portmark audit event is not one of the CRUD activities this class enumerates, so `activity_id` is `99`
+  ("Other") and `activity_name` carries the event kind (`tool.executed`, `approval.denied`, …), which is what
+  the specification requires at 99. `type_uid` is `600399`, computed as `class_uid * 100 + activity_id`.
+- `time` is a UTC epoch in **milliseconds**, as OCSF requires. Portmark stores seconds, so it is converted.
+- `status_id` is `Success` or `Failure` for an outcome, and `Unknown` for an event that reports a STATE
+  rather than a result (`agent.awaiting_input`, `agent.migrating`). An event kind Portmark does not know is
+  `Unknown`, never `Success`.
+- **A signed head is a `Success` only when its signature verified.** An export made without a trust registry
+  records the head as `unchecked`, which maps to `Unknown`; a head that failed its check maps to `Failure` at
+  `High` severity. Calling an unverified head a success would tell a SIEM that Portmark vouched for a chain
+  nobody looked at, and would hide the one alarm an export exists to raise.
+- **`verify-export` checks the OCSF fields too, not only the record inside them.** It re-projects the native
+  record it finds under `unmapped` and requires the result to equal the record presented, so a file whose
+  `status`, `time`, `severity` or `activity_name` was rewritten is refused even though the carried record is
+  untouched. Two values cannot be derived from the record and are taken as presented: the producer's version
+  string, and the exporter's clock, which reaches a record only when it carries no time of its own. Because
+  the projection constants take part in that check, changing one (the OCSF version, a class or status label)
+  makes files exported by an earlier Portmark read as altered -- treat it as a format change.
+- `severity_id` is `Informational` normally, `Medium` for a refusal or a denied or expired approval (the gate
+  working as designed, but worth seeing), and `High` for a failure, a kill or a rejected result.
+- `src_endpoint` and `actor.application` name the Portmark host. An audit event has no network peer, and
+  neither object needs one: both accept a name and a uid instead of an address.
+- **The hash chain travels under `unmapped.portmark`**, which is where OCSF puts a mapper's source-specific
+  data. It carries the whole native record, so nothing is lost.
+- **`attestation_list` is deliberately left empty.** Its `chain_uid` / `prev_event` / `fingerprint` fields
+  look like a perfect home for the chain, but OCSF defines that fingerprint as covering *the OCSF record's*
+  canonical bytes, while Portmark's hash covers the *original* audit event before projection. Putting one
+  where the other belongs would state something false, and a verifier following the specification would
+  recompute, find a mismatch, and read an honest export as tampered with.
+- The `ai_operation` profile is not applied. Its `ai_agent` object wants an agent identity that is not on
+  every record — the projection policy decides what survives — and emitting the profile empty, or inventing
+  an identity, would both be worse than leaving it out.
 
 ## Audit Floor
 

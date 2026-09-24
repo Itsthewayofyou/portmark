@@ -30,6 +30,7 @@ from portmark.audit_export import (
     ProjectionPolicy,
     Projector,
     VerifyReport,
+    ocsf_encoder,
     read_export,
     run_export,
     verify_against_store,
@@ -37,6 +38,7 @@ from portmark.audit_export import (
 )
 from portmark.cli import main as cli_main
 from portmark.factory import make_demo_envelope, make_host
+from portmark.ocsf import HEAD_SIGNATURE_VERIFIED, from_ocsf, to_ocsf
 from portmark.security import EnvelopeSigner, TrustRegistry, TrustedIdentity, canonical_json
 from portmark.storage import InMemoryRuntimeStore, PostgresRuntimeStore, SQLiteRuntimeStore
 
@@ -371,6 +373,158 @@ class VerifyExportTests(ExportCase):
         self.assertEqual(self.verify(self.data + newer, level2=True, keyring=rotated).status, "valid")
 
 
+class OcsfExportTests(ExportCase):
+    """The OCSF shape (class 6003), and the fact that verification is untouched by it."""
+
+    def ocsf_export(self, **kwargs):
+        return self.export(encode=ocsf_encoder("9.9.9", 1_700_000_000), **kwargs)
+
+    def test_an_ocsf_export_verifies_at_both_levels_exactly_as_a_native_one(self):
+        # The point of the whole mapping: a SIEM-shaped file is still a Portmark export.
+        self.run_task()
+        report, data = self.ocsf_export()
+        self.assertTrue(report.ok, report.integrity_failures)
+        for record in lines_of(data):
+            self.assertEqual(record["class_uid"], 6003)
+        self.assertEqual(self.verify(data, level2=True).status, "valid")
+
+    def test_the_round_trip_is_exact(self):
+        # Level 2 compares the WHOLE record for equality, so anything lost or reshaped on the way through
+        # reads as a record that was altered after export.
+        self.run_task()
+        _, native = self.export()
+        _, shaped = self.ocsf_export()
+        self.assertEqual([from_ocsf(record) for record in lines_of(shaped)], lines_of(native))
+
+    def test_every_record_carries_what_the_class_requires(self):
+        self.run_task()
+        for record in lines_of(self.ocsf_export()[1]):
+            with self.subTest(record["activity_name"]):
+                for field_name in ("activity_id", "actor", "api", "category_uid", "class_uid",
+                                   "metadata", "severity_id", "src_endpoint", "time", "type_uid"):
+                    self.assertIn(field_name, record)
+                self.assertEqual(record["type_uid"], record["class_uid"] * 100 + record["activity_id"])
+                self.assertEqual(record["type_name"], f"{record['class_name']}: {record['activity_name']}")
+                self.assertEqual(record["metadata"]["version"], "1.9.0")
+                self.assertEqual(record["metadata"]["product"], {
+                    "name": "Portmark", "vendor_name": "Portmark", "version": "9.9.9",
+                })
+                self.assertEqual(record["api"]["operation"], record["activity_name"])
+                # `at_least_one` on an actor and on a network endpoint: both are satisfied without
+                # inventing a network address for a local audit record.
+                self.assertIn("application", record["actor"])
+                self.assertTrue(record["src_endpoint"].get("name"))
+
+    def test_the_timestamp_is_milliseconds_not_seconds(self):
+        # Portmark stores epoch SECONDS; OCSF requires milliseconds. Getting this wrong puts every event
+        # in 1970 and is invisible until a SIEM draws a timeline.
+        self.run_task()
+        for record in lines_of(self.ocsf_export()[1]):
+            native = from_ocsf(record)
+            stamp = native.get("created_at") or native.get("signed_at")
+            if stamp is not None:
+                with self.subTest(record["activity_name"]):
+                    self.assertEqual(record["time"], stamp * 1000)
+
+    def test_an_outcome_is_reported_as_success_or_failure_and_a_state_as_neither(self):
+        cases = {
+            "tool.executed": (1, "Success"),
+            "tool.refused": (2, "Failure"),
+            "tool.killed": (2, "Failure"),
+            "agent.awaiting_input": (0, "Unknown"),  # a state, not a result
+            "not.a.portmark.event": (0, "Unknown"),
+        }
+        for event, (status_id, status) in cases.items():
+            with self.subTest(event):
+                record = to_ocsf(
+                    {"kind": "event", "event": event, "key": "k", "host_id": "h", "created_at": 1, "details": {}},
+                    product_version="1", now_seconds=1,
+                )
+                self.assertEqual((record["status_id"], record["status"]), (status_id, status))
+
+    def test_a_refusal_is_louder_than_a_success_and_a_failure_is_louder_still(self):
+        def severity(event):
+            return to_ocsf(
+                {"kind": "event", "event": event, "key": "k", "host_id": "h", "created_at": 1, "details": {}},
+                product_version="1", now_seconds=1,
+            )["severity_id"]
+
+        self.assertLess(severity("tool.executed"), severity("tool.refused"))
+        self.assertLess(severity("tool.refused"), severity("tool.failed"))
+
+    def test_the_chain_is_carried_whole_and_no_attestation_is_claimed(self):
+        # The hash chain covers the ORIGINAL audit event, not this record, so `attestation_list` -- whose
+        # fingerprint the specification defines as covering THIS record -- must stay absent.
+        self.run_task()
+        for record in lines_of(self.ocsf_export()[1]):
+            self.assertNotIn("attestation_list", record)
+            carried = record["unmapped"]["portmark"]
+            self.assertEqual(carried["schema"], "portmark.audit.export.v1")
+            self.assertIn("hash" if carried["kind"] == "event" else "head_hash", carried)
+
+    def test_an_integrity_failure_is_exported_as_a_loud_failure_and_still_fails_verification(self):
+        self.run_task()
+        self.sql("UPDATE audit_events SET details_json = ? WHERE sequence = 1", ('{"tampered":true}',))
+        report, data = self.ocsf_export()
+        self.assertFalse(report.ok)
+        control = [r for r in lines_of(data) if r["activity_name"] == "audit.export.integrity_failure"]
+        self.assertEqual(len(control), 1)
+        self.assertEqual((control[0]["status_id"], control[0]["severity_id"]), (2, 4))
+        self.assertEqual(control[0]["time"], 1_700_000_000 * 1000)  # the exporter's own clock: it has no other
+        self.assertEqual(self.verify(data).status, "invalid")
+
+    def test_a_head_is_a_success_only_when_its_signature_verified(self):
+        # An exported head carries the outcome of its own signature check. Reporting a head that FAILED that
+        # check as a success hides the one alarm an export exists to raise; reporting an unchecked one as a
+        # success claims Portmark vouched for a chain nobody looked at.
+        cases = {
+            "valid": (1, 1),
+            "valid-key-revoked": (1, 1),
+            "unchecked": (0, 1),
+            "signature-invalid": (2, 4),
+            "untrusted": (2, 4),
+            "a-status-from-a-later-version": (2, 4),
+        }
+        for signature_status, (status_id, severity_id) in cases.items():
+            with self.subTest(signature_status):
+                record = to_ocsf(
+                    {"kind": "head", "key": "k", "host_id": "h", "signed_at": 1,
+                     "signature_status": signature_status},
+                    product_version="1", now_seconds=1,
+                )
+                self.assertEqual((record["status_id"], record["severity_id"]), (status_id, severity_id))
+        # And the accepted set is not stale: a real export of a genuinely signed head lands inside it.
+        self.run_task()
+        self.assertIn(lines_of(self.export()[1])[-1]["signature_status"], HEAD_SIGNATURE_VERIFIED)
+
+    def test_rewriting_the_ocsf_fields_around_an_untouched_record_is_refused(self):
+        # Verification reads the native record out of `unmapped`, so nothing else would ever look at the
+        # fields a SIEM actually displays. A failure relabelled as a success must not verify.
+        self.run_task()
+        _, data = self.ocsf_export()
+        records = lines_of(data)
+        for field, value in (("status", "Failure"), ("status_id", 2), ("time", 0),
+                             ("severity_id", 4), ("activity_name", "audit.head")):
+            with self.subTest(field):
+                edited = [dict(record) for record in records]
+                # Edit a record the value actually differs on, or the "tampering" is a no-op and the
+                # test passes without ever exercising the check.
+                target = next((record for record in edited if record[field] != value), None)
+                self.assertIsNotNone(target, field)
+                target[field] = value
+                report = VerifyReport()
+                read_export([canonical_json(record) + b"\n" for record in edited], report)
+                self.assertEqual(report.status, "invalid")
+                self.assertIn("do not describe the record they carry", " ".join(report.reasons))
+
+    def test_an_ocsf_record_from_elsewhere_is_refused_not_guessed_at(self):
+        report = VerifyReport()
+        foreign = canonical_json({"class_uid": 6003, "unmapped": {"other_vendor": {"x": 1}}}) + b"\n"
+        read_export([foreign], report)
+        self.assertEqual(report.status, "invalid")
+        self.assertIn("did not come from Portmark", " ".join(report.reasons))
+
+
 class ProjectionUnitTests(unittest.TestCase):
     def setUp(self):
         self.projector = Projector(ProjectionPolicy.builtin(), Keyring("a", {"a": KEY_A}))
@@ -505,6 +659,21 @@ class CliTests(ExportCase):
     def export_cli(self, *extra):
         return self.cli("audit", "export", "--out", str(self.out), "--cursor-file", str(self.cursor),
                         "--projection-keyring", str(self.keyring_path), *extra)
+
+    def test_the_ocsf_format_flag_writes_ocsf_and_verify_export_still_reads_it(self):
+        code, _, _ = self.export_cli("--format", "ocsf")
+        self.assertEqual(code, 0)
+        written = lines_of(self.out.read_bytes())
+        self.assertTrue(written)
+        for record in written:
+            self.assertEqual(record["class_uid"], 6003)
+        code, stdout, stderr = self.cli(
+            "audit", "verify-export", "--in", str(self.out), "--against-store",
+            "--projection-keyring", str(self.keyring_path),
+        )
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["status"], "valid")
+        self.assertEqual(json.loads(stdout)["level"], 2)
 
     def test_export_then_verify_at_both_levels(self):
         synced = []

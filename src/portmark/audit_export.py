@@ -21,6 +21,7 @@ from typing import Any, BinaryIO
 
 from ._durable_file import atomic_write_bytes
 from .json_guard import StrictJSONError, strict_json_loads
+from .ocsf import from_ocsf, is_ocsf, projection_mismatch
 from .security import canonical_json
 from .storage import (
     DEFAULT_ADMIN_PAGE_SIZE,
@@ -331,6 +332,19 @@ def encode_record(record: Mapping[str, Any]) -> bytes:
     return canonical_json(record) + b"\n"
 
 
+def ocsf_encoder(product_version: str, now_seconds: int) -> Callable[[Mapping[str, Any]], bytes]:
+    """An encoder that writes each record as OCSF instead of Portmark's own shape.
+
+    The native record is still what is built and what is verified; this only decides how it is WRITTEN. See
+    ocsf.py for why the chain travels under `unmapped` rather than in `attestation_list`."""
+    from .ocsf import to_ocsf  # noqa: PLC0415 - only an OCSF export pays for it
+
+    def encode(record: Mapping[str, Any]) -> bytes:
+        return canonical_json(to_ocsf(record, product_version=product_version, now_seconds=now_seconds)) + b"\n"
+
+    return encode
+
+
 class ExportCursor:
     """Per-task watermark: the next sequence to export and the hash of the last exported event.
 
@@ -414,6 +428,7 @@ def run_export(
     durable: bool = True,
     page_size: int = DEFAULT_ADMIN_PAGE_SIZE,
     max_events: int = DEFAULT_EXPORT_EVENTS,
+    encode: Callable[[Mapping[str, Any]], bytes] = encode_record,
     _after_write: Callable[[], None] | None = None,
 ) -> ExportReport:
     """Export everything past the cursor. Per page: write the records, flush (+ fsync when `durable`), and
@@ -433,12 +448,12 @@ def run_export(
         for task in page.tasks:
             if task.task_id in failed:
                 continue
-            reason = _export_task(task, cursor, projector, verifier, lines, report)
+            reason = _export_task(task, cursor, projector, verifier, lines, report, encode)
             if reason is not None:
                 failed.add(task.task_id)
                 failure = control_record(task.task_id, cursor.tasks.get(task.task_id, (0, ""))[0], reason)
                 report.integrity_failures.append(failure)
-                lines.append(encode_record(failure))
+                lines.append(encode(failure))
         if lines:
             out.write(b"".join(lines))
             out.flush()
@@ -459,6 +474,7 @@ def _export_task(
     verifier: AuditHeadVerifier | None,
     lines: list[bytes],
     report: ExportReport,
+    encode: Callable[[Mapping[str, Any]], bytes] = encode_record,
 ) -> str | None:
     task_id = task.task_id
     position, last_hash = cursor.tasks.get(task_id, (0, None))
@@ -474,7 +490,7 @@ def _export_task(
         details, reason = _check_event(task_id, position, previous, row)
         if reason is not None:
             return reason
-        lines.append(encode_record(event_record(task_id, row, details, projector)))
+        lines.append(encode(event_record(task_id, row, details, projector)))
         report.events += 1
         position, previous = position + 1, row["hash"]
         cursor.tasks[task_id] = (position, row["hash"])
@@ -483,7 +499,7 @@ def _export_task(
     if position != head_sequence or previous != task.head["head_hash"]:
         return "stored head does not match the stored events (missing or extra rows)"
     status = "unchecked" if verifier is None else _verify_head_signature(verifier, task_id, task.head).head_status or "invalid"
-    lines.append(encode_record(head_record(task_id, task.head, status)))
+    lines.append(encode(head_record(task_id, task.head, status)))
     report.heads += 1
     report.tasks += 1
     return None
@@ -535,6 +551,21 @@ def read_export(lines: Iterable[bytes], report: VerifyReport) -> dict[str, dict[
         if not isinstance(record, dict):
             report.fail(f"line {number} is not a JSON object")
             continue
+        if is_ocsf(record):
+            # An OCSF file is verified exactly as a native one: the native record travels intact inside it,
+            # so unwrapping here means every check below is the same code on the same values.
+            native = from_ocsf(record)
+            if native is None:
+                report.fail(f"line {number} is an OCSF record that did not come from Portmark")
+                continue
+            # The checks below all run on the native record, so the OCSF fields a SIEM reads would never be
+            # looked at. They must be shown to describe the record they carry, or an export can be rewritten
+            # to say anything at all and still verify.
+            differing = projection_mismatch(record, native)
+            if differing is not None:
+                report.fail(f"line {number}: the OCSF fields do not describe the record they carry: {differing}")
+                continue
+            record = native
         if record.get("schema") == CONTROL_SCHEMA:
             report.fail(f"export-control record: task {record.get('task_id')!r}: {record.get('reason')}")
             continue
