@@ -6,6 +6,20 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 ### Added
 
+- **OAuth for HTTP MCP servers.** An `oauth` block on an HTTP server delegates the operator's own access to
+  a service such as GitHub, Linear or Notion. Portmark does not implement OAuth: the official `mcp` SDK is
+  an exactly pinned optional extra (`pip install 'portmark[mcp-oauth]'`, owner decision D1) and Portmark
+  performs every request itself, so each one keeps the resolve-once address pinning, verified TLS, byte caps
+  and deadline that an MCP request has. A redirect from an OAuth endpoint is refused rather than followed.
+  `portmark mcp login <server>` runs the authorization-code flow -- collecting the redirect on a loopback
+  listener, or with `--manual` from a url you paste, for a machine with no browser -- and
+  `portmark mcp logout <server>` deletes what it stored. The store is `0600` and is refused if anyone else
+  can read it. Renewal runs in the host, where the SDK lives; the isolated worker only READS the store, so
+  the extra's 28 packages never enter the sandboxed process, and an expired token there is a refusal rather
+  than an unauthenticated call. Tokens are bound to their issuer and client, and the endpoints discovered at
+  login are pinned, because the SDK's refresh path would otherwise post the refresh token to the resource
+  server. See MCP.md.
+
 - **`portmark audit export --format ocsf`** writes each exported record as OCSF 1.9.0 class `api_activity`
   (`class_uid` 6003), read from the live schema on 2026-09-23, so a SIEM can read an export without a custom
   parser. `verify-export` reads either shape without being told which, and both verification levels are
