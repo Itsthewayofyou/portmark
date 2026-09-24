@@ -8069,10 +8069,17 @@ class RuntimeTests(unittest.TestCase):
         image_python = f"3.{pinned.group(1)}"
         root = Path(__file__).parents[1]
         ci = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-        matrices = re.findall(r'python-version: \[([^\]]*)\]', ci)
-        self.assertEqual(len(matrices), 2, matrices)  # `test` and `windows-tests`
-        for matrix in matrices:
-            self.assertIn(f'"{image_python}"', matrix)
+        # Found BY JOB, not by counting every matrix in the file. The two FULL matrices are `test` and
+        # `windows-tests`; a lane may legitimately pin a narrower set of its own (official-a2a-sdk runs the
+        # oldest and newest only), and counting would either break on such a lane or start demanding the
+        # image's Python from a job that never claimed to cover it.
+        blocks = dict(re.findall(r"^  ([a-z0-9-]+):\n(.*?)(?=^  [a-z0-9-]+:\n|\Z)", ci, re.MULTILINE | re.DOTALL))
+        for job in ("test", "windows-tests"):
+            with self.subTest(job=job):
+                self.assertIn(job, blocks)
+                matrix = re.search(r'python-version: \[([^\]]*)\]', blocks[job])
+                self.assertIsNotNone(matrix, f"{job} has no python-version matrix")
+                self.assertIn(f'"{image_python}"', matrix.group(1))
         self.assertIn(
             f'"Programming Language :: Python :: {image_python}"',
             (root / "pyproject.toml").read_text(encoding="utf-8"),

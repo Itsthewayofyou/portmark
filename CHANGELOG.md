@@ -31,11 +31,20 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   CI's negative control was run too -- a copy with every hash replaced is refused by the hash check, and the
   untampered export still installs.
 - **The a2a-sdk bump was actually exercised.** `tests/test_runtime.py` gates two tests on the real SDK being
-  importable, and neither CI nor the default install has it, so both normally skip. The SDK was installed at
-  1.1.4 and the file run against it: `test_local_agent_card_parses_under_strict_official_schema` and
-  `test_local_and_sdk_agent_cards_are_identical` ran and passed, so the strict-schema agent card still parses
-  and both adapters still serve the same card. 1.1.4 also carries upstream SSRF hardening on
+  importable, and neither CI nor the default install had it, so both skipped everywhere. The SDK was
+  installed at 1.1.4 and the file run against it: `test_local_agent_card_parses_under_strict_official_schema`
+  and `test_local_and_sdk_agent_cards_are_identical` ran and passed, so the strict-schema agent card still
+  parses and both adapters still serve the same card. 1.1.4 also carries upstream SSRF hardening on
   push-notification URLs, which Portmark does not rely on but does not lose by taking.
+- **That check is now a gate, not a habit.** New CI job `official-a2a-sdk` installs the `[a2a]` extra at its
+  hash-locked pin on the oldest and newest supported Python (3.11 and 3.14; `requires-python` is `>=3.11`)
+  and runs the runtime suite with the SDK present. The extra had no hash-pinned export at all, so
+  `requirements/a2a.txt` is new and `scripts/lock_requirements.py` now generates it like every other set.
+- **A skip fails that lane.** A skipped test still reports `OK (skipped=n)`, so a lane whose install quietly
+  failed would have gone green having proved nothing -- which is precisely how the gap stayed invisible. The
+  job asserts the SDK is importable, that exactly two tests were selected, and that the final line is a bare
+  `OK`. The guard was checked both ways before it was committed: it passes with the SDK installed and fails
+  with `OK (skipped=2)` without it.
 
 ### MCP tools over stdio (MCP/SIEM plan, PR 2)
 
