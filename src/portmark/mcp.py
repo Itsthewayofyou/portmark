@@ -69,6 +69,17 @@ def register_mcp_tools(registry: ToolRegistry, config: McpConfig, client_version
     existing = set(registry.names())
     names: list[str] = []
     for server in config.servers.values():
+        if server.oauth is not None:
+            # The call path does not read `oauth` yet: `mcp_worker._connect_http` takes its bearer from
+            # `bearer_env` and nothing else, so registering these tools would produce a server that is
+            # configured for OAuth and contacted WITHOUT a token. A setting that is accepted but not in
+            # force is the failure mode Portmark refuses everywhere else, so the host does not start.
+            # Removed by the commit that wires `current_access_token` in and adds `portmark mcp login`.
+            raise McpConfigError(
+                f"server {server.name!r} sets `oauth`, and the OAuth call path is not built yet: the token "
+                "would never be sent and the server would be contacted unauthenticated. Use `bearer_env`, "
+                "or wait for `portmark mcp login`."
+            )
         for tool in server.tools.values():
             if tool.name in existing:
                 # A server must never shadow a tool that is already installed.

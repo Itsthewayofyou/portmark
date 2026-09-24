@@ -27,9 +27,11 @@ from portmark.mcp_oauth import (
     sdk_available,
 )
 from portmark.security import canonical_json
+from portmark.mcp import register_mcp_tools
 from portmark.mcp_client import McpError
 from portmark.mcp_config import McpConfigError, McpOAuthConfig, McpServerConfig, config_from_bytes, server_digest
 from portmark.mcp_http import checked_fetch
+from portmark.tools import ToolRegistry
 from portmark.mcp_token_store import (
     SCHEMA,
     STORE_VERSION,
@@ -122,6 +124,26 @@ class OauthConfigTests(unittest.TestCase):
     def test_an_unknown_key_in_the_oauth_block_is_refused(self):
         # A misspelled key that is ignored reads as a setting that is in force.
         self.assertIn("unknown keys", self.refusal(dict(OAUTH, client_secret="literal")))  # nosec B106 - a misspelled KEY name being refused, not a credential
+
+
+class OauthNotYetWiredTests(unittest.TestCase):
+    """Until the call path reads `oauth`, a server that sets it must not start."""
+
+    def test_the_host_refuses_to_register_a_server_whose_oauth_would_be_ignored(self):
+        # Accepting a setting that is not in force is the failure this whole codebase refuses elsewhere:
+        # the operator would read the config, believe the server is authorized, and it would be contacted
+        # with no token at all. Failing at start-up is the honest answer until the wiring lands.
+        document = {
+            "schema": "portmark.mcp.config.v1",
+            "servers": {"example": dict(HTTP_SERVER, oauth=OAUTH)},
+        }
+        path = Path(tempfile.mkdtemp()) / "mcp.json"
+        path.write_text(json.dumps(document), encoding="utf-8")
+        config = config_from_bytes(path.read_bytes(), str(path))
+        with self.assertRaises(McpConfigError) as caught:
+            register_mcp_tools(ToolRegistry(), config)
+        self.assertIn("not built yet", str(caught.exception))
+        self.assertIn("unauthenticated", str(caught.exception))
 
 
 class OauthTransportTests(unittest.TestCase):
