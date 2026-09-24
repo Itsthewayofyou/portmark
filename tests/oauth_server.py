@@ -7,9 +7,13 @@ driver has to refuse. `mode` selects which of those it is being today.
 
 from __future__ import annotations
 
+import datetime
 import json
+import ssl
+import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs
 
 ACCESS_TOKEN = "access-token-from-the-fake-server"  # nosec B105 - a fixture, not a credential
@@ -28,7 +32,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     @property
     def origin(self) -> str:
-        return f"http://{self.server.server_address[0]}:{self.server.server_address[1]}"
+        return self.server.origin
 
     def reply(self, status: int, body: bytes = b"", headers: dict | None = None) -> None:
         self.send_response(status)
@@ -48,11 +52,16 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler's spelling
         mode = self.server.mode
         if self.path.startswith("/.well-known/oauth-protected-resource"):
+            self.server.prm_requests.append(self.path)
             if mode == "redirecting_metadata":
                 # Never followed: the destination has been checked by nobody.
                 self.reply(302, headers={"Location": "http://169.254.169.254/latest/meta-data/"})
                 return
-            self.json(200, {"resource": f"{self.origin}/mcp", "authorization_servers": [self.origin],
+            # `moved_issuer`: the resource now names a DIFFERENT authorization server than the one that
+            # issued the stored credentials. Not a hypothetical -- it is either a reconfiguration or an
+            # attack, and from the client's side those look the same.
+            named = "https://somewhere-else.example" if mode == "moved_issuer" else self.origin
+            self.json(200, {"resource": f"{self.origin}/mcp", "authorization_servers": [named],
                             "scopes_supported": [SCOPE]})
             return
         if self.path.startswith("/.well-known/oauth-authorization-server") or self.path.startswith("/.well-known/openid-configuration"):
@@ -107,15 +116,59 @@ class _Handler(BaseHTTPRequestHandler):
         }
 
 
+def _trust_anchor(directory: Path) -> tuple[Path, Path]:
+    """A throwaway certificate for `localhost`, so the tests reach this server over REAL TLS.
+
+    The alternative -- letting `checked_fetch` accept plain http for a loopback address -- would be a test
+    weakening a security rule, and the rule it weakens is the one that keeps a refresh token off the wire in
+    clear. Generating a certificate is cheaper than that trade."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(name).issuer_name(name).public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=5))
+        .not_valid_after(now + datetime.timedelta(hours=1))
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost")]), critical=False)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    certificate_path, key_path = directory / "cert.pem", directory / "key.pem"
+    certificate_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+    ))
+    return certificate_path, key_path
+
+
 class FakeAuthorizationServer:
-    """Start with `with FakeAuthorizationServer() as server:` and read `server.url`."""
+    """A loopback authorization server over REAL TLS.
+
+    `with FakeAuthorizationServer() as server:` then read `server.url` and pass `server.context` to whatever
+    performs the request, so the throwaway certificate is the only anchor it trusts."""
 
     def __init__(self, mode: str = "ok") -> None:
+        self._dir = tempfile.TemporaryDirectory()
+        certificate_path, key_path = _trust_anchor(Path(self._dir.name))
         self._http = HTTPServer(("127.0.0.1", 0), _Handler)
+        server_side = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server_side.load_cert_chain(str(certificate_path), str(key_path))
+        self._http.socket = server_side.wrap_socket(self._http.socket, server_side=True)
+        # The certificate names `localhost`, and the address it resolves to is what the transport pins.
+        self._http.origin = f"https://localhost:{self._http.server_address[1]}"
         self._http.mode = mode
         self._http.token_requests = []
         self._http.token_paths = []
+        self._http.prm_requests = []
         self._http.mcp_requests = []
+        self._context = ssl.create_default_context(cafile=str(certificate_path))
         self._thread = threading.Thread(target=self._http.serve_forever, daemon=True)
 
     def __enter__(self) -> "FakeAuthorizationServer":
@@ -126,11 +179,16 @@ class FakeAuthorizationServer:
         self._http.shutdown()
         self._http.server_close()
         self._thread.join(timeout=5)
+        self._dir.cleanup()
+
+    @property
+    def context(self) -> ssl.SSLContext:
+        """A verifying context whose only trust anchor is this server's throwaway certificate."""
+        return self._context
 
     @property
     def origin(self) -> str:
-        host, port = self._http.server_address[0], self._http.server_address[1]
-        return f"http://{host}:{port}"
+        return self._http.origin
 
     @property
     def url(self) -> str:
@@ -143,6 +201,10 @@ class FakeAuthorizationServer:
     @property
     def token_paths(self) -> list:
         return self._http.token_paths
+
+    @property
+    def prm_requests(self) -> list:
+        return self._http.prm_requests
 
     @property
     def mcp_requests(self) -> list:

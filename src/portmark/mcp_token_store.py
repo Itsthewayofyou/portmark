@@ -77,15 +77,35 @@ class StoredTokens:
 def binding_error(tokens: StoredTokens, issuer: str, client_id: str) -> str | None:
     """Why these tokens must not be used against this authorization server and client, or None.
 
-    Checked before every use, not only at login: the authorization server a resource names can change after
-    the tokens were stored, and that is precisely the case the specification says to refuse."""
-    if tokens.issuer != issuer:
-        return (f"the stored tokens were issued by {tokens.issuer!r}, but the server now names {issuer!r}; "
-                "log in again rather than reuse credentials from a different authorization server")
-    if tokens.client_id != client_id:
-        return (f"the stored tokens belong to client {tokens.client_id!r}, but the configuration now names "
-                f"{client_id!r}; log in again")
-    return None
+    `issuer` must be a FRESHLY DISCOVERED value, not the one out of `tokens`. Passing `tokens.issuer` here
+    compares a value with itself and checks nothing -- an easy mistake, and one that was made and caught in
+    review. `issuer_mismatch` and `client_mismatch` exist so a caller that only has one of the two says so
+    rather than inventing the other."""
+    return issuer_mismatch(tokens, issuer) or client_mismatch(tokens, client_id)
+
+
+def issuer_mismatch(tokens: StoredTokens, discovered_issuer: str) -> str | None:
+    """Whether these credentials belong to a DIFFERENT authorization server than the one now named.
+
+    The specification's MUST: credentials are keyed by the authorization server that issued them, a client
+    MUST NOT reuse credentials from a different one, and SHOULD surface an error. A resource that starts
+    naming a different authorization server is either being reconfigured or being attacked, and from inside
+    the process those look identical."""
+    if tokens.issuer == discovered_issuer:
+        return None
+    return (f"the stored tokens were issued by {tokens.issuer!r}, but the server now names "
+            f"{discovered_issuer!r}; log in again rather than reuse credentials from a different "
+            "authorization server")
+
+
+def client_mismatch(tokens: StoredTokens, client_id: str) -> str | None:
+    """Whether these credentials belong to a different client than the configuration now names.
+
+    Checkable without any network, because both sides are already in hand."""
+    if tokens.client_id == client_id:
+        return None
+    return (f"the stored tokens belong to client {tokens.client_id!r}, but the configuration now names "
+            f"{client_id!r}; log in again")
 
 
 def read_tokens(path: str) -> StoredTokens | None:

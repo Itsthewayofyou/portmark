@@ -35,7 +35,7 @@ from typing import Any
 
 from .mcp_client import McpError
 from .mcp_http import MAX_METADATA_BYTES, checked_fetch
-from .mcp_token_store import StoredTokens, binding_error, read_tokens, write_tokens
+from .mcp_token_store import StoredTokens, client_mismatch, issuer_mismatch, read_tokens, write_tokens
 
 # `pip install "portmark[mcp-oauth]"`. Named once so the advice cannot drift between messages.
 EXTRA_HINT = 'OAuth for MCP needs the official SDK: install the optional extra, `pip install "portmark[mcp-oauth]"`'
@@ -209,7 +209,11 @@ def current_access_token(
         raise McpOAuthError(
             f"no stored authorization for this server; run `portmark mcp login` (store: {token_store})"
         )
-    mismatch = binding_error(stored, stored.issuer, client_id)
+    # Only the CLIENT half is checkable here, and saying so is the point. Comparing the stored issuer with
+    # itself -- which is what an unqualified binding check would do on this path -- proves nothing. Learning
+    # which authorization server the resource NOW names costs a network round trip, so it happens where
+    # there is already one: on refresh, below. The window is one access-token lifetime.
+    mismatch = client_mismatch(stored, client_id)
     if mismatch:
         raise McpOAuthError(mismatch)
     if stored.fresh(now):
@@ -317,13 +321,8 @@ def refresh(
         response_types_supported=["code"],
     )
     network = _Network(total_seconds, request_timeout, allow_private, context)
-    asyncio.run(_drive(provider, httpx2.Request("POST", server_url), network, storage))
+    asyncio.run(_renew(provider, httpx2.Request("POST", server_url), network, storage, server_url, stored))
     renewed = _harvest(provider, storage, client_id, scopes or stored.scopes)
-    mismatch = binding_error(stored, renewed.issuer, client_id)
-    if mismatch:
-        # The specification's MUST, enforced at the one moment there is fresh evidence: discovery just ran,
-        # and it named a different authorization server than the one these credentials belong to.
-        raise McpOAuthError(mismatch)
     return Authorization(
         renewed.issuer,
         client_id,
@@ -404,6 +403,50 @@ async def _drive(provider: Any, request: Any, network: _Network, storage: _Stora
         raise McpOAuthError(f"the authorization flow asked for more than {MAX_FLOW_STEPS} requests and was stopped")
     finally:
         await _close(flow)
+
+
+async def _renew(provider: Any, request: Any, network: _Network, storage: _Storage,
+                 server_url: str, stored: StoredTokens) -> None:
+    """Check the binding against what the resource says NOW, then refresh."""
+    await _refuse_if_the_issuer_changed(server_url, stored, network)
+    await _drive(provider, request, network, storage)
+
+
+async def _refuse_if_the_issuer_changed(server_url: str, stored: StoredTokens, network: _Network) -> None:
+    """Ask the resource which authorization server it names, and refuse if it is not the one that issued these.
+
+    This is the specification's binding requirement done for real. It costs one request, which is why it
+    happens on refresh rather than on every call: a refresh is already a network operation, and an
+    access-token lifetime is the resulting window.
+
+    The discovery itself is the SDK's -- `build_protected_resource_metadata_discovery_urls` implements the
+    required order (the `WWW-Authenticate` url, then the path-aware well-known, then the root one) and
+    `handle_protected_resource_response` parses it. Portmark performs the requests and makes the comparison.
+    Reimplementing the ordering here is exactly the duplication decision D1 exists to avoid.
+
+    A resource that publishes no protected-resource metadata cannot be checked this way, and that is stated
+    rather than treated as a pass: there is nothing to compare, so the refresh proceeds on the pinned
+    endpoint alone, which is itself bound to the issuer."""
+    from mcp.client.auth.utils import (  # noqa: PLC0415 - part of the optional extra
+        build_protected_resource_metadata_discovery_urls,
+        create_oauth_metadata_request,
+        handle_protected_resource_response,
+    )
+
+    for url in build_protected_resource_metadata_discovery_urls(None, server_url):
+        try:
+            answer = network.perform(create_oauth_metadata_request(url))
+        except McpOAuthError:
+            continue  # this well-known url is not served; the next one may be
+        metadata = await handle_protected_resource_response(answer)
+        if metadata is None:
+            continue
+        advertised = tuple(str(server) for server in (metadata.authorization_servers or ()))
+        if advertised and stored.issuer not in advertised:
+            raise McpOAuthError(
+                issuer_mismatch(stored, advertised[0]) or "the authorization server changed"
+            )
+        return
 
 
 async def _close(flow: Any) -> None:

@@ -30,6 +30,9 @@ EXPORTS = {
     "runtime": ["--no-default-groups"],  # the package's own dependencies (the Docker image)
     "ci": ["--no-default-groups", "--group", "ci"],  # runtime + test/scan tooling
     "a2a": ["--no-default-groups", "--extra", "a2a"],  # the official A2A SDK, for the conformance lane
+    # The file is `mcp_oauth.txt` while the extra is `mcp-oauth`: the extra name is fixed by PEP 685
+    # normalisation, the export name is not, so it stays inside the supply-chain check's `\w+`.
+    "mcp_oauth": ["--no-default-groups", "--extra", "mcp-oauth"],  # the official MCP SDK, for the OAuth lane
     "postgres": ["--no-default-groups", "--extra", "postgres"],
     "wasmtime": ["--no-default-groups", "--extra", "wasmtime"],
     "release": ["--only-group", "release"],  # build, twine, uv (for the SBOM)

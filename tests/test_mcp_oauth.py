@@ -27,7 +27,9 @@ from portmark.mcp_oauth import (
     sdk_available,
 )
 from portmark.security import canonical_json
+from portmark.mcp_client import McpError
 from portmark.mcp_config import McpConfigError, McpOAuthConfig, McpServerConfig, config_from_bytes, server_digest
+from portmark.mcp_http import checked_fetch
 from portmark.mcp_token_store import (
     SCHEMA,
     STORE_VERSION,
@@ -120,6 +122,25 @@ class OauthConfigTests(unittest.TestCase):
     def test_an_unknown_key_in_the_oauth_block_is_refused(self):
         # A misspelled key that is ignored reads as a setting that is in force.
         self.assertIn("unknown keys", self.refusal(dict(OAUTH, client_secret="literal")))  # nosec B106 - a misspelled KEY name being refused, not a credential
+
+
+class OauthTransportTests(unittest.TestCase):
+    """The rules `checked_fetch` holds an OAuth endpoint to. No SDK needed: this is Portmark's own transport."""
+
+    def test_an_oauth_endpoint_over_plain_http_is_refused_even_when_private_is_allowed(self):
+        """`allow_private` says which ADDRESSES may be reached. It is not permission to drop TLS.
+
+        Conflating the two is how a discovered private token endpoint ends up receiving a client secret, an
+        authorization code or a refresh token in clear. The specification mandates https for the OAuth
+        endpoints, and there is deliberately no flag that opens it -- the tests reach a loopback
+        authorization server over real TLS with a throwaway trust anchor instead."""
+        for url in ("http://127.0.0.1:1/token", "http://10.0.0.1/.well-known/oauth-authorization-server"):
+            with self.subTest(url=url):
+                for allow_private in (True, False):
+                    with self.assertRaises(McpError) as caught:
+                        checked_fetch("GET", url, total_seconds=5, request_timeout=1,
+                                      allow_private=allow_private)
+                    self.assertIn("must be https", str(caught.exception))
 
 
 class OauthDigestTests(unittest.TestCase):
@@ -283,6 +304,7 @@ class OauthDriverTests(unittest.TestCase):
             read_callback=self.read_callback(server),
             allow_private=True,
             total_seconds=30,
+            context=server.context,
         )
         settings.update(changes)
         return authorize(**settings)
@@ -343,7 +365,7 @@ class OauthDriverTests(unittest.TestCase):
         with FakeAuthorizationServer() as server:
             with self.assertRaises(McpOAuthError) as caught:
                 self.authorize(server, allow_private=False)
-        self.assertIn("https", str(caught.exception))
+        self.assertIn("not usable", str(caught.exception))
 
     def test_a_refused_token_exchange_is_reported_and_stores_nothing(self):
         with FakeAuthorizationServer("token_refused") as server:
@@ -403,6 +425,7 @@ class OauthRefreshTests(unittest.TestCase):
         base = dict(
             server_url=server.url, token_store=self.store, client_id="portmark-test-client",
             client_secret="portmark-test-secret", allow_private=True,  # nosec B106 - a loopback fixture
+            context=server.context,
         )
         base.update(changes)
         return base
@@ -446,6 +469,26 @@ class OauthRefreshTests(unittest.TestCase):
             current_access_token(**self.settings(server))
             self.assertEqual(server.token_paths, ["/elsewhere/token"])
             self.assertEqual(server.mcp_requests, [])
+
+    def test_a_refresh_is_refused_when_the_server_now_names_a_different_authorization_server(self):
+        """The specification's binding MUST, checked against what the resource says NOW.
+
+        This is the test that was missing. Comparing the stored issuer with itself -- which is what an
+        unqualified binding check does on the cached path -- cannot fail, so it proved nothing. Here the
+        resource is made to advertise a different authorization server, and the refresh must refuse rather
+        than renew credentials at a server they do not belong to."""
+        with FakeAuthorizationServer("moved_issuer") as server:
+            write_tokens(self.store, self.stored(server, expires_at=1, refresh_token="a-refresh-token"))  # nosec B106 - a loopback fixture
+            with self.assertRaises(McpOAuthError) as caught:
+                current_access_token(**self.settings(server))
+        self.assertIn("different authorization server", str(caught.exception))
+        self.assertIn("somewhere-else.example", str(caught.exception))
+        # Nothing was renewed: the refresh token never left.
+        self.assertEqual(server.token_requests, [])
+        # And the check was made by ASKING, not by comparing the store with itself. Asserted in this test
+        # rather than a separate one because the two cannot be told apart by a mutant: skipping the fetch
+        # and neutering the comparison both show up here and nowhere else.
+        self.assertTrue(server.prm_requests, "the protected-resource metadata was never fetched")
 
     def test_a_refresh_without_a_pinned_endpoint_is_refused_rather_than_guessed_at(self):
         with FakeAuthorizationServer() as server:
@@ -496,7 +539,7 @@ class OauthRefreshTests(unittest.TestCase):
                 client_secret="portmark-test-secret",  # nosec B106 - a loopback fixture
                 redirect_uri="http://127.0.0.1:0/callback",
                 open_authorization=open_authorization, read_callback=read_callback,
-                allow_private=True, total_seconds=30,
+                allow_private=True, total_seconds=30, context=server.context,
             )
         self.assertEqual(result.token_endpoint, f"{server.origin}/token")
         self.assertEqual(result.authorization_endpoint, f"{server.origin}/authorize")

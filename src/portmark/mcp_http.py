@@ -488,10 +488,13 @@ def checked_fetch(
     follow redirects on its internal requests, which is exactly why Portmark performs them instead of letting
     the SDK perform them."""
     split = urlsplit(url)
-    if split.scheme != "https" and not allow_private:
-        # The specification mandates https for the OAuth endpoints, unlike the MCP endpoint itself. The
-        # exception exists so a loopback test server can be reached, and `allow_private` is already the
-        # operator's explicit statement that this deployment is not on the public internet.
+    if split.scheme != "https":
+        # No exception, and deliberately not one that `allow_private` can open. `allow_private` says WHICH
+        # ADDRESSES may be reached; it is not a statement about encryption, and letting it disable TLS here
+        # would mean a discovered private token endpoint could receive a client secret, an authorization
+        # code or a refresh token in clear. The specification mandates https for the OAuth endpoints --
+        # unlike the MCP endpoint itself, where Portmark's rule is its own. The tests reach a loopback
+        # authorization server over real TLS with a test trust anchor rather than by weakening this.
         raise McpError(TRANSPORT_ERROR, f"an OAuth endpoint must be https, not {split.scheme!r}")
     transport = HttpTransport(url, request_timeout, total_seconds, allow_private=allow_private, context=context)
     return transport.one_shot(method, headers or {}, body, max_bytes)
