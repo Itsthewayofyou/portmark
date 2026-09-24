@@ -37,7 +37,7 @@ from portmark.mcp_oauth import (
 from portmark.security import canonical_json
 from portmark import mcp_worker
 from portmark.cli import _install_mcp_tools
-from portmark.mcp import refresh_oauth_tokens
+from portmark.mcp import McpStartupError, probe_server, refresh_oauth_tokens
 from portmark.mcp_http import HttpTransport, resolve_endpoint_address
 from portmark.mcp_login import DEFAULT_REDIRECT, _Loopback, login, logout, result_from_redirect
 from portmark.mcp_client import McpError
@@ -249,13 +249,23 @@ class OauthWorkerTests(unittest.TestCase):
         self.assertEqual(json.loads(answer.stdout.strip().splitlines()[-1]), [])
 
     def test_an_expired_stored_token_is_refused_rather_than_sent(self):
-        # The worker cannot renew, so the honest answer is to refuse. Sending it would authenticate as
-        # nobody and be logged by the resource server as a failed call the operator never made.
+        """Both ways in, because the refusal is one function and `probe_server` is exported.
+
+        The worker cannot renew, so the honest answer is to refuse. Sending it would authenticate as nobody
+        and be logged by the resource server as a failed call the operator never made. `probe_server` is
+        checked here rather than in a test of its own: it reaches the same `_stored_access_token`, so a
+        separate test would rest on the same line and neither mutant would prove its own thing. What is
+        asserted for both is that the server saw NOTHING.
+        """
         self.stored(expires_at=int(time.time()) - 1)
         with patch.dict(os.environ, self.environment()):
             with self.assertRaises(McpError) as caught:
                 mcp_worker.call({"path": "a.txt"})
-        self.assertIn("expired", str(caught.exception))
+            self.assertIn("expired", str(caught.exception))
+            self.assertEqual(self.server.seen, [])
+            with self.assertRaises(McpStartupError) as probed:
+                probe_server(str(self.config_path), "files", timeout=60)
+        self.assertIn("expired", str(probed.exception))
         self.assertEqual(self.server.seen, [])
 
     def test_no_stored_authorization_says_how_to_create_one(self):
