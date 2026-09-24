@@ -126,6 +126,50 @@ def _shutdown(process: subprocess.Popen[bytes]) -> None:
         pass
 
 
+def _stored_access_token(server: McpServerConfig) -> str:
+    """The access token for an `oauth` server, read from the store. No SDK, and NO renewal.
+
+    This runs inside the isolated worker, and that is the whole reason it may not renew anything: renewing
+    drives the `mcp` SDK, whose 28 packages include a web-server framework, and keeping those out of the
+    sandbox is why the token logic lives in the host at all. The worker reads a string -- exactly as
+    `bearer_env` gives it one -- and refuses a stale one rather than sending it.
+
+    # debt: a host running longer than one access-token lifetime sees calls start to fail closed, because
+    # the store is refreshed at start-up and not again; upgrade when an operator reports it, or when a
+    # host-side background refresher lands.
+    """
+    from .mcp_token_store import TokenStoreError, client_mismatch, read_tokens  # noqa: PLC0415 - oauth only
+
+    oauth = server.oauth
+    assert oauth is not None  # nosec B101 - the only caller checks, and mypy needs it said
+    try:
+        stored = read_tokens(oauth.token_store)
+    except TokenStoreError as error:
+        raise _fail(TRANSPORT_ERROR, f"the OAuth token store for {server.name!r} is unusable: {error}") from None
+    if stored is None:
+        raise _fail(
+            TRANSPORT_ERROR,
+            f"there is no stored authorization for MCP server {server.name!r}: "
+            f"run `portmark mcp login {server.name}`",
+        )
+    # The store records which client the tokens were issued TO. If the operator re-pointed `client_id_env`
+    # at a different application, the stored token belongs to the old one and must not be sent to the new
+    # one's account. Checked only when the host passed the value through, since a name the host does not
+    # have is absent rather than empty.
+    configured = os.environ.get(oauth.client_id_env, "")
+    mismatch = client_mismatch(stored, configured) if configured else None
+    if mismatch:
+        raise _fail(TRANSPORT_ERROR, mismatch)
+    if not stored.fresh():
+        raise _fail(
+            TRANSPORT_ERROR,
+            f"the stored access token for MCP server {server.name!r} has expired, and the isolated worker "
+            "never renews one; restart the host to refresh it, or run `portmark mcp login "
+            f"{server.name}` if the refresh token is gone too",
+        )
+    return stored.access_token
+
+
 def _connect_http(server: McpServerConfig) -> tuple[None, McpClient]:
     """One MCP endpoint over Streamable HTTP. No process, and deliberately NO restart of any kind.
 
@@ -141,6 +185,7 @@ def _connect_http(server: McpServerConfig) -> tuple[None, McpClient]:
         server.bearer_env,
         os.environ.get(server.bearer_env) if server.bearer_env else None,
         server.allow_private,
+        bearer_token=_stored_access_token(server) if server.oauth is not None else "",
     )
     client = McpClient(transport, request_timeout(server.timeout_seconds), os.environ.get(VERSION_ENV, ""))
     try:
@@ -255,7 +300,10 @@ def discover(arguments: dict[str, Any]) -> Any:
 
 
 def tool_environment(config_path: str, server: McpServerConfig, tool: McpToolConfig, version: str = "") -> dict[str, str]:
-    """The small, non-secret identifiers the worker needs. Secrets travel only through `secret_env`."""
+    """The small, non-secret identifiers the worker needs. Secrets travel only through `secret_env`.
+
+    An `oauth` server's token STORE PATH is not carried here: the worker re-reads the config by path and
+    finds it there, which keeps one description of where the tokens live."""
     environment = {
         CONFIG_ENV: os.path.abspath(config_path),
         SERVER_ENV: tool.server,

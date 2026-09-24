@@ -264,31 +264,53 @@ def _floor_reader(config, audit_verifier):
 
 
 def _run_mcp(parser: argparse.ArgumentParser, args: argparse.Namespace, config) -> None:
-    """`portmark mcp pin`: what each server offers right now, and the pin that would approve it."""
-    from .mcp import dumps, pin_report
-    from .mcp_config import McpConfigError
+    """`portmark mcp pin | login | logout`."""
+    from .mcp import dumps, pin_report, refresh_oauth_tokens
+    from .mcp_config import McpConfigError, load_config
+    from .mcp_oauth import McpOAuthError
 
     if not config.mcp_config_path:
-        parser.error("mcp pin requires --mcp-config or PORTMARK_MCP_CONFIG")
+        parser.error(f"mcp {args.mcp_command} requires --mcp-config or PORTMARK_MCP_CONFIG")
+    path = config.mcp_config_path
     try:
-        print(dumps(pin_report(config.mcp_config_path, args.server)))
-    except McpConfigError as error:
+        if args.mcp_command == "login":
+            from .mcp_login import login  # noqa: PLC0415 - only this command pays for the SDK import
+
+            print(dumps(login(path, args.server, manual=args.manual,
+                              redirect_uri=args.redirect_uri or "", total_seconds=args.timeout)))
+            return
+        if args.mcp_command == "logout":
+            from .mcp_login import logout  # noqa: PLC0415 - as above
+
+            print(dumps(logout(path, args.server)))
+            return
+        # `pin` probes each server, and an OAuth server's probe carries the stored access token. Renewing it
+        # first is what makes `mcp pin` usable an hour after logging in; it is a convenience and not a
+        # guard, because a stale token makes the worker refuse rather than send an unauthenticated request.
+        refresh_oauth_tokens(load_config(path))
+        print(dumps(pin_report(path, args.server)))
+    except (McpConfigError, McpOAuthError) as error:
         parser.error(str(error))
 
 
 def _install_mcp_tools(parser: argparse.ArgumentParser, path: str, tools):
     """Check every pin against the live servers, then register the approved tools. Fails closed on drift."""
-    from .mcp import check_pins, register_mcp_tools
+    from .mcp import check_pins, refresh_oauth_tokens, register_mcp_tools
     from .mcp_config import McpConfigError, load_config
+    from .mcp_oauth import McpOAuthError
     from .security import SecurityError
     from .tools import ToolRegistry
 
     registry = tools if tools is not None else ToolRegistry()
     try:
         mcp_config = load_config(path)
+        # BEFORE the pin check, because a pin check probes every server and an OAuth server's probe needs a
+        # usable access token. Renewing drives the SDK, so it happens here in the host and never inside the
+        # isolated worker, which only reads the string this leaves in the store.
+        refresh_oauth_tokens(mcp_config)
         check_pins(mcp_config)
         names = register_mcp_tools(registry, mcp_config)
-    except (McpConfigError, SecurityError) as error:
+    except (McpConfigError, SecurityError, McpOAuthError) as error:
         parser.error(str(error))
     print(f"MCP tools registered: {', '.join(names)}", file=sys.stderr)
     return registry
@@ -807,6 +829,28 @@ def main() -> None:
         "pin", help="print each tool an MCP server offers now, with the pin to approve it (it never approves)"
     )
     mcp_pin.add_argument("--server", help="one server from the config (default: every server)")
+    from .mcp_login import DEFAULT_LOGIN_SECONDS as MCP_LOGIN_SECONDS  # noqa: PLC0415 - parser text only
+    from .mcp_login import DEFAULT_REDIRECT as MCP_DEFAULT_REDIRECT  # noqa: PLC0415 - parser text only
+
+    mcp_login = mcp_commands.add_parser(
+        "login", help="authorize Portmark against one OAuth MCP server, and store what it grants"
+    )
+    mcp_login.add_argument("server", help="the server from the config to authorize")
+    mcp_login.add_argument(
+        "--manual", action="store_true",
+        help="print the url and read the redirect you paste back, for a machine with no browser",
+    )
+    mcp_login.add_argument(
+        "--redirect-uri",
+        help=f"the redirect registered with the provider (default {MCP_DEFAULT_REDIRECT}); "
+             "without --manual it must be a loopback http address, which is what is listened on",
+    )
+    mcp_login.add_argument(
+        "--timeout", type=float, default=MCP_LOGIN_SECONDS,
+        help=f"seconds for the WHOLE login, including your time in the browser (default {MCP_LOGIN_SECONDS:g})",
+    )
+    mcp_logout = mcp_commands.add_parser("logout", help="delete the stored authorization for one server")
+    mcp_logout.add_argument("server", help="the server from the config to forget")
     audit_parser = subparsers.add_parser("audit", help="export the audit chains for a SIEM, or verify an export")
     audit_commands = audit_parser.add_subparsers(dest="audit_command", required=True)
     export_parser = audit_commands.add_parser(

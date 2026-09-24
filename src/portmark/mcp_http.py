@@ -107,8 +107,16 @@ def checked_bearer(name: str, value: str | None) -> str:
     value (`http/client.py:1343`), and the worker forwards error text to the host."""
     if not value:
         raise McpError(TRANSPORT_ERROR, f"the MCP server needs a bearer token, and {name} is unset or empty")
+    return usable_token(value, f"the token in {name}")
+
+
+def usable_token(value: str, described: str) -> str:
+    """The same header check, for a token that did not come from an environment variable.
+
+    `described` names the SOURCE and never the value: an unusable token must be reported without printing
+    it, because the worker forwards error text to the host and the host writes it to the audit chain."""
     if not is_header_safe(value) or " " in value:
-        raise McpError(TRANSPORT_ERROR, f"the token in {name} is not usable in an HTTP header")
+        raise McpError(TRANSPORT_ERROR, f"{described} is not usable in an HTTP header")
     return value
 
 
@@ -123,6 +131,7 @@ class HttpTransport(Transport):
         bearer_name: str = "",
         bearer_value: str | None = None,
         allow_private: bool = False,
+        bearer_token: str = "",
         context: ssl.SSLContext | None = None,
     ) -> None:
         split = urlsplit(url)
@@ -137,7 +146,18 @@ class HttpTransport(Transport):
         self._deadline = time.monotonic() + total_seconds
         self._allow_private = allow_private
         self._context = context
-        self._bearer = checked_bearer(bearer_name, bearer_value) if bearer_name else ""
+        # A token READ FROM THE STORE arrives with no environment-variable name, and `checked_bearer` is
+        # keyed on that name -- so handing it in as `bearer_value` alone would drop it silently and send an
+        # unauthenticated request. It gets its own parameter for exactly that reason.
+        if bearer_name and bearer_token:
+            raise McpError(
+                TRANSPORT_ERROR,
+                "a bearer token may come from `bearer_env` or from the OAuth token store, not from both",
+            )
+        if bearer_token:
+            self._bearer = usable_token(bearer_token, "the stored OAuth access token")
+        else:
+            self._bearer = checked_bearer(bearer_name, bearer_value) if bearer_name else ""
         # A legacy server MAY hand out a session id on any response and expects it back on every later
         # request. That is transport state, like a cookie: the protocol above never sees it.
         self._session_id = ""

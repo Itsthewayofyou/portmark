@@ -11,15 +11,20 @@ import contextlib
 import io
 import json
 import os
+import re
+import socket as socket_module
 import stat
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
-from oauth_server import ACCESS_TOKEN, AUTHORIZATION_CODE, REFRESH_TOKEN, FakeAuthorizationServer
+import mcp_http_server
+from oauth_server import ACCESS_TOKEN, AUTHORIZATION_CODE, REFRESH_TOKEN, FakeAuthorizationServer, _trust_anchor
 
 from portmark.mcp_oauth import (
     McpOAuthError,
@@ -30,8 +35,12 @@ from portmark.mcp_oauth import (
     sdk_available,
 )
 from portmark.security import canonical_json
+from portmark import mcp_worker
 from portmark.cli import _install_mcp_tools
-from portmark.mcp import pin_report, probe_server, register_mcp_tools
+from portmark.mcp import pin_report, probe_server, refresh_oauth_tokens, register_mcp_tools
+from portmark.mcp_config import definition_digest, load_config, server_digest
+from portmark.mcp_http import HttpTransport, resolve_endpoint_address
+from portmark.mcp_login import DEFAULT_REDIRECT, _Loopback, login, logout, result_from_redirect
 from portmark.mcp_client import McpError
 from portmark.mcp_config import McpConfigError, McpOAuthConfig, McpServerConfig, config_from_bytes, server_digest
 from portmark.mcp_http import checked_fetch
@@ -130,67 +139,206 @@ class OauthConfigTests(unittest.TestCase):
         self.assertIn("unknown keys", self.refusal(dict(OAUTH, client_secret="literal")))  # nosec B106 - a misspelled KEY name being refused, not a credential
 
 
-class OauthNotYetWiredTests(unittest.TestCase):
-    """Until the call path reads `oauth`, a server that sets it must not start -- or be CONTACTED.
+class OauthBearerDeliveryTests(unittest.TestCase):
+    """A token read from the STORE has no environment-variable name, and the transport is keyed on one."""
 
-    Refusing late is not refusing. The start-up sequence probes every server before it registers anything,
-    so a guard that sat only at registration would let the refusal message claim something already untrue:
-    the server would have received unauthenticated requests before the host decided not to start.
+    def test_a_token_with_no_environment_variable_name_is_still_sent(self):
+        """The failure this guards against is silent and fails OPEN.
+
+        `checked_bearer` is reached only when `bearer_name` is set, so an access token handed in as the
+        value alone would be dropped and the request sent with no `Authorization` header at all -- to a
+        server the operator configured precisely because it needs one.
+        """
+        transport = HttpTransport("https://mcp.example.com/mcp", 5.0, 5.0, bearer_token="tok-from-store")  # nosec B106
+        headers = transport._request_headers(b"{}", {})
+        self.assertEqual(headers["Authorization"], "Bearer tok-from-store")
+
+    def test_a_token_from_the_store_and_one_from_the_environment_together_are_refused(self):
+        # The config refuses `oauth` beside `bearer_env`, but the transport is reachable on its own and
+        # would otherwise pick one silently. Which one it picked would decide who the request authenticates
+        # as, so there is no safe default.
+        with self.assertRaises(McpError) as caught:
+            HttpTransport("https://mcp.example.com/mcp", 5.0, 5.0, "MCP_TOKEN", "env-token",
+                          bearer_token="store-token")  # nosec B106
+        self.assertIn("not from both", str(caught.exception))
+
+    def test_an_unusable_stored_token_is_refused_without_printing_it(self):
+        # `http.client` would reject it too, and its own message prints the offending value; the worker
+        # forwards error text to the host, which writes it to the audit chain.
+        with self.assertRaises(McpError) as caught:
+            HttpTransport("https://mcp.example.com/mcp", 5.0, 5.0, bearer_token="tok with space")  # nosec B106
+        self.assertIn("not usable", str(caught.exception))
+        self.assertNotIn("tok with space", str(caught.exception))
+
+
+class OauthWorkerTests(unittest.TestCase):
+    """The isolated worker's half: read a string from the store, and never renew one.
+
+    Renewal drives the SDK, whose 28 packages include a web-server framework. Keeping those out of the
+    sandboxed worker is the entire reason the token logic lives in the host, so the test that the worker
+    does not import the SDK is the test that this design is still the design.
     """
 
     def setUp(self):
-        document = {
+        self.root = Path(tempfile.mkdtemp())
+        self.store = str(self.root / "tokens.json")
+        certificate, key = _trust_anchor(self.root)
+        address = resolve_endpoint_address("localhost", 0, allow_private=True)
+        self.server, port = mcp_http_server.start("modern", str(certificate), str(key), host=address)
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.certificate = str(certificate)
+        self.pin = definition_digest(mcp_http_server.TOOLS["read_file"])
+        self.config_path = self.root / "mcp.json"
+        self.config_path.write_text(json.dumps({
+            "schema": "portmark.mcp.config.v1",
+            "servers": {"files": {
+                "url": f"https://localhost:{port}/mcp", "allow_private": True, "timeout_seconds": 20,
+                "oauth": {"client_id_env": "EXAMPLE_CLIENT_ID", "token_store": self.store},
+                "tools": {"read_file": {"pin": self.pin, "read_only": True}},
+            }},
+        }), encoding="utf-8")
+
+    def stored(self, **changes):
+        fields = {"issuer": "https://issuer.example", "client_id": "cid", "access_token": "store-tok",
+                  "expires_at": int(time.time()) + 3600, "refresh_token": "r"}
+        fields.update(changes)
+        write_tokens(self.store, StoredTokens(**fields))
+
+    def environment(self):
+        server = load_config(str(self.config_path)).servers["files"]
+        return {
+            "SSL_CERT_FILE": self.certificate,
+            "EXAMPLE_CLIENT_ID": "cid",
+            "PORTMARK_MCP_CONFIG": str(self.config_path), "PORTMARK_MCP_SERVER": "files",
+            "PORTMARK_MCP_TOOL": "read_file", "PORTMARK_MCP_PIN": self.pin,
+            "PORTMARK_MCP_LAUNCH": server_digest(server),
+        }
+
+    def test_the_worker_sends_the_access_token_it_read_from_the_store(self):
+        self.stored()
+        with patch.dict(os.environ, self.environment()):
+            value = mcp_worker.call({"path": "a.txt"})
+        self.assertEqual(value["content"][0]["text"], 'read_file:{"path": "a.txt"}')
+        headers = {name.lower(): item for name, item in self.server.seen[-1][0].items()}
+        self.assertEqual(headers["authorization"], "Bearer store-tok")
+
+    def test_the_worker_does_not_import_the_sdk(self):
+        """Run the real call in its own interpreter and ask it what it loaded.
+
+        Checking `sys.modules` in THIS process would prove nothing: the test suite imports the SDK for the
+        driver tests, so the name is already there. A separate interpreter is the only honest reading.
+        """
+        self.stored()
+        driver = (
+            "import json, os, sys;"
+            "sys.path[:0] = ['src', 'tests'];"
+            "from portmark import mcp_worker;"
+            "mcp_worker.call({'path': 'a.txt'});"
+            "print(json.dumps(sorted(n for n in sys.modules if n == 'mcp' or n.startswith('mcp.'))))"
+        )
+        answer = subprocess.run(  # nosec B603 - this interpreter, a literal program, no shell
+            [sys.executable, "-c", driver],
+            cwd=str(Path(__file__).resolve().parent.parent), capture_output=True, text=True,
+            env={**os.environ, **self.environment(), "PYTHONDONTWRITEBYTECODE": "1"}, timeout=120,
+        )
+        self.assertEqual(answer.returncode, 0, answer.stderr[-2000:])
+        self.assertEqual(json.loads(answer.stdout.strip().splitlines()[-1]), [])
+
+    def test_an_expired_stored_token_is_refused_rather_than_sent(self):
+        # The worker cannot renew, so the honest answer is to refuse. Sending it would authenticate as
+        # nobody and be logged by the resource server as a failed call the operator never made.
+        self.stored(expires_at=int(time.time()) - 1)
+        with patch.dict(os.environ, self.environment()):
+            with self.assertRaises(McpError) as caught:
+                mcp_worker.call({"path": "a.txt"})
+        self.assertIn("expired", str(caught.exception))
+        self.assertEqual(self.server.seen, [])
+
+    def test_no_stored_authorization_says_how_to_create_one(self):
+        with patch.dict(os.environ, self.environment()):
+            with self.assertRaises(McpError) as caught:
+                mcp_worker.call({"path": "a.txt"})
+        self.assertIn("portmark mcp login files", str(caught.exception))
+        self.assertEqual(self.server.seen, [])
+
+    def test_a_token_issued_to_a_different_client_is_refused(self):
+        # Re-pointing `client_id_env` at another application leaves the old application's tokens in the
+        # store. Sending them would act on the OLD client's granted authority under the new one's name.
+        self.stored(client_id="a-different-application")
+        with patch.dict(os.environ, self.environment()):
+            with self.assertRaises(McpError) as caught:
+                mcp_worker.call({"path": "a.txt"})
+        self.assertIn("client", str(caught.exception))
+        self.assertEqual(self.server.seen, [])
+
+
+class OauthHostRefreshTests(unittest.TestCase):
+    """The host's half: make the store current before anything reads it, and say plainly when it cannot."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.path = self.root / "mcp.json"
+        self.path.write_text(json.dumps({
             "schema": "portmark.mcp.config.v1",
             "servers": {"example": dict(HTTP_SERVER, oauth=OAUTH)},
-        }
-        self.path = Path(tempfile.mkdtemp()) / "mcp.json"
-        self.path.write_text(json.dumps(document), encoding="utf-8")
+        }), encoding="utf-8")
 
-    def test_the_host_refuses_to_register_a_server_whose_oauth_would_be_ignored(self):
-        # Accepting a setting that is not in force is the failure this whole codebase refuses elsewhere:
-        # the operator would read the config, believe the server is authorized, and it would be contacted
-        # with no token at all. Failing at start-up is the honest answer until the wiring lands.
-        config = config_from_bytes(self.path.read_bytes(), str(self.path))
-        with self.assertRaises(McpConfigError) as caught:
-            register_mcp_tools(ToolRegistry(), config)
-        self.assertIn("not built yet", str(caught.exception))
-        self.assertIn("unauthenticated", str(caught.exception))
+    def test_a_server_with_no_oauth_block_is_left_alone(self):
+        plain = self.root / "plain.json"
+        plain.write_text(json.dumps({
+            "schema": "portmark.mcp.config.v1", "servers": {"example": dict(HTTP_SERVER)},
+        }), encoding="utf-8")
+        self.assertEqual(refresh_oauth_tokens(load_config(str(plain))), ())
 
-    def test_start_up_refuses_before_any_server_has_been_probed(self):
-        """The real start-up sequence, not the registration step alone.
-
-        `_install_mcp_tools` runs `check_pins` FIRST, and a probe starts the server and talks to it. The
-        observable that matters is therefore not the refusal -- it is that the probe was never attempted.
-        `probe_server` is patched so that only a check placed ahead of the loop can keep the count at zero.
-        """
-        with patch("portmark.mcp.probe_server") as probe:
-            with contextlib.redirect_stderr(io.StringIO()) as complaint:
-                # argparse turns the refusal into its own exit; the message still has to be the real one.
-                with self.assertRaises(SystemExit):
-                    _install_mcp_tools(argparse.ArgumentParser(), str(self.path), None)
-        self.assertEqual(probe.call_count, 0)
-        self.assertIn("unauthenticated", complaint.getvalue())
-
-    def test_probing_a_server_that_sets_oauth_is_refused_by_the_probe_itself(self):
-        """`probe_server` is exported and called directly, so the guard has to live in it.
-
-        Nothing is patched here. If this raises, no process was launched and no request was sent, which is
-        the property the refusal message asserts.
-        """
-        with self.assertRaises(McpConfigError) as caught:
-            probe_server(str(self.path), "example", timeout=1)
-        self.assertIn("unauthenticated", str(caught.exception))
-
-    def test_mcp_pin_refuses_the_same_configuration_without_probing(self):
-        """`portmark mcp pin` probes too, and pinning is not a reason to contact a server unauthenticated.
-
-        The way out is in the message rather than in a flag: pin with the `oauth` block removed.
-        """
-        with patch("portmark.mcp.probe_server") as probe:
+    def test_the_missing_optional_extra_is_named_rather_than_raised_as_an_import_error(self):
+        with patch("portmark.mcp_oauth.sdk_available", return_value=False):
             with self.assertRaises(McpConfigError) as caught:
-                pin_report(str(self.path), "example", timeout=1)
+                refresh_oauth_tokens(load_config(str(self.path)))
+        self.assertIn("portmark[mcp-oauth]", str(caught.exception))
+
+    def test_an_unset_client_id_variable_is_named(self):
+        with patch("portmark.mcp_oauth.sdk_available", return_value=True):
+            with patch.dict(os.environ, {"EXAMPLE_CLIENT_ID": ""}):
+                with self.assertRaises(McpConfigError) as caught:
+                    refresh_oauth_tokens(load_config(str(self.path)))
+        self.assertIn("EXAMPLE_CLIENT_ID", str(caught.exception))
+
+    def test_start_up_refreshes_the_store_before_it_probes_anything(self):
+        """A probe of an OAuth server carries the stored access token, so the order is load, renew, probe.
+
+        `probe_server` is patched, so the only way the count stays at zero is a renewal that ran first and
+        refused. The refusal itself is not the observable: a probe that happened is.
+        """
+        with patch("portmark.mcp.probe_server") as probe:
+            with patch("portmark.mcp_oauth.sdk_available", return_value=False):
+                with contextlib.redirect_stderr(io.StringIO()) as complaint:
+                    with self.assertRaises(SystemExit):
+                        _install_mcp_tools(argparse.ArgumentParser(), str(self.path), None)
         self.assertEqual(probe.call_count, 0)
-        self.assertIn("Remove the `oauth` block", str(caught.exception))
+        self.assertIn("portmark[mcp-oauth]", complaint.getvalue())
+
+    def test_the_worker_is_given_the_client_id_and_never_the_client_secret(self):
+        """The worker compares the stored client against the configured one, so it needs the id.
+
+        It never speaks to the authorization server, so a client SECRET there would be a credential with
+        no use in that process and one more place for it to leak from.
+        """
+        from portmark.mcp import _worker_environment
+
+        document = {
+            "schema": "portmark.mcp.config.v1",
+            "servers": {"example": dict(HTTP_SERVER, oauth=dict(
+                OAUTH, client_secret_env="EXAMPLE_CLIENT_SECRET"))},
+        }
+        path = self.root / "secret.json"
+        path.write_text(json.dumps(document), encoding="utf-8")
+        config = config_from_bytes(path.read_bytes(), str(path))
+        server = config.servers["example"]
+        with patch.dict(os.environ, {"EXAMPLE_CLIENT_ID": "cid", "EXAMPLE_CLIENT_SECRET": "shh"}):
+            environment = _worker_environment(str(path), server, server.tools["read_file"], "")
+        self.assertEqual(environment.get("EXAMPLE_CLIENT_ID"), "cid")
+        self.assertNotIn("EXAMPLE_CLIENT_SECRET", environment)
 
 
 class OauthTransportTests(unittest.TestCase):
@@ -664,3 +812,194 @@ class SdkContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _free_loopback_port() -> int:
+    """A port nothing is listening on right now. The listener under test binds it a moment later."""
+    probe = socket_module.socket(socket_module.AF_INET, socket_module.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    return port
+
+
+class RedirectParsingTests(unittest.TestCase):
+    """What comes back from the authorization server is handed on as received, or refused."""
+
+    def setUp(self):
+        if not sdk_available():
+            self.skipTest("requires portmark[mcp-oauth]")
+
+    def test_the_issuer_is_carried_through(self):
+        """RFC 9207. Portmark does not read `iss`; the SDK compares it with the discovered issuer.
+
+        A parser that quietly dropped it would turn that comparison into a no-op -- and every test that
+        only looked at the resulting token would still pass, which is exactly why this one looks at `iss`.
+        """
+        result = result_from_redirect(
+            "http://127.0.0.1:3000/callback?code=abc&state=xyz&iss=https%3A%2F%2Fissuer.example"
+        )
+        self.assertEqual(result.code, "abc")
+        self.assertEqual(result.state, "xyz")
+        self.assertEqual(result.iss, "https://issuer.example")
+
+    def test_a_refusal_from_the_authorization_server_is_reported_as_one(self):
+        with self.assertRaises(McpOAuthError) as caught:
+            result_from_redirect("http://127.0.0.1:3000/callback?error=access_denied&error_description=nope")
+        self.assertIn("access_denied", str(caught.exception))
+        self.assertIn("nope", str(caught.exception))
+
+    def test_a_url_with_no_code_says_to_paste_the_whole_thing(self):
+        # The commonest operator mistake is pasting the address bar before the redirect completes.
+        with self.assertRaises(McpOAuthError) as caught:
+            result_from_redirect("http://127.0.0.1:3000/callback")
+        self.assertIn("whole url", str(caught.exception))
+
+
+class LoopbackListenerTests(unittest.TestCase):
+    """The convenience path: collect the redirect without the operator copying anything."""
+
+    def setUp(self):
+        if not sdk_available():
+            self.skipTest("requires portmark[mcp-oauth]")
+
+    def test_a_redirect_uri_that_is_not_loopback_is_refused(self):
+        """An authorization CODE arrives in that url's query string.
+
+        Binding a routable interface would publish it to anyone else who can reach the port, and the code
+        is exchangeable for the operator's tokens until it is used.
+        """
+        with self.assertRaises(McpConfigError) as caught:
+            _Loopback("http://10.0.0.5:3000/callback", io.StringIO(), 5.0)
+        self.assertIn("loopback", str(caught.exception))
+
+    def test_https_is_refused_because_the_listener_speaks_plain_http(self):
+        with self.assertRaises(McpConfigError):
+            _Loopback("https://127.0.0.1:3000/callback", io.StringIO(), 5.0)
+
+    def test_the_listener_collects_a_real_redirect(self):
+        import asyncio
+        import threading
+        import urllib.request
+
+        redirect = f"http://127.0.0.1:{_free_loopback_port()}/callback"
+        collector = _Loopback(redirect, io.StringIO(), 10.0)
+        with collector:
+            def visit():
+                for _ in range(50):
+                    try:
+                        urllib.request.urlopen(  # nosec B310 - a literal http loopback url built here
+                            f"{redirect}?code=the-code&state=the-state&iss=https%3A%2F%2Fissuer.example"
+                        ).read()
+                        return
+                    except OSError:
+                        time.sleep(0.05)
+
+            caller = threading.Thread(target=visit, daemon=True)
+            caller.start()
+            result = asyncio.run(collector.collect())
+            caller.join(timeout=5)
+        self.assertEqual(result.code, "the-code")
+        self.assertEqual(result.state, "the-state")
+        self.assertEqual(result.iss, "https://issuer.example")
+
+    def test_a_login_nobody_completes_gives_the_terminal_back(self):
+        """The flow's budget is spent by REQUESTS, and waiting for a human performs none of them.
+
+        Without its own deadline the listener would hold the terminal for ever.
+        """
+        import asyncio
+
+        collector = _Loopback(f"http://127.0.0.1:{_free_loopback_port()}/callback", io.StringIO(), 0.0)
+        with collector:
+            with self.assertRaises(McpOAuthError) as caught:
+                asyncio.run(collector.collect())
+        self.assertIn("--manual", str(caught.exception))
+
+
+class LoginCommandTests(unittest.TestCase):
+    """`portmark mcp login --manual` against a real authorization server over real TLS."""
+
+    def setUp(self):
+        if not sdk_available():
+            self.skipTest("requires portmark[mcp-oauth]")
+        self.root = Path(tempfile.mkdtemp())
+        self.store = str(self.root / "tokens.json")
+
+    def config(self, server, **oauth_changes):
+        oauth = {"client_id_env": "EXAMPLE_CLIENT_ID", "client_secret_env": "EXAMPLE_CLIENT_SECRET",
+                 "token_store": self.store, "scopes": ["files:read"]}
+        oauth.update(oauth_changes)
+        path = self.root / "mcp.json"
+        path.write_text(json.dumps({
+            "schema": "portmark.mcp.config.v1",
+            "servers": {"files": {
+                "url": server.url, "allow_private": True, "oauth": oauth,
+                "tools": {"read_file": {"pin": "sha256:" + "a" * 64, "read_only": True}},
+            }},
+        }), encoding="utf-8")
+        return str(path)
+
+    def paste_from(self, transcript, redirect, issuer):
+        """Answer the way an operator does: read the url that was printed, and hand back where it sent you.
+
+        The `state` cannot be invented -- the SDK generates it and compares it with `compare_digest` -- so
+        the only way to answer is to read what was shown, which is what a person does."""
+
+        class _Stdin:
+            def readline(self, limit=-1):
+                shown = re.search(r"(https://\S+/authorize\?\S+)", transcript.getvalue())
+                assert shown is not None, transcript.getvalue()
+                query = parse_qs(urlsplit(shown.group(1)).query)
+                return (f"{redirect}?code={AUTHORIZATION_CODE}&state={query['state'][0]}"
+                        f"&iss={quote(issuer, safe='')}\n")
+
+        return _Stdin()
+
+    def test_a_manual_login_stores_what_was_granted_and_prints_no_token(self):
+        with FakeAuthorizationServer() as server:
+            path = self.config(server)
+            transcript = io.StringIO()
+            environment = {"EXAMPLE_CLIENT_ID": "portmark-test-client",
+                           "EXAMPLE_CLIENT_SECRET": "portmark-test-secret",  # nosec B105 - a loopback fixture
+                           "SSL_CERT_FILE": server.certificate}
+            with patch.dict(os.environ, environment):
+                with patch("sys.stdin", self.paste_from(transcript, DEFAULT_REDIRECT, server.origin)):
+                    granted = login(path, "files", manual=True, total_seconds=30, out=transcript)
+        self.assertEqual(granted["issuer"], server.origin)
+        self.assertEqual(granted["client_id"], "portmark-test-client")
+        self.assertTrue(granted["refreshable"])
+        # What is printed ends up in a scrollback buffer and often in a terminal recording.
+        printed = json.dumps(granted)
+        self.assertNotIn(ACCESS_TOKEN, printed)
+        self.assertNotIn(REFRESH_TOKEN, printed)
+        stored = read_tokens(self.store)
+        self.assertEqual(stored.access_token, ACCESS_TOKEN)
+        self.assertEqual(stored.refresh_token, REFRESH_TOKEN)
+        self.assertTrue(stored.token_endpoint, "the endpoint must be pinned, or a refresh has to guess")
+        if os.name == "posix":
+            self.assertEqual(stat.S_IMODE(os.stat(self.store).st_mode), 0o600)
+
+    def test_logging_out_removes_the_stored_authorization_and_saying_so_twice_is_not_a_failure(self):
+        with FakeAuthorizationServer() as server:
+            path = self.config(server)
+            write_tokens(self.store, StoredTokens("https://issuer.example", "cid", "a", 1, "r"))
+            self.assertTrue(logout(path, "files")["removed"])
+            self.assertFalse(logout(path, "files")["removed"])
+
+    def test_logging_in_to_a_server_that_does_not_use_oauth_is_refused(self):
+        path = self.root / "plain.json"
+        path.write_text(json.dumps({
+            "schema": "portmark.mcp.config.v1", "servers": {"files": dict(HTTP_SERVER)},
+        }), encoding="utf-8")
+        with self.assertRaises(McpConfigError) as caught:
+            login(str(path), "files")
+        self.assertIn("no `oauth` block", str(caught.exception))
+
+    def test_an_unset_client_id_variable_is_named_rather_than_sent_as_an_empty_client(self):
+        with FakeAuthorizationServer() as server:
+            path = self.config(server)
+            with patch.dict(os.environ, {"EXAMPLE_CLIENT_ID": ""}):
+                with self.assertRaises(McpConfigError) as caught:
+                    login(path, "files")
+        self.assertIn("EXAMPLE_CLIENT_ID", str(caught.exception))

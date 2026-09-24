@@ -158,6 +158,7 @@ class FakeAuthorizationServer:
     def __init__(self, mode: str = "ok") -> None:
         self._dir = tempfile.TemporaryDirectory()
         certificate_path, key_path = _trust_anchor(Path(self._dir.name))
+        self._certificate = str(certificate_path)
         # BIND WHERE THE CLIENT WILL CONNECT, rather than assuming IPv4. The certificate names `localhost`,
         # and what `localhost` resolves to is not the same everywhere: this project's GitHub runners answer
         # `::1` while the development machine answers `127.0.0.1` (observed 2026-09-23). Binding 127.0.0.1
@@ -198,6 +199,11 @@ class FakeAuthorizationServer:
     def context(self) -> ssl.SSLContext:
         """A verifying context whose only trust anchor is this server's throwaway certificate."""
         return self._context
+
+    @property
+    def certificate(self) -> str:
+        """The certificate file, for a test that must reach code which builds its own default context."""
+        return self._certificate
 
     @property
     def origin(self) -> str:

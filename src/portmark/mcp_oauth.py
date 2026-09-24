@@ -90,6 +90,12 @@ def _sdk() -> Any:
         import httpx2  # noqa: PLC0415 - an optional extra, imported only when a server uses OAuth
         from mcp.client.auth.oauth2 import OAuthClientProvider  # noqa: PLC0415
         from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata  # noqa: PLC0415
+
+        # Checked, not returned: `mcp_login` imports it where it is used. An mcp that is IMPORTABLE is not
+        # the same as an mcp that has what Portmark uses -- 1.26.0 has `mcp.client.auth.oauth2` and no
+        # `AuthorizationCodeResult` at all, so without this line `sdk_available()` answers yes and a login
+        # then dies on an ImportError instead of saying which package to install.
+        from mcp.shared.auth import AuthorizationCodeResult  # noqa: PLC0415, F401
     except ImportError as error:
         raise McpOAuthError(f"{EXTRA_HINT} ({error})") from error
     return httpx2, OAuthClientProvider, OAuthClientMetadata, OAuthClientInformationFull
