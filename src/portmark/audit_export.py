@@ -21,7 +21,7 @@ from typing import Any, BinaryIO
 
 from ._durable_file import atomic_write_bytes
 from .json_guard import StrictJSONError, strict_json_loads
-from .ocsf import from_ocsf, is_ocsf
+from .ocsf import from_ocsf, is_ocsf, projection_mismatch
 from .security import canonical_json
 from .storage import (
     DEFAULT_ADMIN_PAGE_SIZE,
@@ -557,6 +557,13 @@ def read_export(lines: Iterable[bytes], report: VerifyReport) -> dict[str, dict[
             native = from_ocsf(record)
             if native is None:
                 report.fail(f"line {number} is an OCSF record that did not come from Portmark")
+                continue
+            # The checks below all run on the native record, so the OCSF fields a SIEM reads would never be
+            # looked at. They must be shown to describe the record they carry, or an export can be rewritten
+            # to say anything at all and still verify.
+            differing = projection_mismatch(record, native)
+            if differing is not None:
+                report.fail(f"line {number}: the OCSF fields do not describe the record they carry: {differing}")
                 continue
             record = native
         if record.get("schema") == CONTROL_SCHEMA:

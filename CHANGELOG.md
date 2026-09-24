@@ -11,7 +11,9 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
   parser. `verify-export` reads either shape without being told which, and both verification levels are
   unchanged: the native record travels intact under `unmapped.portmark`, and the round trip is exact.
   `attestation_list` is deliberately left empty — OCSF defines its fingerprint as covering the OCSF record,
-  while Portmark's hash covers the original audit event, so filling it would state something false. See
+  while Portmark's hash covers the original audit event, so filling it would state something false. A head is
+  reported as a success only when its signature actually verified, and `verify-export` re-projects each record
+  to confirm the OCSF fields describe the record they carry, so a rewritten `status` or `time` is refused. See
   OPERATIONS.md.
 
 External-audit remediation, held unreleased (no version bump / tag) until the full audit is complete.

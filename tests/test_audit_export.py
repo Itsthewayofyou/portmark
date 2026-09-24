@@ -38,7 +38,7 @@ from portmark.audit_export import (
 )
 from portmark.cli import main as cli_main
 from portmark.factory import make_demo_envelope, make_host
-from portmark.ocsf import from_ocsf, to_ocsf
+from portmark.ocsf import HEAD_SIGNATURE_VERIFIED, from_ocsf, to_ocsf
 from portmark.security import EnvelopeSigner, TrustRegistry, TrustedIdentity, canonical_json
 from portmark.storage import InMemoryRuntimeStore, PostgresRuntimeStore, SQLiteRuntimeStore
 
@@ -472,6 +472,50 @@ class OcsfExportTests(ExportCase):
         self.assertEqual((control[0]["status_id"], control[0]["severity_id"]), (2, 4))
         self.assertEqual(control[0]["time"], 1_700_000_000 * 1000)  # the exporter's own clock: it has no other
         self.assertEqual(self.verify(data).status, "invalid")
+
+    def test_a_head_is_a_success_only_when_its_signature_verified(self):
+        # An exported head carries the outcome of its own signature check. Reporting a head that FAILED that
+        # check as a success hides the one alarm an export exists to raise; reporting an unchecked one as a
+        # success claims Portmark vouched for a chain nobody looked at.
+        cases = {
+            "valid": (1, 1),
+            "valid-key-revoked": (1, 1),
+            "unchecked": (0, 1),
+            "signature-invalid": (2, 4),
+            "untrusted": (2, 4),
+            "a-status-from-a-later-version": (2, 4),
+        }
+        for signature_status, (status_id, severity_id) in cases.items():
+            with self.subTest(signature_status):
+                record = to_ocsf(
+                    {"kind": "head", "key": "k", "host_id": "h", "signed_at": 1,
+                     "signature_status": signature_status},
+                    product_version="1", now_seconds=1,
+                )
+                self.assertEqual((record["status_id"], record["severity_id"]), (status_id, severity_id))
+        # And the accepted set is not stale: a real export of a genuinely signed head lands inside it.
+        self.run_task()
+        self.assertIn(lines_of(self.export()[1])[-1]["signature_status"], HEAD_SIGNATURE_VERIFIED)
+
+    def test_rewriting_the_ocsf_fields_around_an_untouched_record_is_refused(self):
+        # Verification reads the native record out of `unmapped`, so nothing else would ever look at the
+        # fields a SIEM actually displays. A failure relabelled as a success must not verify.
+        self.run_task()
+        _, data = self.ocsf_export()
+        records = lines_of(data)
+        for field, value in (("status", "Failure"), ("status_id", 2), ("time", 0),
+                             ("severity_id", 4), ("activity_name", "audit.head")):
+            with self.subTest(field):
+                edited = [dict(record) for record in records]
+                # Edit a record the value actually differs on, or the "tampering" is a no-op and the
+                # test passes without ever exercising the check.
+                target = next((record for record in edited if record[field] != value), None)
+                self.assertIsNotNone(target, field)
+                target[field] = value
+                report = VerifyReport()
+                read_export([canonical_json(record) + b"\n" for record in edited], report)
+                self.assertEqual(report.status, "invalid")
+                self.assertIn("do not describe the record they carry", " ".join(report.reasons))
 
     def test_an_ocsf_record_from_elsewhere_is_refused_not_guessed_at(self):
         report = VerifyReport()

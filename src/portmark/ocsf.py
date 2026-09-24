@@ -23,6 +23,14 @@ belongs would state something false, and a verifier following the specification 
 mismatch, and read an honest export as tampered with. The chain therefore travels under `unmapped`, which is
 what OCSF sanctions for a mapper's source-specific data.
 
+**Every projected field must be DERIVABLE.** `verify-export` re-projects the native record it finds under
+`unmapped` and requires the result to equal the record presented, so nothing that a SIEM reads may be
+believed on its own word. Exactly two inputs cannot come from the record and are taken as presented: the
+producer's version string, and the exporter's clock, which only ever reaches a record carrying no time of
+its own. The consequence to keep in mind: the constants below (`OCSF_VERSION`, the class and category names,
+the status and severity labels) are part of that derivation, so CHANGING ONE makes files exported by an
+earlier version read as altered. Treat such a change as a format change, not a tidy-up.
+
 **Why no `ai_operation` profile.** It is the schema's mechanism for an autonomous agent, and Portmark's events
 are about one. But its `ai_agent` object wants an agent identity that is not on every record -- the projection
 policy decides what survives, and most kinds carry no agent field. Emitting the profile with nothing in it, or
@@ -52,6 +60,13 @@ LOG_NAME = "portmark.audit"
 UNMAPPED_KEY = "portmark"
 HEAD_ACTIVITY = "audit.head"
 CONTROL_ACTIVITY = "audit.export.integrity_failure"
+# The `signature_status` values an export writes when a head's signature actually verified. Listed rather
+# than matched by prefix on purpose: an unrecognised status -- from a later version, or from a file that was
+# edited -- is then a FAILURE. A prefix rule would make a newly added refusal named "valid-..." read as a
+# success, which is the one direction that loses an alarm.
+HEAD_SIGNATURE_VERIFIED = frozenset({"valid", "valid-legacy-v1", "valid-key-revoked", "valid-key-expired"})
+# What an export writes when no trust registry was given. Nobody checked, so it is neither outcome.
+HEAD_SIGNATURE_UNCHECKED = "unchecked"
 
 SEVERITY_INFORMATIONAL, SEVERITY_MEDIUM, SEVERITY_HIGH = 1, 3, 4
 SEVERITY_NAMES = {0: "Unknown", 1: "Informational", 2: "Low", 3: "Medium", 4: "High", 5: "Critical", 6: "Fatal"}
@@ -125,8 +140,8 @@ def to_ocsf(record: Mapping[str, Any], *, product_version: str, now_seconds: int
     details = native.pop("details", _NO_DETAILS)
     kind = native.get("kind")
     activity, seconds = _activity_and_time(native, kind, now_seconds)
-    status_id = _status_of(kind, native.get("event"))
-    severity_id = _severity_of(kind, native.get("event"))
+    status_id = _status_of(kind, native)
+    severity_id = _severity_of(kind, native)
     host_id = native.get("host_id") or ""
     key = native.get("key")
 
@@ -191,6 +206,29 @@ def from_ocsf(record: Mapping[str, Any]) -> dict[str, Any] | None:
     return rebuilt
 
 
+def projection_mismatch(record: Mapping[str, Any], native: Mapping[str, Any]) -> str | None:
+    """The OCSF fields that do NOT describe the native record they carry, or None when every one does.
+
+    Verification reads the native record out of `unmapped` and checks THAT, so without this nothing would
+    ever look at the fields a SIEM actually reads. An altered `status_id`, `time`, `activity_name` or
+    `severity` would pass every later check while telling a reader something Portmark never said. Re-project
+    and compare: every field this module derives must come back identical.
+
+    Two inputs are taken as presented because they cannot be derived from the record -- the producer's own
+    version string, and the exporter's clock, which reaches a record only when it carries no time of its own.
+    Everything else, including the human-readable `status` and `severity` labels a SIEM displays, is checked.
+    """
+    metadata = record.get("metadata")
+    product = metadata.get("product") if isinstance(metadata, Mapping) else None
+    version = product.get("version") if isinstance(product, Mapping) else None
+    presented = record.get("time")
+    seconds = presented // 1000 if isinstance(presented, int) and not isinstance(presented, bool) else 0
+    expected = to_ocsf(native, product_version=version if isinstance(version, str) else "", now_seconds=seconds)
+    if expected == record:
+        return None
+    return ", ".join(sorted(name for name in set(expected) | set(record) if expected.get(name) != record.get(name)))
+
+
 def _activity_and_time(native: Mapping[str, Any], kind: Any, now_seconds: int) -> tuple[str, int]:
     if kind == "event":
         event = native.get("event")
@@ -205,15 +243,29 @@ def _seconds(value: Any, fallback: int) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else fallback
 
 
-def _status_of(kind: Any, event: Any) -> int:
+def _status_of(kind: Any, native: Mapping[str, Any]) -> int:
     if kind == "head":
-        return STATUS_SUCCESS
+        # A head is a success only when its signature verified. An export made with no trust registry says
+        # "unchecked", which is neither: calling it Success would tell a SIEM that Portmark vouched for a
+        # chain nobody checked, and calling a head that FAILED its check a success hides the alarm entirely.
+        status = native.get("signature_status")
+        if status in HEAD_SIGNATURE_VERIFIED:
+            return STATUS_SUCCESS
+        return STATUS_UNKNOWN if status == HEAD_SIGNATURE_UNCHECKED else STATUS_FAILURE
     if kind != "event":
         return STATUS_FAILURE  # an export-control record exists only to report an integrity failure
+    event = native.get("event")
     return EVENT_STATUS.get(event, STATUS_UNKNOWN) if isinstance(event, str) else STATUS_UNKNOWN
 
 
-def _severity_of(kind: Any, event: Any) -> int:
-    if kind == "event" and isinstance(event, str):
-        return EVENT_SEVERITY.get(event, SEVERITY_INFORMATIONAL)
-    return SEVERITY_INFORMATIONAL if kind in ("event", "head") else SEVERITY_HIGH
+def _severity_of(kind: Any, native: Mapping[str, Any]) -> int:
+    if kind == "event":
+        event = native.get("event")
+        return EVENT_SEVERITY.get(event, SEVERITY_INFORMATIONAL) if isinstance(event, str) else SEVERITY_INFORMATIONAL
+    if kind != "head":
+        return SEVERITY_HIGH
+    # A head whose signature did not verify is the single record a SIEM must not miss in an export.
+    status = native.get("signature_status")
+    if status in HEAD_SIGNATURE_VERIFIED or status == HEAD_SIGNATURE_UNCHECKED:
+        return SEVERITY_INFORMATIONAL
+    return SEVERITY_HIGH

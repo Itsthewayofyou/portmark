@@ -322,6 +322,17 @@ What the mapping does, and what it deliberately does not:
 - `status_id` is `Success` or `Failure` for an outcome, and `Unknown` for an event that reports a STATE
   rather than a result (`agent.awaiting_input`, `agent.migrating`). An event kind Portmark does not know is
   `Unknown`, never `Success`.
+- **A signed head is a `Success` only when its signature verified.** An export made without a trust registry
+  records the head as `unchecked`, which maps to `Unknown`; a head that failed its check maps to `Failure` at
+  `High` severity. Calling an unverified head a success would tell a SIEM that Portmark vouched for a chain
+  nobody looked at, and would hide the one alarm an export exists to raise.
+- **`verify-export` checks the OCSF fields too, not only the record inside them.** It re-projects the native
+  record it finds under `unmapped` and requires the result to equal the record presented, so a file whose
+  `status`, `time`, `severity` or `activity_name` was rewritten is refused even though the carried record is
+  untouched. Two values cannot be derived from the record and are taken as presented: the producer's version
+  string, and the exporter's clock, which reaches a record only when it carries no time of its own. Because
+  the projection constants take part in that check, changing one (the OCSF version, a class or status label)
+  makes files exported by an earlier Portmark read as altered -- treat it as a format change.
 - `severity_id` is `Informational` normally, `Medium` for a refusal or a denied or expired approval (the gate
   working as designed, but worth seeing), and `High` for a failure, a kill or a rejected result.
 - `src_endpoint` and `actor.application` name the Portmark host. An audit event has no network peer, and
