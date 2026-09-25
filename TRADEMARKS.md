@@ -49,5 +49,12 @@ reasonable requests are granted; the point of this file is that most of them do 
 
 ## Status
 
-These are common-law marks arising from use. They are not registered at the time of writing.
+These are common-law marks arising from use. They are not registered at the time of writing, and no
+registered-mark symbol is claimed anywhere in this project.
+
+The mark **Portmark** has been used publicly and continuously for this software since **2026-08-28**,
+the date the repository was published and release 0.1.0 was distributed on PyPI. That date is
+recorded here because unregistered rights run from first use, and the record is easier to keep now
+than to reconstruct later.
+
 Registration may follow. Nothing here is a waiver of any right not expressly granted.
