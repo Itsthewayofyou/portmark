@@ -1248,6 +1248,27 @@ class McpCommandErrorTests(unittest.TestCase):
         self.assertIn("group readable", complaint.getvalue())
 
 
+def _scripted_clock(*ticks: float):
+    """A stand-in for `time.monotonic` that returns each tick in turn, then holds the last one.
+
+    Sleeping for real and asserting on the measured duration is a flake, not a test. `_renew` reads the
+    clock once before the renewal and once after, and on Windows that clock is coarse enough that
+    `time.sleep(0.05)` measures slightly SHORT of 0.05 -- CI recorded 0.04699999999996862 and failed a
+    `>= 0.05` assertion on Python 3.11. What these tests own is that the cost is measured at all and that
+    the schedule is built from the later reading; neither property is about the host's ability to sleep
+    accurately. So the clock is scripted and the sleep is gone.
+
+    The last tick is held rather than exhausted, so an unrelated caller inside the patched window cannot
+    turn a wrong answer into a `StopIteration` that looks like a different failure.
+    """
+    remaining = list(ticks)
+
+    def clock() -> float:
+        return remaining.pop(0) if len(remaining) > 1 else remaining[0]
+
+    return clock
+
+
 class TokenRefresherTests(unittest.TestCase):
     """Renewing on a timer, in the host. The clock is passed in, so each decision is tested at an instant.
 
@@ -1552,15 +1573,16 @@ class TokenRefresherTests(unittest.TestCase):
         self.store_expiring_in(0)
 
         def slow_renewal(**_):
-            time.sleep(0.05)
             write_tokens(self.store, StoredTokens(
                 "https://issuer.example", "cid", "renewed", self.NOW + 3600, "a-refresh-token"))
             return "renewed"
 
         refresher = self.refresher()
-        with patch("portmark.mcp_oauth.current_access_token", side_effect=slow_renewal):
+        with patch("portmark.mcp_oauth.current_access_token", side_effect=slow_renewal), \
+                patch("portmark.mcp.time.monotonic", _scripted_clock(100.0, 107.0)):
             refresher.tick(self.NOW)
-        self.assertGreaterEqual(refresher._renewal_cost.get("files", 0.0), 0.05)
+        self.assertEqual(refresher._renewal_cost.get("files", 0.0), 7.0,
+                         "the renewal spanned seven seconds of the clock, and all seven are remembered")
 
     def test_the_wait_after_a_renewal_counts_the_time_the_renewal_took(self):
         """The wait is served from the moment the renewal FINISHED, not the moment it started.
@@ -1574,12 +1596,12 @@ class TokenRefresherTests(unittest.TestCase):
         self.store_expiring_in(0)
 
         def slow_renewal(**_):
-            time.sleep(0.05)
             write_tokens(self.store, StoredTokens(
                 "https://issuer.example", "cid", "renewed", self.NOW + 100, "a-refresh-token"))
             return "renewed"
 
-        with patch("portmark.mcp_oauth.current_access_token", side_effect=slow_renewal):
+        with patch("portmark.mcp_oauth.current_access_token", side_effect=slow_renewal), \
+                patch("portmark.mcp.time.monotonic", _scripted_clock(100.0, 100.05)):
             refresher.tick(self.NOW)
         # What is asserted is the CLOCK the schedule is built from, not the wait it produces. The wait also
         # depends on the deadline and on reading the new expiry back, each of which has its own test;
