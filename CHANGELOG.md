@@ -4,6 +4,15 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 ## Unreleased
 
+### Changed
+
+- **The MCP scope decisions are written down rather than merely true.** `portmark.asgi:create_app` installs
+  no MCP tools, and that is now stated as a decision with its reason: it is an importable factory, and
+  reading ambient configuration there would make a deployment's authority implicit. An embedded deployment
+  that needs MCP will get a named opt-in factory instead. MCP.md also records why resources, prompts and
+  sampling are deferred, the order they would have to arrive in, and why Portmark-as-an-MCP-server waits for
+  a concrete consumer. Documentation only -- no behaviour changed.
+
 ### Added
 
 - **MCP OAuth tokens are renewed for as long as the host runs.** `portmark serve` now keeps every `oauth`

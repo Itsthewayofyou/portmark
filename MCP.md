@@ -137,8 +137,31 @@ and the worst it can cost is a `portmark mcp login`. A refusal from the authoriz
 final for that server: many servers rotate the refresh token on use, so retrying a refused refresh spends a
 credential that is already dead. Everything else is retried.
 
-`portmark demo` is a single run and starts no refresher. `portmark.asgi:create_app` installs no MCP tools at
-all, so it has none to renew.
+`portmark demo` is a single run and starts no refresher.
+
+`portmark.asgi:create_app` installs no MCP tools at all, so it has none to renew. **That is a decision, not
+an omission, and it is not going to change.** `create_app` is an importable application factory: importing
+it, or deploying it under any ASGI server, must not quietly widen what the process can reach. Reading
+`PORTMARK_MCP_CONFIG` there would let ambient process configuration hand the app remote tools, and it would
+oblige the factory to own OAuth renewal, live pin checks, a background thread's lifetime and start-up
+failure -- consistently across Uvicorn, Gunicorn, test clients and every other host. The objection is not
+that the agent becomes too capable. It is that the capability becomes implicit.
+
+The boundary is therefore:
+
+| Entry point | MCP tools |
+| --- | --- |
+| `portmark serve` | batteries included -- installs the configured servers and owns their lifetime |
+| `portmark.asgi:create_app` | never -- the predictable core app, no ambient MCP activation |
+| a future explicit factory | opt-in only, with proper ASGI lifespan start-up and shutdown |
+
+The claim is deliberately narrow. `create_app` *does* read `PORTMARK_TOOLS` from the environment, and that
+names trusted local code the operator put on the machine. An MCP block is a different thing: it names a
+remote party, over the network, whose answers arrive at call time. That is the activation this boundary
+keeps out.
+
+If an embedded deployment ever needs MCP, it gets a separately named factory that says so -- on the order of
+`portmark.asgi:create_mcp_app(...)` -- rather than a new meaning for `create_app`.
 
 `portmark mcp login <server>` opens a browser by printing the url, and collects the redirect on a one-shot
 listener bound to a literal loopback address -- no other address is accepted, because an authorization code
@@ -319,4 +342,17 @@ projection policy: argument names of a foreign tool are as model-chosen as the v
   because a mediated call has no side channel to a human.
 - MCP resources, prompts, sampling, subscriptions, and `notifications/tools/list_changed`: a pin is
   re-checked at every call, so a changed list is an error rather than an event to follow.
-- Portmark as an MCP **server**.
+
+  These are deferred deliberately, and they must not arrive together. What Portmark takes from a server
+  today is a set of explicitly pinned **tools**; descriptions and schemas do not steer the model. Each of
+  the remaining features breaks that in its own way -- resources bring in remote and possibly hostile
+  context, prompts bring in remote instructions, and sampling lets a server ask Portmark's model to do work,
+  which creates delegated and potentially recursive agency. If they are ever built, the order is fixed:
+  first **resources**, as untrusted size-bounded data behind an explicit policy grant; then **prompts**,
+  only as operator-pinned templates that are never injected automatically; and **sampling** last, with its
+  own authorization, a recursion limit, a budget, and none of the calling tool's authority.
+- Portmark as an MCP **server**. It is feasible, but it opens a new public execution boundary and duplicates
+  what A2A already exposes, so it waits for a concrete consumer that demands it. The real question is not
+  the protocol but *which* Portmark operations may be exported -- so if it is built, the tool surface is
+  narrow and explicitly configured. The registry, the policies, the audit operations, approvals and the
+  administrative commands are not exported automatically.
