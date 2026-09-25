@@ -2,7 +2,10 @@ Portmark
 Copyright (c) 2026 Josh (Itsthewayofyou)
 
 The licensor of Portmark, for the purposes of the Elastic License 2.0 in LICENSE,
-is Josh (Itsthewayofyou), the sole copyright holder of this software.
+is Josh (Itsthewayofyou).
+
+Contributors retain copyright in their own contributions, and license them to the
+licensor on the terms in CONTRIBUTING.md.
 
 --------------------------------------------------------------------------------
 Current license
@@ -10,11 +13,14 @@ Current license
 
 Portmark is available under the Elastic License 2.0. The full text is in LICENSE.
 
-In plain terms, and without replacing that text: you may use, copy, modify and
-redistribute Portmark, including inside your own commercial product and including
-deployment inside your own organization at any scale, at no charge. What you may
-not do is offer Portmark itself to third parties as a hosted or managed service
-that exposes a substantial set of its features.
+In plain terms, and without replacing or narrowing that text: you may use, copy,
+modify and redistribute Portmark, including inside your own commercial product and
+including deployment inside your own organization at any scale, at no charge. What
+you may not do is provide Portmark to third parties as a hosted or managed service
+where the service provides users with access to any substantial set of the features
+or functionality of Portmark.
+
+Where this summary and LICENSE differ, LICENSE governs.
 
 The Elastic License 2.0 is a source-available license. It is not an OSI-approved
 open-source license, because it restricts one field of use. Portmark states this
@@ -42,18 +48,36 @@ and to releases made from them.
 Abandonment pledge
 --------------------------------------------------------------------------------
 
-Portmark is a security boundary. Depending on one is a long commitment, so this
-is an undertaking by the licensor rather than a term of the license above.
+Portmark is a security boundary. Depending on one is a long commitment, so the
+licensor makes the following additional grant. It is made here rather than in
+LICENSE, and it adds to the Elastic License 2.0 without altering it.
 
-If twelve consecutive months pass with no new commit on the default branch of
-<https://github.com/Itsthewayofyou/portmark>, then from the end of that period
-the most recent release as of that date becomes additionally available under the
-Apache License 2.0, at the option of any recipient, without further action by
-anyone.
+A **Qualifying Maintenance Event** is either of the following, applied to Portmark
+itself rather than to the material around it:
 
-This pledge is irrevocable and applies to every release of Portmark made under
-the Elastic License 2.0. It is a floor, not a ceiling: the licensor may always
-grant broader terms.
+  (a) the publication of a release of Portmark; or
+  (b) a change merged into the default branch of
+      <https://github.com/Itsthewayofyou/portmark> that fixes a security problem,
+      fixes a defect, restores or extends compatibility, or adds to or changes
+      Portmark's functionality.
+
+The following are **not** Qualifying Maintenance Events, however they reach the
+default branch: automated dependency updates; changes only to documentation,
+comments, formatting, tests, licensing or project metadata; and changes made by
+automation without human review.
+
+If twelve consecutive months pass with no Qualifying Maintenance Event, then from
+the end of that period the most recent release as of that date becomes
+additionally available under the Apache License 2.0, at the option of any
+recipient, without further action by anyone.
+
+This is a present and irrevocable grant of those Apache License 2.0 rights,
+conditioned only on the objective event described above, and not a promise to
+grant them in future. It applies to every release of Portmark made under the
+Elastic License 2.0. It binds the licensor and the licensor's successors,
+assigns, heirs and any later owner of the copyright in Portmark, and it survives
+the licensor's death, incapacity, or sale or transfer of the project. It is a
+floor, not a ceiling: the licensor may always grant broader terms.
 
 --------------------------------------------------------------------------------
 Trademarks

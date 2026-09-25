@@ -10,13 +10,15 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
   terms and an abandonment pledge. Nothing about the code changed. You may still use, modify and
   redistribute Portmark, ship it inside your own commercial product, and deploy it inside your own
   organization at any scale, free and without asking — there is no revenue threshold and no paid
-  tier. The one thing withheld is offering Portmark itself to third parties as a hosted or managed
-  service. This is a source-available license, not an OSI-approved open-source one, and Portmark says
-  so rather than calling itself open source. **Every version up to the `last-mit` tag stays MIT
-  permanently**, including PyPI releases 0.1.0 through 0.9.2; that grant is not withdrawn and the
-  text is kept in `LICENSE-MIT`. Alongside it, an irrevocable pledge: if twelve consecutive months
-  pass with no commit on the default branch, the most recent release becomes additionally available
-  under Apache-2.0. See `NOTICE`, `TRADEMARKS.md` and `CONTRIBUTING.md`.
+  tier. The one thing withheld is providing Portmark to third parties as a hosted or managed service
+  where the service gives users access to any substantial set of Portmark's features or
+  functionality. This is a source-available license, not an OSI-approved open-source one, and
+  Portmark says so rather than calling itself open source. **Every version up to the `last-mit` tag
+  stays MIT permanently**, including PyPI releases 0.1.0 through 0.9.2; that grant is not withdrawn
+  and the text is kept in `LICENSE-MIT`. Alongside it, an irrevocable grant that binds successors: if
+  twelve consecutive months pass with no substantive maintenance -- no release, and no merged fix or
+  functional change -- the most recent release becomes additionally available under Apache-2.0. See
+  `NOTICE`, `TRADEMARKS.md` and `CONTRIBUTING.md`.
 
 - **The MCP scope decisions are written down rather than merely true.** `portmark.asgi:create_app` installs
   no MCP tools, and that is now stated as a decision with its reason: it is an importable factory, and
