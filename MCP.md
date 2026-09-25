@@ -123,15 +123,22 @@ Three processes, deliberately separated:
 | Step | Runs in | Needs the SDK |
 | --- | --- | --- |
 | `portmark mcp login <server>` -- the whole authorization-code flow | your terminal | yes |
-| renewing a near-expiry access token | the host, at start-up | yes |
+| renewing a near-expiry access token | the host: at start-up, then on a timer | yes |
 | reading the token and sending `Authorization: Bearer` | the **isolated worker** | **no** |
 
 The worker reads the token store and gets a string, exactly as `bearer_env` gives it one. That is why the
 extra's 28 packages -- which include `starlette` and `uvicorn` -- never enter the sandboxed process. The
 worker cannot renew anything, so an expired token there is a **refusal**, never an unauthenticated call.
-Restarting the host renews it. A host running longer than one access-token lifetime will therefore start
-refusing until it is restarted; that ceiling is marked in the source and a background refresher is the
-upgrade.
+
+`portmark serve` renews in the background for as long as it runs, further ahead of expiry than the margin
+the worker refuses at -- so the renewal is always ahead of the refusal rather than racing it. It is not a
+guard and cannot become one: if it stops, the worker still refuses a stale token rather than sending one,
+and the worst it can cost is a `portmark mcp login`. A refusal from the authorization server is treated as
+final for that server: many servers rotate the refresh token on use, so retrying a refused refresh spends a
+credential that is already dead. Everything else is retried.
+
+`portmark demo` is a single run and starts no refresher. `portmark.asgi:create_app` installs no MCP tools at
+all, so it has none to renew.
 
 `portmark mcp login <server>` opens a browser by printing the url, and collects the redirect on a one-shot
 listener bound to a literal loopback address -- no other address is accepted, because an authorization code

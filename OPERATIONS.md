@@ -642,6 +642,18 @@ Redaction is pattern-based: do not rely on it for a secret in an unusual format
 logs as sensitive operational data because task IDs, key IDs, policy versions,
 host IDs, and audit event structure remain visible by design.
 
+### Upgrading the MCP OAuth extra
+
+`portmark[mcp-oauth]` pins `mcp` **exactly**, and `mcp` in turn requires `mcp-types` at exactly its own
+version -- `mcp==2.2.0` requires `mcp-types==2.2.0` (read from the installed metadata, 2026-09-24). So the
+two always move together, and a Dependabot pull request that raises one alone cannot resolve. Raise the pin
+in `pyproject.toml`, then regenerate with `python scripts/lock_requirements.py`, which rewrites `uv.lock` and
+`requirements/mcp_oauth.txt` with the matching hashes. A range is never acceptable here: `lock_requirements
+--check` needs an exact pin.
+
+The `mcp-oauth-sdk` CI lane installs the extra on the oldest and newest supported Python and treats a SKIP as
+a failure, so an upgrade that breaks the OAuth path cannot pass by skipping its tests.
+
 CI runs the regression suite across Python 3.11, 3.12, 3.13, and 3.14 on Linux and
 Windows, executes the A2A parser fuzz target, runs Bandit, and audits installed
 dependencies with `pip-audit --strict`. The `container` job builds the shipped image

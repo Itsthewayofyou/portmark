@@ -6,6 +6,17 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 ### Added
 
+- **MCP OAuth tokens are renewed for as long as the host runs.** `portmark serve` now keeps every `oauth`
+  server's stored access token current in the background, renewing further ahead of expiry than the margin
+  the isolated worker refuses at -- so the renewal is always ahead of the refusal rather than racing it. It
+  removes the previous ceiling, where a host running longer than one access-token lifetime began refusing
+  calls until it was restarted. It is not a guard and cannot become one: if it stops, the worker still
+  refuses a stale token rather than sending one. A refusal from the authorization server is final for that
+  server -- many servers rotate the refresh token on use, so retrying a refused refresh spends a credential
+  that is already dead -- and everything else is retried. `portmark demo` is a single run and starts no
+  refresher; `portmark.asgi:create_app` installs no MCP tools at all. See MCP.md, and OPERATIONS.md for the
+  paired `mcp` / `mcp-types` version bump an upgrade needs.
+
 - **OAuth for HTTP MCP servers.** An `oauth` block on an HTTP server delegates the operator's own access to
   a service such as GitHub, Linear or Notion. Portmark does not implement OAuth: the official `mcp` SDK is
   an exactly pinned optional extra (`pip install 'portmark[mcp-oauth]'`, owner decision D1) and Portmark

@@ -8,19 +8,23 @@ and refuses everything the operator did not approve. See MCP.md.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import logging
 import os
 import signal
 import subprocess  # nosec B404 - runs THIS interpreter to probe a server inside a bounded child tree
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from .json_guard import StrictJSONError, strict_json_loads
 from .mcp_client import ERROR_CODES
 from .mcp_config import McpConfig, McpConfigError, McpServerConfig, McpToolConfig, load_config
+from .mcp_token_store import REFRESH_MARGIN_SECONDS, StoredTokens, TokenStoreError, read_tokens
 from .mcp_worker import tool_environment
 from .tools import ToolRegistry, _launch_process_tree
 
@@ -34,6 +38,42 @@ CALL_TARGET = "portmark.mcp_worker:call"
 # this would turn a finished call into `tool.killed` while the worker was still closing down (Codex R1).
 STARTUP_ALLOWANCE_SECONDS = 10.0
 PIN_CHECK_TIMEOUT_SECONDS = 60.0
+# How long before expiry the background refresher renews. It MUST be wider than the worker's own
+# `REFRESH_MARGIN_SECONDS` (60): the worker starts refusing at that boundary, so renewing at the same
+# instant would leave a window in which calls already fail and the renewal has not happened yet. The
+# refresher has to run ahead of the refuser, not beside it.
+REFRESH_AHEAD_SECONDS = 300
+# A renewal that failed for a reason that might pass -- a network blip, a store briefly unreadable.
+REFRESH_RETRY_SECONDS = 30.0
+# Never spin, and never sleep so long that a token bought with a short lifetime expires unnoticed.
+MIN_REFRESH_SLEEP_SECONDS = 5.0
+# The least time between two renewals OF ONE SERVER. A token whose whole life is shorter than the margin
+# above is due again as soon as it is issued, and without this it would be renewed on every tick. It is a
+# floor on politeness, not on correctness: it YIELDS whenever keeping it would push the renewal past the
+# moment the worker starts refusing.
+MIN_RENEWAL_INTERVAL_SECONDS = 30.0
+# Renew at least this long before the worker's own margin would begin refusing, so the renewal finishes
+# first rather than racing it. It is a FLOOR: a renewal is network work, and starting five seconds early
+# guarantees nothing if the renewal itself takes longer than that -- the gap only moves. Each server's
+# slack therefore also grows to cover the longest renewal it has actually taken.
+RENEWAL_SLACK_SECONDS = 5
+# ...but not without limit, or one slow renewal would declare every token unmaintainable.
+MAX_RENEWAL_SLACK_SECONDS = 30
+# The SMALLEST token lifetime that can still be served without a gap, when renewals are quick. Each
+# issuance is usable for only `lifetime - REFRESH_MARGIN_SECONDS` seconds, so anything shorter would need
+# renewing oftener than the loop can even wake -- a storm against the authorization server, not a refresh.
+# Measured by walking the clock over the real rule: a 70-second token is served with no gap at all, a
+# 69-second one is not, and the difference is exactly these three terms. Below it the honest answer is to
+# stop and say so, so calls fail closed with one precise line instead of flapping with no explanation.
+#
+# This is the DEFAULT. The real threshold is computed per server from `_slack_for`, which grows when that
+# server's renewals are slow -- if a renewal takes twenty seconds, a seventy-second token really cannot be
+# kept usable, and pretending otherwise with a constant would be the comfortable answer rather than the
+# true one.
+UNMAINTAINABLE_LIFETIME_SECONDS = (
+    REFRESH_MARGIN_SECONDS + RENEWAL_SLACK_SECONDS + int(MIN_REFRESH_SLEEP_SECONDS)
+)
+MAX_REFRESH_SLEEP_SECONDS = 300.0
 MAX_PROBE_BYTES = 1 << 20
 PROBE_CHUNK_BYTES = 1 << 16
 # The probe worker sweeps its OWN process group before exiting, to take the MCP server's background children
@@ -154,6 +194,296 @@ def _worker_environment(path: str, server: McpServerConfig, tool: McpToolConfig,
         if name in os.environ:
             environment[name] = os.environ[name]
     return environment
+
+
+def _fingerprint(path: str, stored: StoredTokens) -> str:
+    """Which authorization this is, without keeping the credentials themselves.
+
+    The refresh token alone is not enough. Some authorization servers hand back the SAME refresh token when
+    the operator authorizes again, and then a login that fixed the problem looks identical to the one that
+    was refused -- so renewals would never resume and recovery would still secretly need a restart. The
+    access token and its expiry change on any new grant, so they are part of the answer too.
+
+    Nothing in OAuth REQUIRES either to change, though, and two grants can land on the same expiry second.
+    So the store's own identity is folded in as well: `write_tokens` replaces the file, which gives it a new
+    inode and a new modification time even when the bytes are identical -- verified. That makes every
+    successful login visible without adding a generation counter to the stored format.
+
+    The two signals are ADDITIVE, which is what makes the file identity safe to rely on: a filesystem that
+    reuses inodes or has coarse timestamps -- some network filesystems -- simply falls back to the token
+    material, which changes on any ordinary new grant. The only login that could escape both is one that
+    reissued byte-identical tokens with the same expiry second ON such a filesystem.
+
+    Only ever compared with another fingerprint, so a digest carries everything needed and none of the
+    material: this value is kept for the life of the process."""
+    try:
+        marker = os.stat(path)
+        identity = f"{marker.st_ino}:{marker.st_mtime_ns}"
+    except OSError:  # pragma: no cover - the caller has just read this file
+        identity = ""
+    material = "\n".join((stored.refresh_token, stored.access_token, str(stored.expires_at), identity))
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+class TokenRefresher:
+    """Keeps every `oauth` server's stored access token usable for as long as the host runs.
+
+    This is the host half of the separation, running on a timer instead of only at start-up. Renewing drives
+    the SDK, so it happens here and never in the isolated worker, which only reads the string this leaves in
+    the store.
+
+    It is deliberately not a guard and cannot become one: if it stops, or never starts, the worker still
+    refuses a stale token rather than sending it. The worst a broken refresher can do is turn a renewal into
+    an operator having to log in again.
+
+    Two failures are handled oppositely, which is the whole reason `McpOAuthRefused` exists. A transport
+    failure is worth trying again shortly. A refusal from the authorization server is not: many servers
+    rotate the refresh token on use, so repeating a refused refresh spends a credential that is already dead
+    and hammers the server with it. A refused server is dropped for the life of this process, and the
+    worker's own refusal is what tells the operator to log in."""
+
+    def __init__(self, config: McpConfig, ahead: int = REFRESH_AHEAD_SECONDS) -> None:
+        self._config = config
+        self._ahead = ahead
+        self._names = tuple(name for name, server in config.servers.items() if server.oauth is not None)
+        # Server name -> a digest of the refresh token that was refused. A DIGEST, so a long-lived object
+        # does not hold a second copy of a credential; and the token itself rather than a bare flag, so a
+        # new authorization stored by `portmark mcp login` can be told apart from the dead one.
+        self._refused: dict[str, str] = {}
+        # When each server was last renewed, so one of them cannot be renewed on every tick.
+        self._last_renewal: dict[str, int] = {}
+        # Servers already reported as issuing tokens too short to keep usable, so it is said once.
+        self._unmaintainable: set[str] = set()
+        # ...and those reported as needing renewals oftener than the usual interval. Also said once.
+        self._frequent: set[str] = set()
+        # The longest renewal each server has actually taken, so the slack can cover it.
+        self._renewal_cost: dict[str, float] = {}
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def wanted(self) -> bool:
+        """Whether there is anything to refresh at all. A config with no `oauth` server starts no thread."""
+        return bool(self._names)
+
+    def live(self) -> tuple[str, ...]:
+        """The servers still being renewed: those whose stored authorization has not been refused."""
+        return tuple(name for name in self._names if name not in self._refused)
+
+    def _wait_before_renewing(self, name: str, stored: StoredTokens, now: int) -> float:
+        """How long to wait before renewing this server, or 0 to renew now.
+
+        Three things pull on the answer, and the order between them is the whole rule:
+
+        * PREFERRED -- the configured margin. Right for an ordinary token measured in hours.
+        * FLOOR -- the least time between two renewals of one server. Without it, a token whose life is
+          shorter than the margin is due again the instant it is issued and gets renewed on every tick:
+          measured at one renewal every five seconds for a two-minute token, which is hammering the
+          authorization server rather than refreshing it.
+        * DEADLINE -- the moment the worker starts refusing, less a little slack so the renewal finishes
+          first rather than racing it.
+
+        **The deadline beats the floor.** A floor applied blindly opens a hole for exactly the lifetimes
+        between the worker's margin and the floor above it: measured, an 89-second token spent 20 seconds
+        of every 10 minutes being refused while the refresher waited out a politeness limit. Correctness
+        is not something to be polite about.
+
+        Capping the MARGIN instead was tried before either of these and is worse than both: with the cap
+        taken from the time remaining, the gap to renewal is always a fraction of what is left and never
+        reaches zero, so the token is never renewed at all.
+
+        A token too short for `_slack_for` to fit inside is a different thing entirely: no
+        schedule can keep it usable, because the worker refuses it before there is room to renew. Renewing
+        harder cannot help, so it is named once and left to the floor, and the worker's refusal is the
+        report the operator acts on."""
+        last = self._last_renewal.get(name)
+        floor = 0.0 if last is None else max(0.0, MIN_RENEWAL_INTERVAL_SECONDS - (now - last))
+        slack = self._slack_for(name)
+        if last is not None and stored.expires_at - last < REFRESH_MARGIN_SECONDS + slack + int(
+            MIN_REFRESH_SLEEP_SECONDS
+        ):
+            self._report_unmaintainable(name, stored.expires_at - last)
+            return floor or MIN_RENEWAL_INTERVAL_SECONDS
+        preferred = float(stored.expires_at - self._ahead - now)
+        deadline = float(stored.expires_at - REFRESH_MARGIN_SECONDS - slack - now)
+        if last is not None and deadline < MIN_RENEWAL_INTERVAL_SECONDS:
+            self._report_frequent_renewals(name, stored.expires_at - last, deadline)
+        return max(0.0, min(max(preferred, floor), deadline))
+
+    def _report_frequent_renewals(self, name: str, lifetime: int, interval: float) -> None:
+        """Said once, because it is a property of the provider rather than an event.
+
+        These tokens ARE served, with no gap -- the deadline beats the floor, which is the whole point of
+        the rule. But they are renewed oftener than the floor suggests, and an operator reading that
+        constant would otherwise be surprised by the traffic. Raising the unmaintainable threshold to the
+        floor instead would refuse a configuration that works perfectly well, which is the worse trade."""
+        if name in self._frequent:
+            return
+        self._frequent.add(name)
+        logger.warning(
+            "MCP server %r issues access tokens lasting about %ds, so keeping one usable needs a renewal "
+            "roughly every %.0fs -- oftener than the usual %.0fs. Calls are served normally; ask the "
+            "provider for a longer token lifetime to reduce the traffic.",
+            name, lifetime, max(interval, MIN_REFRESH_SLEEP_SECONDS), MIN_RENEWAL_INTERVAL_SECONDS,
+        )
+
+    def _report_unmaintainable(self, name: str, lifetime: int) -> None:
+        """Say it once per server. Repeating it every tick would bury the message it matters most to read."""
+        if name in self._unmaintainable:
+            return
+        self._unmaintainable.add(name)
+        logger.error(
+            "MCP server %r issues access tokens lasting about %ds, and the worker refuses any token with "
+            "less than %ds left, so no renewal schedule can keep one usable; calls to this server will "
+            "fail closed. Ask the provider for a longer token lifetime.",
+            name, lifetime, REFRESH_MARGIN_SECONDS,
+        )
+
+    def tick(self, now: int) -> float:
+        """Renew whatever is due at `now`, and answer how long to wait before asking again.
+
+        Takes the clock as an argument so the decision can be tested at chosen instants rather than by
+        sleeping and hoping. Never raises: a host must not fall over because an authorization server did."""
+        soonest = MAX_REFRESH_SLEEP_SECONDS
+        # Every configured server, INCLUDING the refused ones: a refused server is read so that a new
+        # authorization can be noticed. Reading is free of the credential that was refused.
+        for name in self._names:
+            server = self._config.servers[name]
+            assert server.oauth is not None  # nosec B101 - `_names` holds only servers that have one
+            try:
+                stored = read_tokens(server.oauth.token_store)
+            except TokenStoreError as error:
+                # Unreadable now, perhaps readable after the operator fixes the mode. Nothing to renew from.
+                logger.warning("MCP server %r: the OAuth token store cannot be read: %s", name, error)
+                soonest = min(soonest, REFRESH_RETRY_SECONDS)
+                continue
+            if stored is None:
+                # Never logged in. There is nothing to renew and nothing to say that the worker will not
+                # say better, with the command to run, at the moment a call actually needs the token.
+                continue
+            if not self._still_refused(name, server.oauth.token_store, stored):
+                continue
+            held = self._wait_before_renewing(name, stored, now)
+            if held > 0:
+                soonest = min(soonest, held)
+                continue
+            soonest = min(soonest, self._renew(name, server, stored, now))
+        return max(MIN_REFRESH_SLEEP_SECONDS, soonest)
+
+    def _slack_for(self, name: str) -> int:
+        """How long before the worker's margin this server's renewal must start.
+
+        Five seconds early guarantees nothing if the renewal takes six: the gap moves rather than closes.
+        So the slack is at least the constant and at least twice the longest renewal this server has
+        actually taken, capped so one slow renewal cannot declare every token unmaintainable."""
+        observed = self._renewal_cost.get(name, 0.0)
+        return int(min(MAX_RENEWAL_SLACK_SECONDS, max(RENEWAL_SLACK_SECONDS, 2 * observed)))
+
+    def _still_refused(self, name: str, path: str, stored: StoredTokens) -> bool:
+        """Whether this server is still carrying the authorization that was refused.
+
+        Told apart by the refresh token, so logging in again brings the server back on its own. Without
+        this, `portmark mcp login` appeared to work -- the new token serves calls until it nears expiry --
+        and then the host never renewed that server again, so recovery secretly needed a restart."""
+        refused = self._refused.get(name)
+        if refused is None:
+            return True
+        if refused == _fingerprint(path, stored):
+            return False  # the same dead credential; asking again cannot help and can make it worse
+        del self._refused[name]
+        logger.info("MCP server %r: a new authorization was stored, so renewals resume", name)
+        return True
+
+    def _renew(self, name: str, server: McpServerConfig, stored: StoredTokens, now: int) -> float:
+        from .mcp_oauth import McpOAuthError, McpOAuthRefused, current_access_token  # noqa: PLC0415
+
+        assert server.oauth is not None  # nosec B101 - as in `tick`
+        started = time.monotonic()
+        try:
+            current_access_token(
+                server_url=server.url,
+                token_store=server.oauth.token_store,
+                client_id=os.environ.get(server.oauth.client_id_env, ""),
+                client_secret=os.environ.get(server.oauth.client_secret_env, "")
+                if server.oauth.client_secret_env
+                else "",
+                scopes=server.oauth.scopes,
+                allow_private=server.allow_private,
+                now=now,
+                margin=self._ahead,
+            )
+        except McpOAuthRefused as error:
+            # ANSWERED, and the answer was no. Retrying with THIS credential cannot help and can make it
+            # worse; a different one, stored by a fresh login, is a different question and is asked.
+            self._refused[name] = _fingerprint(server.oauth.token_store, stored)
+            logger.error(
+                "MCP server %r: the authorization server refused to renew this authorization, and it will "
+                "not be offered again; run `portmark mcp login %s` and renewals resume on their own: %s",
+                name, name, error,
+            )
+            return MAX_REFRESH_SLEEP_SECONDS
+        except (McpOAuthError, TokenStoreError) as error:
+            logger.warning("MCP server %r: renewing the access token failed, will retry: %s", name, error)
+            return REFRESH_RETRY_SECONDS
+        except Exception:  # noqa: BLE001 - a host must not fall over because a renewal did
+            logger.exception("MCP server %r: renewing the access token raised unexpectedly", name)
+            return REFRESH_RETRY_SECONDS
+        # What this server's renewals actually cost, so the slack can cover the next one.
+        elapsed = time.monotonic() - started
+        self._renewal_cost[name] = max(self._renewal_cost.get(name, 0.0), elapsed)
+        # THE CLOCK HAS MOVED. The wait returned below is served from the moment this renewal finished, not
+        # from the moment it started, so scheduling on the `now` captured before the network request hands
+        # the elapsed time back as extra delay and quietly eats the head start the slack just bought.
+        # Measured before this line existed: a 2-second renewal cost 2 of the 30 seconds intended, and the
+        # reviewer's 20-second case cost 20 of them -- leaving 10. Rounded UP, because erring towards
+        # renewing early is the safe direction.
+        completed = now + math.ceil(elapsed)
+        self._last_renewal[name] = completed
+        return self._due_after_renewal(name, server, completed)
+
+    def _due_after_renewal(self, name: str, server: McpServerConfig, now: int) -> float:
+        """When the token just written needs renewing. READ BACK, never assumed.
+
+        Returning a fixed wait here was wrong for any server whose tokens are shorter-lived than that wait:
+        the next wake-up would arrive after the worker had already begun refusing, and the first sign of it
+        would be calls failing on a host whose refresher was working exactly as written.
+
+        It answers with the same rule the tick path uses, rather than a second copy of it -- which is how
+        the deadline that beats the politeness floor reaches this path too."""
+        assert server.oauth is not None  # nosec B101 - as in `tick`
+        try:
+            stored = read_tokens(server.oauth.token_store)
+        except TokenStoreError:
+            return REFRESH_RETRY_SECONDS
+        if stored is None:  # pragma: no cover - the renewal just wrote it
+            return REFRESH_RETRY_SECONDS
+        return self._wait_before_renewing(name, stored, now)
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            wait = self.tick(int(time.time()))
+            self._stop.wait(wait)
+
+    def start(self) -> None:
+        """Start renewing in the background. A config with no `oauth` server starts nothing."""
+        if not self.wanted or self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._loop, name="portmark-mcp-oauth-refresh", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop and wait. `Event.wait` is what the loop sleeps on, so this returns promptly."""
+        self._stop.set()
+        thread, self._thread = self._thread, None
+        if thread is not None:
+            thread.join(timeout=10.0)
+
+    def __enter__(self) -> TokenRefresher:
+        self.start()
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self.stop()
 
 
 def probe_server(config_path: str, server: str, timeout: float = PIN_CHECK_TIMEOUT_SECONDS) -> PinReport:
@@ -282,6 +612,7 @@ __all__ = [
     "CALL_TARGET",
     "McpStartupError",
     "PinReport",
+    "TokenRefresher",
     "check_pins",
     "pin_report",
     "probe_server",
