@@ -1,7 +1,7 @@
 # Portmark
 
 [![CI](https://github.com/Itsthewayofyou/portmark/actions/workflows/ci.yml/badge.svg)](https://github.com/Itsthewayofyou/portmark/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/Itsthewayofyou/portmark/blob/main/LICENSE)
+[![License: Elastic 2.0](https://img.shields.io/badge/license-Elastic--2.0-blue.svg)](https://github.com/Itsthewayofyou/portmark/blob/main/LICENSE)
 
 **A signed leash for AI agents that go out and act — enforced by the host, not the prompt.**
 
@@ -371,4 +371,27 @@ stable interface to substitute against.
 
 ## License
 
-MIT. See [LICENSE](https://github.com/Itsthewayofyou/portmark/blob/main/LICENSE).
+**Elastic License 2.0.** See [LICENSE](https://github.com/Itsthewayofyou/portmark/blob/main/LICENSE)
+for the text and [NOTICE](https://github.com/Itsthewayofyou/portmark/blob/main/NOTICE) for what it
+means here.
+
+Use it, modify it, ship it inside your own product, and deploy it inside your own organization at any
+scale — free, with no revenue test and nobody to ask. The one thing the license withholds is offering
+Portmark itself to third parties as a hosted or managed service.
+
+This is a **source-available** license, not an OSI-approved open-source one, because it restricts a
+field of use. Portmark says so rather than calling itself open source.
+
+Two commitments go with it:
+
+- **Earlier versions stay MIT, permanently.** Everything up to the `last-mit` tag — including PyPI
+  releases 0.1.0 through 0.9.2 — was released under the MIT License, and that grant is not withdrawn.
+  The text is kept in [LICENSE-MIT](https://github.com/Itsthewayofyou/portmark/blob/main/LICENSE-MIT).
+- **An abandonment pledge.** If twelve consecutive months pass with no commit on the default branch,
+  the most recent release becomes additionally available under Apache-2.0, automatically. Depending
+  on a security boundary is a long commitment, and this is the floor under it.
+
+The license grants no trademark rights; see
+[TRADEMARKS.md](https://github.com/Itsthewayofyou/portmark/blob/main/TRADEMARKS.md) for what you may
+do with the name without asking. Contribution terms are in
+[CONTRIBUTING.md](https://github.com/Itsthewayofyou/portmark/blob/main/CONTRIBUTING.md).

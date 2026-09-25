@@ -1,0 +1,64 @@
+Portmark
+Copyright (c) 2026 Josh (Itsthewayofyou)
+
+The licensor of Portmark, for the purposes of the Elastic License 2.0 in LICENSE,
+is Josh (Itsthewayofyou), the sole copyright holder of this software.
+
+--------------------------------------------------------------------------------
+Current license
+--------------------------------------------------------------------------------
+
+Portmark is available under the Elastic License 2.0. The full text is in LICENSE.
+
+In plain terms, and without replacing that text: you may use, copy, modify and
+redistribute Portmark, including inside your own commercial product and including
+deployment inside your own organization at any scale, at no charge. What you may
+not do is offer Portmark itself to third parties as a hosted or managed service
+that exposes a substantial set of its features.
+
+The Elastic License 2.0 is a source-available license. It is not an OSI-approved
+open-source license, because it restricts one field of use. Portmark states this
+plainly rather than describing itself as open source.
+
+--------------------------------------------------------------------------------
+Earlier versions remain MIT, permanently
+--------------------------------------------------------------------------------
+
+Every version of Portmark up to and including the commit tagged `last-mit` was
+released under the MIT License, whose text is preserved in LICENSE-MIT. That
+grant is perpetual and is not withdrawn by this change. It covers:
+
+  * every commit up to and including the `last-mit` tag; and
+  * the PyPI releases 0.1.0, 0.2.0, 0.3.0, 0.3.1, 0.4.0, 0.4.1, 0.6.1, 0.8.0,
+    0.9.0, 0.9.1 and 0.9.2.
+
+Anyone who obtained any of those may continue to use them under the MIT License
+for as long as they wish. Nothing here asks for those rights back.
+
+The Elastic License 2.0 applies only to commits made after the `last-mit` tag,
+and to releases made from them.
+
+--------------------------------------------------------------------------------
+Abandonment pledge
+--------------------------------------------------------------------------------
+
+Portmark is a security boundary. Depending on one is a long commitment, so this
+is an undertaking by the licensor rather than a term of the license above.
+
+If twelve consecutive months pass with no new commit on the default branch of
+<https://github.com/Itsthewayofyou/portmark>, then from the end of that period
+the most recent release as of that date becomes additionally available under the
+Apache License 2.0, at the option of any recipient, without further action by
+anyone.
+
+This pledge is irrevocable and applies to every release of Portmark made under
+the Elastic License 2.0. It is a floor, not a ceiling: the licensor may always
+grant broader terms.
+
+--------------------------------------------------------------------------------
+Trademarks
+--------------------------------------------------------------------------------
+
+The Elastic License 2.0 grants no trademark rights. "Portmark" and the Portmark
+logo are marks of the licensor. TRADEMARKS.md says what is permitted without
+asking, and what is not.
