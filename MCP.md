@@ -152,11 +152,16 @@ The boundary is therefore:
 | Entry point | MCP tools |
 | --- | --- |
 | `portmark serve` | batteries included -- installs the configured servers and owns their lifetime |
-| `portmark.asgi:create_app` | never -- the predictable core app, no ambient activation |
+| `portmark.asgi:create_app` | never -- the predictable core app, no ambient MCP activation |
 | a future explicit factory | opt-in only, with proper ASGI lifespan start-up and shutdown |
 
-If an embedded deployment ever needs MCP, it gets a *named* factory that says so -- something on the order
-of `create_app(mcp_config_path=...)` -- not a new meaning for the existing one.
+The claim is deliberately narrow. `create_app` *does* read `PORTMARK_TOOLS` from the environment, and that
+names trusted local code the operator put on the machine. An MCP block is a different thing: it names a
+remote party, over the network, whose answers arrive at call time. That is the activation this boundary
+keeps out.
+
+If an embedded deployment ever needs MCP, it gets a separately named factory that says so -- on the order of
+`portmark.asgi:create_mcp_app(...)` -- rather than a new meaning for `create_app`.
 
 `portmark mcp login <server>` opens a browser by printing the url, and collects the redirect on a one-shot
 listener bound to a literal loopback address -- no other address is accepted, because an authorization code
