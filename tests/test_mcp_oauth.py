@@ -42,6 +42,7 @@ from portmark import mcp_worker
 from portmark.cli import _finite_seconds, _install_mcp_tools, _run_mcp
 from portmark.mcp import (
     MIN_REFRESH_SLEEP_SECONDS,
+    MIN_RENEWAL_INTERVAL_SECONDS,
     REFRESH_AHEAD_SECONDS,
     REFRESH_RETRY_SECONDS,
     McpStartupError,
@@ -1363,6 +1364,64 @@ class TokenRefresherTests(unittest.TestCase):
             with patch.object(TokenRefresher, "_renew", return_value=0.0):
                 slept = refresher.tick(self.NOW)
         self.assertEqual(slept, MIN_REFRESH_SLEEP_SECONDS)
+
+    def renews_to_a_token_lasting(self, seconds, refresh_token="a-refresh-token"):  # nosec B107 - a fixture
+        """Stand in for an authorization server that issues tokens of a given life."""
+
+        def renew(**_):
+            write_tokens(self.store, StoredTokens(
+                "https://issuer.example", "cid", "renewed", self.NOW + seconds, refresh_token))
+            return "renewed"
+
+        return renew
+
+    def test_the_next_wake_up_comes_from_the_token_that_was_just_written(self):
+        """A fixed wait after renewing is wrong for any server whose tokens are shorter than that wait.
+
+        This server issues two-minute tokens. Sleeping the full five minutes would let the worker begin
+        refusing well before the refresher next woke -- on a host whose refresher was doing exactly what it
+        was written to do. The expiry is read back rather than assumed.
+        """
+        self.store_expiring_in(0)
+        with patch("portmark.mcp_oauth.current_access_token", side_effect=self.renews_to_a_token_lasting(120)):
+            slept = self.refresher().tick(self.NOW)
+        self.assertEqual(slept, MIN_REFRESH_SLEEP_SECONDS)
+
+    def test_one_server_cannot_be_renewed_on_every_tick(self):
+        """A token shorter than the margin is due again the moment it is issued.
+
+        Scheduling alone would therefore renew it on every tick -- measured at one renewal every five
+        seconds for a two-minute token, which is hammering the authorization server rather than refreshing
+        it. Capping the margin instead was tried and is worse: the gap to renewal then never reaches zero
+        and the token is never renewed at all.
+        """
+        self.store_expiring_in(0)
+        refresher = self.refresher()
+        with patch("portmark.mcp_oauth.current_access_token",
+                   side_effect=self.renews_to_a_token_lasting(120)) as renew:
+            refresher.tick(self.NOW)
+            slept = refresher.tick(self.NOW + 5)
+        renew.assert_called_once()
+        self.assertEqual(slept, MIN_RENEWAL_INTERVAL_SECONDS - 5)
+
+    def test_a_fresh_login_brings_a_refused_server_back_on_its_own(self):
+        """`portmark mcp login` is what the refusal tells the operator to run, so it has to be enough.
+
+        Before this, it looked like it was: the new token served calls until it neared expiry, and then
+        this server was never renewed again. Recovery secretly needed a host restart, and nothing said so.
+        """
+        self.store_expiring_in(0)
+        refresher = self.refresher()
+        with patch("portmark.mcp_oauth.current_access_token", side_effect=McpOAuthRefused("no")):
+            refresher.tick(self.NOW)
+        self.assertEqual(refresher.live(), ())
+        # What `portmark mcp login` leaves behind: a DIFFERENT authorization, not the one that was refused.
+        write_tokens(self.store, StoredTokens(
+            "https://issuer.example", "cid", "fresh", self.NOW + 60, "a-different-refresh-token"))
+        with patch("portmark.mcp_oauth.current_access_token") as renew:
+            refresher.tick(self.NOW)
+        renew.assert_called_once()
+        self.assertEqual(refresher.live(), ("files",))
 
     def test_the_thread_starts_and_stops(self):
         self.store_expiring_in(3600)

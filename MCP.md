@@ -123,7 +123,7 @@ Three processes, deliberately separated:
 | Step | Runs in | Needs the SDK |
 | --- | --- | --- |
 | `portmark mcp login <server>` -- the whole authorization-code flow | your terminal | yes |
-| renewing a near-expiry access token | the host, at start-up | yes |
+| renewing a near-expiry access token | the host: at start-up, then on a timer | yes |
 | reading the token and sending `Authorization: Bearer` | the **isolated worker** | **no** |
 
 The worker reads the token store and gets a string, exactly as `bearer_env` gives it one. That is why the

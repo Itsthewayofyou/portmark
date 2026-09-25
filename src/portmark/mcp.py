@@ -8,6 +8,7 @@ and refuses everything the operator did not approve. See MCP.md.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -22,7 +23,7 @@ from typing import Any
 from .json_guard import StrictJSONError, strict_json_loads
 from .mcp_client import ERROR_CODES
 from .mcp_config import McpConfig, McpConfigError, McpServerConfig, McpToolConfig, load_config
-from .mcp_token_store import TokenStoreError, read_tokens
+from .mcp_token_store import StoredTokens, TokenStoreError, read_tokens
 from .mcp_worker import tool_environment
 from .tools import ToolRegistry, _launch_process_tree
 
@@ -45,6 +46,9 @@ REFRESH_AHEAD_SECONDS = 300
 REFRESH_RETRY_SECONDS = 30.0
 # Never spin, and never sleep so long that a token bought with a short lifetime expires unnoticed.
 MIN_REFRESH_SLEEP_SECONDS = 5.0
+# The least time between two renewals OF ONE SERVER. A token whose whole life is shorter than the margin
+# above is due again as soon as it is issued, and without this it would be renewed on every tick.
+MIN_RENEWAL_INTERVAL_SECONDS = 30.0
 MAX_REFRESH_SLEEP_SECONDS = 300.0
 MAX_PROBE_BYTES = 1 << 20
 PROBE_CHUNK_BYTES = 1 << 16
@@ -168,6 +172,14 @@ def _worker_environment(path: str, server: McpServerConfig, tool: McpToolConfig,
     return environment
 
 
+def _fingerprint(stored: StoredTokens) -> str:
+    """Which authorization this is, without keeping the credential itself.
+
+    Only ever compared with another fingerprint, so a digest says everything the refresher needs: whether
+    the thing in the store is still the one that was refused."""
+    return hashlib.sha256(stored.refresh_token.encode("utf-8")).hexdigest()
+
+
 class TokenRefresher:
     """Keeps every `oauth` server's stored access token usable for as long as the host runs.
 
@@ -189,7 +201,12 @@ class TokenRefresher:
         self._config = config
         self._ahead = ahead
         self._names = tuple(name for name, server in config.servers.items() if server.oauth is not None)
-        self._given_up: set[str] = set()
+        # Server name -> a digest of the refresh token that was refused. A DIGEST, so a long-lived object
+        # does not hold a second copy of a credential; and the token itself rather than a bare flag, so a
+        # new authorization stored by `portmark mcp login` can be told apart from the dead one.
+        self._refused: dict[str, str] = {}
+        # When each server was last renewed, so one of them cannot be renewed on every tick.
+        self._last_renewal: dict[str, int] = {}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -199,8 +216,31 @@ class TokenRefresher:
         return bool(self._names)
 
     def live(self) -> tuple[str, ...]:
-        """The servers still being renewed: those not refused by their authorization server."""
-        return tuple(name for name in self._names if name not in self._given_up)
+        """The servers still being renewed: those whose stored authorization has not been refused."""
+        return tuple(name for name in self._names if name not in self._refused)
+
+    def _due_in(self, stored: StoredTokens, now: int) -> float:
+        """Seconds until this token needs renewing. Negative or zero means now."""
+        return float(stored.expires_at - self._ahead - now)
+
+    def _too_soon_to_renew(self, name: str, now: int) -> float:
+        """How long this server must wait before being renewed again, or 0 if it may be renewed now.
+
+        A token whose whole life is shorter than the renewal margin is due again the moment it is issued,
+        so scheduling alone would renew it on every tick. Measured, for a two-minute token: one renewal
+        every five seconds, which is hammering the authorization server rather than refreshing it.
+
+        Capping the MARGIN instead was tried first and is worse: with the cap set from the time remaining,
+        the gap to renewal is always a fraction of what is left and never reaches zero, so the token is
+        never renewed at all while the worker quietly starts refusing it.
+
+        This floor leaves an ordinary token untouched -- it is not due again for most of an hour -- and
+        turns the short-lived case into one renewal every 30 seconds, which keeps roughly 90 seconds of
+        life in the store for a two-minute token, comfortably above the 60 the worker insists on. A token
+        shorter than that 60 cannot be made to work by any schedule; the worker is already refusing it, and
+        the refusal is the honest report."""
+        last = self._last_renewal.get(name)
+        return 0.0 if last is None else max(0.0, MIN_RENEWAL_INTERVAL_SECONDS - (now - last))
 
     def tick(self, now: int) -> float:
         """Renew whatever is due at `now`, and answer how long to wait before asking again.
@@ -208,7 +248,9 @@ class TokenRefresher:
         Takes the clock as an argument so the decision can be tested at chosen instants rather than by
         sleeping and hoping. Never raises: a host must not fall over because an authorization server did."""
         soonest = MAX_REFRESH_SLEEP_SECONDS
-        for name in self.live():
+        # Every configured server, INCLUDING the refused ones: a refused server is read so that a new
+        # authorization can be noticed. Reading is free of the credential that was refused.
+        for name in self._names:
             server = self._config.servers[name]
             assert server.oauth is not None  # nosec B101 - `_names` holds only servers that have one
             try:
@@ -222,14 +264,35 @@ class TokenRefresher:
                 # Never logged in. There is nothing to renew and nothing to say that the worker will not
                 # say better, with the command to run, at the moment a call actually needs the token.
                 continue
-            due = stored.expires_at - self._ahead - now
-            if due > 0:
-                soonest = min(soonest, float(due))
+            if not self._still_refused(name, stored):
                 continue
-            soonest = min(soonest, self._renew(name, server, now))
+            due = self._due_in(stored, now)
+            if due > 0:
+                soonest = min(soonest, due)
+                continue
+            held = self._too_soon_to_renew(name, now)
+            if held > 0:
+                soonest = min(soonest, held)
+                continue
+            soonest = min(soonest, self._renew(name, server, stored, now))
         return max(MIN_REFRESH_SLEEP_SECONDS, soonest)
 
-    def _renew(self, name: str, server: McpServerConfig, now: int) -> float:
+    def _still_refused(self, name: str, stored: StoredTokens) -> bool:
+        """Whether this server is still carrying the authorization that was refused.
+
+        Told apart by the refresh token, so logging in again brings the server back on its own. Without
+        this, `portmark mcp login` appeared to work -- the new token serves calls until it nears expiry --
+        and then the host never renewed that server again, so recovery secretly needed a restart."""
+        refused = self._refused.get(name)
+        if refused is None:
+            return True
+        if refused == _fingerprint(stored):
+            return False  # the same dead credential; asking again cannot help and can make it worse
+        del self._refused[name]
+        logger.info("MCP server %r: a new authorization was stored, so renewals resume", name)
+        return True
+
+    def _renew(self, name: str, server: McpServerConfig, stored: StoredTokens, now: int) -> float:
         from .mcp_oauth import McpOAuthError, McpOAuthRefused, current_access_token  # noqa: PLC0415
 
         assert server.oauth is not None  # nosec B101 - as in `tick`
@@ -247,11 +310,13 @@ class TokenRefresher:
                 margin=self._ahead,
             )
         except McpOAuthRefused as error:
-            # ANSWERED, and the answer was no. Retrying cannot help and can make it worse.
-            self._given_up.add(name)
+            # ANSWERED, and the answer was no. Retrying with THIS credential cannot help and can make it
+            # worse; a different one, stored by a fresh login, is a different question and is asked.
+            self._refused[name] = _fingerprint(stored)
             logger.error(
-                "MCP server %r: the authorization server refused to renew, and it will not be asked again "
-                "in this process; run `portmark mcp login %s`: %s", name, name, error,
+                "MCP server %r: the authorization server refused to renew this authorization, and it will "
+                "not be offered again; run `portmark mcp login %s` and renewals resume on their own: %s",
+                name, name, error,
             )
             return MAX_REFRESH_SLEEP_SECONDS
         except (McpOAuthError, TokenStoreError) as error:
@@ -260,7 +325,23 @@ class TokenRefresher:
         except Exception:  # noqa: BLE001 - a host must not fall over because a renewal did
             logger.exception("MCP server %r: renewing the access token raised unexpectedly", name)
             return REFRESH_RETRY_SECONDS
-        return MAX_REFRESH_SLEEP_SECONDS
+        self._last_renewal[name] = now
+        return self._due_after_renewal(server, now)
+
+    def _due_after_renewal(self, server: McpServerConfig, now: int) -> float:
+        """When the token just written needs renewing. READ BACK, never assumed.
+
+        Returning a fixed wait here was wrong for any server whose tokens are shorter-lived than that wait:
+        the next wake-up would arrive after the worker had already begun refusing, and the first sign of it
+        would be calls failing on a host whose refresher was working exactly as written."""
+        assert server.oauth is not None  # nosec B101 - as in `tick`
+        try:
+            stored = read_tokens(server.oauth.token_store)
+        except TokenStoreError:
+            return REFRESH_RETRY_SECONDS
+        if stored is None:  # pragma: no cover - the renewal just wrote it
+            return REFRESH_RETRY_SECONDS
+        return max(0.0, self._due_in(stored, now))
 
     def _loop(self) -> None:
         while not self._stop.is_set():
