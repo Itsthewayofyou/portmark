@@ -43,6 +43,7 @@ from portmark.cli import _finite_seconds, _install_mcp_tools, _run_mcp
 from portmark.mcp import (
     MIN_REFRESH_SLEEP_SECONDS,
     MIN_RENEWAL_INTERVAL_SECONDS,
+    UNMAINTAINABLE_LIFETIME_SECONDS,
     REFRESH_AHEAD_SECONDS,
     REFRESH_RETRY_SECONDS,
     McpStartupError,
@@ -64,6 +65,7 @@ from portmark.mcp_config import (
 )
 from portmark.mcp_http import checked_fetch
 from portmark.mcp_token_store import (
+    REFRESH_MARGIN_SECONDS,
     SCHEMA,
     STORE_VERSION,
     StoredTokens,
@@ -1385,7 +1387,11 @@ class TokenRefresherTests(unittest.TestCase):
         self.store_expiring_in(0)
         with patch("portmark.mcp_oauth.current_access_token", side_effect=self.renews_to_a_token_lasting(120)):
             slept = self.refresher().tick(self.NOW)
-        self.assertEqual(slept, MIN_REFRESH_SLEEP_SECONDS)
+        # What the rule answers for a two-minute token: the floor, because the worker does not begin
+        # refusing for another 55 seconds and there is no reason to renew sooner than that.
+        self.assertEqual(slept, MIN_RENEWAL_INTERVAL_SECONDS)
+        self.assertLess(slept, 120 - REFRESH_MARGIN_SECONDS,
+                        "and it must come before the worker starts refusing this token")
 
     def test_one_server_cannot_be_renewed_on_every_tick(self):
         """A token shorter than the margin is due again the moment it is issued.
@@ -1422,6 +1428,64 @@ class TokenRefresherTests(unittest.TestCase):
             refresher.tick(self.NOW)
         renew.assert_called_once()
         self.assertEqual(refresher.live(), ("files",))
+
+    def test_the_renewal_floor_yields_rather_than_open_a_refusal_window(self):
+        """The lifetimes between the worker's margin and the floor above it are the dangerous ones.
+
+        A 70-second token is unusable to the worker after 10 seconds, because the worker insists on 60
+        remaining. A politeness floor of 30 seconds applied blindly would make the refresher wait out 20 of
+        those seconds while calls failed. Measured on the rule before this fix: an 89-second token spent 20
+        seconds of every 10 minutes being refused. Correctness is not something to be polite about.
+        """
+        refresher = self.refresher()
+        self.store_expiring_in(70)
+        refresher._last_renewal["files"] = self.NOW  # renewed just now, so the floor is at its widest
+        with patch("portmark.mcp_oauth.current_access_token") as renew:
+            slept = refresher.tick(self.NOW)
+        renew.assert_not_called()
+        self.assertLess(slept, 70 - REFRESH_MARGIN_SECONDS,
+                        "the floor must give way: the worker refuses this token 10 seconds from now")
+
+    def test_a_token_too_short_to_keep_usable_is_named_rather_than_chased(self):
+        """No schedule can keep a 60-second token usable when the worker refuses below 60 remaining.
+
+        Renewing harder cannot help, so saying so once is the useful act. It must also not turn into a
+        renewal on every tick, which would be a storm against the authorization server on top of an outage.
+        """
+        self.assertLessEqual(60, UNMAINTAINABLE_LIFETIME_SECONDS)
+        refresher = self.refresher()
+        self.store_expiring_in(60)
+        refresher._last_renewal["files"] = self.NOW
+        with patch("portmark.mcp_oauth.current_access_token") as renew:
+            with self.assertLogs("portmark.mcp", level="ERROR") as logged:
+                slept = refresher.tick(self.NOW)
+                refresher.tick(self.NOW)
+                refresher.tick(self.NOW)
+        renew.assert_not_called()
+        said = [line for line in logged.output if "no renewal schedule can keep one usable" in line]
+        # Three ticks, ONE report. Repeating it every tick would bury the message it matters most to read.
+        self.assertEqual(len(said), 1, logged.output)
+        self.assertEqual(slept, MIN_RENEWAL_INTERVAL_SECONDS)
+
+    def test_a_login_that_reuses_the_refresh_token_still_resumes_renewal(self):
+        """Some authorization servers hand back the SAME refresh token when the operator authorizes again.
+
+        Recognising an authorization by its refresh token alone therefore cannot tell the login that fixed
+        the problem from the one that was refused, and recovery would still secretly need a host restart.
+        The access token and its expiry change on any new grant, so they are part of the answer.
+        """
+        self.store_expiring_in(0)
+        refresher = self.refresher()
+        with patch("portmark.mcp_oauth.current_access_token", side_effect=McpOAuthRefused("no")):
+            refresher.tick(self.NOW)
+        self.assertEqual(refresher.live(), ())
+        # A fresh login, with the SAME refresh token the server refused to renew with.
+        write_tokens(self.store, StoredTokens(
+            "https://issuer.example", "cid", "a-brand-new-access-token", self.NOW + 3600, "a-refresh-token"))
+        with patch("portmark.mcp_oauth.current_access_token") as renew:
+            refresher.tick(self.NOW)
+        self.assertEqual(refresher.live(), ("files",))
+        renew.assert_not_called()  # a fresh hour-long token is not due yet; what matters is that it is back
 
     def test_the_thread_starts_and_stops(self):
         self.store_expiring_in(3600)
