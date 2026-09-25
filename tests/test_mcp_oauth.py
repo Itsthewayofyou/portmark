@@ -1487,6 +1487,78 @@ class TokenRefresherTests(unittest.TestCase):
         self.assertEqual(refresher.live(), ("files",))
         renew.assert_not_called()  # a fresh hour-long token is not due yet; what matters is that it is back
 
+    def test_a_server_needing_frequent_renewals_says_so_once(self):
+        """These tokens ARE served -- the deadline beats the floor, which is the point of the rule.
+
+        But a 70-second token needs renewing every few seconds to stay usable, far oftener than the floor
+        an operator reading the constants would expect, so the traffic should not be a surprise. Raising
+        the unmaintainable threshold to the floor instead would refuse a configuration that works perfectly
+        well, which is the worse trade.
+        """
+        refresher = self.refresher()
+        self.store_expiring_in(70)
+        refresher._last_renewal["files"] = self.NOW
+        with patch("portmark.mcp_oauth.current_access_token"):
+            with self.assertLogs("portmark.mcp", level="WARNING") as logged:
+                refresher.tick(self.NOW)
+                refresher.tick(self.NOW)
+                refresher.tick(self.NOW)
+        said = [line for line in logged.output if "oftener than the usual" in line]
+        self.assertEqual(len(said), 1, logged.output)
+        self.assertIn("Calls are served normally", said[0])
+
+    def test_the_slack_grows_to_cover_a_renewal_that_is_slow(self):
+        """Starting five seconds early guarantees nothing if the renewal takes six: the gap only moves.
+
+        A server whose renewals take twenty seconds genuinely cannot keep a 94-second token usable, and
+        saying it can -- because a constant says five -- would be the comfortable answer rather than the
+        true one.
+        """
+        refresher = self.refresher()
+        self.store_expiring_in(94)
+        refresher._last_renewal["files"] = self.NOW
+        self.assertEqual(refresher._slack_for("files"), 5, "with quick renewals the slack is the constant")
+        refresher._renewal_cost["files"] = 20.0
+        self.assertEqual(refresher._slack_for("files"), 30, "and it grows to cover what was observed")
+        with patch("portmark.mcp_oauth.current_access_token"):
+            with self.assertLogs("portmark.mcp", level="ERROR") as logged:
+                refresher.tick(self.NOW)
+        self.assertIn("no renewal schedule can keep one usable", "\n".join(logged.output))
+
+    def test_what_a_renewal_actually_cost_is_remembered(self):
+        """The slack can only cover a slow renewal if the cost is measured rather than assumed."""
+        self.store_expiring_in(0)
+
+        def slow_renewal(**_):
+            time.sleep(0.05)
+            write_tokens(self.store, StoredTokens(
+                "https://issuer.example", "cid", "renewed", self.NOW + 3600, "a-refresh-token"))
+            return "renewed"
+
+        refresher = self.refresher()
+        with patch("portmark.mcp_oauth.current_access_token", side_effect=slow_renewal):
+            refresher.tick(self.NOW)
+        self.assertGreaterEqual(refresher._renewal_cost.get("files", 0.0), 0.05)
+
+    def test_a_login_that_writes_the_same_bytes_is_still_noticed(self):
+        """Nothing in OAuth requires a new grant to change either token, and two can share an expiry second.
+
+        `write_tokens` replaces the file, so the store gets a new inode and modification time even when the
+        bytes are identical -- which makes every successful login visible without adding a generation
+        counter to the stored format.
+        """
+        self.store_expiring_in(0)
+        refresher = self.refresher()
+        with patch("portmark.mcp_oauth.current_access_token", side_effect=McpOAuthRefused("no")):
+            refresher.tick(self.NOW)
+        self.assertEqual(refresher.live(), ())
+        # A fresh login that happened to produce byte-for-byte the same record.
+        self.store_expiring_in(0)
+        with patch("portmark.mcp_oauth.current_access_token") as renew:
+            refresher.tick(self.NOW)
+        self.assertEqual(refresher.live(), ("files",))
+        renew.assert_called_once()
+
     def test_the_thread_starts_and_stops(self):
         self.store_expiring_in(3600)
         refresher = self.refresher()

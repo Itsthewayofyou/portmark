@@ -51,15 +51,24 @@ MIN_REFRESH_SLEEP_SECONDS = 5.0
 # floor on politeness, not on correctness: it YIELDS whenever keeping it would push the renewal past the
 # moment the worker starts refusing.
 MIN_RENEWAL_INTERVAL_SECONDS = 30.0
-# Renew this long before the worker's own margin would begin refusing, so the renewal finishes first
-# rather than racing it.
+# Renew at least this long before the worker's own margin would begin refusing, so the renewal finishes
+# first rather than racing it. It is a FLOOR: a renewal is network work, and starting five seconds early
+# guarantees nothing if the renewal itself takes longer than that -- the gap only moves. Each server's
+# slack therefore also grows to cover the longest renewal it has actually taken.
 RENEWAL_SLACK_SECONDS = 5
-# A token shorter than this cannot be served without a gap. Each issuance is usable for only
-# `lifetime - REFRESH_MARGIN_SECONDS` seconds, so closing the gap would mean renewing more often than once
-# every `MIN_REFRESH_SLEEP_SECONDS` -- a storm against the authorization server, not a refresh. Measured by
-# walking the clock over the real rule: a 70-second token is served with no gap at all, a 69-second one is
-# not, and the difference is exactly these three terms. Below it the honest answer is to stop and say so:
-# calls then fail closed with one precise line, instead of flapping with no explanation.
+# ...but not without limit, or one slow renewal would declare every token unmaintainable.
+MAX_RENEWAL_SLACK_SECONDS = 30
+# The SMALLEST token lifetime that can still be served without a gap, when renewals are quick. Each
+# issuance is usable for only `lifetime - REFRESH_MARGIN_SECONDS` seconds, so anything shorter would need
+# renewing oftener than the loop can even wake -- a storm against the authorization server, not a refresh.
+# Measured by walking the clock over the real rule: a 70-second token is served with no gap at all, a
+# 69-second one is not, and the difference is exactly these three terms. Below it the honest answer is to
+# stop and say so, so calls fail closed with one precise line instead of flapping with no explanation.
+#
+# This is the DEFAULT. The real threshold is computed per server from `_slack_for`, which grows when that
+# server's renewals are slow -- if a renewal takes twenty seconds, a seventy-second token really cannot be
+# kept usable, and pretending otherwise with a constant would be the comfortable answer rather than the
+# true one.
 UNMAINTAINABLE_LIFETIME_SECONDS = (
     REFRESH_MARGIN_SECONDS + RENEWAL_SLACK_SECONDS + int(MIN_REFRESH_SLEEP_SECONDS)
 )
@@ -186,7 +195,7 @@ def _worker_environment(path: str, server: McpServerConfig, tool: McpToolConfig,
     return environment
 
 
-def _fingerprint(stored: StoredTokens) -> str:
+def _fingerprint(path: str, stored: StoredTokens) -> str:
     """Which authorization this is, without keeping the credentials themselves.
 
     The refresh token alone is not enough. Some authorization servers hand back the SAME refresh token when
@@ -194,9 +203,19 @@ def _fingerprint(stored: StoredTokens) -> str:
     was refused -- so renewals would never resume and recovery would still secretly need a restart. The
     access token and its expiry change on any new grant, so they are part of the answer too.
 
+    Nothing in OAuth REQUIRES either to change, though, and two grants can land on the same expiry second.
+    So the store's own identity is folded in as well: `write_tokens` replaces the file, which gives it a new
+    inode and a new modification time even when the bytes are identical -- verified. That makes every
+    successful login visible without adding a generation counter to the stored format.
+
     Only ever compared with another fingerprint, so a digest carries everything needed and none of the
     material: this value is kept for the life of the process."""
-    material = "\n".join((stored.refresh_token, stored.access_token, str(stored.expires_at)))
+    try:
+        marker = os.stat(path)
+        identity = f"{marker.st_ino}:{marker.st_mtime_ns}"
+    except OSError:  # pragma: no cover - the caller has just read this file
+        identity = ""
+    material = "\n".join((stored.refresh_token, stored.access_token, str(stored.expires_at), identity))
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
@@ -229,6 +248,10 @@ class TokenRefresher:
         self._last_renewal: dict[str, int] = {}
         # Servers already reported as issuing tokens too short to keep usable, so it is said once.
         self._unmaintainable: set[str] = set()
+        # ...and those reported as needing renewals oftener than the usual interval. Also said once.
+        self._frequent: set[str] = set()
+        # The longest renewal each server has actually taken, so the slack can cover it.
+        self._renewal_cost: dict[str, float] = {}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -263,18 +286,40 @@ class TokenRefresher:
         taken from the time remaining, the gap to renewal is always a fraction of what is left and never
         reaches zero, so the token is never renewed at all.
 
-        A token with no more life than `UNMAINTAINABLE_LIFETIME_SECONDS` is a different thing entirely: no
+        A token too short for `_slack_for` to fit inside is a different thing entirely: no
         schedule can keep it usable, because the worker refuses it before there is room to renew. Renewing
         harder cannot help, so it is named once and left to the floor, and the worker's refusal is the
         report the operator acts on."""
         last = self._last_renewal.get(name)
         floor = 0.0 if last is None else max(0.0, MIN_RENEWAL_INTERVAL_SECONDS - (now - last))
-        if last is not None and stored.expires_at - last < UNMAINTAINABLE_LIFETIME_SECONDS:
+        slack = self._slack_for(name)
+        if last is not None and stored.expires_at - last < REFRESH_MARGIN_SECONDS + slack + int(
+            MIN_REFRESH_SLEEP_SECONDS
+        ):
             self._report_unmaintainable(name, stored.expires_at - last)
             return floor or MIN_RENEWAL_INTERVAL_SECONDS
         preferred = float(stored.expires_at - self._ahead - now)
-        deadline = float(stored.expires_at - REFRESH_MARGIN_SECONDS - RENEWAL_SLACK_SECONDS - now)
+        deadline = float(stored.expires_at - REFRESH_MARGIN_SECONDS - slack - now)
+        if last is not None and deadline < MIN_RENEWAL_INTERVAL_SECONDS:
+            self._report_frequent_renewals(name, stored.expires_at - last, deadline)
         return max(0.0, min(max(preferred, floor), deadline))
+
+    def _report_frequent_renewals(self, name: str, lifetime: int, interval: float) -> None:
+        """Said once, because it is a property of the provider rather than an event.
+
+        These tokens ARE served, with no gap -- the deadline beats the floor, which is the whole point of
+        the rule. But they are renewed oftener than the floor suggests, and an operator reading that
+        constant would otherwise be surprised by the traffic. Raising the unmaintainable threshold to the
+        floor instead would refuse a configuration that works perfectly well, which is the worse trade."""
+        if name in self._frequent:
+            return
+        self._frequent.add(name)
+        logger.warning(
+            "MCP server %r issues access tokens lasting about %ds, so keeping one usable needs a renewal "
+            "roughly every %.0fs -- oftener than the usual %.0fs. Calls are served normally; ask the "
+            "provider for a longer token lifetime to reduce the traffic.",
+            name, lifetime, max(interval, MIN_REFRESH_SLEEP_SECONDS), MIN_RENEWAL_INTERVAL_SECONDS,
+        )
 
     def _report_unmaintainable(self, name: str, lifetime: int) -> None:
         """Say it once per server. Repeating it every tick would bury the message it matters most to read."""
@@ -310,7 +355,7 @@ class TokenRefresher:
                 # Never logged in. There is nothing to renew and nothing to say that the worker will not
                 # say better, with the command to run, at the moment a call actually needs the token.
                 continue
-            if not self._still_refused(name, stored):
+            if not self._still_refused(name, server.oauth.token_store, stored):
                 continue
             held = self._wait_before_renewing(name, stored, now)
             if held > 0:
@@ -319,7 +364,16 @@ class TokenRefresher:
             soonest = min(soonest, self._renew(name, server, stored, now))
         return max(MIN_REFRESH_SLEEP_SECONDS, soonest)
 
-    def _still_refused(self, name: str, stored: StoredTokens) -> bool:
+    def _slack_for(self, name: str) -> int:
+        """How long before the worker's margin this server's renewal must start.
+
+        Five seconds early guarantees nothing if the renewal takes six: the gap moves rather than closes.
+        So the slack is at least the constant and at least twice the longest renewal this server has
+        actually taken, capped so one slow renewal cannot declare every token unmaintainable."""
+        observed = self._renewal_cost.get(name, 0.0)
+        return int(min(MAX_RENEWAL_SLACK_SECONDS, max(RENEWAL_SLACK_SECONDS, 2 * observed)))
+
+    def _still_refused(self, name: str, path: str, stored: StoredTokens) -> bool:
         """Whether this server is still carrying the authorization that was refused.
 
         Told apart by the refresh token, so logging in again brings the server back on its own. Without
@@ -328,7 +382,7 @@ class TokenRefresher:
         refused = self._refused.get(name)
         if refused is None:
             return True
-        if refused == _fingerprint(stored):
+        if refused == _fingerprint(path, stored):
             return False  # the same dead credential; asking again cannot help and can make it worse
         del self._refused[name]
         logger.info("MCP server %r: a new authorization was stored, so renewals resume", name)
@@ -338,6 +392,7 @@ class TokenRefresher:
         from .mcp_oauth import McpOAuthError, McpOAuthRefused, current_access_token  # noqa: PLC0415
 
         assert server.oauth is not None  # nosec B101 - as in `tick`
+        started = time.monotonic()
         try:
             current_access_token(
                 server_url=server.url,
@@ -354,7 +409,7 @@ class TokenRefresher:
         except McpOAuthRefused as error:
             # ANSWERED, and the answer was no. Retrying with THIS credential cannot help and can make it
             # worse; a different one, stored by a fresh login, is a different question and is asked.
-            self._refused[name] = _fingerprint(stored)
+            self._refused[name] = _fingerprint(server.oauth.token_store, stored)
             logger.error(
                 "MCP server %r: the authorization server refused to renew this authorization, and it will "
                 "not be offered again; run `portmark mcp login %s` and renewals resume on their own: %s",
@@ -368,6 +423,8 @@ class TokenRefresher:
             logger.exception("MCP server %r: renewing the access token raised unexpectedly", name)
             return REFRESH_RETRY_SECONDS
         self._last_renewal[name] = now
+        # What this server's renewals actually cost, so the slack can cover the next one.
+        self._renewal_cost[name] = max(self._renewal_cost.get(name, 0.0), time.monotonic() - started)
         return self._due_after_renewal(name, server, now)
 
     def _due_after_renewal(self, name: str, server: McpServerConfig, now: int) -> float:
