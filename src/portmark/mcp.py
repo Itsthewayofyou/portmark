@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import logging
 import os
 import signal
@@ -207,6 +208,11 @@ def _fingerprint(path: str, stored: StoredTokens) -> str:
     So the store's own identity is folded in as well: `write_tokens` replaces the file, which gives it a new
     inode and a new modification time even when the bytes are identical -- verified. That makes every
     successful login visible without adding a generation counter to the stored format.
+
+    The two signals are ADDITIVE, which is what makes the file identity safe to rely on: a filesystem that
+    reuses inodes or has coarse timestamps -- some network filesystems -- simply falls back to the token
+    material, which changes on any ordinary new grant. The only login that could escape both is one that
+    reissued byte-identical tokens with the same expiry second ON such a filesystem.
 
     Only ever compared with another fingerprint, so a digest carries everything needed and none of the
     material: this value is kept for the life of the process."""
@@ -422,10 +428,18 @@ class TokenRefresher:
         except Exception:  # noqa: BLE001 - a host must not fall over because a renewal did
             logger.exception("MCP server %r: renewing the access token raised unexpectedly", name)
             return REFRESH_RETRY_SECONDS
-        self._last_renewal[name] = now
         # What this server's renewals actually cost, so the slack can cover the next one.
-        self._renewal_cost[name] = max(self._renewal_cost.get(name, 0.0), time.monotonic() - started)
-        return self._due_after_renewal(name, server, now)
+        elapsed = time.monotonic() - started
+        self._renewal_cost[name] = max(self._renewal_cost.get(name, 0.0), elapsed)
+        # THE CLOCK HAS MOVED. The wait returned below is served from the moment this renewal finished, not
+        # from the moment it started, so scheduling on the `now` captured before the network request hands
+        # the elapsed time back as extra delay and quietly eats the head start the slack just bought.
+        # Measured before this line existed: a 2-second renewal cost 2 of the 30 seconds intended, and the
+        # reviewer's 20-second case cost 20 of them -- leaving 10. Rounded UP, because erring towards
+        # renewing early is the safe direction.
+        completed = now + math.ceil(elapsed)
+        self._last_renewal[name] = completed
+        return self._due_after_renewal(name, server, completed)
 
     def _due_after_renewal(self, name: str, server: McpServerConfig, now: int) -> float:
         """When the token just written needs renewing. READ BACK, never assumed.

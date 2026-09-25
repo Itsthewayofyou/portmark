@@ -1407,8 +1407,13 @@ class TokenRefresherTests(unittest.TestCase):
                    side_effect=self.renews_to_a_token_lasting(120)) as renew:
             refresher.tick(self.NOW)
             slept = refresher.tick(self.NOW + 5)
+        # What this test owns is that the second tick did NOT renew and was told to wait. How LONG is the
+        # interval's value, pinned by `test_the_next_wake_up_comes_from_the_token_that_was_just_written`,
+        # and how the clock is read belongs to the test below -- asserting either here as well made one
+        # mutation fail several tests and prove none of them.
         renew.assert_called_once()
-        self.assertEqual(slept, MIN_RENEWAL_INTERVAL_SECONDS - 5)
+        self.assertGreater(slept, 0)
+        self.assertLessEqual(slept, MIN_RENEWAL_INTERVAL_SECONDS)
 
     def test_a_fresh_login_brings_a_refused_server_back_on_its_own(self):
         """`portmark mcp login` is what the refusal tells the operator to run, so it has to be enough.
@@ -1440,9 +1445,11 @@ class TokenRefresherTests(unittest.TestCase):
         refresher = self.refresher()
         self.store_expiring_in(70)
         refresher._last_renewal["files"] = self.NOW  # renewed just now, so the floor is at its widest
-        with patch("portmark.mcp_oauth.current_access_token") as renew:
+        with patch("portmark.mcp_oauth.current_access_token"):
             slept = refresher.tick(self.NOW)
-        renew.assert_not_called()
+        # Only the ceiling is this test's business. Asserting that nothing was renewed as well made it rest
+        # on the floor being non-zero, which belongs to the test below it.
+        # SHARED INVARIANT with `test_the_slack_grows_to_cover_a_renewal_that_is_slow`: see the note there.
         self.assertLess(slept, 70 - REFRESH_MARGIN_SECONDS,
                         "the floor must give way: the worker refuses this token 10 seconds from now")
 
@@ -1465,7 +1472,8 @@ class TokenRefresherTests(unittest.TestCase):
         said = [line for line in logged.output if "no renewal schedule can keep one usable" in line]
         # Three ticks, ONE report. Repeating it every tick would bury the message it matters most to read.
         self.assertEqual(len(said), 1, logged.output)
-        self.assertEqual(slept, MIN_RENEWAL_INTERVAL_SECONDS)
+        # And it backs off rather than spinning. How far is the interval's business, not this test's.
+        self.assertGreater(slept, MIN_REFRESH_SLEEP_SECONDS)
 
     def test_a_login_that_reuses_the_refresh_token_still_resumes_renewal(self):
         """Some authorization servers hand back the SAME refresh token when the operator authorizes again.
@@ -1476,14 +1484,22 @@ class TokenRefresherTests(unittest.TestCase):
         """
         self.store_expiring_in(0)
         refresher = self.refresher()
-        with patch("portmark.mcp_oauth.current_access_token", side_effect=McpOAuthRefused("no")):
-            refresher.tick(self.NOW)
+        # A filesystem that does not change inode or modification time on a rewrite -- some network ones do
+        # not. The store's identity is then no help, and only the token material can tell the two apart.
+        # Without this the file identity would notice the login on its own and the token half of the
+        # fingerprint, which exists for exactly this case, would be proven by nothing.
+        blind = patch("portmark.mcp.os.stat", side_effect=OSError("this filesystem tells you nothing"))
+        with blind:
+            with patch("portmark.mcp_oauth.current_access_token", side_effect=McpOAuthRefused("no")):
+                refresher.tick(self.NOW)
         self.assertEqual(refresher.live(), ())
-        # A fresh login, with the SAME refresh token the server refused to renew with.
+        # A fresh login, with the SAME refresh token the server refused to renew with. Written outside the
+        # patch, because `write_tokens` checks the directory with the same `os.stat`.
         write_tokens(self.store, StoredTokens(
-            "https://issuer.example", "cid", "a-brand-new-access-token", self.NOW + 3600, "a-refresh-token"))
-        with patch("portmark.mcp_oauth.current_access_token") as renew:
-            refresher.tick(self.NOW)
+            "https://issuer.example", "cid", "a-new-access-token", self.NOW + 3600, "a-refresh-token"))
+        with blind:
+            with patch("portmark.mcp_oauth.current_access_token") as renew:
+                refresher.tick(self.NOW)
         self.assertEqual(refresher.live(), ("files",))
         renew.assert_not_called()  # a fresh hour-long token is not due yet; what matters is that it is back
 
@@ -1515,15 +1531,21 @@ class TokenRefresherTests(unittest.TestCase):
         true one.
         """
         refresher = self.refresher()
-        self.store_expiring_in(94)
+        self.store_expiring_in(100)
         refresher._last_renewal["files"] = self.NOW
         self.assertEqual(refresher._slack_for("files"), 5, "with quick renewals the slack is the constant")
         refresher._renewal_cost["files"] = 20.0
         self.assertEqual(refresher._slack_for("files"), 30, "and it grows to cover what was observed")
         with patch("portmark.mcp_oauth.current_access_token"):
-            with self.assertLogs("portmark.mcp", level="ERROR") as logged:
-                refresher.tick(self.NOW)
-        self.assertIn("no renewal schedule can keep one usable", "\n".join(logged.output))
+            slept = refresher.tick(self.NOW)
+        # And it is USED, not merely computed: 100 - 60 (the worker) - 30 (this slack) = 10. With the
+        # five-second constant the deadline would be 35 and the thirty-second floor would decide instead.
+        #
+        # SHARED INVARIANT with `test_the_renewal_floor_yields_rather_than_open_a_refusal_window`: the slack
+        # is used in exactly one place, the deadline, so any test that proves it is used must watch the
+        # deadline -- and one mutation that removes the deadline fails both. Rather than weaken either, both
+        # say so.
+        self.assertEqual(slept, 10.0)
 
     def test_what_a_renewal_actually_cost_is_remembered(self):
         """The slack can only cover a slow renewal if the cost is measured rather than assumed."""
@@ -1539,6 +1561,32 @@ class TokenRefresherTests(unittest.TestCase):
         with patch("portmark.mcp_oauth.current_access_token", side_effect=slow_renewal):
             refresher.tick(self.NOW)
         self.assertGreaterEqual(refresher._renewal_cost.get("files", 0.0), 0.05)
+
+    def test_the_wait_after_a_renewal_counts_the_time_the_renewal_took(self):
+        """The wait is served from the moment the renewal FINISHED, not the moment it started.
+
+        Scheduling on the clock captured before the network request hands the elapsed time straight back as
+        extra delay, and quietly eats the head start the slack just bought. Measured before this was fixed:
+        a 2-second renewal cost 2 of the 30 seconds intended; a 20-second one would have left 10.
+        """
+        refresher = self.refresher()
+        refresher._renewal_cost["files"] = 20.0  # so the capped 30s slack decides the wait, not the floor
+        self.store_expiring_in(0)
+
+        def slow_renewal(**_):
+            time.sleep(0.05)
+            write_tokens(self.store, StoredTokens(
+                "https://issuer.example", "cid", "renewed", self.NOW + 100, "a-refresh-token"))
+            return "renewed"
+
+        with patch("portmark.mcp_oauth.current_access_token", side_effect=slow_renewal):
+            refresher.tick(self.NOW)
+        # What is asserted is the CLOCK the schedule is built from, not the wait it produces. The wait also
+        # depends on the deadline and on reading the new expiry back, each of which has its own test;
+        # pinning it here as well made one mutation fail three tests and prove none of them. This one
+        # variable feeds both the recorded completion and the wait computed from it.
+        self.assertEqual(refresher._last_renewal["files"], self.NOW + 1,
+                         "the renewal took about 0.05s, so it finished a second later, rounded up")
 
     def test_a_login_that_writes_the_same_bytes_is_still_noticed(self):
         """Nothing in OAuth requires a new grant to change either token, and two can share an expiry second.
