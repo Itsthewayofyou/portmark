@@ -390,10 +390,12 @@ Two commitments go with it:
   releases 0.1.0 through 0.9.2 — was released under the MIT License, and that grant is not withdrawn.
   The text is kept in [LICENSE-MIT](https://github.com/Itsthewayofyou/portmark/blob/main/LICENSE-MIT).
 - **An abandonment pledge.** If twelve consecutive months pass with no substantive maintenance — no
-  release, and no merged fix or functional change — the most recent release becomes additionally
-  available under Apache-2.0, automatically, and the grant binds whoever owns Portmark by then.
-  Depending on a security boundary is a long commitment, and this is the floor under it. `NOTICE` has
-  the exact definition; a typo fix or a dependency bump does not reset the clock.
+  release, and no merged fix or functional change — Portmark is dormant. Anyone may then ask, in
+  public, whether it is still maintained; if thirty more days pass with still no maintenance, the most
+  recent release becomes additionally available under Apache-2.0, automatically, and the grant binds
+  whoever owns Portmark by then. Depending on a security boundary is a long commitment, and this is
+  the floor under it. `NOTICE` has the exact wording: a typo fix or a dependency bump does not reset
+  the clock, and taking the repository down does not defeat the grant.
 
 The license grants no trademark rights; see
 [TRADEMARKS.md](https://github.com/Itsthewayofyou/portmark/blob/main/TRADEMARKS.md) for what you may

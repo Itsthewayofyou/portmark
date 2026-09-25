@@ -17,8 +17,9 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
   stays MIT permanently**, including PyPI releases 0.1.0 through 0.9.2; that grant is not withdrawn
   and the text is kept in `LICENSE-MIT`. Alongside it, an irrevocable grant that binds successors: if
   twelve consecutive months pass with no substantive maintenance -- no release, and no merged fix or
-  functional change -- the most recent release becomes additionally available under Apache-2.0. See
-  `NOTICE`, `TRADEMARKS.md` and `CONTRIBUTING.md`.
+  functional change -- Portmark is dormant, and if a public request for confirmation then goes thirty
+  days unanswered, the most recent release becomes additionally available under Apache-2.0. Taking the
+  repository down does not defeat that. See `NOTICE`, `TRADEMARKS.md` and `CONTRIBUTING.md`.
 
 - **The MCP scope decisions are written down rather than merely true.** `portmark.asgi:create_app` installs
   no MCP tools, and that is now stated as a decision with its reason: it is an importable factory, and

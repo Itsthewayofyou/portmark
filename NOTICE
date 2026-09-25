@@ -66,13 +66,28 @@ default branch: automated dependency updates; changes only to documentation,
 comments, formatting, tests, licensing or project metadata; and changes made by
 automation without human review.
 
-If twelve consecutive months pass with no Qualifying Maintenance Event, then from
-the end of that period the most recent release as of that date becomes
-additionally available under the Apache License 2.0, at the option of any
-recipient, without further action by anyone.
+If twelve consecutive months pass with no Qualifying Maintenance Event, Portmark
+is **dormant**. Any person may then publish a written request for confirmation
+that Portmark is still maintained, by opening a public issue at
+<https://github.com/Itsthewayofyou/portmark/issues> or by writing to the licensor.
+
+If no Qualifying Maintenance Event occurs within thirty days after such a request,
+then at the end of those thirty days the most recent release of Portmark existing
+at that point becomes additionally available under the Apache License 2.0, at the
+option of any recipient, and without further action by anyone, including the
+licensor.
+
+If the repository named above is unavailable, or no means of making the request is
+published, the thirty days are not required and those rights vest at the end of
+the twelve months.
+
+The thirty days exist only so that the grant cannot vest while nobody has yet
+noticed that Portmark is dormant. They are not an opportunity to defeat it: the
+request may be made by anyone, at any time once Portmark is dormant, and as often
+as necessary.
 
 This is a present and irrevocable grant of those Apache License 2.0 rights,
-conditioned only on the objective event described above, and not a promise to
+conditioned only on the objective events described above, and not a promise to
 grant them in future. It applies to every release of Portmark made under the
 Elastic License 2.0. It binds the licensor and the licensor's successors,
 assigns, heirs and any later owner of the copyright in Portmark, and it survives
