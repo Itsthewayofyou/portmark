@@ -1,0 +1,103 @@
+Portmark
+Copyright (c) 2026 Josh (Itsthewayofyou)
+
+The licensor of Portmark, for the purposes of the Elastic License 2.0 in LICENSE,
+is Josh (Itsthewayofyou).
+
+Contributors retain copyright in their own contributions, and license them to the
+licensor on the terms in CONTRIBUTING.md.
+
+--------------------------------------------------------------------------------
+Current license
+--------------------------------------------------------------------------------
+
+Portmark is available under the Elastic License 2.0. The full text is in LICENSE.
+
+In plain terms, and without replacing or narrowing that text: you may use, copy,
+modify and redistribute Portmark, including inside your own commercial product and
+including deployment inside your own organization at any scale, at no charge. What
+you may not do is provide Portmark to third parties as a hosted or managed service
+where the service provides users with access to any substantial set of the features
+or functionality of Portmark.
+
+Where this summary and LICENSE differ, LICENSE governs.
+
+The Elastic License 2.0 is a source-available license. It is not an OSI-approved
+open-source license, because it restricts one field of use. Portmark states this
+plainly rather than describing itself as open source.
+
+--------------------------------------------------------------------------------
+Earlier versions remain MIT, permanently
+--------------------------------------------------------------------------------
+
+Every version of Portmark up to and including the commit tagged `last-mit` was
+released under the MIT License, whose text is preserved in LICENSE-MIT. That
+grant is perpetual and is not withdrawn by this change. It covers:
+
+  * every commit up to and including the `last-mit` tag; and
+  * the PyPI releases 0.1.0, 0.2.0, 0.3.0, 0.3.1, 0.4.0, 0.4.1, 0.6.1, 0.8.0,
+    0.9.0, 0.9.1 and 0.9.2.
+
+Anyone who obtained any of those may continue to use them under the MIT License
+for as long as they wish. Nothing here asks for those rights back.
+
+The Elastic License 2.0 applies only to commits made after the `last-mit` tag,
+and to releases made from them.
+
+--------------------------------------------------------------------------------
+Abandonment pledge
+--------------------------------------------------------------------------------
+
+Portmark is a security boundary. Depending on one is a long commitment, so the
+licensor makes the following additional grant. It is made here rather than in
+LICENSE, and it adds to the Elastic License 2.0 without altering it.
+
+A **Qualifying Maintenance Event** is either of the following, applied to Portmark
+itself rather than to the material around it:
+
+  (a) the publication of a release of Portmark; or
+  (b) a change merged into the default branch of
+      <https://github.com/Itsthewayofyou/portmark> that fixes a security problem,
+      fixes a defect, restores or extends compatibility, or adds to or changes
+      Portmark's functionality.
+
+The following are **not** Qualifying Maintenance Events, however they reach the
+default branch: automated dependency updates; changes only to documentation,
+comments, formatting, tests, licensing or project metadata; and changes made by
+automation without human review.
+
+If twelve consecutive months pass with no Qualifying Maintenance Event, Portmark
+is **dormant**. Any person may then publish a written request for confirmation
+that Portmark is still maintained, by opening a public issue at
+<https://github.com/Itsthewayofyou/portmark/issues> or by writing to the licensor.
+
+If no Qualifying Maintenance Event occurs within thirty days after such a request,
+then at the end of those thirty days the most recent release of Portmark existing
+at that point becomes additionally available under the Apache License 2.0, at the
+option of any recipient, and without further action by anyone, including the
+licensor.
+
+If the repository named above is unavailable, or no means of making the request is
+published, the thirty days are not required and those rights vest at the end of
+the twelve months.
+
+The thirty days exist only so that the grant cannot vest while nobody has yet
+noticed that Portmark is dormant. They are not an opportunity to defeat it: the
+request may be made by anyone, at any time once Portmark is dormant, and as often
+as necessary.
+
+This is a present and irrevocable grant of those Apache License 2.0 rights,
+conditioned only on the objective events described above, and not a promise to
+grant them in future. It applies to every release of Portmark made under the
+Elastic License 2.0. It binds the licensor and the licensor's successors,
+assigns, heirs and any later owner of the copyright in Portmark, and it survives
+the licensor's death, incapacity, or sale or transfer of the project. It is a
+floor, not a ceiling: the licensor may always grant broader terms.
+
+--------------------------------------------------------------------------------
+Trademarks
+--------------------------------------------------------------------------------
+
+The Elastic License 2.0 grants no trademark rights. "Portmark" and the Portmark
+logo are marks of the licensor. TRADEMARKS.md says what is permitted without
+asking, and what is not.
