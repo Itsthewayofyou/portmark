@@ -1234,21 +1234,12 @@ class InMemoryRuntimeStore:
         with self._lock:
             events = self._audit_events.get(task_id, [])
             head = self._audit_heads.get(task_id)
-            if not events or head is None:
-                return AuditVerificationResult("invalid", "audit chain is missing")
-            previous = events[0]["previous"]
-            for expected_sequence, event in enumerate(events):
-                if event["sequence"] != expected_sequence or event["previous"] != previous:
-                    return AuditVerificationResult("invalid", "audit chain sequence or previous hash is inconsistent")
-                if not _audit_event_hash_matches(
-                    event["sequence"], event["event"], event["details"], event["previous"], event.get("host_id", ""), event["hash"]
-                ):
-                    return AuditVerificationResult("invalid", "audit event hash is invalid")
-                previous = event["hash"]
-            if head["head_hash"] != previous or head["sequence"] != len(events):
-                return AuditVerificationResult("invalid", "stored audit head does not match audit events")
-            head_result = _verify_head_signature(self._audit_head_verifier, task_id, head)
-            return _check_migration_anchor(self._audit_head_verifier, head_result, events[0]["details"], allow_legacy_anchor)
+            rows = [
+                {"sequence": event["sequence"], "event": event["event"], "details": event["details"],
+                 "previous_hash": event["previous"], "hash": event["hash"], "host_id": event.get("host_id", "")}
+                for event in events
+            ]
+            return _verify_audit_rows(self._audit_head_verifier, task_id, rows, head, allow_legacy_anchor)
 
     def verify_audit_chain(self, task_id: str) -> bool:
         return self.verify_audit_chain_status(task_id).valid
@@ -2448,43 +2439,7 @@ class SQLiteRuntimeStore:
                 "SELECT head_hash, sequence, host_id, signature_key_id, signature, signed_at FROM audit_heads WHERE task_id = ?",
                 (task_id,),
             ).fetchone()
-        if not rows or head is None:
-            return AuditVerificationResult("invalid", "audit chain is missing")
-        previous = rows[0]["previous_hash"] if rows else ""
-        first_details: Any = None
-        for expected_sequence, row in enumerate(rows):
-            if row["sequence"] != expected_sequence or row["previous_hash"] != previous:
-                return AuditVerificationResult("invalid", "audit chain sequence or previous hash is inconsistent")
-            try:
-                details = json.loads(row["details_json"])
-            except json.JSONDecodeError:
-                return AuditVerificationResult("invalid", "audit event details are malformed")
-            if expected_sequence == 0:
-                first_details = details
-            if not _audit_event_hash_matches(
-                row["sequence"], row["event"], details, row["previous_hash"], row["host_id"], row["hash"]
-            ):
-                return AuditVerificationResult("invalid", "audit event hash is invalid")
-            previous = row["hash"]
-        try:
-            head_sequence = int(head["sequence"])
-        except (TypeError, ValueError):
-            return AuditVerificationResult("invalid", "signed audit head sequence is malformed")
-        if head["head_hash"] != previous or head_sequence != len(rows):
-            return AuditVerificationResult("invalid", "stored audit head does not match audit events")
-        head_result = _verify_head_signature(
-            self._audit_head_verifier,
-            task_id,
-            {
-                "head_hash": head["head_hash"],
-                "sequence": head_sequence,
-                "host_id": head["host_id"],
-                "signature_key_id": head["signature_key_id"],
-                "signature": head["signature"],
-                "signed_at": head["signed_at"],
-            },
-        )
-        return _check_migration_anchor(self._audit_head_verifier, head_result, first_details, allow_legacy_anchor)
+        return _verify_audit_rows(self._audit_head_verifier, task_id, rows, head, allow_legacy_anchor)
 
     def verify_audit_chain(self, task_id: str) -> bool:
         return self.verify_audit_chain_status(task_id).valid
@@ -3251,43 +3206,7 @@ class PostgresRuntimeStore:
                 "SELECT head_hash, sequence, host_id, signature_key_id, signature, signed_at FROM audit_heads WHERE task_id = %s",
                 (task_id,),
             ).fetchone()
-        if not rows or head is None:
-            return AuditVerificationResult("invalid", "audit chain is missing")
-        previous = rows[0]["previous_hash"] if rows else ""
-        first_details: Any = None
-        for expected_sequence, row in enumerate(rows):
-            if row["sequence"] != expected_sequence or row["previous_hash"] != previous:
-                return AuditVerificationResult("invalid", "audit chain sequence or previous hash is inconsistent")
-            try:
-                details = json.loads(row["details_json"])
-            except json.JSONDecodeError:
-                return AuditVerificationResult("invalid", "audit event details are malformed")
-            if expected_sequence == 0:
-                first_details = details
-            if not _audit_event_hash_matches(
-                row["sequence"], row["event"], details, row["previous_hash"], row["host_id"], row["hash"]
-            ):
-                return AuditVerificationResult("invalid", "audit event hash is invalid")
-            previous = row["hash"]
-        try:
-            head_sequence = int(head["sequence"])
-        except (TypeError, ValueError):
-            return AuditVerificationResult("invalid", "signed audit head sequence is malformed")
-        if head["head_hash"] != previous or head_sequence != len(rows):
-            return AuditVerificationResult("invalid", "stored audit head does not match audit events")
-        head_result = _verify_head_signature(
-            self._audit_head_verifier,
-            task_id,
-            {
-                "head_hash": head["head_hash"],
-                "sequence": head_sequence,
-                "host_id": head["host_id"],
-                "signature_key_id": head["signature_key_id"],
-                "signature": head["signature"],
-                "signed_at": head["signed_at"],
-            },
-        )
-        return _check_migration_anchor(self._audit_head_verifier, head_result, first_details, allow_legacy_anchor)
+        return _verify_audit_rows(self._audit_head_verifier, task_id, rows, head, allow_legacy_anchor)
 
     def verify_audit_chain(self, task_id: str) -> bool:
         return self.verify_audit_chain_status(task_id).valid
@@ -4014,6 +3933,46 @@ LEGACY_ANCHOR_ALLOWED_REASON = (
     "legacy migration anchor accepted by --allow-legacy-anchor: the source proof was NOT independently "
     "reverified (compatibility mode, not an equivalent security mode)"
 )
+
+
+def _verify_audit_rows(
+    verifier: AuditHeadVerifier | None, task_id: str, rows: list[Any], head: Any, allow_legacy_anchor: bool
+) -> AuditVerificationResult:
+    """Check one snapshot of a task's audit chain: every link, every event hash, the head, its signature.
+
+    Every store reads its events and head from ONE snapshot (Section 10 F3) and hands them here, so the
+    check itself has a single implementation. `rows` are in sequence order, each with sequence, event,
+    previous_hash, hash, host_id, and either the decoded `details` or the stored `details_json`.
+    """
+    if not rows or head is None:
+        return AuditVerificationResult("invalid", "audit chain is missing")
+    previous = rows[0]["previous_hash"]
+    first_details: Any = None
+    for expected_sequence, row in enumerate(rows):
+        if row["sequence"] != expected_sequence or row["previous_hash"] != previous:
+            return AuditVerificationResult("invalid", "audit chain sequence or previous hash is inconsistent")
+        if "details" in row.keys():
+            details = row["details"]
+        else:
+            try:
+                details = json.loads(row["details_json"])
+            except json.JSONDecodeError:
+                return AuditVerificationResult("invalid", "audit event details are malformed")
+        if expected_sequence == 0:
+            first_details = details
+        if not _audit_event_hash_matches(
+            row["sequence"], row["event"], details, row["previous_hash"], row["host_id"], row["hash"]
+        ):
+            return AuditVerificationResult("invalid", "audit event hash is invalid")
+        previous = row["hash"]
+    try:
+        head_sequence = int(head["sequence"])
+    except (TypeError, ValueError):
+        return AuditVerificationResult("invalid", "signed audit head sequence is malformed")
+    if head["head_hash"] != previous or head_sequence != len(rows):
+        return AuditVerificationResult("invalid", "stored audit head does not match audit events")
+    head_result = _verify_head_signature(verifier, task_id, {**dict(head), "sequence": head_sequence})
+    return _check_migration_anchor(verifier, head_result, first_details, allow_legacy_anchor)
 
 
 def _check_migration_anchor(
