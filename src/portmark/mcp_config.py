@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
 
-from .json_guard import StrictJSONError, strict_json_loads
+from .json_guard import StrictJSONError, reject_unknown_keys, strict_json_loads
 from .models import MAX_TOOL_NAME_LENGTH, validate_tool_name
 from .security import canonical_json
 
@@ -123,12 +123,6 @@ def request_timeout(total_seconds: float) -> float:
     return max(1.0, total_seconds / 4)
 
 
-def _reject_unknown(value: Mapping[str, Any], allowed: tuple[str, ...], label: str) -> None:
-    unknown = sorted(set(value) - set(allowed))
-    if unknown:
-        raise McpConfigError(f"{label} has unknown keys: {unknown}")
-
-
 @dataclass(frozen=True)
 class McpToolConfig:
     """One approved tool: what it is called on the server, what Portmark registers it as, and its pin."""
@@ -198,7 +192,7 @@ def _tool_from_spec(server: str, tool: str, value: Any) -> McpToolConfig:
         raise McpConfigError(f"{label}: a server tool name must match {_SERVER_TOOL_NAME.pattern}")
     if not isinstance(value, dict):
         raise McpConfigError(f"{label} must be an object")
-    _reject_unknown(value, TOOL_FIELDS, label)
+    reject_unknown_keys(value, TOOL_FIELDS, label, McpConfigError)
     pin = value.get("pin")
     if not isinstance(pin, str) or not _PIN.match(pin):
         raise McpConfigError(f"{label}.pin must be 'sha256:' plus 64 lower-case hex characters; run `portmark mcp pin`")
@@ -238,7 +232,7 @@ def _server_from_spec(name: str, value: Any) -> McpServerConfig:
         raise McpConfigError(f"server name {name!r} must match {_SERVER_NAME.pattern}")
     if not isinstance(value, dict):
         raise McpConfigError(f"{label} must be an object")
-    _reject_unknown(value, SERVER_FIELDS, label)
+    reject_unknown_keys(value, SERVER_FIELDS, label, McpConfigError)
     transport = _transport_of(value, label)
     _reject_foreign_keys(value, transport, label)
     command, args, secret_env = "", [], []
@@ -294,7 +288,7 @@ def _oauth_from_spec(value: Any, label: str) -> McpOAuthConfig:
     """The `oauth` block: variable NAMES, a store path, and the scopes to ask for."""
     if not isinstance(value, dict):
         raise McpConfigError(f"{label} must be an object")
-    _reject_unknown(value, OAUTH_FIELDS, label)
+    reject_unknown_keys(value, OAUTH_FIELDS, label, McpConfigError)
     client_id_env = value.get("client_id_env")
     if not isinstance(client_id_env, str) or not _ENV_NAME.match(client_id_env):
         raise McpConfigError(f"{label}.client_id_env must be the NAME of an environment variable, not a client id")
@@ -379,7 +373,7 @@ def config_from_bytes(raw: bytes, path: str = "") -> McpConfig:
         raise McpConfigError(f"MCP config is not valid JSON: {error}") from error
     if not isinstance(document, dict):
         raise McpConfigError("MCP config must be a JSON object")
-    _reject_unknown(document, ("schema", "servers"), "MCP config")
+    reject_unknown_keys(document, ("schema", "servers"), "MCP config", McpConfigError)
     if document.get("schema") != CONFIG_SCHEMA:
         raise McpConfigError(f"MCP config schema must be {CONFIG_SCHEMA!r}")
     raw_servers = document.get("servers")
