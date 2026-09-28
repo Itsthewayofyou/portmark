@@ -29,7 +29,7 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
   to be imported and is now refused before any import.
 - **Guarded clean-ups, same behaviour.** The strict Base64URL codec and two field validators moved from
   `security.py` to a neutral `_encoding.py` that policy, the witness client and the CLI import instead of
-  `security.py`'s private helpers (the CI coverage gate now includes `_encoding.py`). OAuth client
+  `security.py`'s private helpers (`_encoding.py` has its own CI coverage gate). OAuth client
   credentials are read through one small resolver; `McpOAuthConfig` stays names only. The SDK agent card is
   the local card round-tripped through the pinned SDK (a test asserts the round trip is exact). The A2A card
   and task are built as literals; the parsing types are unchanged and the output is identical. The Wasm
