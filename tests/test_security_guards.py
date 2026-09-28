@@ -9,8 +9,6 @@ from pathlib import Path
 from portmark.models import AgentEnvelope, AgentManifest, AgentState, Permit, ResourceBudget, ToolGrant
 from portmark.policy import load_host_policy
 from portmark.security import (
-    ApprovalAuthority,
-    AttestationAuthority,
     AttestationPolicy,
     EnvelopeSigner,
     ExternalAttestationVerifier,
@@ -26,6 +24,7 @@ from portmark.security import (
     load_trust_registry,
     validate_constraints,
 )
+from authority_fixtures import ApprovalAuthority, AttestationAuthority
 
 
 NOW = 2_000_000

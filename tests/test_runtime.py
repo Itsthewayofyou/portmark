@@ -46,8 +46,6 @@ from portmark.providers import GenericHttpProvider, ModelProvider, NativeWasmtim
 from portmark.policy import load_host_policy
 from portmark.security import (
     AUDIT_HASH_VERSION,
-    ApprovalAuthority,
-    AttestationAuthority,
     AttestationPolicy,
     AuditLog,
     EnvelopeSigner,
@@ -64,6 +62,7 @@ from portmark.security import (
     generate_signing_material,
     load_trust_registry,
 )
+from authority_fixtures import ApprovalAuthority, AttestationAuthority
 from portmark.host import AgentHost
 from portmark.storage import POSTGRES_SCHEMA_VERSION, SQLITE_BUSY_TIMEOUT_MS, SQLITE_SCHEMA_VERSION, InMemoryRuntimeStore, PostgresRuntimeStore, SQLiteRuntimeStore
 from portmark.cli import main as cli_main

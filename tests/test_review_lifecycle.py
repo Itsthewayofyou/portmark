@@ -25,7 +25,8 @@ from dataclasses import asdict
 
 from portmark.models import ProviderDecision, ResourceBudget, ToolGrant
 from portmark.providers import ModelProvider
-from portmark.security import ApprovalAuthority, HostPolicy, PermitExpiredError, SecurityError
+from portmark.security import HostPolicy, PermitExpiredError, SecurityError
+from authority_fixtures import ApprovalAuthority
 from portmark.storage import SQLiteRuntimeStore
 from test_section12_capacity_clock import FakeTime
 
