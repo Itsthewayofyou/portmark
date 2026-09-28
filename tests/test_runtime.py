@@ -4856,6 +4856,28 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(timed_out, "deadline not enforced while the stdin write blocked")
         self.assertLess(elapsed, 3.0, "stdin write bypassed the execution deadline")
 
+    def test_wasm_bounded_releases_the_worker_on_start_failure_and_on_an_error_after_launch(self):
+        # The launched process tree owns cleanup. A child that cannot start raises and leaves nothing
+        # behind; an error after launch (here the reader threads cannot start) still stops the child
+        # AND reaps it, so no zombie outlives the failed call.
+        from portmark import providers
+
+        with self.assertRaises(OSError):
+            providers._run_bounded([str(Path(tempfile.gettempdir()) / "no-such-portmark-worker")], b"",
+                                   timeout=1, max_output_bytes=10, env=dict(os.environ))
+        launched = []
+
+        def launch(argv, popen_kwargs):
+            launched.append(providers._launch_plain(argv, popen_kwargs))
+            return launched[-1]
+
+        env = dict(os.environ, PROD_SLEEP="30")  # would outlive the test if nothing stopped it
+        with patch.object(threading.Thread, "start", side_effect=RuntimeError("can't start new thread")):
+            with self.assertRaisesRegex(RuntimeError, "can't start new thread"):
+                providers._run_bounded([sys.executable, self._write_producer()], b"", timeout=30,
+                                       max_output_bytes=10, env=env, launch=launch)
+        self.assertIsNotNone(launched[0].returncode, "the child was not stopped and reaped")
+
     @contextmanager
     def _three_store_context(self, backend):
         # Three stores (2 sources + 1 destination) on one backend, for the section 4 #7
