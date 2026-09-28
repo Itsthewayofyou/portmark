@@ -49,7 +49,8 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey,
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from .json_guard import StrictJSONError, strict_json_loads
-from .security import _b64url_decode, _b64url_encode, canonical_json
+from ._encoding import b64url_decode as _b64url_decode, b64url_encode as _b64url_encode
+from .security import canonical_json
 from .witness import FORKED, ROLLED_BACK, FloorError
 
 REQUEST_DOMAIN = b"portmark.witness.request.v1\n"

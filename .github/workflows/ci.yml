@@ -45,8 +45,9 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Check security.py coverage
         run: |
-          coverage run --source=portmark.security -m unittest discover -s tests -q
-          coverage report --include='src/portmark/security.py' --fail-under=95
+          # _encoding.py holds the strict Base64URL codec the signature checks rely on (finding #6).
+          coverage run --source=portmark.security,portmark._encoding -m unittest discover -s tests -q
+          coverage report --include='src/portmark/security.py,src/portmark/_encoding.py' --fail-under=95
       - name: Run parser fuzz target
         run: python tests/fuzz_a2a_parser.py
       - name: Run security scan

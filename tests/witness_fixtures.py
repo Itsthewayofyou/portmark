@@ -9,7 +9,7 @@ from pathlib import Path
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from portmark.remote_witness import WitnessClient, public_key_bytes
-from portmark.security import _b64url_encode
+from portmark._encoding import b64url_encode as _b64url_encode
 from portmark.witness_server import ENROLMENT_FORMAT, Enrolment, WitnessLog, WitnessService, make_witness_app
 
 HOST = "host:alpha"

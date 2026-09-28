@@ -571,7 +571,7 @@ def _run_time_floor(parser: argparse.ArgumentParser, args: argparse.Namespace, c
 def _run_witness(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     """EV-013: the reference remote witness. It needs no host, store, or trust registry."""
     from .remote_witness import generate_key_file, key_id_for
-    from .security import _b64url_encode
+    from ._encoding import b64url_encode as _b64url_encode
 
     if args.witness_command == "keygen":
         try:
