@@ -8000,8 +8000,9 @@ class RuntimeTests(unittest.TestCase):
     def test_local_and_sdk_agent_cards_are_identical(self):
         """Both adapters must serve the same card.
 
-        The card is swapped rather than stacked when --a2a-adapter changes, so
-        without this the two modes can silently diverge.
+        The SDK adapter serves the local card after a round trip through the SDK's
+        strict AgentCard. This asserts the round trip is exact: the pinned SDK
+        neither drops nor adds a field, with or without bearer auth.
         """
         for require_auth in (True, False):
             with self.subTest(require_auth=require_auth):
