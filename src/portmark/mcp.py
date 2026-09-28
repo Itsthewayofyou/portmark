@@ -59,20 +59,6 @@ MIN_RENEWAL_INTERVAL_SECONDS = 30.0
 RENEWAL_SLACK_SECONDS = 5
 # ...but not without limit, or one slow renewal would declare every token unmaintainable.
 MAX_RENEWAL_SLACK_SECONDS = 30
-# The SMALLEST token lifetime that can still be served without a gap, when renewals are quick. Each
-# issuance is usable for only `lifetime - REFRESH_MARGIN_SECONDS` seconds, so anything shorter would need
-# renewing oftener than the loop can even wake -- a storm against the authorization server, not a refresh.
-# Measured by walking the clock over the real rule: a 70-second token is served with no gap at all, a
-# 69-second one is not, and the difference is exactly these three terms. Below it the honest answer is to
-# stop and say so, so calls fail closed with one precise line instead of flapping with no explanation.
-#
-# This is the DEFAULT. The real threshold is computed per server from `_slack_for`, which grows when that
-# server's renewals are slow -- if a renewal takes twenty seconds, a seventy-second token really cannot be
-# kept usable, and pretending otherwise with a constant would be the comfortable answer rather than the
-# true one.
-UNMAINTAINABLE_LIFETIME_SECONDS = (
-    REFRESH_MARGIN_SECONDS + RENEWAL_SLACK_SECONDS + int(MIN_REFRESH_SLEEP_SECONDS)
-)
 MAX_REFRESH_SLEEP_SECONDS = 300.0
 MAX_PROBE_BYTES = 1 << 20
 PROBE_CHUNK_BYTES = 1 << 16
@@ -299,6 +285,13 @@ class TokenRefresher:
         last = self._last_renewal.get(name)
         floor = 0.0 if last is None else max(0.0, MIN_RENEWAL_INTERVAL_SECONDS - (now - last))
         slack = self._slack_for(name)
+        # The smallest lifetime that can be served without a gap. Each issuance is usable for only
+        # `lifetime - REFRESH_MARGIN_SECONDS` seconds, so anything shorter would need renewing oftener than
+        # the loop can even wake -- a storm against the authorization server, not a refresh. With quick
+        # renewals that is 60 + 5 + 5 = 70 seconds: a 70-second token is served with no gap, a 69-second one
+        # is not. The slack is per server and grows when its renewals are slow, so a fixed constant here
+        # would be the comfortable answer rather than the true one. Below it, calls fail closed with one
+        # precise line instead of flapping with no explanation.
         if last is not None and stored.expires_at - last < REFRESH_MARGIN_SECONDS + slack + int(
             MIN_REFRESH_SLEEP_SECONDS
         ):
