@@ -175,8 +175,7 @@ residual risks.
 
 Envelopes are signed with Ed25519 by default and verified through a key-ID-based trust registry.
 See [SIGNING_KEYS.md](https://github.com/Itsthewayofyou/portmark/blob/main/SIGNING_KEYS.md) for key generation, rotation, revocation, trust
-bootstrap guidance, and why SPIFFE is a planned opt-in rather than the trust root. The legacy HMAC signer is retained only behind
-`PORTMARK_ALLOW_LEGACY_HMAC=unsafe-test-only` plus an explicit `PORTMARK_SIGNING_KEY`.
+bootstrap guidance, and why SPIFFE is a planned opt-in rather than the trust root. The legacy HMAC signer was removed; setting `PORTMARK_ALLOW_LEGACY_HMAC` now stops the host at boot instead of falling back to a generated key.
 
 ## Run it
 
@@ -347,7 +346,7 @@ pending. Without a dispatcher a migration stays durably pending and is never del
 Portmark is **reference-complete with six named substitution points**. Signing and trust,
 transactional persistence, the A2A 1.0 surface, external policy with approval gates, WIT-shaped
 Wasm execution, and confidential-computing attestation are all implemented and covered by the
-regression suite. [PRODUCTION_TASKS.md](https://github.com/Itsthewayofyou/portmark/blob/main/PRODUCTION_TASKS.md) holds the task-level record.
+regression suite. [CHANGELOG.md](CHANGELOG.md) holds the task-level record.
 
 It is a reference implementation: read it, fork it, and substitute the seams below. It is not
 intended as a drop-in production dependency.

@@ -19,13 +19,13 @@ from pathlib import Path
 from portmark.a2a import envelope_from_dict
 from portmark.factory import make_demo_envelope, make_host
 from portmark.security import (
-    AttestationAuthority,
     AttestationPolicy,
     EnvelopeSigner,
     ExternalMigrationPreflight,
     MigrationPolicy,
     SecurityError,
 )
+from authority_fixtures import AttestationAuthority
 from portmark.storage import SQLiteRuntimeStore
 from test_runtime import MigrateThenCompleteProvider, _StubMigrationAttester, trust_signer
 

@@ -692,28 +692,13 @@ class RuntimeStore(Protocol):
         two concurrent reconcile executions. Returns True iff the lease was extended."""
         ...
 
-    def consumed_nonce_exists(self, nonce: str) -> bool:
-        ...
-
     def load_checkpoint(self, task_id: str) -> dict[str, Any] | None:
-        ...
-
-    def checkpoint_owner(self, task_id: str) -> tuple[str | None, str | None] | None:
-        """PM-001: the stored `(issuer, subject)` of this task, or None when there is no checkpoint.
-
-        `(None, None)` means the row predates the owner column. The host reads this to refuse a
-        foreign resume BEFORE anything is written; `save_checkpoint` re-checks it durably, inside
-        the transaction that does the generation CAS, so this read is a courtesy, not the gate.
-        """
         ...
 
     def audit_head(self, task_id: str) -> tuple[str, int] | None:
         ...
 
     def verify_audit_chain_status(self, task_id: str, allow_legacy_anchor: bool = False) -> AuditVerificationResult:
-        ...
-
-    def verify_audit_chain(self, task_id: str) -> bool:
         ...
 
     def audit_export_page(
@@ -1207,20 +1192,11 @@ class InMemoryRuntimeStore:
         # In-memory: no external dependency to probe, always ready.
         return None
 
-    def consumed_nonce_exists(self, nonce: str) -> bool:
-        with self._lock:
-            return nonce in self._nonces
-
     def load_checkpoint(self, task_id: str) -> dict[str, Any] | None:
         with self._lock:
             row = self._checkpoints.get(task_id)
             # Stored rows are {generation, closed, state}; callers see the state blob.
             return json.loads(json.dumps(row["state"])) if row is not None else None
-
-    def checkpoint_owner(self, task_id: str) -> tuple[str | None, str | None] | None:
-        with self._lock:
-            row = self._checkpoints.get(task_id)
-            return None if row is None else (row.get("owner_issuer"), row.get("owner_subject"))
 
     def audit_head(self, task_id: str) -> tuple[str, int] | None:
         with self._lock:
@@ -1234,24 +1210,12 @@ class InMemoryRuntimeStore:
         with self._lock:
             events = self._audit_events.get(task_id, [])
             head = self._audit_heads.get(task_id)
-            if not events or head is None:
-                return AuditVerificationResult("invalid", "audit chain is missing")
-            previous = events[0]["previous"]
-            for expected_sequence, event in enumerate(events):
-                if event["sequence"] != expected_sequence or event["previous"] != previous:
-                    return AuditVerificationResult("invalid", "audit chain sequence or previous hash is inconsistent")
-                if not _audit_event_hash_matches(
-                    event["sequence"], event["event"], event["details"], event["previous"], event.get("host_id", ""), event["hash"]
-                ):
-                    return AuditVerificationResult("invalid", "audit event hash is invalid")
-                previous = event["hash"]
-            if head["head_hash"] != previous or head["sequence"] != len(events):
-                return AuditVerificationResult("invalid", "stored audit head does not match audit events")
-            head_result = _verify_head_signature(self._audit_head_verifier, task_id, head)
-            return _check_migration_anchor(self._audit_head_verifier, head_result, events[0]["details"], allow_legacy_anchor)
-
-    def verify_audit_chain(self, task_id: str) -> bool:
-        return self.verify_audit_chain_status(task_id).valid
+            rows = [
+                {"sequence": event["sequence"], "event": event["event"], "details": event["details"],
+                 "previous_hash": event["previous"], "hash": event["hash"], "host_id": event.get("host_id", "")}
+                for event in events
+            ]
+            return _verify_audit_rows(self._audit_head_verifier, task_id, rows, head, allow_legacy_anchor)
 
     # -- Section 10 PR B: audit-floor support (reads + the per-host marker) ------------------
     def audit_heads_for_host(self, host_id: str) -> list[tuple[str, str, int]]:
@@ -2409,22 +2373,10 @@ class SQLiteRuntimeStore:
         if version != SQLITE_SCHEMA_VERSION:
             raise RuntimeError(f"SQLite store schema version {version} is not the supported version {SQLITE_SCHEMA_VERSION}")
 
-    def consumed_nonce_exists(self, nonce: str) -> bool:
-        with self._connection() as connection:
-            row = connection.execute("SELECT 1 FROM consumed_nonces WHERE nonce = ?", (nonce,)).fetchone()
-            return row is not None
-
     def load_checkpoint(self, task_id: str) -> dict[str, Any] | None:
         with self._connection() as connection:
             row = connection.execute(f"SELECT {_CHECKPOINT_ROW} FROM checkpoints WHERE task_id = ?", (task_id,)).fetchone()  # nosec B608 -- constant column list
         return _decode_row(self.checkpoint_codec, task_id, row) if row is not None else None
-
-    def checkpoint_owner(self, task_id: str) -> tuple[str | None, str | None] | None:
-        with self._connection() as connection:
-            row = connection.execute(
-                f"SELECT {_CHECKPOINT_ROW} FROM checkpoints WHERE task_id = ?", (task_id,)  # nosec B608 -- constant column list
-            ).fetchone()
-        return _authenticated_owner(self.checkpoint_codec, task_id, row)
 
     def audit_head(self, task_id: str) -> tuple[str, int] | None:
         with self._connection() as connection:
@@ -2448,46 +2400,7 @@ class SQLiteRuntimeStore:
                 "SELECT head_hash, sequence, host_id, signature_key_id, signature, signed_at FROM audit_heads WHERE task_id = ?",
                 (task_id,),
             ).fetchone()
-        if not rows or head is None:
-            return AuditVerificationResult("invalid", "audit chain is missing")
-        previous = rows[0]["previous_hash"] if rows else ""
-        first_details: Any = None
-        for expected_sequence, row in enumerate(rows):
-            if row["sequence"] != expected_sequence or row["previous_hash"] != previous:
-                return AuditVerificationResult("invalid", "audit chain sequence or previous hash is inconsistent")
-            try:
-                details = json.loads(row["details_json"])
-            except json.JSONDecodeError:
-                return AuditVerificationResult("invalid", "audit event details are malformed")
-            if expected_sequence == 0:
-                first_details = details
-            if not _audit_event_hash_matches(
-                row["sequence"], row["event"], details, row["previous_hash"], row["host_id"], row["hash"]
-            ):
-                return AuditVerificationResult("invalid", "audit event hash is invalid")
-            previous = row["hash"]
-        try:
-            head_sequence = int(head["sequence"])
-        except (TypeError, ValueError):
-            return AuditVerificationResult("invalid", "signed audit head sequence is malformed")
-        if head["head_hash"] != previous or head_sequence != len(rows):
-            return AuditVerificationResult("invalid", "stored audit head does not match audit events")
-        head_result = _verify_head_signature(
-            self._audit_head_verifier,
-            task_id,
-            {
-                "head_hash": head["head_hash"],
-                "sequence": head_sequence,
-                "host_id": head["host_id"],
-                "signature_key_id": head["signature_key_id"],
-                "signature": head["signature"],
-                "signed_at": head["signed_at"],
-            },
-        )
-        return _check_migration_anchor(self._audit_head_verifier, head_result, first_details, allow_legacy_anchor)
-
-    def verify_audit_chain(self, task_id: str) -> bool:
-        return self.verify_audit_chain_status(task_id).valid
+        return _verify_audit_rows(self._audit_head_verifier, task_id, rows, head, allow_legacy_anchor)
 
     # -- Section 10 PR B: audit-floor support (reads + the per-host marker) ------------------
     def audit_heads_for_host(self, host_id: str) -> list[tuple[str, str, int]]:
@@ -3210,22 +3123,10 @@ class PostgresRuntimeStore:
         if version != POSTGRES_SCHEMA_VERSION:
             raise RuntimeError(f"Postgres store schema version {version} is not the supported version {POSTGRES_SCHEMA_VERSION}")
 
-    def consumed_nonce_exists(self, nonce: str) -> bool:
-        with self._connect() as connection:
-            row = connection.execute("SELECT 1 FROM consumed_nonces WHERE nonce = %s", (nonce,)).fetchone()
-            return row is not None
-
     def load_checkpoint(self, task_id: str) -> dict[str, Any] | None:
         with self._connect() as connection:
             row = connection.execute(f"SELECT {_CHECKPOINT_ROW} FROM checkpoints WHERE task_id = %s", (task_id,)).fetchone()  # nosec B608 -- constant column list
         return _decode_row(self.checkpoint_codec, task_id, row) if row is not None else None
-
-    def checkpoint_owner(self, task_id: str) -> tuple[str | None, str | None] | None:
-        with self._connect() as connection:
-            row = connection.execute(
-                f"SELECT {_CHECKPOINT_ROW} FROM checkpoints WHERE task_id = %s", (task_id,)  # nosec B608 -- constant column list
-            ).fetchone()
-        return _authenticated_owner(self.checkpoint_codec, task_id, row)
 
     def audit_head(self, task_id: str) -> tuple[str, int] | None:
         with self._connect() as connection:
@@ -3251,46 +3152,7 @@ class PostgresRuntimeStore:
                 "SELECT head_hash, sequence, host_id, signature_key_id, signature, signed_at FROM audit_heads WHERE task_id = %s",
                 (task_id,),
             ).fetchone()
-        if not rows or head is None:
-            return AuditVerificationResult("invalid", "audit chain is missing")
-        previous = rows[0]["previous_hash"] if rows else ""
-        first_details: Any = None
-        for expected_sequence, row in enumerate(rows):
-            if row["sequence"] != expected_sequence or row["previous_hash"] != previous:
-                return AuditVerificationResult("invalid", "audit chain sequence or previous hash is inconsistent")
-            try:
-                details = json.loads(row["details_json"])
-            except json.JSONDecodeError:
-                return AuditVerificationResult("invalid", "audit event details are malformed")
-            if expected_sequence == 0:
-                first_details = details
-            if not _audit_event_hash_matches(
-                row["sequence"], row["event"], details, row["previous_hash"], row["host_id"], row["hash"]
-            ):
-                return AuditVerificationResult("invalid", "audit event hash is invalid")
-            previous = row["hash"]
-        try:
-            head_sequence = int(head["sequence"])
-        except (TypeError, ValueError):
-            return AuditVerificationResult("invalid", "signed audit head sequence is malformed")
-        if head["head_hash"] != previous or head_sequence != len(rows):
-            return AuditVerificationResult("invalid", "stored audit head does not match audit events")
-        head_result = _verify_head_signature(
-            self._audit_head_verifier,
-            task_id,
-            {
-                "head_hash": head["head_hash"],
-                "sequence": head_sequence,
-                "host_id": head["host_id"],
-                "signature_key_id": head["signature_key_id"],
-                "signature": head["signature"],
-                "signed_at": head["signed_at"],
-            },
-        )
-        return _check_migration_anchor(self._audit_head_verifier, head_result, first_details, allow_legacy_anchor)
-
-    def verify_audit_chain(self, task_id: str) -> bool:
-        return self.verify_audit_chain_status(task_id).valid
+        return _verify_audit_rows(self._audit_head_verifier, task_id, rows, head, allow_legacy_anchor)
 
     # -- Section 10 PR B: audit-floor support (reads + the per-host marker) ------------------
     def audit_heads_for_host(self, host_id: str) -> list[tuple[str, str, int]]:
@@ -3667,16 +3529,6 @@ def _decode_row(codec: CheckpointCodec | None, task_id: str, row: Any) -> dict[s
     return blob
 
 
-def _authenticated_owner(codec: CheckpointCodec | None, task_id: str, row: Any) -> tuple[str | None, str | None] | None:
-    # EV-006: with a keyring the owner columns are returned only after the row authenticates, so an
-    # edited owner is refused here like in load_checkpoint and save_checkpoint.
-    if row is None:
-        return None
-    if codec is not None:
-        _decode_row(codec, task_id, row)
-    return (row["owner_issuer"], row["owner_subject"])
-
-
 def _check_sealed_status(task_id: str, blob: dict[str, Any], row: Any) -> None:
     if blob.get("status") != row["status"]:
         raise CheckpointCryptoError(f"checkpoint {task_id!r} status column does not match the sealed state")
@@ -4014,6 +3866,46 @@ LEGACY_ANCHOR_ALLOWED_REASON = (
     "legacy migration anchor accepted by --allow-legacy-anchor: the source proof was NOT independently "
     "reverified (compatibility mode, not an equivalent security mode)"
 )
+
+
+def _verify_audit_rows(
+    verifier: AuditHeadVerifier | None, task_id: str, rows: list[Any], head: Any, allow_legacy_anchor: bool
+) -> AuditVerificationResult:
+    """Check one snapshot of a task's audit chain: every link, every event hash, the head, its signature.
+
+    Every store reads its events and head from ONE snapshot (Section 10 F3) and hands them here, so the
+    check itself has a single implementation. `rows` are in sequence order, each with sequence, event,
+    previous_hash, hash, host_id, and either the decoded `details` or the stored `details_json`.
+    """
+    if not rows or head is None:
+        return AuditVerificationResult("invalid", "audit chain is missing")
+    previous = rows[0]["previous_hash"]
+    first_details: Any = None
+    for expected_sequence, row in enumerate(rows):
+        if row["sequence"] != expected_sequence or row["previous_hash"] != previous:
+            return AuditVerificationResult("invalid", "audit chain sequence or previous hash is inconsistent")
+        if "details" in row.keys():
+            details = row["details"]
+        else:
+            try:
+                details = json.loads(row["details_json"])
+            except json.JSONDecodeError:
+                return AuditVerificationResult("invalid", "audit event details are malformed")
+        if expected_sequence == 0:
+            first_details = details
+        if not _audit_event_hash_matches(
+            row["sequence"], row["event"], details, row["previous_hash"], row["host_id"], row["hash"]
+        ):
+            return AuditVerificationResult("invalid", "audit event hash is invalid")
+        previous = row["hash"]
+    try:
+        head_sequence = int(head["sequence"])
+    except (TypeError, ValueError):
+        return AuditVerificationResult("invalid", "signed audit head sequence is malformed")
+    if head["head_hash"] != previous or head_sequence != len(rows):
+        return AuditVerificationResult("invalid", "stored audit head does not match audit events")
+    head_result = _verify_head_signature(verifier, task_id, {**dict(head), "sequence": head_sequence})
+    return _check_migration_anchor(verifier, head_result, first_details, allow_legacy_anchor)
 
 
 def _check_migration_anchor(

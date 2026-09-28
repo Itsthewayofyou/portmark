@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any, BinaryIO
 
 from ._durable_file import atomic_write_bytes
-from .json_guard import StrictJSONError, strict_json_loads
+from .json_guard import StrictJSONError, reject_unknown_keys, strict_json_loads
 from .ocsf import from_ocsf, is_ocsf, projection_mismatch
 from .security import canonical_json
 from .storage import (
@@ -81,12 +81,6 @@ class ExportConfigError(ValueError):
     """A policy, keyring, cursor, or argument problem: nothing was exported (CLI exit 2)."""
 
 
-def _reject_unknown(value: Mapping[str, Any], allowed: Iterable[str], label: str) -> None:
-    unknown = set(value) - set(allowed)
-    if unknown:
-        raise ExportConfigError(f"{label} has unknown keys: {sorted(unknown)}")
-
-
 def _string_list(value: Any, label: str) -> tuple[str, ...]:
     if not isinstance(value, list) or not all(isinstance(item, str) and item for item in value):
         raise ExportConfigError(f"{label} must be a list of non-empty strings")
@@ -105,7 +99,7 @@ class FieldRule:
 def _field_rule(value: Any, label: str, allow_mode: bool) -> FieldRule:
     if not isinstance(value, dict):
         raise ExportConfigError(f"{label} must be an object")
-    _reject_unknown(value, ("include", "redact", "mode") if allow_mode else ("include", "redact"), label)
+    reject_unknown_keys(value, ("include", "redact", "mode") if allow_mode else ("include", "redact"), label, ExportConfigError)
     if "mode" in value:
         if value["mode"] != "hash_only":
             raise ExportConfigError(f"{label}.mode must be \"hash_only\"")
@@ -139,7 +133,7 @@ class ProjectionPolicy:
             raise ExportConfigError(f"projection policy is not valid JSON: {error}") from error
         if not isinstance(document, dict):
             raise ExportConfigError("projection policy must be a JSON object")
-        _reject_unknown(document, ("schema", "events", "tool_arguments"), "projection policy")
+        reject_unknown_keys(document, ("schema", "events", "tool_arguments"), "projection policy", ExportConfigError)
         if document.get("schema") != POLICY_SCHEMA:
             raise ExportConfigError(f"projection policy schema must be {POLICY_SCHEMA!r}")
         events = {kind: FieldRule(fields) for kind, fields in BUILTIN_EVENT_FIELDS.items()}
@@ -153,7 +147,7 @@ class ProjectionPolicy:
         arguments = document.get("tool_arguments", {})
         if not isinstance(arguments, dict):
             raise ExportConfigError("projection policy tool_arguments must be an object")
-        _reject_unknown(arguments, ("default", "tools"), "tool_arguments")
+        reject_unknown_keys(arguments, ("default", "tools"), "tool_arguments", ExportConfigError)
         if arguments.get("default", "hash_only") != "hash_only":
             # Raw arguments are never the default: a tool the policy does not name exports a count + digest.
             raise ExportConfigError('tool_arguments.default must be "hash_only"')
@@ -187,7 +181,7 @@ class Keyring:
             raise ExportConfigError("projection keyring is not valid JSON") from error
         if not isinstance(document, dict):
             raise ExportConfigError("projection keyring must be a JSON object")
-        _reject_unknown(document, ("active", "keys"), "projection keyring")
+        reject_unknown_keys(document, ("active", "keys"), "projection keyring", ExportConfigError)
         raw_keys = document.get("keys")
         if not isinstance(raw_keys, dict) or not raw_keys:
             raise ExportConfigError("projection keyring needs a non-empty keys object")
@@ -369,7 +363,7 @@ class ExportCursor:
             raise ExportConfigError("export cursor is not valid JSON; refusing to guess where the export stopped") from error
         if not isinstance(document, dict) or document.get("schema") != CURSOR_SCHEMA or not isinstance(document.get("tasks"), dict):
             raise ExportConfigError(f"export cursor must be a {CURSOR_SCHEMA} object")
-        _reject_unknown(document, ("schema", "tasks"), "export cursor")
+        reject_unknown_keys(document, ("schema", "tasks"), "export cursor", ExportConfigError)
         tasks: dict[str, tuple[int, str]] = {}
         for task_id, entry in document["tasks"].items():
             if (

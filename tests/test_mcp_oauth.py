@@ -34,7 +34,6 @@ from portmark.mcp_oauth import (
     authorize,
     current_access_token,
     refresh,
-    refuse_sync_use,
     sdk_available,
 )
 from portmark.security import canonical_json
@@ -43,7 +42,6 @@ from portmark.cli import _finite_seconds, _install_mcp_tools, _run_mcp
 from portmark.mcp import (
     MIN_REFRESH_SLEEP_SECONDS,
     MIN_RENEWAL_INTERVAL_SECONDS,
-    UNMAINTAINABLE_LIFETIME_SECONDS,
     REFRESH_AHEAD_SECONDS,
     REFRESH_RETRY_SECONDS,
     McpStartupError,
@@ -722,18 +720,9 @@ class OauthDriverTests(unittest.TestCase):
         import httpx2
         from mcp.client.auth.oauth2 import OAuthClientProvider
 
+        # If this fails, the SDK defines its own `sync_auth_flow`: re-check the reasoning above before
+        # raising the pin.
         self.assertIs(OAuthClientProvider.sync_auth_flow, httpx2.Auth.sync_auth_flow)
-        refuse_sync_use(OAuthClientProvider)
-
-        # A guard whose refusal path never runs is decoration. Feed it the shape it exists to catch -- a
-        # future SDK that grows its own synchronous path -- and it must refuse.
-        class WithASyncPath(OAuthClientProvider):
-            def sync_auth_flow(self, request):  # pragma: no cover - never called, only inspected
-                raise NotImplementedError
-
-        with self.assertRaises(McpOAuthError) as caught:
-            refuse_sync_use(WithASyncPath)
-        self.assertIn("sync_auth_flow", str(caught.exception))
 
     def test_without_the_extra_the_error_says_how_to_install_it(self):
         with patch.dict(sys.modules, {"mcp.client.auth.oauth2": None}):
@@ -1480,7 +1469,6 @@ class TokenRefresherTests(unittest.TestCase):
         Renewing harder cannot help, so saying so once is the useful act. It must also not turn into a
         renewal on every tick, which would be a storm against the authorization server on top of an outage.
         """
-        self.assertLessEqual(60, UNMAINTAINABLE_LIFETIME_SECONDS)
         refresher = self.refresher()
         self.store_expiring_in(60)
         refresher._last_renewal["files"] = self.NOW
@@ -1495,6 +1483,20 @@ class TokenRefresherTests(unittest.TestCase):
         self.assertEqual(len(said), 1, logged.output)
         # And it backs off rather than spinning. How far is the interval's business, not this test's.
         self.assertGreater(slept, MIN_REFRESH_SLEEP_SECONDS)
+
+    def test_the_unmaintainable_boundary_is_seventy_seconds_with_quick_renewals(self):
+        """The exact edge: margin 60 + slack 5 + the loop's 5-second wake. 70 is kept usable, 69 is named."""
+        for lifetime, named in ((69, True), (70, False)):
+            with self.subTest(lifetime=lifetime):
+                refresher = self.refresher()
+                self.store_expiring_in(lifetime)
+                refresher._last_renewal["files"] = self.NOW
+                with patch("portmark.mcp_oauth.current_access_token"), \
+                        self.assertLogs("portmark.mcp", level="DEBUG") as logged:
+                    refresher.tick(self.NOW)
+                    logging.getLogger("portmark.mcp").debug("tick done")  # assertLogs needs one record
+                said = any("no renewal schedule can keep one usable" in line for line in logged.output)
+                self.assertEqual(said, named, logged.output)
 
     def test_a_login_that_reuses_the_refresh_token_still_resumes_renewal(self):
         """Some authorization servers hand back the SAME refresh token when the operator authorizes again.

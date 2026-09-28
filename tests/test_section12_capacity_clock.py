@@ -25,6 +25,7 @@ from portmark._clock import ClockRollbackError, TimeFloorError, TrustedClock, ch
 from portmark.factory import build_envelope, make_demo_envelope, make_host
 from portmark.maintenance import parse_cutoff, prune_cutoffs, reset_time_floor, run_prune
 from portmark.security import SecurityError, TrustSource, canonical_json
+from store_probes import nonce_is_consumed
 from portmark.storage import (
     MAX_ADMIN_PAGE_SIZE,
     MAX_CLAIM_LIMIT,
@@ -507,9 +508,9 @@ class PruneTests(unittest.TestCase):
                 report = run_prune(store, None, now, apply=True, batch_size=2, clock=FakeTime(now).clock())
                 self.assertEqual((report["expired_nonces"]["deleted"], report["delivered_migrations"]["deleted"]), (5, 1))
                 self.assertEqual(report["batches"], 4)  # 2 + 2 + 1 nonces, 1 migration
-                self.assertTrue(store.consumed_nonce_exists("recent"))  # inside the clock tolerance: kept
-                self.assertTrue(store.consumed_nonce_exists("legacy"))  # no stored expiry: kept
-                self.assertFalse(store.consumed_nonce_exists("old-0"))
+                self.assertTrue(nonce_is_consumed(store, "recent"))  # inside the clock tolerance: kept
+                self.assertTrue(nonce_is_consumed(store, "legacy"))  # no stored expiry: kept
+                self.assertFalse(nonce_is_consumed(store, "old-0"))
                 self.assertEqual({row["task_id"] for row in store.list_pending_migrations()}, {"m-no-receipt", "m-pending"})
                 self.assertEqual([row["task_id"] for row in store.list_dead_migrations()], ["m-dead"])
                 log = store.maintenance_log()
@@ -664,7 +665,7 @@ class CliAndEntrypointTests(unittest.TestCase):
             self.assertEqual(code, 0, err)
             self.assertIn("DRY RUN", err)
             self.assertEqual(json.loads(out)["expired_nonces"]["deleted"], 0)
-            self.assertTrue(store.consumed_nonce_exists("old-0"))
+            self.assertTrue(nonce_is_consumed(store, "old-0"))
             code, out, err = self._cli("--store-path", path, "store", "prune", "--before", str(now - 1_000), "--apply")
             self.assertEqual(code, 0, err)
             self.assertEqual(json.loads(out)["expired_nonces"]["deleted"], 5)
@@ -765,7 +766,7 @@ class PostgresClockAndPruneTests(unittest.TestCase):
         self.assertEqual((dry["expired_nonces"]["eligible"], dry["delivered_migrations"]["eligible"]), (1, 1))
         report = self.store.prune(now - TOLERANCE, now + 10, apply=True, batch_size=1)
         self.assertEqual((report["expired_nonces"]["deleted"], report["delivered_migrations"]["deleted"]), (1, 1))
-        self.assertTrue(self.store.consumed_nonce_exists("legacy"))
+        self.assertTrue(nonce_is_consumed(self.store, "legacy"))
         self.assertEqual([row["task_id"] for row in self.store.list_pending_migrations()], ["m-pending"])
         self.assertEqual(self.store.maintenance_log()[0]["action"], "prune")
         self.assertEqual(self.store.capacity_report()["backend"], "postgres")

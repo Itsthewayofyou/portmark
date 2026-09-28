@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 # Legit envelopes / decisions nest ~8-15 deep; json.loads hits RecursionError near the ~1000
@@ -117,3 +118,10 @@ def strict_json_loads(raw: str | bytes | bytearray, *, max_bytes: int | None = N
         # StrictJSONError so a caller catching StrictJSONError cannot be bypassed by an uncaught
         # ValueError. (Integer magnitude is thus bounded by Python's default limit, surfaced here.)
         raise StrictJSONError("malformed or unsafe JSON") from error
+
+
+def reject_unknown_keys(value: Mapping[str, Any], allowed: Iterable[str], label: str, error: type[Exception]) -> None:
+    """Refuse a config object with keys outside `allowed`: a typo must not be silently ignored."""
+    unknown = sorted(set(value) - set(allowed))
+    if unknown:
+        raise error(f"{label} has unknown keys: {unknown}")

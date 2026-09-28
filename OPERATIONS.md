@@ -65,10 +65,7 @@ A host with an audit floor records it and refuses to start on a registry with a 
 example an old copy that still trusts a revoked key) or the same version with different content.
 A floor requires a versioned registry.
 
-Ed25519 is the default signer. The legacy HMAC signer is blocked unless
-`PORTMARK_ALLOW_LEGACY_HMAC=unsafe-test-only` and a non-empty
-`PORTMARK_SIGNING_KEY` are both set. Treat that path as a dependency-free test
-fixture only; do not use it for a production trust domain.
+Ed25519 is the signer. The legacy HMAC signer was removed; setting `PORTMARK_ALLOW_LEGACY_HMAC` now stops the host at boot instead of falling back to a generated key.
 
 ## Policy Updates
 

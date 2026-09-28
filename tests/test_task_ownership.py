@@ -157,7 +157,7 @@ class TaskOwnershipTests(unittest.TestCase):
             connection.execute("UPDATE checkpoints SET owner_issuer = NULL, owner_subject = NULL, closed = 1")
             connection.commit()
         self.assertIsNotNone(store.load_checkpoint("task-closed"))
-        self.assertTrue(store.verify_audit_chain("task-closed"))
+        self.assertTrue(store.verify_audit_chain_status("task-closed").valid)
 
     def test_an_upgraded_database_leaves_its_rows_ownerless(self):
         # The v13 -> v14 step adds the columns; it must NOT invent an owner for existing rows.
@@ -170,7 +170,10 @@ class TaskOwnershipTests(unittest.TestCase):
             )
             connection.commit()
         store = SQLiteRuntimeStore(path)  # upgrades through v14 (owner columns) to v15 (EV-013) on open
-        self.assertEqual(store.checkpoint_owner("old-task"), (None, None))
+        # No owner was invented: a caller that asserts one is refused as a legacy row, not as a foreign one.
+        with self.assertRaisesRegex(SecurityError, "legacy checkpoint has no stored owner"):
+            with store.transaction() as transaction:
+                transaction.save_checkpoint("old-task", AgentState("old-task", "goal"), 1, owner=("user:alice", "agent:demo"))
         with contextlib.closing(sqlite3.connect(str(path))) as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
         self.assertEqual(version, 15)
@@ -187,7 +190,6 @@ class OwnershipStoreContractTests(unittest.TestCase):
     def _check(self, store):
         with store.transaction() as transaction:
             self.assertEqual(transaction.save_checkpoint("contract-task", self._state(), 0, owner=("user:alice", "agent:demo")), 1)
-        self.assertEqual(store.checkpoint_owner("contract-task"), ("user:alice", "agent:demo"))
         with self.assertRaisesRegex(SecurityError, "different owner"):
             with store.transaction() as transaction:
                 transaction.save_checkpoint("contract-task", self._state(1), 1, owner=("user:bob", "agent:demo"))
@@ -201,7 +203,6 @@ class OwnershipStoreContractTests(unittest.TestCase):
         # that asserts an owner is refused with the upgrade message, not adopted as the owner.
         with store.transaction() as transaction:
             self.assertEqual(transaction.save_checkpoint("legacy-task", self._state(), 0), 1)
-        self.assertEqual(store.checkpoint_owner("legacy-task"), (None, None))
         with self.assertRaisesRegex(SecurityError, "legacy checkpoint has no stored owner"):
             with store.transaction() as transaction:
                 transaction.save_checkpoint("legacy-task", self._state(1), 1, owner=("user:mallory", "agent:demo"))

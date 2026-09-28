@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import copy
 import secrets
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Callable
 
 from .models import AttestationEvidence
@@ -48,32 +48,34 @@ def _other(*current: Any) -> str:
 
 @dataclass(frozen=True)
 class ConformanceCase:
-    name: str
-    expect: str  # "accept" or "reject"
-    outcome: str  # "accepted" or "rejected"
-    detail: str
+    """One case of a conformance kit. Shared by this kit and the witness kit (witness_conformance)."""
 
-    @property
-    def passed(self) -> bool:
-        return (self.expect == "accept") == (self.outcome == "accepted")
+    name: str
+    expect: str  # "accept", or what refusal the kit expects ("reject", or a witness refusal code)
+    outcome: str  # what happened: "accepted", "rejected", "refused:<code>", "unavailable" or "skipped"
+    passed: bool
+    detail: str
 
 
 @dataclass(frozen=True)
 class ConformanceReport:
     cases: tuple[ConformanceCase, ...]
+    host_id: str | None = None  # the witness kit names the host identity it ran as
 
     @property
     def passed(self) -> bool:
-        return all(case.passed for case in self.cases)
+        # A report with no cases proved nothing, so it does not pass.
+        return bool(self.cases) and all(case.passed for case in self.cases)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "status": "pass" if self.passed else "fail",
-            "cases": [
-                {"name": case.name, "expect": case.expect, "outcome": case.outcome, "passed": case.passed, "detail": case.detail}
-                for case in self.cases
-            ],
-        }
+        head: dict[str, Any] = {"status": "pass" if self.passed else "fail"}
+        if self.host_id is not None:
+            head["host_id"] = self.host_id
+        return {**head, "cases": [asdict(case) for case in self.cases]}
+
+
+def _verdict(name: str, expect: str, outcome: str, detail: str) -> ConformanceCase:
+    return ConformanceCase(name, expect, outcome, (expect == "accept") == (outcome == "accepted"), detail)
 
 
 def load_base_request(value: Any) -> dict[str, Any]:
@@ -198,8 +200,8 @@ def _run_case(verifier: ExternalAttestationVerifierProtocol, name: str, expect: 
             request["now"],
         )
     except SecurityError as error:
-        return ConformanceCase(name, expect, "rejected", str(error))
-    return ConformanceCase(name, expect, "accepted", "")
+        return _verdict(name, expect, "rejected", str(error))
+    return _verdict(name, expect, "accepted", "")
 
 
 def _mutated(plain: dict[str, Any], name: str, mutate: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
@@ -260,8 +262,8 @@ def run_preflight_conformance(
             evidence = preflight.attest(target, relying_party, challenge)
             policy.verify_migration_challenge(evidence, challenge, target, relying_party)
         except SecurityError as error:
-            return ConformanceCase(name, expect, "rejected", str(error))
-        return ConformanceCase(name, expect, "accepted", "")
+            return _verdict(name, expect, "rejected", str(error))
+        return _verdict(name, expect, "accepted", "")
 
     return ConformanceReport((
         attempt("first-challenge", "accept", destination),

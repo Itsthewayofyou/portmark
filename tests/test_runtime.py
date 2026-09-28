@@ -30,12 +30,11 @@ import urllib.request
 from dataclasses import FrozenInstanceError, asdict
 from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from http.client import HTTPResponse
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
-from portmark.a2a import MAX_REQUEST_BYTES, DEFAULT_MAX_CONCURRENT_REQUESTS, A2AAuthConfig, BoundedReferenceHTTPServer, RateLimiter, envelope_from_dict, is_loopback_bind, make_asgi_app, make_handler, serve
+from portmark.a2a import MAX_REQUEST_BYTES, DEFAULT_MAX_CONCURRENT_REQUESTS, A2AAuthConfig, RateLimiter, envelope_from_dict, is_loopback_bind, make_asgi_app, serve
 from portmark.a2a_types import make_agent_card
 from portmark.config import RuntimeConfig
 from portmark.factory import build_envelope, make_demo_envelope, make_host, signer_from_environment
@@ -47,14 +46,11 @@ from portmark.providers import GenericHttpProvider, ModelProvider, NativeWasmtim
 from portmark.policy import load_host_policy
 from portmark.security import (
     AUDIT_HASH_VERSION,
-    ApprovalAuthority,
-    AttestationAuthority,
     AttestationPolicy,
     AuditLog,
     EnvelopeSigner,
     audit_event_record,
     ExternalAttestationVerifier,
-    HmacEnvelopeSigner,
     HostPolicy,
     MigrationPolicy,
     SecurityError,
@@ -65,6 +61,7 @@ from portmark.security import (
     generate_signing_material,
     load_trust_registry,
 )
+from authority_fixtures import ApprovalAuthority, AttestationAuthority
 from portmark.host import AgentHost
 from portmark.storage import POSTGRES_SCHEMA_VERSION, SQLITE_BUSY_TIMEOUT_MS, SQLITE_SCHEMA_VERSION, InMemoryRuntimeStore, PostgresRuntimeStore, SQLiteRuntimeStore
 from portmark.cli import main as cli_main
@@ -77,6 +74,8 @@ from portmark.tools import (
     _has_tree_termination_primitive,
 )
 from examples.tools import http_fetch
+from asgi_test_server import serve_asgi
+from store_probes import nonce_is_consumed
 from fuzz_a2a_parser import run_fuzz_cases
 
 # Section 7 PR 2b: a side-effecting tool now requires an acknowledged IsolationProfile on the
@@ -639,6 +638,66 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(config.a2a_agent_card_rate_limit_per_ip, 78)
         self.assertEqual(config.a2a_agent_card_rate_limit_window_seconds, 90)
 
+    def test_runtime_config_takes_a_cli_value_only_when_one_is_supplied(self):
+        # merged_with_args, field by field: a CLI option overrides the configured value only when it is
+        # truthy. None, "", 0 and False all mean "not supplied" and keep the configured value.
+        from dataclasses import fields
+
+        supplied = {  # CLI option -> (RuntimeConfig field, value on the command line, value in the config)
+            "host_id": ("host_id", "host:cli", "host:cli"),
+            "provider_endpoint": ("provider_endpoint", "https://cli.example/run", "https://cli.example/run"),
+            "wasm_component": ("wasm_component", "cli.wasm", "cli.wasm"),
+            "wasm_engine": ("wasm_engine", "wasmtime", "wasmtime"),
+            "store_backend": ("store_backend", "postgres", "postgres"),
+            "store_path": ("store_path", "cli.sqlite", "cli.sqlite"),
+            "policy_path": ("policy_path", "cli-policy.json", "cli-policy.json"),
+            "mcp_config": ("mcp_config_path", "cli-mcp.json", "cli-mcp.json"),
+            "trust_registry_path": ("trust_registry_path", "cli-trust.json", "cli-trust.json"),
+            "audit_floor_path": ("audit_floor_path", "cli-floor.json", "cli-floor.json"),
+            "reload_policy": ("reload_policy", True, True),
+            "attestation_verifier_command": ("attestation_verifier_command", "verify --strict", ("verify", "--strict")),
+            "require_attestation": ("require_attestation", True, True),
+            "allow_local_provider_endpoint": ("allow_local_provider_endpoint", True, True),
+            "a2a_token": ("a2a_token", "cli-token", "cli-token"),
+            "a2a_adapter": ("a2a_adapter", "sdk", "sdk"),
+            "a2a_public_base_url": ("a2a_public_base_url", "https://cli.example", "https://cli.example"),
+            "a2a_trusted_proxies": ("a2a_trusted_proxies", "10.0.0.0/8", "10.0.0.0/8"),
+            "log_level": ("log_level", "DEBUG", "DEBUG"),
+            "log_json": ("log_json", True, True),
+            "enable_hsts": ("enable_hsts", True, True),
+            "allow_direct_a2a": ("allow_direct_a2a", True, True),
+            "a2a_max_concurrent_requests": ("a2a_max_concurrent_requests", 7, 7),
+            "a2a_rate_limit_per_ip": ("a2a_rate_limit_per_ip", 7, 7),
+            "a2a_rate_limit_window_seconds": ("a2a_rate_limit_window_seconds", 7, 7),
+            "a2a_agent_card_rate_limit_per_ip": ("a2a_agent_card_rate_limit_per_ip", 7, 7),
+            "a2a_agent_card_rate_limit_window_seconds": ("a2a_agent_card_rate_limit_window_seconds", 7, 7),
+        }
+        config_only = {"a2a_body_read_timeout_seconds", "shutdown_grace_seconds", "profile",
+                       "attestation_allowed_measurements", "migration_preflight_command"}
+        # Every field is either set from the CLI or never is; a new field must be placed in one of the two.
+        self.assertEqual({name for name, _, _ in supplied.values()} | config_only,
+                         {field.name for field in fields(RuntimeConfig)})
+        base = RuntimeConfig(
+            a2a_body_read_timeout_seconds=3.0, shutdown_grace_seconds=4.0, profile="development",
+            attestation_allowed_measurements=("m1",), migration_preflight_command=("preflight",),
+        )
+        nothing = SimpleNamespace(**{option: None for option in supplied})
+        for option, (name, cli_value, expected) in supplied.items():
+            with self.subTest(option=option):
+                merged = base.merged_with_args(SimpleNamespace(**{**vars(nothing), option: cli_value}))
+                self.assertEqual(getattr(merged, name), expected)
+                self.assertEqual({field: getattr(merged, field) for field in config_only},
+                                 {field: getattr(base, field) for field in config_only})
+                # The verifier command is always a string on the command line; a blank one is not a command.
+                empties = (None, "", "  ") if option == "attestation_verifier_command" else (None, "", 0, False)
+                configured = RuntimeConfig(**{**vars(base), name: expected})
+                for empty in empties:
+                    kept = configured.merged_with_args(SimpleNamespace(**{**vars(nothing), option: empty}))
+                    self.assertEqual(getattr(kept, name), expected)
+        self.assertEqual(base.merged_with_args(nothing), base)
+        # An option a subcommand does not define at all is not supplied either.
+        self.assertEqual(base.merged_with_args(SimpleNamespace()), base)
+
     def test_json_log_formatter_emits_structured_internal_exception(self):
         formatter = JsonLogFormatter()
         try:
@@ -736,19 +795,17 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(SecurityError, "key id is missing"):
             host.run(missing_key_id)
 
-    def test_legacy_hmac_signer_requires_explicit_unsafe_test_opt_in_and_key(self):
-        with patch.dict(os.environ, {"PORTMARK_ALLOW_LEGACY_HMAC": "1"}, clear=True):
-            with self.assertRaisesRegex(RuntimeError, "unsafe-test-only"):
-                signer_from_environment()
-        with patch.dict(os.environ, {"PORTMARK_ALLOW_LEGACY_HMAC": "unsafe-test-only"}, clear=True):
-            with self.assertRaisesRegex(RuntimeError, "PORTMARK_SIGNING_KEY"):
-                signer_from_environment()
-        with patch.dict(os.environ, {
-            "PORTMARK_ALLOW_LEGACY_HMAC": "unsafe-test-only",
-            "PORTMARK_SIGNING_KEY": "explicit legacy integration test key",
-        }, clear=True):
-            signer = signer_from_environment()
-        self.assertIsInstance(signer, HmacEnvelopeSigner)
+    def test_removed_legacy_hmac_switch_fails_closed(self):
+        # The HMAC signer is gone. Its old switch must stop the host, never fall through to a generated
+        # key -- including the exact value and key that used to enable it.
+        for env in (
+            {"PORTMARK_ALLOW_LEGACY_HMAC": "1"},
+            {"PORTMARK_ALLOW_LEGACY_HMAC": "unsafe-test-only",
+             "PORTMARK_SIGNING_KEY": "explicit legacy integration test key"},
+        ):
+            with self.subTest(env=env), patch.dict(os.environ, env, clear=True):
+                with self.assertRaisesRegex(RuntimeError, "legacy HMAC signer was removed"):
+                    signer_from_environment()
 
     def test_canonical_signature_is_stable(self):
         private_key = bytes(range(32))
@@ -2930,7 +2987,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(checkpoint["status"], "ready")  # closed source, migrated away
             self.assertEqual(checkpoint["memory"], {})  # working state dropped under budget pressure
             self.assertIn("checkpoint.terminalized", [event["event"] for event in result.audit])
-            self.assertTrue(store.verify_audit_chain(result.task_id))
+            self.assertTrue(store.verify_audit_chain_status(result.task_id).valid)
 
     def test_host_enforced_projection_hides_undeclared_fields_from_in_process_provider(self):
         # Finding #4: a grant's output_projection is enforced at the host boundary, so
@@ -3405,7 +3462,7 @@ class RuntimeTests(unittest.TestCase):
                         tr.join(timeout=30)
                         tc.join(timeout=30)
                         self.assertTrue(store.is_task_cancelled(task_id))
-                        self.assertEqual(store.consumed_nonce_exists(nonce), outcome["redeemed"])
+                        self.assertEqual(nonce_is_consumed(store, nonce), outcome["redeemed"])
 
     def test_cancel_during_tool_launch_does_not_prevent_effect_best_effort_limit(self):
         # Section 5 #3 — the documented BEST-EFFORT boundary, asserted (not just documented). Tier 3:
@@ -3834,7 +3891,7 @@ class RuntimeTests(unittest.TestCase):
                     self.assertEqual(checkpoint["result"], result.result)
                     self.assertEqual(store.audit_head(result.task_id), (result.audit[-1]["hash"], result.audit[-1]["sequence"] + 1))
                     self.assertEqual(store.verify_audit_chain_status(result.task_id).status, "valid")
-                    self.assertTrue(store.verify_audit_chain(result.task_id))
+                    self.assertTrue(store.verify_audit_chain_status(result.task_id).valid)
 
                     unverifiable = self._reopen_store(backend, store)
                     self.assertEqual(unverifiable.verify_audit_chain_status(result.task_id).status, "unverifiable")
@@ -3862,7 +3919,7 @@ class RuntimeTests(unittest.TestCase):
                                 outcomes.append("rejected")
                     self.assertEqual(outcomes.count("completed"), 1)
                     self.assertEqual(outcomes.count("rejected"), 1)
-                    self.assertTrue(store.consumed_nonce_exists(envelope.permit.nonce))
+                    self.assertTrue(nonce_is_consumed(store, envelope.permit.nonce))
 
     def test_runtime_store_contract_detects_audit_chain_corruption(self):
         signer = EnvelopeSigner.generate("contract-corrupt-key", "host:local-demo", ("host:local-demo",))
@@ -3871,12 +3928,12 @@ class RuntimeTests(unittest.TestCase):
                 with self.subTest(backend=backend):
                     host = make_host(signer=signer, store=store, allow_ephemeral_signing_key=True)
                     result = host.run(make_demo_envelope(host, f"{backend} corrupt"))
-                    self.assertTrue(store.verify_audit_chain(result.task_id))
+                    self.assertTrue(store.verify_audit_chain_status(result.task_id).valid)
                     self._corrupt_store_audit(store, result.task_id, backend)
                     verification = store.verify_audit_chain_status(result.task_id)
                     self.assertEqual(verification.status, "invalid")
                     self.assertEqual(verification.reason, "stored audit head does not match audit events")
-                    self.assertFalse(store.verify_audit_chain(result.task_id))
+                    self.assertFalse(store.verify_audit_chain_status(result.task_id).valid)
 
     def test_runtime_store_contract_detects_audit_host_id_tamper(self):
         # Altering a stored event's host_id must break verification: host_id is
@@ -3888,12 +3945,12 @@ class RuntimeTests(unittest.TestCase):
                 with self.subTest(backend=backend):
                     host = make_host(signer=signer, store=store, allow_ephemeral_signing_key=True)
                     result = host.run(make_demo_envelope(host, f"{backend} host tamper"))
-                    self.assertTrue(store.verify_audit_chain(result.task_id))
+                    self.assertTrue(store.verify_audit_chain_status(result.task_id).valid)
                     self._tamper_store_host_id(store, result.task_id, backend)
                     verification = store.verify_audit_chain_status(result.task_id)
                     self.assertEqual(verification.status, "invalid")
                     self.assertEqual(verification.reason, "audit event hash is invalid")
-                    self.assertFalse(store.verify_audit_chain(result.task_id))
+                    self.assertFalse(store.verify_audit_chain_status(result.task_id).valid)
 
     def test_audit_event_hash_commits_to_format_version(self):
         # The per-event hash covers hash_version, so the audit format is
@@ -3933,14 +3990,14 @@ class RuntimeTests(unittest.TestCase):
 
                     first = source.run(envelope)
                     self.assertEqual(source_store.load_checkpoint(first.task_id)["status"], "ready")
-                    self.assertTrue(source_store.verify_audit_chain(first.task_id))
+                    self.assertTrue(source_store.verify_audit_chain_status(first.task_id).valid)
                     self.assertIsNotNone(first.migration_envelope)
 
                     migrated = envelope_from_dict(first.migration_envelope)
                     second = destination.run(migrated)
                     self.assertEqual(second.status, "completed")
                     self.assertEqual(destination_store.load_checkpoint(second.task_id)["status"], "completed")
-                    self.assertTrue(destination_store.verify_audit_chain(second.task_id))
+                    self.assertTrue(destination_store.verify_audit_chain_status(second.task_id).valid)
 
                     # Finding #3: the destination's local sequence restarts at 0, so
                     # the verified prior anchor is recorded in the first event's
@@ -4121,7 +4178,7 @@ class RuntimeTests(unittest.TestCase):
             refused = store.verify_audit_chain_status(second.task_id)
             self.assertEqual((refused.status, refused.anchor_status), ("unverifiable", "legacy-anchor"), refused.reason)
             self.assertIn("cannot be independently reverified", refused.reason)
-            self.assertFalse(store.verify_audit_chain(second.task_id))
+            self.assertFalse(store.verify_audit_chain_status(second.task_id).valid)
             allowed = store.verify_audit_chain_status(second.task_id, allow_legacy_anchor=True)
             self.assertEqual((allowed.status, allowed.anchor_status), ("valid", "legacy-anchor"), allowed.reason)
             self.assertIn("NOT independently reverified", allowed.reason)
@@ -4309,7 +4366,7 @@ class RuntimeTests(unittest.TestCase):
                     second = destination.run(migrated)
                     self.assertEqual(second.status, "completed")
                     self.assertEqual(destination_store.load_checkpoint(second.task_id)["status"], "completed")
-                    self.assertTrue(destination_store.verify_audit_chain(second.task_id))
+                    self.assertTrue(destination_store.verify_audit_chain_status(second.task_id).valid)
 
     def test_project_state_for_migration_branches(self):
         # Section 4 #6 unit pins for project_state_for_migration:
@@ -4521,7 +4578,7 @@ class RuntimeTests(unittest.TestCase):
             checkpoint = store.load_checkpoint(envelope.state.task_id)
             self.assertIsNotNone(checkpoint)
             self.assertEqual(checkpoint["status"], "failed")  # durable terminal, not running
-            self.assertTrue(store.verify_audit_chain(envelope.state.task_id))  # closed chain intact
+            self.assertTrue(store.verify_audit_chain_status(envelope.state.task_id).valid)  # closed chain intact
 
     def test_strict_json_rejects_duplicate_keys(self):
         # Section 8 finding #4: a JSON object with duplicate keys parses silently last-wins in
@@ -4876,8 +4933,8 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(resB.status, "completed")
             # Two distinct resident tasks, two verifying chains, distinct namespaced ids.
             self.assertNotEqual(resA.task_id, resB.task_id)
-            self.assertTrue(dest_store.verify_audit_chain(resA.task_id))
-            self.assertTrue(dest_store.verify_audit_chain(resB.task_id))
+            self.assertTrue(dest_store.verify_audit_chain_status(resA.task_id).valid)
+            self.assertTrue(dest_store.verify_audit_chain_status(resB.task_id).valid)
             self.assertEqual(dest_store.load_checkpoint(resA.task_id)["status"], "completed")
             self.assertEqual(dest_store.load_checkpoint(resB.task_id)["status"], "completed")
             # The original (source-chosen) id is NOT a stored key at the destination.
@@ -5152,7 +5209,7 @@ class RuntimeTests(unittest.TestCase):
             # in-process cache.
             with self.assertRaisesRegex(SecurityError, "closed"):
                 second_host.run(replay)
-            self.assertTrue(second_host.store.consumed_nonce_exists(replay.permit.nonce))
+            self.assertTrue(nonce_is_consumed(second_host.store, replay.permit.nonce))
 
     def test_captured_suspended_envelope_rejected_after_resume_advances_generation(self):
         # Finding EV-008, the reviewer's adversarial sequence: a suspended envelope
@@ -5274,7 +5331,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertIsNotNone(checkpoint)
             self.assertEqual(checkpoint["status"], "completed")
             self.assertEqual(checkpoint["result"], result.result)
-            self.assertTrue(store.verify_audit_chain(result.task_id))
+            self.assertTrue(store.verify_audit_chain_status(result.task_id).valid)
             self.assertEqual(store.audit_head(result.task_id), (result.audit[-1]["hash"], result.audit[-1]["sequence"] + 1))
 
     def test_sqlite_store_closes_connections_after_reads(self):
@@ -5299,7 +5356,6 @@ class RuntimeTests(unittest.TestCase):
                 return connection
 
             with patch("portmark.storage.sqlite3.connect", side_effect=tracking_connect):
-                store.consumed_nonce_exists("no-such-nonce")
                 store.load_checkpoint(result.task_id)
                 store.audit_head(result.task_id)
                 store.verify_audit_chain_status(result.task_id)
@@ -5363,7 +5419,7 @@ class RuntimeTests(unittest.TestCase):
                 self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 0)
 
             store = SQLiteRuntimeStore(path)
-            self.assertTrue(store.consumed_nonce_exists("legacy-nonce"))
+            self.assertTrue(nonce_is_consumed(store, "legacy-nonce"))
             with self._raw_sqlite(path) as connection:
                 self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SQLITE_SCHEMA_VERSION)
 
@@ -5440,16 +5496,16 @@ class RuntimeTests(unittest.TestCase):
                     store = SQLiteRuntimeStore(path)
                     host = make_host(store=store, allow_ephemeral_signing_key=True)
                     result = host.run(make_demo_envelope(host, f"audit tamper {name}"))
-                    self.assertTrue(store.verify_audit_chain(result.task_id))
+                    self.assertTrue(store.verify_audit_chain_status(result.task_id).valid)
                     with self._raw_sqlite(path) as connection:
                         connection.execute(statement, (result.task_id,))
                     self.assertEqual(store.verify_audit_chain_status(result.task_id).status, "invalid")
-                    self.assertFalse(store.verify_audit_chain(result.task_id))
+                    self.assertFalse(store.verify_audit_chain_status(result.task_id).valid)
 
         with tempfile.TemporaryDirectory() as directory:
             store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
             self.assertEqual(store.verify_audit_chain_status("missing-task").status, "invalid")
-            self.assertFalse(store.verify_audit_chain("missing-task"))
+            self.assertFalse(store.verify_audit_chain_status("missing-task").valid)
 
     def test_sqlite_audit_chain_rejects_fabricated_consistent_history(self):
         def event(sequence, name, details, previous):
@@ -5500,15 +5556,15 @@ class RuntimeTests(unittest.TestCase):
                     ("task-forged", previous, len(fabricated), "host:local-demo", "", "", int(time.time())),
                 )
 
-            self.assertFalse(store.verify_audit_chain("task-forged"))
+            self.assertFalse(store.verify_audit_chain_status("task-forged").valid)
 
             host = make_host(signer=signer, store=store, allow_ephemeral_signing_key=True)
             result = host.run(make_demo_envelope(host, "signed history"))
-            self.assertTrue(store.verify_audit_chain(result.task_id))
+            self.assertTrue(store.verify_audit_chain_status(result.task_id).valid)
             with self._raw_sqlite(path) as connection:
                 connection.execute("UPDATE audit_heads SET signature = 'tampered' WHERE task_id = ?", (result.task_id,))
             self.assertEqual(store.verify_audit_chain_status(result.task_id).status, "invalid")
-            self.assertFalse(store.verify_audit_chain(result.task_id))
+            self.assertFalse(store.verify_audit_chain_status(result.task_id).valid)
 
     def test_sqlite_audit_chain_status_reports_unverifiable_without_trust_registry(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -5526,7 +5582,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(unverifiable.status, "unverifiable")
             self.assertIn("trust registry", unverifiable.reason)
             self.assertFalse(unverifiable.valid)
-            self.assertFalse(SQLiteRuntimeStore(path).verify_audit_chain(result.task_id))
+            self.assertFalse(SQLiteRuntimeStore(path).verify_audit_chain_status(result.task_id).valid)
 
     def test_verify_audit_cli_reports_valid_invalid_unverifiable_and_missing_chains(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -5671,7 +5727,7 @@ class RuntimeTests(unittest.TestCase):
                 with store.transaction() as transaction:
                     transaction.consume_nonce("nonce-1", "agent:demo", "host:local-demo", "task-1")
                     transaction.append_audit_events("task-1", "host:local-demo", (event, event))
-            self.assertFalse(store.consumed_nonce_exists("nonce-1"))
+            self.assertFalse(nonce_is_consumed(store, "nonce-1"))
             self.assertIsNone(store.load_checkpoint("task-1"))
             self.assertIsNone(store.audit_head("task-1"))
 
@@ -5705,7 +5761,7 @@ class RuntimeTests(unittest.TestCase):
             source_checkpoint = source_store.load_checkpoint(first.task_id)
             self.assertEqual(source_checkpoint["status"], "ready")
             self.assertEqual(source_checkpoint["memory"]["migration"], {"from": "host:source", "to": "host:destination"})
-            self.assertTrue(source_store.verify_audit_chain(first.task_id))
+            self.assertTrue(source_store.verify_audit_chain_status(first.task_id).valid)
             self.assertEqual(first.migration_envelope["previous_audit_host_id"], "host:source")
             self.assertEqual(first.migration_envelope["previous_audit_signature_key_id"], source_signer.key_id)
             self.assertTrue(first.migration_envelope["previous_audit_signature"])
@@ -5714,7 +5770,7 @@ class RuntimeTests(unittest.TestCase):
             second = destination.run(envelope_from_dict(first.migration_envelope))
             self.assertEqual(second.status, "completed")
             self.assertEqual(destination_store.load_checkpoint(second.task_id)["status"], "completed")
-            self.assertTrue(destination_store.verify_audit_chain(second.task_id))
+            self.assertTrue(destination_store.verify_audit_chain_status(second.task_id).valid)
 
     def test_sqlite_store_rejects_concurrent_replay(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -5758,8 +5814,8 @@ class RuntimeTests(unittest.TestCase):
             store = SQLiteRuntimeStore(path, signer)
             nonces_by_task = {envelope.state.task_id: envelope.permit.nonce for envelope in envelopes}
             for result in results:
-                self.assertTrue(store.verify_audit_chain(result.task_id))
-                self.assertTrue(store.consumed_nonce_exists(nonces_by_task[result.task_id]))
+                self.assertTrue(store.verify_audit_chain_status(result.task_id).valid)
+                self.assertTrue(nonce_is_consumed(store, nonces_by_task[result.task_id]))
             with self._raw_sqlite(path) as connection:
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM consumed_nonces").fetchone()[0], len(envelopes))
                 rows = connection.execute(
@@ -6433,13 +6489,6 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(SecurityError, "unexpected fields"):  # extra nested object
             source.verify_migration_receipt({**receipt, "extra": {"nested": True}})
 
-        # HMAC path enforces the same exact-shape rule
-        hm = HmacEnvelopeSigner(b"k" * 32, "hmac-receipt-key")
-        h_receipt = hm.sign_migration_receipt(payload)
-        hm.verify_migration_receipt(h_receipt)
-        with self.assertRaisesRegex(SecurityError, "unexpected fields"):
-            hm.verify_migration_receipt({**h_receipt, "completion_status": "completed"})
-
         # End-to-end: settle refuses an extra-field receipt and the row stays pending.
         with tempfile.TemporaryDirectory() as directory:
             src_host, dst_host, _, envelope = self._migration_pair(directory)
@@ -6453,7 +6502,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(src_host.store.list_pending_migrations(), [])
 
     def test_migration_receipt_verify_rejection_branches(self):
-        # Exercise every rejection path in receipt verification (Ed25519 + HMAC).
+        # Exercise every rejection path in receipt verification.
         from portmark.security import migration_receipt_payload
 
         dest = EnvelopeSigner.generate("br-dest", "host:destination", ("host:destination",))
@@ -6500,15 +6549,6 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(SecurityError, "signature is invalid"):
             reg().verify_migration_receipt({**receipt, "signature": flipped}, now=1000)
 
-        # HMAC path: baseline verifies; wrong key and bad signature rejected
-        hm = HmacEnvelopeSigner(b"k" * 32, "hk")
-        h_receipt = hm.sign_migration_receipt(payload)
-        hm.verify_migration_receipt(h_receipt)
-        with self.assertRaisesRegex(SecurityError, "not trusted"):
-            HmacEnvelopeSigner(b"k" * 32, "other").verify_migration_receipt(h_receipt)
-        with self.assertRaisesRegex(SecurityError, "signature is invalid"):
-            hm.verify_migration_receipt({**h_receipt, "signature": "00"})
-
     def test_migration_receipt_write_failure_rolls_back_admission(self):
         # Atomicity: the receipt is written inside the destination's admission transaction, so if the
         # receipt insert fails the WHOLE admission rolls back -- no checkpoint, no consumed nonce, no
@@ -6529,7 +6569,7 @@ class RuntimeTests(unittest.TestCase):
 
             self.assertIsNone(destination.store.load_checkpoint(task_id))
             self.assertIsNone(destination.store.audit_head(task_id))
-            self.assertFalse(destination.store.consumed_nonce_exists(migrated.permit.nonce))
+            self.assertFalse(nonce_is_consumed(destination.store, migrated.permit.nonce))
             self.assertIsNone(destination.store.get_migration_receipt(task_id))
 
     # ---- Section 4 part 3a: outbox reliability (#3 claim/lease, #4 dead-letter, #8 conflict) ----
@@ -7143,11 +7183,8 @@ class RuntimeTests(unittest.TestCase):
 
     def test_a2a_agent_card_and_signed_submission(self):
         host = make_host()
-        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(host, A2AAuthConfig("a2a-secret")))
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        base = f"http://127.0.0.1:{server.server_port}"
-        try:
+        with serve_asgi(make_asgi_app(host, A2AAuthConfig("a2a-secret"))) as port:
+            base = f"http://127.0.0.1:{port}"
             with urllib.request.urlopen(base + "/.well-known/agent-card.json") as response:  # nosec B310
                 card = json.load(response)
             self.assertNotIn("protocolVersion", card)  # not an AgentCard field
@@ -7170,9 +7207,6 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(result["id"], "req-1")
             self.assertEqual(result["result"]["status"]["state"], "completed")
             self.assertEqual(result["result"]["metadata"]["portmark_status"], "completed")
-        finally:
-            server.shutdown()
-            server.server_close()
 
     def test_a2a_result_artifact_excludes_checkpoint_and_audit(self):
         # Finding #4: the A2A egress must not hand the caller the internal
@@ -7200,31 +7234,19 @@ class RuntimeTests(unittest.TestCase):
     def test_a2a_sdk_adapter_emits_official_agent_card_shape(self):
         with self._fake_official_a2a_sdk():
             host = make_host()
-            server = ThreadingHTTPServer(
-                ("127.0.0.1", 0),
-                make_handler(host, A2AAuthConfig("a2a-secret"), a2a_adapter="sdk"),
-            )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            base = f"http://127.0.0.1:{server.server_port}"
-            try:
+            with serve_asgi(make_asgi_app(host, A2AAuthConfig("a2a-secret"), a2a_adapter="sdk")) as port:
+                base = f"http://127.0.0.1:{port}"
                 with urllib.request.urlopen(base + "/.well-known/agent-card.json") as response:  # nosec B310
                     card = json.load(response)
                 self.assertEqual(card["securitySchemes"]["bearer"]["httpAuthSecurityScheme"]["scheme"], "bearer")
                 self.assertEqual(card["securityRequirements"], [{"schemes": {"bearer": {}}}])
                 self.assertEqual(card["supportedInterfaces"][0]["protocolBinding"], "JSONRPC")
-            finally:
-                server.shutdown()
-                server.server_close()
 
     def test_a2a_sdk_adapter_rejects_request_parts_before_host_execution(self):
         with self._fake_official_a2a_sdk():
             host = make_host()
-            server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(host, a2a_adapter="sdk"))
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            base = f"http://127.0.0.1:{server.server_port}"
-            try:
+            with serve_asgi(make_asgi_app(host, a2a_adapter="sdk")) as port:
+                base = f"http://127.0.0.1:{port}"
                 body = json.loads(self._a2a_request_body(host, "sdk invalid part").decode())
                 body["params"]["message"]["parts"] = [{"kind": "unknown", "payload": "locally accepted"}]
                 request = urllib.request.Request(
@@ -7238,9 +7260,6 @@ class RuntimeTests(unittest.TestCase):
                 self.assertEqual(raised.exception.code, 400)
                 self.assertEqual(json.load(raised.exception)["error"]["code"], -32602)
                 run.assert_not_called()
-            finally:
-                server.shutdown()
-                server.server_close()
 
     def test_a2a_sdk_adapter_requires_optional_dependency(self):
         original_import = __import__
@@ -7252,15 +7271,12 @@ class RuntimeTests(unittest.TestCase):
 
         with patch("builtins.__import__", side_effect=blocked_import):
             with self.assertRaisesRegex(RuntimeError, "portmark\\[a2a\\]"):
-                make_handler(make_host(), a2a_adapter="sdk")
+                make_asgi_app(make_host(), a2a_adapter="sdk")
 
     def test_a2a_security_headers_are_set_with_opt_in_hsts(self):
         host = make_host()
-        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(host, enable_hsts=True))
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        base = f"http://127.0.0.1:{server.server_port}"
-        try:
+        with serve_asgi(make_asgi_app(host, enable_hsts=True)) as port:
+            base = f"http://127.0.0.1:{port}"
             with urllib.request.urlopen(base + "/.well-known/agent-card.json") as response:  # nosec B310
                 self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
                 self.assertEqual(response.headers["Referrer-Policy"], "no-referrer")
@@ -7268,20 +7284,11 @@ class RuntimeTests(unittest.TestCase):
                 self.assertIn("default-src 'none'", response.headers["Content-Security-Policy"])
                 self.assertIn("geolocation=()", response.headers["Permissions-Policy"])
                 self.assertEqual(response.headers["Strict-Transport-Security"], "max-age=31536000")
-        finally:
-            server.shutdown()
-            server.server_close()
 
     def test_a2a_metrics_endpoint_requires_bearer_auth_and_returns_snapshot(self):
         host = make_host()
-        server = ThreadingHTTPServer(
-            ("127.0.0.1", 0),
-            make_handler(host, A2AAuthConfig("metrics-secret"), rate_limit_per_ip=100),
-        )
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        base = f"http://127.0.0.1:{server.server_port}"
-        try:
+        with serve_asgi(make_asgi_app(host, A2AAuthConfig("metrics-secret"), rate_limit_per_ip=100)) as port:
+            base = f"http://127.0.0.1:{port}"
             body = self._a2a_request_body(host, "metrics endpoint")
             submit = urllib.request.Request(
                 base + "/message:send",
@@ -7322,20 +7329,11 @@ class RuntimeTests(unittest.TestCase):
             self.assertIn("portmark_provider_decision_duration_seconds_count 2", text)
             self.assertIn("portmark_tool_invocation_duration_seconds_count 1", text)
             self.assertIn("portmark_a2a_request_duration_seconds_count 1", text)
-        finally:
-            server.shutdown()
-            server.server_close()
 
     def test_a2a_metrics_endpoint_is_rate_limited_separately(self):
         host = make_host()
-        server = ThreadingHTTPServer(
-            ("127.0.0.1", 0),
-            make_handler(host, A2AAuthConfig("metrics-secret"), rate_limit_per_ip=1, rate_limit_window_seconds=60),
-        )
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        base = f"http://127.0.0.1:{server.server_port}"
-        try:
+        with serve_asgi(make_asgi_app(host, A2AAuthConfig("metrics-secret"), rate_limit_per_ip=1, rate_limit_window_seconds=60)) as port:
+            base = f"http://127.0.0.1:{port}"
             request = urllib.request.Request(base + "/metrics", headers={"Authorization": "Bearer metrics-secret"})
             with urllib.request.urlopen(request) as response:  # nosec B310
                 self.assertEqual(json.load(response), {"counters": {}})
@@ -7346,26 +7344,17 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, 429)
             self.assertEqual(raised.exception.headers["Retry-After"], "60")
             self.assertEqual(json.load(raised.exception)["error"], {"code": -32002, "message": "rate limit exceeded"})
-        finally:
-            server.shutdown()
-            server.server_close()
 
     def test_a2a_metrics_endpoint_is_not_open_when_message_auth_is_disabled(self):
         host = make_host()
-        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(host))
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        base = f"http://127.0.0.1:{server.server_port}"
-        try:
+        with serve_asgi(make_asgi_app(host)) as port:
+            base = f"http://127.0.0.1:{port}"
             with self.assertRaises(urllib.error.HTTPError) as raised:
                 urllib.request.urlopen(base + "/metrics")  # nosec B310
             self.assertEqual(raised.exception.code, 401)
             payload = json.load(raised.exception)
             self.assertEqual(payload["error"], {"code": -32001, "message": "unauthorized"})
             self.assertEqual(raised.exception.headers["WWW-Authenticate"], 'Bearer realm="portmark"')
-        finally:
-            server.shutdown()
-            server.server_close()
 
     def test_a2a_serve_requires_loopback_even_when_direct_exposure_flag_is_set(self):
         public_bind = ".".join(("0", "0", "0", "0"))
@@ -7374,7 +7363,6 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(is_loopback_bind("localhost"))
         self.assertFalse(is_loopback_bind(public_bind))
         self.assertFalse(is_loopback_bind("192.0.2.10"))
-        self.assertFalse(issubclass(BoundedReferenceHTTPServer, ThreadingHTTPServer))
 
         host = make_host()
         with patch("portmark.a2a.run_uvicorn") as run:
@@ -8127,11 +8115,8 @@ class RuntimeTests(unittest.TestCase):
 
     def test_a2a_errors_do_not_expose_internal_exception_details(self):
         host = make_host()
-        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(host))
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        base = f"http://127.0.0.1:{server.server_port}"
-        try:
+        with serve_asgi(make_asgi_app(host)) as port:
+            base = f"http://127.0.0.1:{port}"
             envelope = make_demo_envelope(host, "A2A tamper")
             envelope.state.goal = "tampered after signing"
             body = self._a2a_request_body(host, "A2A tamper", envelope=envelope)
@@ -8142,9 +8127,6 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(payload, {"jsonrpc": "2.0", "id": "req-1", "error": {"code": -32000, "message": "message submission failed"}})
             self.assertNotIn("SecurityError", json.dumps(payload))
             self.assertNotIn("signature", json.dumps(payload))
-        finally:
-            server.shutdown()
-            server.server_close()
 
     def test_a2a_errors_are_classified_by_who_caused_them(self):
         # Audit plan 007: a server failure is a 5xx, a refused request stays 400, and the body is the same
@@ -8164,38 +8146,27 @@ class RuntimeTests(unittest.TestCase):
         ]
         host = make_host()
         app = make_asgi_app(host, A2AAuthConfig("secret"))
-        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(host, A2AAuthConfig("secret")))
-        threading.Thread(target=server.serve_forever, daemon=True).start()
         body = self._a2a_request_body(host, "classified")
         headers = {"Content-Type": "application/json", "Content-Length": str(len(body)), "Authorization": "Bearer secret"}
-        try:
-            for label, error, expected in cases:
-                with self.subTest(label), patch.object(host, "run", side_effect=error), patch("portmark.a2a.logger.exception"):
-                    status, response_headers, payload = self._asgi_call(app, "POST", "/message:send", headers, body)
-                    request = urllib.request.Request(f"http://127.0.0.1:{server.server_port}/message:send", data=body, headers=headers)
-                    with self.assertRaises(urllib.error.HTTPError) as raised:
-                        urllib.request.urlopen(request)  # nosec B310
-                    local_status, local_payload = raised.exception.code, raised.exception.read()
-                self.assertEqual((status, local_status), (expected, expected))  # both transports share the router
-                self.assertNotIn(sentinel.encode(), payload + local_payload)
-                decoded = json.loads(payload)["error"]
-                if expected == 503:
-                    self.assertEqual(decoded, {"code": -32003, "message": "service temporarily unavailable"})
-                    self.assertEqual(dict(response_headers).get("retry-after", dict(response_headers).get("Retry-After")),
-                                     str(WITNESS_RETRY_AFTER_SECONDS))
-                else:
-                    self.assertEqual(decoded, {"code": -32000, "message": "message submission failed"})
-            # A structurally malformed envelope (valid JSON, past auth) is the CLIENT's fault through the real
-            # parser: still 400, never reclassified as a server failure by the 500 default.
-            malformed = json.loads(body)
-            del malformed["params"]["metadata"]["portmark_envelope"]["signature"]
-            malformed_body = json.dumps(malformed).encode()
-            status, _, payload = self._asgi_call(app, "POST", "/message:send", {**headers, "Content-Length": str(len(malformed_body))},
-                                                 malformed_body)
-            self.assertEqual((status, json.loads(payload)["error"]["code"]), (400, -32602))
-        finally:
-            server.shutdown()
-            server.server_close()
+        for label, error, expected in cases:
+            with self.subTest(label), patch.object(host, "run", side_effect=error), patch("portmark.a2a.logger.exception"):
+                status, response_headers, payload = self._asgi_call(app, "POST", "/message:send", headers, body)
+            self.assertEqual(status, expected)
+            self.assertNotIn(sentinel.encode(), payload)
+            decoded = json.loads(payload)["error"]
+            if expected == 503:
+                self.assertEqual(decoded, {"code": -32003, "message": "service temporarily unavailable"})
+                self.assertEqual(response_headers.get("retry-after"), str(WITNESS_RETRY_AFTER_SECONDS))
+            else:
+                self.assertEqual(decoded, {"code": -32000, "message": "message submission failed"})
+        # A structurally malformed envelope (valid JSON, past auth) is the CLIENT's fault through the real
+        # parser: still 400, never reclassified as a server failure by the 500 default.
+        malformed = json.loads(body)
+        del malformed["params"]["metadata"]["portmark_envelope"]["signature"]
+        malformed_body = json.dumps(malformed).encode()
+        status, _, payload = self._asgi_call(app, "POST", "/message:send", {**headers, "Content-Length": str(len(malformed_body))},
+                                             malformed_body)
+        self.assertEqual((status, json.loads(payload)["error"]["code"]), (400, -32602))
         metrics = host.metrics.prometheus_text()
         self.assertIn('reason="witness_unavailable"', metrics)
         self.assertIn('reason="internal"', metrics)
@@ -8238,11 +8209,8 @@ class RuntimeTests(unittest.TestCase):
 
     def test_a2a_requires_bearer_auth_before_envelope_parsing(self):
         host = make_host()
-        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(host, A2AAuthConfig("a2a-secret")))
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        base = f"http://127.0.0.1:{server.server_port}"
-        try:
+        with serve_asgi(make_asgi_app(host, A2AAuthConfig("a2a-secret"))) as port:
+            base = f"http://127.0.0.1:{port}"
             body = json.dumps({
                 "jsonrpc": "2.0",
                 "id": "req-1",
@@ -8269,17 +8237,11 @@ class RuntimeTests(unittest.TestCase):
             with self.assertRaises(urllib.error.HTTPError) as raised:
                 urllib.request.urlopen(request)  # nosec B310
             self.assertEqual(raised.exception.code, 401)
-        finally:
-            server.shutdown()
-            server.server_close()
 
     def test_a2a_rejects_malformed_unsupported_oversized_and_wrong_content_type(self):
         host = make_host()
-        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(host))
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        base = f"http://127.0.0.1:{server.server_port}"
-        try:
+        with serve_asgi(make_asgi_app(host)) as port:
+            base = f"http://127.0.0.1:{port}"
             cases = [
                 (b"{", {"Content-Type": "application/json"}, 400, -32700),
                 # Section 8 finding #4: unsafe-but-valid JSON must reject as a parse error (-32700),
@@ -8313,21 +8275,15 @@ class RuntimeTests(unittest.TestCase):
                     self.assertEqual(payload["jsonrpc"], "2.0")
                     self.assertEqual(payload["error"]["code"], code)
             with self.subTest(status=413, code=-32600):
-                self.assertEqual(self._oversized_rejection(server.server_port), (413, -32600))
-        finally:
-            server.shutdown()
-            server.server_close()
+                self.assertEqual(self._oversized_rejection(port), (413, -32600))
 
     def test_a2a_parser_fuzz_target_fails_closed(self):
         run_fuzz_cases(iterations=200)
 
     def test_a2a_rate_limits_message_submissions_per_ip(self):
         host = make_host()
-        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(host, rate_limit_per_ip=1, rate_limit_window_seconds=60))
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        base = f"http://127.0.0.1:{server.server_port}"
-        try:
+        with serve_asgi(make_asgi_app(host, rate_limit_per_ip=1, rate_limit_window_seconds=60)) as port:
+            base = f"http://127.0.0.1:{port}"
             first = urllib.request.Request(
                 base + "/message:send",
                 data=self._a2a_request_body(host, "first limited task"),
@@ -8347,20 +8303,11 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(raised.exception.headers["Retry-After"], "60")
             payload = json.load(raised.exception)
             self.assertEqual(payload["error"], {"code": -32002, "message": "rate limit exceeded"})
-        finally:
-            server.shutdown()
-            server.server_close()
 
     def test_a2a_rate_limits_agent_card_per_ip(self):
         host = make_host()
-        server = ThreadingHTTPServer(
-            ("127.0.0.1", 0),
-            make_handler(host, agent_card_rate_limit_per_ip=1, agent_card_rate_limit_window_seconds=60),
-        )
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        base = f"http://127.0.0.1:{server.server_port}"
-        try:
+        with serve_asgi(make_asgi_app(host, agent_card_rate_limit_per_ip=1, agent_card_rate_limit_window_seconds=60)) as port:
+            base = f"http://127.0.0.1:{port}"
             with urllib.request.urlopen(base + "/.well-known/agent-card.json") as response:  # nosec B310
                 self.assertEqual(json.load(response)["supportedInterfaces"][0]["protocolVersion"], "1.0")
 
@@ -8370,9 +8317,6 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(raised.exception.headers["Retry-After"], "60")
             payload = json.load(raised.exception)
             self.assertEqual(payload["error"], {"code": -32002, "message": "rate limit exceeded"})
-        finally:
-            server.shutdown()
-            server.server_close()
 
     def test_a2a_bounded_reference_server_handles_concurrent_loopback_load(self):
         """Concurrent requests all complete and none are cross-contaminated.
@@ -8386,93 +8330,57 @@ class RuntimeTests(unittest.TestCase):
         """
         workers = 8
         host = make_host()
-        server = BoundedReferenceHTTPServer(
-            ("127.0.0.1", 0),
-            make_handler(
-                host,
-                max_concurrent_requests=workers * 2,
-                rate_limit_per_ip=100,
-                agent_card_rate_limit_per_ip=100,
-            ),
-            max_connections=workers * 2,
-        )
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        base = f"http://127.0.0.1:{server.server_port}"
+        with serve_asgi(make_asgi_app(host, max_concurrent_requests=workers * 2, rate_limit_per_ip=100, agent_card_rate_limit_per_ip=100,)) as port:
+            base = f"http://127.0.0.1:{port}"
 
-        def submit(index):
-            body = self._a2a_request_body(host, f"load task {index}")
-            request = urllib.request.Request(base + "/message:send", data=body, headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(request, timeout=10) as response:  # nosec B310
-                payload = json.load(response)
-            return payload["result"]["status"]["state"]
+            def submit(index):
+                body = self._a2a_request_body(host, f"load task {index}")
+                request = urllib.request.Request(base + "/message:send", data=body, headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(request, timeout=10) as response:  # nosec B310
+                    payload = json.load(response)
+                return payload["result"]["status"]["state"]
 
-        def get_card(_):
-            with urllib.request.urlopen(base + "/.well-known/agent-card.json", timeout=10) as response:  # nosec B310
-                return json.load(response)["supportedInterfaces"][0]["protocolVersion"]
+            def get_card(_):
+                with urllib.request.urlopen(base + "/.well-known/agent-card.json", timeout=10) as response:  # nosec B310
+                    return json.load(response)["supportedInterfaces"][0]["protocolVersion"]
 
-        try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
                 message_states = list(executor.map(submit, range(12)))
                 card_versions = list(executor.map(get_card, range(12)))
             self.assertEqual(message_states, ["completed"] * 12)
             self.assertEqual(card_versions, ["1.0"] * 12)
-        finally:
-            server.shutdown()
-            server.server_close()
 
-    @unittest.skipIf(
-        sys.platform == "win32",
-        "connection cap holds on Windows, but a saturated listener aborts the socket "
-        "(WinError 10053) instead of returning a clean 503 body; this test asserts the "
-        "POSIX rejection shape. The cap itself is Linux-verified.",
-    )
-    def test_a2a_connection_cap_rejects_saturated_message_submissions(self):
+    def test_a2a_admission_cap_rejects_saturated_message_submissions(self):
         host = make_host()
         entered = threading.Event()
         release = threading.Event()
         host.providers["blocker"] = BlockingProvider(entered, release)
-        server = BoundedReferenceHTTPServer(
-            ("127.0.0.1", 0),
-            make_handler(host, max_concurrent_requests=100, rate_limit_per_ip=100),
-            max_connections=1,
-        )
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        base = f"http://127.0.0.1:{server.server_port}"
+        with serve_asgi(make_asgi_app(host, max_concurrent_requests=1, rate_limit_per_ip=100)) as port:
+            base = f"http://127.0.0.1:{port}"
 
-        def submit_blocking_request():
-            request = urllib.request.Request(
-                base + "/message:send",
-                data=self._a2a_request_body(host, "blocking task", make_demo_envelope(host, "blocking task", "blocker")),
-                headers={"Content-Type": "application/json"},
-            )
-            with urllib.request.urlopen(request) as response:  # nosec B310
-                return json.load(response)
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(submit_blocking_request)
-            try:
-                # Generous budgets on purpose: the connection-cap logic is
-                # race-free (the first request holds its semaphore slot until its
-                # thread finishes), so the only way this test fails is a starved
-                # runner not scheduling the blocked request in time. Wide timeouts
-                # keep it deterministic under a loaded full-suite run; a healthy
-                # machine still returns the instant the events fire.
-                self.assertTrue(entered.wait(30))
-                second = urllib.request.Request(
+            def submit_blocking_request():
+                request = urllib.request.Request(
                     base + "/message:send",
-                    data=self._a2a_request_body(host, "busy task"),
+                    data=self._a2a_request_body(host, "blocking task", make_demo_envelope(host, "blocking task", "blocker")),
                     headers={"Content-Type": "application/json"},
                 )
-                status, payload = self._busy_rejection(server.server_port, second.data)
-                self.assertEqual(status, 503)
-                self.assertEqual(payload["error"], {"code": -32003, "message": "server busy"})
-            finally:
-                release.set()
-                server.shutdown()
-                server.server_close()
-            self.assertEqual(future.result(timeout=30)["result"]["status"]["state"], "completed")
+                with urllib.request.urlopen(request) as response:  # nosec B310
+                    return json.load(response)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(submit_blocking_request)
+                try:
+                    # Generous budgets on purpose: the admission cap is race-free (the first run holds its
+                    # permit until the run ends), so the only way this test fails is a starved runner not
+                    # scheduling the blocked request in time. A healthy machine returns the instant the
+                    # events fire.
+                    self.assertTrue(entered.wait(30))
+                    status, payload = self._busy_rejection(port, self._a2a_request_body(host, "busy task"))
+                    self.assertEqual(status, 503)
+                    self.assertEqual(payload["error"], {"code": -32003, "message": "server busy"})
+                finally:
+                    release.set()
+                self.assertEqual(future.result(timeout=30)["result"]["status"]["state"], "completed")
 
     def _busy_rejection(self, port, body):
         sock = socket.create_connection(("127.0.0.1", port), timeout=30)

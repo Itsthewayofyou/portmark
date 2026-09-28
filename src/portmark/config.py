@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .a2a import (
     DEFAULT_AGENT_CARD_RATE_LIMIT_PER_IP,
@@ -134,49 +134,27 @@ class RuntimeConfig:
         )
 
     def merged_with_args(self, args) -> "RuntimeConfig":
-        return RuntimeConfig(
-            host_id=args.host_id or self.host_id,
-            provider_endpoint=args.provider_endpoint or self.provider_endpoint,
-            wasm_component=args.wasm_component or self.wasm_component,
-            wasm_engine=getattr(args, "wasm_engine", None) or self.wasm_engine,
-            store_backend=getattr(args, "store_backend", None) or self.store_backend,
-            store_path=args.store_path or self.store_path,
-            policy_path=args.policy_path or self.policy_path,
-            mcp_config_path=getattr(args, "mcp_config", None) or self.mcp_config_path,
-            trust_registry_path=args.trust_registry_path or self.trust_registry_path,
-            audit_floor_path=getattr(args, "audit_floor_path", None) or self.audit_floor_path,
-            reload_policy=bool(args.reload_policy or self.reload_policy),
-            attestation_verifier_command=_argv(getattr(args, "attestation_verifier_command", None)) or self.attestation_verifier_command,
-            require_attestation=bool(getattr(args, "require_attestation", False) or self.require_attestation),
-            allow_local_provider_endpoint=bool(getattr(args, "allow_local_provider_endpoint", False) or self.allow_local_provider_endpoint),
-            a2a_token=getattr(args, "a2a_token", None) or self.a2a_token,
-            a2a_adapter=getattr(args, "a2a_adapter", None) or self.a2a_adapter,
-            a2a_public_base_url=getattr(args, "a2a_public_base_url", None) or self.a2a_public_base_url,
-            a2a_trusted_proxies=getattr(args, "a2a_trusted_proxies", None) or self.a2a_trusted_proxies,
-            log_level=args.log_level or self.log_level,
-            log_json=bool(args.log_json or self.log_json),
-            enable_hsts=bool(args.enable_hsts or self.enable_hsts),
-            allow_direct_a2a=bool(getattr(args, "allow_direct_a2a", False) or self.allow_direct_a2a),
-            a2a_max_concurrent_requests=getattr(args, "a2a_max_concurrent_requests", None) or self.a2a_max_concurrent_requests,
-            a2a_rate_limit_per_ip=getattr(args, "a2a_rate_limit_per_ip", None) or self.a2a_rate_limit_per_ip,
-            a2a_rate_limit_window_seconds=getattr(args, "a2a_rate_limit_window_seconds", None) or self.a2a_rate_limit_window_seconds,
-            a2a_agent_card_rate_limit_per_ip=getattr(
-                args,
-                "a2a_agent_card_rate_limit_per_ip",
-                None,
-            ) or self.a2a_agent_card_rate_limit_per_ip,
-            a2a_agent_card_rate_limit_window_seconds=getattr(
-                args,
-                "a2a_agent_card_rate_limit_window_seconds",
-                None,
-            ) or self.a2a_agent_card_rate_limit_window_seconds,
-            a2a_body_read_timeout_seconds=self.a2a_body_read_timeout_seconds,
-            shutdown_grace_seconds=self.shutdown_grace_seconds,
-            profile=self.profile,
-            attestation_allowed_measurements=self.attestation_allowed_measurements,
-            migration_preflight_command=self.migration_preflight_command,
-        )
+        """Overlay the CLI options on this config. An option that is absent, None, "", 0 or False was not
+        supplied and keeps the configured value; the fields outside _CLI_FIELDS are never set from the CLI."""
+        overrides = {}
+        for option, name in _CLI_FIELDS.items():
+            value = getattr(args, option, None)
+            if option == "attestation_verifier_command":
+                value = _argv(value)
+            if value:
+                overrides[name] = value
+        return replace(self, **overrides)
 
+
+# CLI option name -> RuntimeConfig field.
+_CLI_FIELDS = {name: name for name in (
+    "host_id", "provider_endpoint", "wasm_component", "wasm_engine", "store_backend", "store_path",
+    "policy_path", "trust_registry_path", "audit_floor_path", "reload_policy", "attestation_verifier_command",
+    "require_attestation", "allow_local_provider_endpoint", "a2a_token", "a2a_adapter", "a2a_public_base_url",
+    "a2a_trusted_proxies", "log_level", "log_json", "enable_hsts", "allow_direct_a2a",
+    "a2a_max_concurrent_requests", "a2a_rate_limit_per_ip", "a2a_rate_limit_window_seconds",
+    "a2a_agent_card_rate_limit_per_ip", "a2a_agent_card_rate_limit_window_seconds",
+)} | {"mcp_config": "mcp_config_path"}
 
 def _argv(value: str | None) -> tuple[str, ...] | None:
     if value is None or not value.strip():

@@ -24,6 +24,7 @@ from __future__ import annotations
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 # A run launches at most max_tool_calls tools; the report keeps a bounded tail so a runaway run cannot
@@ -101,28 +102,29 @@ class RunProgress:
             return self._snapshot_locked()
 
 
-_local = threading.local()
+# A context variable, not a thread-local: two runs interleaved on one event-loop thread each keep their
+# own record. A new thread starts without it, so work a run hands to another thread is not tracked.
+_current: ContextVar[RunProgress | None] = ContextVar("portmark_run_progress", default=None)
 
 
 @contextmanager
 def tracking(progress: RunProgress) -> Iterator[RunProgress]:
-    """Make `progress` the current thread's run record for the duration of the block."""
-    previous = getattr(_local, "progress", None)
-    _local.progress = progress
+    """Make `progress` the current run record for the duration of the block."""
+    token = _current.set(progress)
     try:
         yield progress
     finally:
-        _local.progress = previous
+        _current.reset(token)
 
 
 def begin(operation: str, *, effect_id: str | None = None) -> None:
     """Start `operation` for the current tracked run, or raise RunAbandoned (see the module note)."""
-    progress = getattr(_local, "progress", None)
+    progress = _current.get()
     if progress is not None:
         progress.begin(operation, effect_id=effect_id)
 
 
 def note(**fields: Any) -> None:
-    progress = getattr(_local, "progress", None)
+    progress = _current.get()
     if progress is not None:
         progress.note(**fields)

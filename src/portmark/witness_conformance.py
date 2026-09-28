@@ -18,7 +18,6 @@ the witness already holds for the id, with fresh task ids, so it can run again a
 from __future__ import annotations
 
 import secrets
-from dataclasses import dataclass
 from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -33,38 +32,10 @@ from .remote_witness import (
     WitnessClient,
     WitnessUnavailable,
 )
+from .verifier_conformance import ConformanceCase, ConformanceReport
 
 CONFORMANCE_PREFIX = "conformance:"
 ACCEPT = "accept"
-
-
-@dataclass(frozen=True)
-class WitnessCase:
-    name: str
-    expect: str  # ACCEPT, or the refusal code the witness must answer
-    outcome: str  # "accepted", "refused:<code>", or "unavailable"
-    passed: bool
-    detail: str
-
-
-@dataclass(frozen=True)
-class WitnessConformanceReport:
-    host_id: str
-    cases: tuple[WitnessCase, ...]
-
-    @property
-    def passed(self) -> bool:
-        return bool(self.cases) and all(case.passed for case in self.cases)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "status": "pass" if self.passed else "fail",
-            "host_id": self.host_id,
-            "cases": [
-                {"name": case.name, "expect": case.expect, "outcome": case.outcome, "passed": case.passed, "detail": case.detail}
-                for case in self.cases
-            ],
-        }
 
 
 def _head(sequence: int, head_hash: str) -> dict[str, Any]:
@@ -73,18 +44,18 @@ def _head(sequence: int, head_hash: str) -> dict[str, Any]:
 
 class _Script:
     def __init__(self) -> None:
-        self.cases: list[WitnessCase] = []
+        self.cases: list[ConformanceCase] = []
         self.stopped = False
 
     def expect(self, name: str, expect: str, call: Any, check: Any = None) -> Answer | None:
         """Run one case. `check(answer)` returns a problem string, or None if the answer is right."""
         if self.stopped:
-            self.cases.append(WitnessCase(name, expect, "skipped", False, "an earlier case failed, so the chain is not where this case needs it"))
+            self.cases.append(ConformanceCase(name, expect, "skipped", False, "an earlier case failed, so the chain is not where this case needs it"))
             return None
         try:
             answer = call()
         except WitnessUnavailable as error:
-            self.cases.append(WitnessCase(name, expect, "unavailable", False, str(error)))
+            self.cases.append(ConformanceCase(name, expect, "unavailable", False, str(error)))
             self.stopped = True
             return None
         outcome = "accepted" if answer.kind != "refusal" else f"refused:{answer.code}"
@@ -94,7 +65,7 @@ class _Script:
             problem = None if answer.code == expect else f"expected a {expect!r} refusal"
         if problem is None and check is not None:
             problem = check(answer)
-        self.cases.append(WitnessCase(name, expect, outcome, problem is None, problem or "ok"))
+        self.cases.append(ConformanceCase(name, expect, outcome, problem is None, problem or "ok"))
         if problem is not None and expect == ACCEPT:
             self.stopped = True  # the chain did not move as the next cases need
         return answer if problem is None else None
@@ -106,7 +77,7 @@ def _equal(label: str, actual: Any, expected: Any) -> str | None:
 
 def run_witness_conformance(
     transport: Transport, witness_public_key: bytes, host_id: str, host_key: Ed25519PrivateKey,
-) -> WitnessConformanceReport:
+) -> ConformanceReport:
     if not host_id.startswith(CONFORMANCE_PREFIX) or len(host_id) == len(CONFORMANCE_PREFIX):
         raise ValueError(f"the conformance host id must start with {CONFORMANCE_PREFIX!r} (it must never be a real host's id)")
     client = WitnessClient(transport, witness_public_key, host_id, host_key)
@@ -116,7 +87,7 @@ def run_witness_conformance(
 
     start = script.expect("state-read", ACCEPT, lambda: client.state(host_id))
     if start is None:
-        return WitnessConformanceReport(host_id, tuple(script.cases))
+        return ConformanceReport(tuple(script.cases), host_id)
     state = start.body
     base = state["pending"] or state["confirmed"]
     base_prev = None if base is None else base["receipt_hash"]
@@ -196,4 +167,4 @@ def run_witness_conformance(
         return None
 
     script.expect("state-reflects-the-chain", ACCEPT, lambda: client.state(host_id, task), read_back)
-    return WitnessConformanceReport(host_id, tuple(script.cases))
+    return ConformanceReport(tuple(script.cases), host_id)
