@@ -22,7 +22,6 @@ from portmark.factory import make_host, signer_from_environment
 from portmark.models import AgentEnvelope, AgentManifest, AgentState, Permit, ResourceBudget, ToolGrant
 from portmark.security import (
     EnvelopeSigner,
-    HmacEnvelopeSigner,
     SecurityError,
     TrustedIdentity,
     TrustRegistry,
@@ -482,10 +481,22 @@ class FollowupAuditTests(unittest.TestCase):
 
     def test_durable_refuses_signer_without_affirmative_stability_marker(self):
         # #5b: stability must be affirmative. A signer that does not declare ephemeral=False
-        # (e.g. a randomly-generated HMAC signer) is not presumed stable.
+        # (here a custom signer that says nothing about it) is not presumed stable.
+        class _UndeclaredStabilitySigner:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __getattr__(self, name):
+                if name == "ephemeral":
+                    raise AttributeError(name)
+                return getattr(self._inner, name)
+
         with tempfile.TemporaryDirectory() as directory:
             store = SQLiteRuntimeStore(str(Path(directory) / "store.sqlite"))
-            signer = HmacEnvelopeSigner.generate()
+            raw = EnvelopeSigner.generate().private_key_bytes()
+            signer = _UndeclaredStabilitySigner(
+                EnvelopeSigner.from_private_key_bytes("env-ed25519-key", "host:local-demo", raw))
+            self.assertFalse(hasattr(signer, "ephemeral"))
             with self.assertRaisesRegex(ValueError, "durable store requires"):
                 make_host(signer=signer, store=store)
 

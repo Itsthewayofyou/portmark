@@ -175,8 +175,7 @@ residual risks.
 
 Envelopes are signed with Ed25519 by default and verified through a key-ID-based trust registry.
 See [SIGNING_KEYS.md](https://github.com/Itsthewayofyou/portmark/blob/main/SIGNING_KEYS.md) for key generation, rotation, revocation, trust
-bootstrap guidance, and why SPIFFE is a planned opt-in rather than the trust root. The legacy HMAC signer is retained only behind
-`PORTMARK_ALLOW_LEGACY_HMAC=unsafe-test-only` plus an explicit `PORTMARK_SIGNING_KEY`.
+bootstrap guidance, and why SPIFFE is a planned opt-in rather than the trust root. The legacy HMAC signer was removed; setting `PORTMARK_ALLOW_LEGACY_HMAC` now stops the host at boot instead of falling back to a generated key.
 
 ## Run it
 

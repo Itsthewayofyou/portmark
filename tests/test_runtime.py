@@ -51,7 +51,6 @@ from portmark.security import (
     EnvelopeSigner,
     audit_event_record,
     ExternalAttestationVerifier,
-    HmacEnvelopeSigner,
     HostPolicy,
     MigrationPolicy,
     SecurityError,
@@ -735,19 +734,17 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(SecurityError, "key id is missing"):
             host.run(missing_key_id)
 
-    def test_legacy_hmac_signer_requires_explicit_unsafe_test_opt_in_and_key(self):
-        with patch.dict(os.environ, {"PORTMARK_ALLOW_LEGACY_HMAC": "1"}, clear=True):
-            with self.assertRaisesRegex(RuntimeError, "unsafe-test-only"):
-                signer_from_environment()
-        with patch.dict(os.environ, {"PORTMARK_ALLOW_LEGACY_HMAC": "unsafe-test-only"}, clear=True):
-            with self.assertRaisesRegex(RuntimeError, "PORTMARK_SIGNING_KEY"):
-                signer_from_environment()
-        with patch.dict(os.environ, {
-            "PORTMARK_ALLOW_LEGACY_HMAC": "unsafe-test-only",
-            "PORTMARK_SIGNING_KEY": "explicit legacy integration test key",
-        }, clear=True):
-            signer = signer_from_environment()
-        self.assertIsInstance(signer, HmacEnvelopeSigner)
+    def test_removed_legacy_hmac_switch_fails_closed(self):
+        # The HMAC signer is gone. Its old switch must stop the host, never fall through to a generated
+        # key -- including the exact value and key that used to enable it.
+        for env in (
+            {"PORTMARK_ALLOW_LEGACY_HMAC": "1"},
+            {"PORTMARK_ALLOW_LEGACY_HMAC": "unsafe-test-only",
+             "PORTMARK_SIGNING_KEY": "explicit legacy integration test key"},
+        ):
+            with self.subTest(env=env), patch.dict(os.environ, env, clear=True):
+                with self.assertRaisesRegex(RuntimeError, "legacy HMAC signer was removed"):
+                    signer_from_environment()
 
     def test_canonical_signature_is_stable(self):
         private_key = bytes(range(32))
@@ -6432,13 +6429,6 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(SecurityError, "unexpected fields"):  # extra nested object
             source.verify_migration_receipt({**receipt, "extra": {"nested": True}})
 
-        # HMAC path enforces the same exact-shape rule
-        hm = HmacEnvelopeSigner(b"k" * 32, "hmac-receipt-key")
-        h_receipt = hm.sign_migration_receipt(payload)
-        hm.verify_migration_receipt(h_receipt)
-        with self.assertRaisesRegex(SecurityError, "unexpected fields"):
-            hm.verify_migration_receipt({**h_receipt, "completion_status": "completed"})
-
         # End-to-end: settle refuses an extra-field receipt and the row stays pending.
         with tempfile.TemporaryDirectory() as directory:
             src_host, dst_host, _, envelope = self._migration_pair(directory)
@@ -6452,7 +6442,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(src_host.store.list_pending_migrations(), [])
 
     def test_migration_receipt_verify_rejection_branches(self):
-        # Exercise every rejection path in receipt verification (Ed25519 + HMAC).
+        # Exercise every rejection path in receipt verification.
         from portmark.security import migration_receipt_payload
 
         dest = EnvelopeSigner.generate("br-dest", "host:destination", ("host:destination",))
@@ -6498,15 +6488,6 @@ class RuntimeTests(unittest.TestCase):
         flipped = receipt["signature"][:-2] + ("AA" if not receipt["signature"].endswith("AA") else "BB")
         with self.assertRaisesRegex(SecurityError, "signature is invalid"):
             reg().verify_migration_receipt({**receipt, "signature": flipped}, now=1000)
-
-        # HMAC path: baseline verifies; wrong key and bad signature rejected
-        hm = HmacEnvelopeSigner(b"k" * 32, "hk")
-        h_receipt = hm.sign_migration_receipt(payload)
-        hm.verify_migration_receipt(h_receipt)
-        with self.assertRaisesRegex(SecurityError, "not trusted"):
-            HmacEnvelopeSigner(b"k" * 32, "other").verify_migration_receipt(h_receipt)
-        with self.assertRaisesRegex(SecurityError, "signature is invalid"):
-            hm.verify_migration_receipt({**h_receipt, "signature": "00"})
 
     def test_migration_receipt_write_failure_rolls_back_admission(self):
         # Atomicity: the receipt is written inside the destination's admission transaction, so if the

@@ -12,7 +12,6 @@ from portmark.security import (
     AttestationPolicy,
     EnvelopeSigner,
     ExternalAttestationVerifier,
-    HmacEnvelopeSigner,
     HostPolicy,
     SecurityError,
     TrustedApprover,
@@ -168,31 +167,6 @@ class SecurityGuardTests(unittest.TestCase):
 
         with self.assertRaisesRegex(SecurityError, "audit head host does not match signing identity"):
             signer.sign_audit_head("task-1", "host:other", "head-hash", 1)
-
-    def test_legacy_hmac_audit_head_guards_are_table_driven(self):
-        signer = HmacEnvelopeSigner(b"x" * 32)
-        envelope = AgentEnvelope(
-            AgentManifest("agent:demo", "1.0.0", "deterministic", ("catalog.search",)),
-            self._permit(),
-            AgentState("task-1", "goal"),
-        )
-        signer.seal(envelope)
-        signer.verify(envelope)
-        payload = audit_head_payload("task-1", "host:local-demo", "head-hash", 1)
-        signature = signer.sign_audit_head("task-1", "host:local-demo", "head-hash", 1)
-        signer.verify_audit_head(signer.key_id, payload, signature)
-
-        cases = [
-            ("signing keys must contain at least 32 bytes", lambda: HmacEnvelopeSigner(b"short")),
-            ("agent envelope signature key id is not trusted", lambda: signer.verify(replace(envelope, signature_key_id="other"))),
-            ("agent envelope signature is invalid", lambda: signer.verify(replace(envelope, signature="bad"))),
-            ("audit head signing key is not trusted", lambda: signer.verify_audit_head("other", payload, signature)),
-            ("audit head signature is invalid", lambda: signer.verify_audit_head(signer.key_id, payload, "bad")),
-        ]
-        for message, action in cases:
-            with self.subTest(message=message):
-                with self.assertRaisesRegex((SecurityError, ValueError), message):
-                    action()
 
     def test_envelope_signer_key_export_and_import_guards(self):
         signer = EnvelopeSigner.generate("export-key", "user:alice", ("host:local-demo",))
