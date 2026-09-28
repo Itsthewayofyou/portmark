@@ -1611,7 +1611,159 @@ def _enable_wal(connection: sqlite3.Connection) -> None:
         delay = min(delay * 2, 0.1)
 
 
-class SQLiteRuntimeStore:
+class _PsycopgQmark:
+    """A psycopg connection that takes _SQLRuntimeStore's shared SQL, written with `?` placeholders."""
+
+    def __init__(self, connection: Any) -> None:
+        self._connection = connection
+
+    def execute(self, query: str, params: Any = None) -> Any:
+        return self._connection.execute(query.replace("?", "%s"), params)
+
+
+class _SQLRuntimeStore:
+    """The store methods SQLite and PostgreSQL run identically: one statement each, no dialect.
+
+    A method belongs here only if the two backends' versions were the same once `?`/`%s` and the
+    connection call are set aside. Anything with a lock, `FOR UPDATE`, `RETURNING`, the database clock or
+    a backend-specific exception stays in its backend. `_session()` yields a connection whose execute()
+    takes `?` placeholders.
+    """
+
+    def _session(self) -> AbstractContextManager[Any]:  # pragma: no cover - each backend defines it
+        raise NotImplementedError
+
+    def set_audit_head_verifier(self, verifier: AuditHeadVerifier) -> None:
+        self._audit_head_verifier = verifier
+
+    def _page(self, status: str, columns: str, limit: int, after: str | None) -> list[dict[str, Any]]:
+        _validate_page(limit, after)
+        with self._session() as connection:
+            rows = connection.execute(
+                f"SELECT {columns} FROM migration_outbox WHERE status = ? AND task_id > ? ORDER BY task_id LIMIT ?",  # nosec B608 -- constant columns
+                (status, after or "", limit),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def list_pending_migrations(self, limit: int = DEFAULT_ADMIN_PAGE_SIZE, after: str | None = None) -> list[dict[str, Any]]:
+        return self._page("pending", "task_id, destination, sealed_envelope_json, status, attempt_count, created_at, claimed_by, lease_expires_at", limit, after)
+
+    def get_migration_receipt(self, task_id: str) -> dict[str, Any] | None:
+        with self._session() as connection:
+            row = connection.execute(
+                "SELECT receipt_json FROM migration_receipts WHERE task_id = ?", (task_id,)
+            ).fetchone()
+        return None if row is None else json.loads(row["receipt_json"])
+
+    def replace_migration_receipt(self, task_id: str, receipt_json: str) -> None:
+        # Overwrite only the receipt body (regenerated attestation + signature); created_at and every
+        # binding stay put. A single UPDATE is atomic under the connection lock, so concurrent
+        # regenerations are last-write-wins over equally-valid receipts, never a partial write.
+        with self._session() as connection:
+            connection.execute(
+                "UPDATE migration_receipts SET receipt_json = ? WHERE task_id = ?",
+                (receipt_json, task_id),
+            )
+
+    def get_effect(self, effect_id: str) -> dict[str, Any] | None:
+        with self._session() as connection:
+            row = connection.execute(
+                "SELECT effect_id, task_id, tool, state, arguments_json, result_json, reason, "
+                "created_at, updated_at, reconcile_claim_id, reconcile_lease_expires_at "
+                "FROM tool_effects WHERE effect_id = ?",
+                (effect_id,),
+            ).fetchone()
+        return None if row is None else dict(row)
+
+    def mark_effect_started(self, effect_id: str) -> None:
+        # Only advance a prepared row to started (durable, right before launch). A row already
+        # started/settled is not moved back.
+        with self._session() as connection:
+            connection.execute(
+                "UPDATE tool_effects SET state = 'started', updated_at = ? "
+                "WHERE effect_id = ? AND state = 'prepared'",
+                (int(time.time()), effect_id),
+            )
+
+    def settle_effect(self, effect_id: str, state: str, result_json: str | None, reason: str | None) -> None:
+        with self._session() as connection:
+            connection.execute(
+                "UPDATE tool_effects SET state = ?, result_json = ?, reason = ?, updated_at = ? "
+                "WHERE effect_id = ?",
+                (state, result_json, reason, int(time.time()), effect_id),
+            )
+
+    def list_dead_migrations(self, limit: int = DEFAULT_ADMIN_PAGE_SIZE, after: str | None = None) -> list[dict[str, Any]]:
+        return self._page("dead", "task_id, destination, sealed_envelope_json, status, attempt_count, created_at, dead_reason", limit, after)
+
+    def requeue_migration(self, task_id: str) -> bool:
+        # Operator recovery of a dead row (NOT lease-scoped) -- clears dead_reason, returns to queue.
+        with self._session() as connection:
+            cursor = connection.execute(
+                "UPDATE migration_outbox SET status = 'pending', dead_reason = NULL, claimed_by = NULL, "
+                "lease_expires_at = NULL WHERE task_id = ? AND status = 'dead'",
+                (task_id,),
+            )
+            return cursor.rowcount > 0
+
+    def find_migration_for_settlement(self, task_id: str) -> dict[str, Any] | None:
+        # Pending OR dead (not delivered): a verified receipt settles a row even after the
+        # dispatcher dead-lettered it, so #4 does not regress the section 4 #2 lost-ack fix.
+        with self._session() as connection:
+            row = connection.execute(
+                "SELECT task_id, destination, sealed_envelope_json, status, attempt_count, created_at, dead_reason "
+                "FROM migration_outbox WHERE task_id = ? AND status IN ('pending', 'dead')",
+                (task_id,),
+            ).fetchone()
+        return None if row is None else dict(row)
+
+    def maintenance_log(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self._session() as connection:
+            rows = connection.execute("SELECT id, at, action, detail_json FROM maintenance_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return _maintenance_rows(rows)
+
+    def load_checkpoint(self, task_id: str) -> dict[str, Any] | None:
+        with self._session() as connection:
+            row = connection.execute(f"SELECT {_CHECKPOINT_ROW} FROM checkpoints WHERE task_id = ?", (task_id,)).fetchone()  # nosec B608 -- constant column list
+        return _decode_row(self.checkpoint_codec, task_id, row) if row is not None else None
+
+    def audit_head(self, task_id: str) -> tuple[str, int] | None:
+        with self._session() as connection:
+            row = connection.execute("SELECT head_hash, sequence FROM audit_heads WHERE task_id = ?", (task_id,)).fetchone()
+            return (row["head_hash"], int(row["sequence"])) if row is not None else None
+
+    def audit_heads_for_host(self, host_id: str) -> list[tuple[str, str, int]]:
+        with self._session() as connection:
+            rows = connection.execute("SELECT task_id, head_hash, sequence FROM audit_heads WHERE host_id = ?", (host_id,)).fetchall()
+        return [(row["task_id"], row["head_hash"], int(row["sequence"])) for row in rows]
+
+    def audit_event_hash(self, task_id: str, sequence: int) -> str | None:
+        with self._session() as connection:
+            row = connection.execute(
+                "SELECT hash FROM audit_events WHERE task_id = ? AND sequence = ?", (task_id, sequence)
+            ).fetchone()
+        return None if row is None else row["hash"]
+
+    def audit_floor_marker(self, host_id: str) -> tuple[int, bool] | None:
+        with self._session() as connection:
+            row = connection.execute("SELECT epoch, pending FROM audit_floor_markers WHERE host_id = ?", (host_id,)).fetchone()
+        return None if row is None else (int(row["epoch"]), bool(row["pending"]))
+
+    def set_audit_floor_marker(self, host_id: str, epoch: int, pending: bool) -> None:
+        with self._session() as connection:
+            connection.execute(
+                "INSERT INTO audit_floor_markers (host_id, epoch, pending, updated_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT (host_id) DO UPDATE SET epoch = EXCLUDED.epoch, pending = EXCLUDED.pending, updated_at = EXCLUDED.updated_at",
+                (host_id, epoch, pending, int(time.time())),
+            )
+
+    def witness_receipt(self, host_id: str) -> tuple[int, str] | None:
+        with self._session() as connection:
+            row = connection.execute("SELECT host_seq, receipt_hash FROM witness_receipts WHERE host_id = ?", (host_id,)).fetchone()
+        return None if row is None else (int(row["host_seq"]), str(row["receipt_hash"]))
+
+
+class SQLiteRuntimeStore(_SQLRuntimeStore):
     is_durable = True
 
     def __init__(
@@ -1629,9 +1781,6 @@ class SQLiteRuntimeStore:
         # Section 4 #3: lease clock is a construction dependency (see InMemoryRuntimeStore).
         self._clock: Callable[[], int] = clock or _wall_clock
         self._initialize()
-
-    def set_audit_head_verifier(self, verifier: AuditHeadVerifier) -> None:
-        self._audit_head_verifier = verifier
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30, isolation_level=None)
@@ -1657,6 +1806,9 @@ class SQLiteRuntimeStore:
                 yield connection
         finally:
             connection.close()
+
+    def _session(self) -> AbstractContextManager[sqlite3.Connection]:
+        return self._connection()
 
     def _initialize(self) -> None:
         _prepare_sqlite_database_file(Path(self.path))
@@ -2010,35 +2162,6 @@ class SQLiteRuntimeStore:
     def transaction(self) -> AbstractContextManager[RuntimeTransaction]:
         return _SQLiteTransaction(self)
 
-    def _page(self, status: str, columns: str, limit: int, after: str | None) -> list[dict[str, Any]]:
-        _validate_page(limit, after)
-        with self._connection() as connection:
-            rows = connection.execute(
-                f"SELECT {columns} FROM migration_outbox WHERE status = ? AND task_id > ? ORDER BY task_id LIMIT ?",  # nosec B608 -- constant columns
-                (status, after or "", limit),
-            ).fetchall()
-            return [dict(row) for row in rows]
-
-    def list_pending_migrations(self, limit: int = DEFAULT_ADMIN_PAGE_SIZE, after: str | None = None) -> list[dict[str, Any]]:
-        return self._page("pending", "task_id, destination, sealed_envelope_json, status, attempt_count, created_at, claimed_by, lease_expires_at", limit, after)
-
-    def get_migration_receipt(self, task_id: str) -> dict[str, Any] | None:
-        with self._connection() as connection:
-            row = connection.execute(
-                "SELECT receipt_json FROM migration_receipts WHERE task_id = ?", (task_id,)
-            ).fetchone()
-        return None if row is None else json.loads(row["receipt_json"])
-
-    def replace_migration_receipt(self, task_id: str, receipt_json: str) -> None:
-        # Overwrite only the receipt body (regenerated attestation + signature); created_at and every
-        # binding stay put. A single UPDATE is atomic under the connection lock, so concurrent
-        # regenerations are last-write-wins over equally-valid receipts, never a partial write.
-        with self._connection() as connection:
-            connection.execute(
-                "UPDATE migration_receipts SET receipt_json = ? WHERE task_id = ?",
-                (receipt_json, task_id),
-            )
-
     def mark_migration_delivered(self, task_id: str, receipt_json: str) -> None:
         with self._connection() as connection:
             connection.execute(
@@ -2062,16 +2185,6 @@ class SQLiteRuntimeStore:
             ).fetchone()
         return row is not None
 
-    def get_effect(self, effect_id: str) -> dict[str, Any] | None:
-        with self._connection() as connection:
-            row = connection.execute(
-                "SELECT effect_id, task_id, tool, state, arguments_json, result_json, reason, "
-                "created_at, updated_at, reconcile_claim_id, reconcile_lease_expires_at "
-                "FROM tool_effects WHERE effect_id = ?",
-                (effect_id,),
-            ).fetchone()
-        return None if row is None else dict(row)
-
     def record_effect_prepared(self, effect_id: str, task_id: str, tool: str, arguments_json: str) -> None:
         # Idempotent on effect_id: a prepared row for a call already recorded is left as-is (the
         # host checks state first). Presence of a prepared row means "intent recorded, not launched".
@@ -2082,24 +2195,6 @@ class SQLiteRuntimeStore:
                 "(effect_id, task_id, tool, state, arguments_json, result_json, reason, created_at, updated_at) "
                 "VALUES (?, ?, ?, 'prepared', ?, NULL, NULL, ?, ?)",
                 (effect_id, task_id, tool, arguments_json, now, now),
-            )
-
-    def mark_effect_started(self, effect_id: str) -> None:
-        # Only advance a prepared row to started (durable, right before launch). A row already
-        # started/settled is not moved back.
-        with self._connection() as connection:
-            connection.execute(
-                "UPDATE tool_effects SET state = 'started', updated_at = ? "
-                "WHERE effect_id = ? AND state = 'prepared'",
-                (int(time.time()), effect_id),
-            )
-
-    def settle_effect(self, effect_id: str, state: str, result_json: str | None, reason: str | None) -> None:
-        with self._connection() as connection:
-            connection.execute(
-                "UPDATE tool_effects SET state = ?, result_json = ?, reason = ?, updated_at = ? "
-                "WHERE effect_id = ?",
-                (state, result_json, reason, int(time.time()), effect_id),
             )
 
     def claim_effect_for_reconcile(self, effect_id: str, claim_id: str, lease_seconds: int) -> bool:
@@ -2229,30 +2324,6 @@ class SQLiteRuntimeStore:
             )
             return cursor.rowcount > 0
 
-    def list_dead_migrations(self, limit: int = DEFAULT_ADMIN_PAGE_SIZE, after: str | None = None) -> list[dict[str, Any]]:
-        return self._page("dead", "task_id, destination, sealed_envelope_json, status, attempt_count, created_at, dead_reason", limit, after)
-
-    def requeue_migration(self, task_id: str) -> bool:
-        # Operator recovery of a dead row (NOT lease-scoped) -- clears dead_reason, returns to queue.
-        with self._connection() as connection:
-            cursor = connection.execute(
-                "UPDATE migration_outbox SET status = 'pending', dead_reason = NULL, claimed_by = NULL, "
-                "lease_expires_at = NULL WHERE task_id = ? AND status = 'dead'",
-                (task_id,),
-            )
-            return cursor.rowcount > 0
-
-    def find_migration_for_settlement(self, task_id: str) -> dict[str, Any] | None:
-        # Pending OR dead (not delivered): a verified receipt settles a row even after the
-        # dispatcher dead-lettered it, so #4 does not regress the section 4 #2 lost-ack fix.
-        with self._connection() as connection:
-            row = connection.execute(
-                "SELECT task_id, destination, sealed_envelope_json, status, attempt_count, created_at, dead_reason "
-                "FROM migration_outbox WHERE task_id = ? AND status IN ('pending', 'dead')",
-                (task_id,),
-            ).fetchone()
-        return None if row is None else dict(row)
-
     def time_floor(self) -> int:
         with self._connection() as connection:
             row = connection.execute("SELECT floor_at FROM time_floor WHERE singleton = 1").fetchone()
@@ -2302,11 +2373,6 @@ class SQLiteRuntimeStore:
                     (int(time.time()), json.dumps(report, sort_keys=True)),
                 )
         return dict(report, applied=apply)
-
-    def maintenance_log(self, limit: int = 100) -> list[dict[str, Any]]:
-        with self._connection() as connection:
-            rows = connection.execute("SELECT id, at, action, detail_json FROM maintenance_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-        return _maintenance_rows(rows)
 
     def prune(self, nonce_cutoff: int, migration_cutoff: int, apply: bool = False, batch_size: int = MAX_PRUNE_BATCH) -> dict[str, Any]:
         def read(sql: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
@@ -2373,16 +2439,6 @@ class SQLiteRuntimeStore:
         if version != SQLITE_SCHEMA_VERSION:
             raise RuntimeError(f"SQLite store schema version {version} is not the supported version {SQLITE_SCHEMA_VERSION}")
 
-    def load_checkpoint(self, task_id: str) -> dict[str, Any] | None:
-        with self._connection() as connection:
-            row = connection.execute(f"SELECT {_CHECKPOINT_ROW} FROM checkpoints WHERE task_id = ?", (task_id,)).fetchone()  # nosec B608 -- constant column list
-        return _decode_row(self.checkpoint_codec, task_id, row) if row is not None else None
-
-    def audit_head(self, task_id: str) -> tuple[str, int] | None:
-        with self._connection() as connection:
-            row = connection.execute("SELECT head_hash, sequence FROM audit_heads WHERE task_id = ?", (task_id,)).fetchone()
-            return (row["head_hash"], int(row["sequence"])) if row is not None else None
-
     def verify_audit_chain_status(self, task_id: str, allow_legacy_anchor: bool = False) -> AuditVerificationResult:
         with self._connection() as connection:
             # Section 10 F3: read the events and the head from ONE snapshot. The connection is
@@ -2403,11 +2459,6 @@ class SQLiteRuntimeStore:
         return _verify_audit_rows(self._audit_head_verifier, task_id, rows, head, allow_legacy_anchor)
 
     # -- Section 10 PR B: audit-floor support (reads + the per-host marker) ------------------
-    def audit_heads_for_host(self, host_id: str) -> list[tuple[str, str, int]]:
-        with self._connection() as connection:
-            rows = connection.execute("SELECT task_id, head_hash, sequence FROM audit_heads WHERE host_id = ?", (host_id,)).fetchall()
-        return [(row["task_id"], row["head_hash"], int(row["sequence"])) for row in rows]
-
     def audit_export_page(
         self,
         after: str | None,
@@ -2433,38 +2484,13 @@ class SQLiteRuntimeStore:
 
             return _assemble_export_page([dict(row) for row in heads], fetch_events, after, watermarks, limit, max_events)
 
-    def audit_event_hash(self, task_id: str, sequence: int) -> str | None:
-        with self._connection() as connection:
-            row = connection.execute(
-                "SELECT hash FROM audit_events WHERE task_id = ? AND sequence = ?", (task_id, sequence)
-            ).fetchone()
-        return None if row is None else row["hash"]
-
-    def audit_floor_marker(self, host_id: str) -> tuple[int, bool] | None:
-        with self._connection() as connection:
-            row = connection.execute("SELECT epoch, pending FROM audit_floor_markers WHERE host_id = ?", (host_id,)).fetchone()
-        return None if row is None else (int(row["epoch"]), bool(row["pending"]))
-
-    def set_audit_floor_marker(self, host_id: str, epoch: int, pending: bool) -> None:
-        with self._connection() as connection:
-            connection.execute(
-                "INSERT INTO audit_floor_markers (host_id, epoch, pending, updated_at) VALUES (?, ?, ?, ?) "
-                "ON CONFLICT (host_id) DO UPDATE SET epoch = EXCLUDED.epoch, pending = EXCLUDED.pending, updated_at = EXCLUDED.updated_at",
-                (host_id, epoch, pending, int(time.time())),
-            )
-
-    def witness_receipt(self, host_id: str) -> tuple[int, str] | None:
-        with self._connection() as connection:
-            row = connection.execute("SELECT host_seq, receipt_hash FROM witness_receipts WHERE host_id = ?", (host_id,)).fetchone()
-        return None if row is None else (int(row["host_seq"]), str(row["receipt_hash"]))
-
     def set_witness_receipt(self, host_id: str, host_seq: int, receipt_hash: str, receipt_json: str) -> None:
         """Outside a save: only an operator rebaseline (`floor-reset --operator-key-file`) writes here."""
         with self._connection() as connection:
             _upsert_witness_receipt(connection, "?", host_id, host_seq, receipt_hash, receipt_json)
 
 
-class PostgresRuntimeStore:
+class PostgresRuntimeStore(_SQLRuntimeStore):
     is_durable = True
 
     def __init__(
@@ -2493,9 +2519,6 @@ class PostgresRuntimeStore:
         # embedded stores and may be injected by a test, but it does NOT govern Postgres lease timing.
         self._clock: Callable[[], int] = clock or _wall_clock
         self._initialize_schema()
-
-    def set_audit_head_verifier(self, verifier: AuditHeadVerifier) -> None:
-        self._audit_head_verifier = verifier
 
     @staticmethod
     def available() -> bool:
@@ -2532,6 +2555,11 @@ class PostgresRuntimeStore:
         connection = _bounded_postgres_connect(self.dsn, self.timeouts, row_factory=rows.dict_row)
         connection.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(self.schema)))
         return connection
+
+    @contextmanager
+    def _session(self) -> Generator[_PsycopgQmark, None, None]:
+        with self._connect() as connection:
+            yield _PsycopgQmark(connection)
 
     def _initialize(self, connection) -> None:
         connection.execute(
@@ -2759,35 +2787,6 @@ class PostgresRuntimeStore:
     def transaction(self) -> AbstractContextManager[RuntimeTransaction]:
         return _PostgresTransaction(self)
 
-    def _page(self, status: str, columns: str, limit: int, after: str | None) -> list[dict[str, Any]]:
-        _validate_page(limit, after)
-        with self._connect() as connection:
-            rows = connection.execute(
-                f"SELECT {columns} FROM migration_outbox WHERE status = %s AND task_id > %s ORDER BY task_id LIMIT %s",  # nosec B608 -- constant columns
-                (status, after or "", limit),
-            ).fetchall()
-            return [dict(row) for row in rows]
-
-    def list_pending_migrations(self, limit: int = DEFAULT_ADMIN_PAGE_SIZE, after: str | None = None) -> list[dict[str, Any]]:
-        return self._page("pending", "task_id, destination, sealed_envelope_json, status, attempt_count, created_at, claimed_by, lease_expires_at", limit, after)
-
-    def get_migration_receipt(self, task_id: str) -> dict[str, Any] | None:
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT receipt_json FROM migration_receipts WHERE task_id = %s", (task_id,)
-            ).fetchone()
-        return None if row is None else json.loads(row["receipt_json"])
-
-    def replace_migration_receipt(self, task_id: str, receipt_json: str) -> None:
-        # Overwrite only the receipt body (regenerated attestation + signature); created_at and every
-        # binding stay put. The single UPDATE takes the row lock, so concurrent regenerations are
-        # last-write-wins over equally-valid receipts, never a partial write.
-        with self._connect() as connection:
-            connection.execute(
-                "UPDATE migration_receipts SET receipt_json = %s WHERE task_id = %s",
-                (receipt_json, task_id),
-            )
-
     def mark_migration_delivered(self, task_id: str, receipt_json: str) -> None:
         with self._connect() as connection:
             connection.execute(
@@ -2819,16 +2818,6 @@ class PostgresRuntimeStore:
             ).fetchone()
         return row is not None
 
-    def get_effect(self, effect_id: str) -> dict[str, Any] | None:
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT effect_id, task_id, tool, state, arguments_json, result_json, reason, "
-                "created_at, updated_at, reconcile_claim_id, reconcile_lease_expires_at "
-                "FROM tool_effects WHERE effect_id = %s",
-                (effect_id,),
-            ).fetchone()
-        return None if row is None else dict(row)
-
     def record_effect_prepared(self, effect_id: str, task_id: str, tool: str, arguments_json: str) -> None:
         # Keyed by the effect_id PRIMARY KEY; idempotent on it. The host serializes effect writes per
         # task in its run loop, so no per-task advisory lock is needed (unlike cancellation, which
@@ -2841,22 +2830,6 @@ class PostgresRuntimeStore:
                 "VALUES (%s, %s, %s, 'prepared', %s, NULL, NULL, %s, %s) "
                 "ON CONFLICT (effect_id) DO NOTHING",
                 (effect_id, task_id, tool, arguments_json, now, now),
-            )
-
-    def mark_effect_started(self, effect_id: str) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                "UPDATE tool_effects SET state = 'started', updated_at = %s "
-                "WHERE effect_id = %s AND state = 'prepared'",
-                (int(time.time()), effect_id),
-            )
-
-    def settle_effect(self, effect_id: str, state: str, result_json: str | None, reason: str | None) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                "UPDATE tool_effects SET state = %s, result_json = %s, reason = %s, updated_at = %s "
-                "WHERE effect_id = %s",
-                (state, result_json, reason, int(time.time()), effect_id),
             )
 
     def claim_effect_for_reconcile(self, effect_id: str, claim_id: str, lease_seconds: int) -> bool:
@@ -2985,27 +2958,6 @@ class PostgresRuntimeStore:
             )
             return cursor.rowcount > 0
 
-    def list_dead_migrations(self, limit: int = DEFAULT_ADMIN_PAGE_SIZE, after: str | None = None) -> list[dict[str, Any]]:
-        return self._page("dead", "task_id, destination, sealed_envelope_json, status, attempt_count, created_at, dead_reason", limit, after)
-
-    def requeue_migration(self, task_id: str) -> bool:
-        with self._connect() as connection:
-            cursor = connection.execute(
-                "UPDATE migration_outbox SET status = 'pending', dead_reason = NULL, claimed_by = NULL, "
-                "lease_expires_at = NULL WHERE task_id = %s AND status = 'dead'",
-                (task_id,),
-            )
-            return cursor.rowcount > 0
-
-    def find_migration_for_settlement(self, task_id: str) -> dict[str, Any] | None:
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT task_id, destination, sealed_envelope_json, status, attempt_count, created_at, dead_reason "
-                "FROM migration_outbox WHERE task_id = %s AND status IN ('pending', 'dead')",
-                (task_id,),
-            ).fetchone()
-        return None if row is None else dict(row)
-
     def time_floor(self) -> int:
         with self._connect() as connection:
             row = connection.execute("SELECT floor_at FROM time_floor WHERE singleton").fetchone()
@@ -3056,11 +3008,6 @@ class PostgresRuntimeStore:
                 (json.dumps({"prior": prior, "new": floor_at, "reason": reason}, sort_keys=True),),
             )
         return prior
-
-    def maintenance_log(self, limit: int = 100) -> list[dict[str, Any]]:
-        with self._connect() as connection:
-            rows = connection.execute("SELECT id, at, action, detail_json FROM maintenance_log ORDER BY id DESC LIMIT %s", (limit,)).fetchall()
-        return _maintenance_rows(rows)
 
     def prune(self, nonce_cutoff: int, migration_cutoff: int, apply: bool = False, batch_size: int = MAX_PRUNE_BATCH) -> dict[str, Any]:
         def read(sql: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
@@ -3123,16 +3070,6 @@ class PostgresRuntimeStore:
         if version != POSTGRES_SCHEMA_VERSION:
             raise RuntimeError(f"Postgres store schema version {version} is not the supported version {POSTGRES_SCHEMA_VERSION}")
 
-    def load_checkpoint(self, task_id: str) -> dict[str, Any] | None:
-        with self._connect() as connection:
-            row = connection.execute(f"SELECT {_CHECKPOINT_ROW} FROM checkpoints WHERE task_id = %s", (task_id,)).fetchone()  # nosec B608 -- constant column list
-        return _decode_row(self.checkpoint_codec, task_id, row) if row is not None else None
-
-    def audit_head(self, task_id: str) -> tuple[str, int] | None:
-        with self._connect() as connection:
-            row = connection.execute("SELECT head_hash, sequence FROM audit_heads WHERE task_id = %s", (task_id,)).fetchone()
-            return (row["head_hash"], int(row["sequence"])) if row is not None else None
-
     def verify_audit_chain_status(self, task_id: str, allow_legacy_anchor: bool = False) -> AuditVerificationResult:
         psycopg, _, _, _ = _postgres_modules()
         with self._connect() as connection:
@@ -3155,11 +3092,6 @@ class PostgresRuntimeStore:
         return _verify_audit_rows(self._audit_head_verifier, task_id, rows, head, allow_legacy_anchor)
 
     # -- Section 10 PR B: audit-floor support (reads + the per-host marker) ------------------
-    def audit_heads_for_host(self, host_id: str) -> list[tuple[str, str, int]]:
-        with self._connect() as connection:
-            rows = connection.execute("SELECT task_id, head_hash, sequence FROM audit_heads WHERE host_id = %s", (host_id,)).fetchall()
-        return [(row["task_id"], row["head_hash"], int(row["sequence"])) for row in rows]
-
     def audit_export_page(
         self,
         after: str | None,
@@ -3187,31 +3119,6 @@ class PostgresRuntimeStore:
                 return [_export_event_row(row) for row in rows]
 
             return _assemble_export_page([dict(row) for row in heads], fetch_events, after, watermarks, limit, max_events)
-
-    def audit_event_hash(self, task_id: str, sequence: int) -> str | None:
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT hash FROM audit_events WHERE task_id = %s AND sequence = %s", (task_id, sequence)
-            ).fetchone()
-        return None if row is None else row["hash"]
-
-    def audit_floor_marker(self, host_id: str) -> tuple[int, bool] | None:
-        with self._connect() as connection:
-            row = connection.execute("SELECT epoch, pending FROM audit_floor_markers WHERE host_id = %s", (host_id,)).fetchone()
-        return None if row is None else (int(row["epoch"]), bool(row["pending"]))
-
-    def set_audit_floor_marker(self, host_id: str, epoch: int, pending: bool) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                "INSERT INTO audit_floor_markers (host_id, epoch, pending, updated_at) VALUES (%s, %s, %s, %s) "
-                "ON CONFLICT (host_id) DO UPDATE SET epoch = EXCLUDED.epoch, pending = EXCLUDED.pending, updated_at = EXCLUDED.updated_at",
-                (host_id, epoch, pending, int(time.time())),
-            )
-
-    def witness_receipt(self, host_id: str) -> tuple[int, str] | None:
-        with self._connect() as connection:
-            row = connection.execute("SELECT host_seq, receipt_hash FROM witness_receipts WHERE host_id = %s", (host_id,)).fetchone()
-        return None if row is None else (int(row["host_seq"]), str(row["receipt_hash"]))
 
     def set_witness_receipt(self, host_id: str, host_seq: int, receipt_hash: str, receipt_json: str) -> None:
         """Outside a save: only an operator rebaseline (`floor-reset --operator-key-file`) writes here."""
@@ -3310,12 +3217,7 @@ class _PostgresTransaction:
                 "SELECT head_hash, sequence FROM audit_heads WHERE task_id = %s FOR UPDATE",
                 (task_id,),
             ).fetchone()
-            expected_sequence = int(head["sequence"]) if head is not None else 0
-            expected_previous = head["head_hash"] if head is not None else event["previous"]
-            if event["sequence"] != expected_sequence:
-                raise SecurityError("audit event sequence is not contiguous")
-            if event["previous"] != expected_previous:
-                raise SecurityError("audit event previous hash does not match stored head")
+            _check_audit_link(head, event)
             try:
                 self._connection.execute(
                     """
@@ -3323,16 +3225,7 @@ class _PostgresTransaction:
                         (task_id, sequence, host_id, event, details_json, previous_hash, hash, created_at)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     """,
-                    (
-                        task_id,
-                        event["sequence"],
-                        host_id,
-                        event["event"],
-                        json.dumps(event["details"], sort_keys=True, separators=(",", ":")),
-                        event["previous"],
-                        event["hash"],
-                        int(time.time()),
-                    ),
+                    _audit_event_row(task_id, host_id, event),
                 )
             except errors.UniqueViolation as error:
                 raise SecurityError("audit event already exists") from error
@@ -3653,12 +3546,7 @@ class _SQLiteTransaction:
                 "SELECT head_hash, sequence FROM audit_heads WHERE task_id = ?",
                 (task_id,),
             ).fetchone()
-            expected_sequence = int(head["sequence"]) if head is not None else 0
-            expected_previous = head["head_hash"] if head is not None else event["previous"]
-            if event["sequence"] != expected_sequence:
-                raise SecurityError("audit event sequence is not contiguous")
-            if event["previous"] != expected_previous:
-                raise SecurityError("audit event previous hash does not match stored head")
+            _check_audit_link(head, event)
             try:
                 self._connection.execute(
                     """
@@ -3666,16 +3554,7 @@ class _SQLiteTransaction:
                         (task_id, sequence, host_id, event, details_json, previous_hash, hash, created_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (
-                        task_id,
-                        event["sequence"],
-                        host_id,
-                        event["event"],
-                        json.dumps(event["details"], sort_keys=True, separators=(",", ":")),
-                        event["previous"],
-                        event["hash"],
-                        int(time.time()),
-                    ),
+                    _audit_event_row(task_id, host_id, event),
                 )
             except sqlite3.IntegrityError as error:
                 raise SecurityError("audit event already exists") from error
@@ -3866,6 +3745,31 @@ LEGACY_ANCHOR_ALLOWED_REASON = (
     "legacy migration anchor accepted by --allow-legacy-anchor: the source proof was NOT independently "
     "reverified (compatibility mode, not an equivalent security mode)"
 )
+
+
+def _check_audit_link(head: Any, event: dict[str, Any]) -> None:
+    """Refuse an event that does not extend the stored head: the chain rule both SQL backends enforce
+    inside their locked write, so it is written once."""
+    expected_sequence = int(head["sequence"]) if head is not None else 0
+    expected_previous = head["head_hash"] if head is not None else event["previous"]
+    if event["sequence"] != expected_sequence:
+        raise SecurityError("audit event sequence is not contiguous")
+    if event["previous"] != expected_previous:
+        raise SecurityError("audit event previous hash does not match stored head")
+
+
+def _audit_event_row(task_id: str, host_id: str, event: dict[str, Any]) -> tuple[Any, ...]:
+    """The audit_events row for `event`. details_json is the compact sorted form the verifier re-reads."""
+    return (
+        task_id,
+        event["sequence"],
+        host_id,
+        event["event"],
+        json.dumps(event["details"], sort_keys=True, separators=(",", ":")),
+        event["previous"],
+        event["hash"],
+        int(time.time()),
+    )
 
 
 def _verify_audit_rows(
