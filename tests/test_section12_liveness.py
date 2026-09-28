@@ -192,6 +192,32 @@ class ThreadStartFailureReleasesPermitTests(unittest.TestCase):
         self.assertEqual(app.run_tracker.active_count(), 0)
 
 
+class RunTrackingScopeTests(unittest.TestCase):
+    def test_two_runs_interleaved_on_one_thread_keep_their_own_records(self):
+        # Two coroutines on ONE event-loop thread, each inside its own tracking() block and interleaved at
+        # an await: each run's notes must land in its own record, never the other's.
+        first, second = _run_progress.RunProgress(), _run_progress.RunProgress()
+
+        async def run(progress, task_id, entered, wait_for, done):
+            with _run_progress.tracking(progress):
+                entered.set()
+                await wait_for.wait()
+                _run_progress.note(task_id=task_id)
+                done.set()
+
+        async def scenario():
+            # A enters and waits for B to enter; B enters and waits for A to note. So A notes (and leaves)
+            # while B's block is still open, and B notes after A's block has closed.
+            a_in, b_in, a_done, b_done = asyncio.Event(), asyncio.Event(), asyncio.Event(), asyncio.Event()
+            await asyncio.gather(run(first, "task-a", a_in, b_in, a_done), run(second, "task-b", b_in, a_done, b_done))
+
+        asyncio.run(scenario())
+        self.assertEqual(first.snapshot()["task_id"], "task-a")
+        self.assertEqual(second.snapshot()["task_id"], "task-b")
+        _run_progress.note(task_id="outside")  # outside any tracked run: a no-op, and no record changes
+        self.assertEqual((first.snapshot()["task_id"], second.snapshot()["task_id"]), ("task-a", "task-b"))
+
+
 class TimeoutValidationTests(unittest.TestCase):
     def test_bounds_that_would_disable_a_limit_are_refused(self):
         for bad in (0, -1, math.nan, math.inf, True, "5", None):
