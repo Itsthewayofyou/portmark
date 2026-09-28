@@ -977,6 +977,25 @@ def _shutdown_hook(app: Any) -> Any:
     raise RuntimeError("the ASGI application has no Portmark shutdown hook (make_asgi_app)")
 
 
+def uvicorn_options(host: str, port: int) -> dict[str, Any]:
+    """The uvicorn settings every Portmark entry point runs with."""
+    return {
+        "host": host,
+        "port": port,
+        # Section 11 #6: uvicorn's default proxy_headers=True rewrites the peer from X-Forwarded-For (for
+        # 127.0.0.1) BEFORE Portmark's trusted-proxy policy runs; that policy is the single authority.
+        "proxy_headers": False,
+        # Section 11 #2: a uvicorn Config re-applies uvicorn's default dictConfig AFTER configure_logging(),
+        # reinstalling non-propagating, unredacted handlers. log_config=None keeps the one redacting root
+        # handler in charge.
+        "log_config": None,
+        "log_level": "warning",
+        "access_log": False,
+        "limit_concurrency": 32,
+        "timeout_keep_alive": 5,
+    }
+
+
 def run_uvicorn(app: Any, options: dict[str, Any]) -> None:
     """Run uvicorn as uvicorn.run() does for one worker without reload, plus Section 12 #1.
 
@@ -1064,21 +1083,4 @@ def serve(
         # tokenless loopback server is an acknowledged configuration here.
         allow_anonymous=True,
     )
-    run_uvicorn(
-        app,
-        {
-            "host": bind,
-            "port": port,
-            "log_level": "warning",
-            # Section 11 #2 (auditor round 2): a uvicorn Config re-applies uvicorn's default
-            # dictConfig AFTER the CLI's configure_logging(), reinstalling non-propagating, unredacted
-            # handlers. log_config=None keeps the one redacting root handler in charge.
-            "log_config": None,
-            # Section 11 #6: uvicorn's default proxy_headers=True rewrites the peer from
-            # X-Forwarded-For (for 127.0.0.1) BEFORE Portmark's trusted-proxy policy runs.
-            "proxy_headers": False,
-            "limit_concurrency": max_concurrent_requests,
-            "timeout_keep_alive": 5,
-            "access_log": False,
-        },
-    )
+    run_uvicorn(app, uvicorn_options(bind, port) | {"limit_concurrency": max_concurrent_requests})
