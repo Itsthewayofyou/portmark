@@ -191,6 +191,32 @@ class EffectiveRevocationTests(unittest.TestCase):
             with self.assertRaisesRegex(SecurityError, "changed on disk"):
                 source.has_key("agent-key")
 
+    def test_trust_source_checks_the_file_even_for_a_key_the_boot_overlay_holds(self):
+        # The overlay (the host's own boot key) is not in the file, but every lookup still verifies the
+        # file first: a changed registry stops the host as a whole, not only the keys the file lists.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trust.json"
+            agent = EnvelopeSigner.generate("agent-key", "user:alice", ("host:local-demo",))
+            _write_registry(path, agent, audiences=("host:local-demo",))
+            source = TrustSource.from_path(path)
+            host_key = EnvelopeSigner.generate("host-key", "host:local-demo", ("host:local-demo",))
+            source.add(TrustedIdentity("host-key", "host:local-demo", host_key.public_key_bytes(), ("*",)))
+            self.assertTrue(source.is_usable("host-key", self.NOW))  # served by the overlay
+
+            _write_registry(path, agent, audiences=("host:local-demo",), revoked=True)
+            checks = {
+                "identity": lambda: source.identity("host-key"),
+                "has_key": lambda: source.has_key("host-key"),
+                "is_usable": lambda: source.is_usable("host-key", self.NOW),
+                "audit_signing_reason": lambda: source.audit_signing_reason("host-key", self.NOW),
+                "verify_audit_floor": lambda: source.verify_audit_floor("host-key", {}, "sig"),
+                "evaluate_audit_head": lambda: source.evaluate_audit_head("host-key", {}, "sig", self.NOW),
+                "verify_migration_receipt": lambda: source.verify_migration_receipt({"signature_key_id": "host-key"}),
+            }
+            for name, check in checks.items():
+                with self.subTest(method=name), self.assertRaisesRegex(SecurityError, "changed on disk"):
+                    check()
+
     def test_effective_revocation_trust_source_fails_closed_when_file_removed(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "trust.json"

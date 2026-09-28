@@ -752,60 +752,41 @@ class TrustSource:
         self._overlay.add(identity)
 
     # -- verification interface (fails closed on any on-disk change) --------------------
-    def identity(self, key_id: str) -> TrustedIdentity | None:
+    def _registry_for(self, key_id: Any) -> TrustRegistry:
+        """The registry that answers for `key_id`: the boot overlay if it holds the key, else the file.
+
+        The file is verified FIRST on every call, so a changed or missing file fails closed even for a
+        key the overlay holds.
+        """
         registry = self._verified_file()
-        return self._overlay.identity(key_id) or registry.identity(key_id)
+        return self._overlay if isinstance(key_id, str) and self._overlay.has_key(key_id) else registry
+
+    def identity(self, key_id: str) -> TrustedIdentity | None:
+        return self._registry_for(key_id).identity(key_id)
 
     def has_key(self, key_id: str) -> bool:
-        registry = self._verified_file()
-        return self._overlay.has_key(key_id) or registry.has_key(key_id)
+        return self._registry_for(key_id).has_key(key_id)
 
     def is_usable(self, key_id: str, now: int | None = None) -> bool:
-        registry = self._verified_file()
-        if self._overlay.has_key(key_id):
-            return self._overlay.is_usable(key_id, now)
-        return registry.is_usable(key_id, now)
+        return self._registry_for(key_id).is_usable(key_id, now)
 
     def audit_signing_reason(self, key_id: str, now: int | None = None) -> str | None:
-        registry = self._verified_file()
-        if self._overlay.has_key(key_id):
-            return self._overlay.audit_signing_reason(key_id, now)
-        return registry.audit_signing_reason(key_id, now)
+        return self._registry_for(key_id).audit_signing_reason(key_id, now)
 
     def require_identity(self, envelope: AgentEnvelope, now: int | None = None) -> TrustedIdentity:
-        registry = self._verified_file()
-        if envelope.signature_key_id and self._overlay.has_key(envelope.signature_key_id):
-            return self._overlay.require_identity(envelope, now)
-        return registry.require_identity(envelope, now)
+        return self._registry_for(envelope.signature_key_id or None).require_identity(envelope, now)
 
     def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None, required_usage: str = "audit") -> None:
-        registry = self._verified_file()
-        if self._overlay.has_key(key_id):
-            self._overlay.verify_audit_head(key_id, payload, signature, now, required_usage=required_usage)
-        else:
-            registry.verify_audit_head(key_id, payload, signature, now, required_usage=required_usage)
+        self._registry_for(key_id).verify_audit_head(key_id, payload, signature, now, required_usage=required_usage)
 
     def verify_audit_floor(self, key_id: str, body: dict[str, Any], signature: str) -> None:
-        registry = self._verified_file()
-        if self._overlay.has_key(key_id):
-            self._overlay.verify_audit_floor(key_id, body, signature)
-        else:
-            registry.verify_audit_floor(key_id, body, signature)
+        self._registry_for(key_id).verify_audit_floor(key_id, body, signature)
 
     def evaluate_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None, required_usage: str = "audit") -> AuditHeadEvaluation:
-        registry = self._verified_file()
-        if self._overlay.has_key(key_id):
-            return self._overlay.evaluate_audit_head(key_id, payload, signature, now, required_usage=required_usage)
-        return registry.evaluate_audit_head(key_id, payload, signature, now, required_usage=required_usage)
+        return self._registry_for(key_id).evaluate_audit_head(key_id, payload, signature, now, required_usage=required_usage)
 
     def verify_migration_receipt(self, receipt: dict[str, Any], now: int | None = None) -> None:
-        registry = self._verified_file()
-        key_id = receipt.get("signature_key_id")
-        if isinstance(key_id, str) and self._overlay.has_key(key_id):
-            self._overlay.verify_migration_receipt(receipt, now)
-        else:
-            registry.verify_migration_receipt(receipt, now)
-
+        self._registry_for(receipt.get("signature_key_id")).verify_migration_receipt(receipt, now)
 
 def _issuer_matches(signing_issuer: str, permit_issuer: str) -> bool:
     return permit_issuer == signing_issuer
