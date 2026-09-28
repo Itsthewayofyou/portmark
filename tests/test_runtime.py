@@ -9493,6 +9493,10 @@ class AgentSideToolingTests(unittest.TestCase):
                 ("missing_tools_module:registry", "could not load --tools"),
                 ("custom_tools:missing_registry", "could not load --tools"),
                 ("custom_tools", "module:function"),
+                ("custom_tools:", "module:function"),  # resolve_name would return the module itself
+                ("custom_tools:registry.", "could not load --tools"),
+                ("custom_tools:registry:extra", "could not load --tools"),
+                (".custom_tools:registry", "could not load --tools"),
             ]
             self._tool_module(directory, "from portmark.tools import ToolRegistry\n\ndef registry():\n    return ToolRegistry()\n")
             with patch.dict(os.environ, {}, clear=True):
@@ -9507,6 +9511,24 @@ class AgentSideToolingTests(unittest.TestCase):
                                         cli_main()
                             self.assertEqual(caught.exception.code, 2)
                             self.assertIn(message, stderr.getvalue())
+
+    def test_tools_loader_resolves_dotted_attributes_and_imports_nothing_else(self):
+        from portmark.tool_loading import ToolLoaderError, load_tools
+
+        with tempfile.TemporaryDirectory() as directory:
+            self._tool_module(directory, (
+                "from portmark.tools import ToolRegistry\n\n"
+                "class holder:\n    registry = staticmethod(lambda: ToolRegistry())\n"
+            ))
+            marker = Path(directory) / "imported.marker"
+            # A module whose name is not an identifier. The strict syntax must refuse it before any import.
+            (Path(directory) / "custom-tools.py").write_text(f"open({str(marker)!r}, 'w').close()\nregistry = None\n")
+            with patch.object(sys, "path", [directory, *sys.path]):
+                sys.modules.pop("custom_tools", None)
+                self.assertIsInstance(load_tools("custom_tools:holder.registry"), ToolRegistry)
+                with self.assertRaisesRegex(ToolLoaderError, "could not load --tools"):
+                    load_tools("custom-tools:registry")
+            self.assertFalse(marker.exists())
 
     def test_cli_rejects_tools_loader_returning_the_wrong_type(self):
         with tempfile.TemporaryDirectory() as directory:
