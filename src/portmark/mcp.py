@@ -23,7 +23,7 @@ from typing import Any
 
 from .json_guard import StrictJSONError, strict_json_loads
 from .mcp_client import ERROR_CODES
-from .mcp_config import McpConfig, McpConfigError, McpServerConfig, McpToolConfig, load_config
+from .mcp_config import McpConfig, McpConfigError, McpServerConfig, McpToolConfig, load_config, oauth_client_credentials
 from .mcp_token_store import REFRESH_MARGIN_SECONDS, StoredTokens, TokenStoreError, read_tokens
 from .mcp_worker import tool_environment
 from .tools import ToolRegistry, _launch_process_tree
@@ -109,7 +109,7 @@ def refresh_oauth_tokens(config: McpConfig, only: str | None = None) -> tuple[st
                 f"MCP server {name!r} uses `oauth`, and the authorization code lives in an optional extra "
                 "that is not installed: `pip install 'portmark[mcp-oauth]'`"
             )
-        client_id = os.environ.get(server.oauth.client_id_env, "")
+        client_id, client_secret = oauth_client_credentials(server.oauth, os.environ)
         if not client_id:
             raise McpStartupError(
                 f"MCP server {name!r} reads its client id from {server.oauth.client_id_env}, "
@@ -120,9 +120,7 @@ def refresh_oauth_tokens(config: McpConfig, only: str | None = None) -> tuple[st
                 server_url=server.url,
                 token_store=server.oauth.token_store,
                 client_id=client_id,
-                client_secret=os.environ.get(server.oauth.client_secret_env, "")
-                if server.oauth.client_secret_env
-                else "",
+                client_secret=client_secret,
                 scopes=server.oauth.scopes,
                 allow_private=server.allow_private,
             )
@@ -392,14 +390,13 @@ class TokenRefresher:
 
         assert server.oauth is not None  # nosec B101 - as in `tick`
         started = time.monotonic()
+        client_id, client_secret = oauth_client_credentials(server.oauth, os.environ)
         try:
             current_access_token(
                 server_url=server.url,
                 token_store=server.oauth.token_store,
-                client_id=os.environ.get(server.oauth.client_id_env, ""),
-                client_secret=os.environ.get(server.oauth.client_secret_env, "")
-                if server.oauth.client_secret_env
-                else "",
+                client_id=client_id,
+                client_secret=client_secret,
                 scopes=server.oauth.scopes,
                 allow_private=server.allow_private,
                 now=now,

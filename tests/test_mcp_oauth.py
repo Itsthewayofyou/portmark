@@ -55,6 +55,7 @@ from portmark.mcp_client import McpError
 from portmark.mcp_config import (
     McpConfigError,
     McpOAuthConfig,
+    oauth_client_credentials,
     McpServerConfig,
     config_from_bytes,
     definition_digest,
@@ -99,6 +100,20 @@ class OauthConfigTests(unittest.TestCase):
         with self.assertRaises(McpConfigError) as caught:
             self.load(oauth, **server_changes)
         return str(caught.exception)
+
+    def test_client_credentials_are_read_by_name_from_the_environment_given(self):
+        oauth = McpOAuthConfig("CID", "/t.json", client_secret_env="SECRET")  # nosec B106 - variable NAMES
+        cases = [
+            ({"CID": "id", "SECRET": "shh"}, ("id", "shh")),  # nosec B105 - fixture values
+            ({"CID": "id"}, ("id", "")),                      # the named secret is unset
+            ({}, ("", "")),                                   # each caller decides what an empty id means
+        ]
+        for environ, expected in cases:
+            with self.subTest(environ=sorted(environ)):
+                self.assertEqual(oauth_client_credentials(oauth, environ), expected)
+        # No secret configured: a variable that happens to exist is never read.
+        public = McpOAuthConfig("CID", "/t.json")
+        self.assertEqual(oauth_client_credentials(public, {"CID": "id", "": "x"}), ("id", ""))
 
     def test_an_oauth_block_carries_names_and_a_path_and_never_a_secret(self):
         config = self.load(dict(OAUTH, client_secret_env="EXAMPLE_SECRET", scopes=["files:read"]))  # nosec B106 - an environment variable NAME, which is the whole point of the test
