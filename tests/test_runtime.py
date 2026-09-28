@@ -637,6 +637,66 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(config.a2a_agent_card_rate_limit_per_ip, 78)
         self.assertEqual(config.a2a_agent_card_rate_limit_window_seconds, 90)
 
+    def test_runtime_config_takes_a_cli_value_only_when_one_is_supplied(self):
+        # merged_with_args, field by field: a CLI option overrides the configured value only when it is
+        # truthy. None, "", 0 and False all mean "not supplied" and keep the configured value.
+        from dataclasses import fields
+
+        supplied = {  # CLI option -> (RuntimeConfig field, value on the command line, value in the config)
+            "host_id": ("host_id", "host:cli", "host:cli"),
+            "provider_endpoint": ("provider_endpoint", "https://cli.example/run", "https://cli.example/run"),
+            "wasm_component": ("wasm_component", "cli.wasm", "cli.wasm"),
+            "wasm_engine": ("wasm_engine", "wasmtime", "wasmtime"),
+            "store_backend": ("store_backend", "postgres", "postgres"),
+            "store_path": ("store_path", "cli.sqlite", "cli.sqlite"),
+            "policy_path": ("policy_path", "cli-policy.json", "cli-policy.json"),
+            "mcp_config": ("mcp_config_path", "cli-mcp.json", "cli-mcp.json"),
+            "trust_registry_path": ("trust_registry_path", "cli-trust.json", "cli-trust.json"),
+            "audit_floor_path": ("audit_floor_path", "cli-floor.json", "cli-floor.json"),
+            "reload_policy": ("reload_policy", True, True),
+            "attestation_verifier_command": ("attestation_verifier_command", "verify --strict", ("verify", "--strict")),
+            "require_attestation": ("require_attestation", True, True),
+            "allow_local_provider_endpoint": ("allow_local_provider_endpoint", True, True),
+            "a2a_token": ("a2a_token", "cli-token", "cli-token"),
+            "a2a_adapter": ("a2a_adapter", "sdk", "sdk"),
+            "a2a_public_base_url": ("a2a_public_base_url", "https://cli.example", "https://cli.example"),
+            "a2a_trusted_proxies": ("a2a_trusted_proxies", "10.0.0.0/8", "10.0.0.0/8"),
+            "log_level": ("log_level", "DEBUG", "DEBUG"),
+            "log_json": ("log_json", True, True),
+            "enable_hsts": ("enable_hsts", True, True),
+            "allow_direct_a2a": ("allow_direct_a2a", True, True),
+            "a2a_max_concurrent_requests": ("a2a_max_concurrent_requests", 7, 7),
+            "a2a_rate_limit_per_ip": ("a2a_rate_limit_per_ip", 7, 7),
+            "a2a_rate_limit_window_seconds": ("a2a_rate_limit_window_seconds", 7, 7),
+            "a2a_agent_card_rate_limit_per_ip": ("a2a_agent_card_rate_limit_per_ip", 7, 7),
+            "a2a_agent_card_rate_limit_window_seconds": ("a2a_agent_card_rate_limit_window_seconds", 7, 7),
+        }
+        config_only = {"a2a_body_read_timeout_seconds", "shutdown_grace_seconds", "profile",
+                       "attestation_allowed_measurements", "migration_preflight_command"}
+        # Every field is either set from the CLI or never is; a new field must be placed in one of the two.
+        self.assertEqual({name for name, _, _ in supplied.values()} | config_only,
+                         {field.name for field in fields(RuntimeConfig)})
+        base = RuntimeConfig(
+            a2a_body_read_timeout_seconds=3.0, shutdown_grace_seconds=4.0, profile="development",
+            attestation_allowed_measurements=("m1",), migration_preflight_command=("preflight",),
+        )
+        nothing = SimpleNamespace(**{option: None for option in supplied})
+        for option, (name, cli_value, expected) in supplied.items():
+            with self.subTest(option=option):
+                merged = base.merged_with_args(SimpleNamespace(**{**vars(nothing), option: cli_value}))
+                self.assertEqual(getattr(merged, name), expected)
+                self.assertEqual({field: getattr(merged, field) for field in config_only},
+                                 {field: getattr(base, field) for field in config_only})
+                # The verifier command is always a string on the command line; a blank one is not a command.
+                empties = (None, "", "  ") if option == "attestation_verifier_command" else (None, "", 0, False)
+                configured = RuntimeConfig(**{**vars(base), name: expected})
+                for empty in empties:
+                    kept = configured.merged_with_args(SimpleNamespace(**{**vars(nothing), option: empty}))
+                    self.assertEqual(getattr(kept, name), expected)
+        self.assertEqual(base.merged_with_args(nothing), base)
+        # An option a subcommand does not define at all is not supplied either.
+        self.assertEqual(base.merged_with_args(SimpleNamespace()), base)
+
     def test_json_log_formatter_emits_structured_internal_exception(self):
         formatter = JsonLogFormatter()
         try:
