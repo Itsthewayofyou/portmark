@@ -30,7 +30,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -589,12 +589,6 @@ async def _no_callback() -> Any:
     raise McpOAuthError("no way to receive the authorization result was offered")
 
 
-def redact(headers: Mapping[str, str]) -> dict[str, str]:
-    """Headers with any credential replaced. For logging a request that failed."""
-    return {name: ("<redacted>" if name.lower() in ("authorization", "cookie") else value)
-            for name, value in headers.items()}
-
-
 __all__ = [
     "EXTRA_HINT",
     "Authorization",
@@ -602,7 +596,6 @@ __all__ = [
     "McpOAuthRefused",
     "authorize",
     "current_access_token",
-    "redact",
     "refresh",
     "sdk_available",
 ]

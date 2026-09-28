@@ -38,7 +38,6 @@ MAX_REPORTED_EFFECT_IDS = 16
 OPERATIONS = frozenset({"deciding", "approving", "tool", "side_effecting_tool", "persisting"})
 # Progress marks that start nothing: recorded with note(), never refused.
 MARKS = frozenset({"admitting", "tool_returned", "persisted"})
-PHASES = OPERATIONS | MARKS
 
 
 class RunAbandoned(RuntimeError):

@@ -74,16 +74,6 @@ class StoredTokens:
                        refresh_token=refresh_token or self.refresh_token)
 
 
-def binding_error(tokens: StoredTokens, issuer: str, client_id: str) -> str | None:
-    """Why these tokens must not be used against this authorization server and client, or None.
-
-    `issuer` must be a FRESHLY DISCOVERED value, not the one out of `tokens`. Passing `tokens.issuer` here
-    compares a value with itself and checks nothing -- an easy mistake, and one that was made and caught in
-    review. `issuer_mismatch` and `client_mismatch` exist so a caller that only has one of the two says so
-    rather than inventing the other."""
-    return issuer_mismatch(tokens, issuer) or client_mismatch(tokens, client_id)
-
-
 def issuer_mismatch(tokens: StoredTokens, discovered_issuer: str) -> str | None:
     """Whether these credentials belong to a DIFFERENT authorization server than the one now named.
 

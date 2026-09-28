@@ -68,8 +68,9 @@ from portmark.mcp_token_store import (
     STORE_VERSION,
     StoredTokens,
     TokenStoreError,
-    binding_error,
     clear_tokens,
+    client_mismatch,
+    issuer_mismatch,
     read_tokens,
     write_tokens,
 )
@@ -482,9 +483,10 @@ class TokenStoreTests(unittest.TestCase):
     def test_tokens_from_a_different_authorization_server_or_client_are_refused(self):
         # The specification's MUST: credentials are keyed by issuer, and a server that starts naming a
         # different authorization server is either being reconfigured or attacked. Both look the same here.
-        self.assertIsNone(binding_error(self.tokens, "https://as.example", "cid"))
-        self.assertIn("different authorization server", binding_error(self.tokens, "https://evil.example", "cid") or "")
-        self.assertIn("log in again", binding_error(self.tokens, "https://as.example", "other") or "")
+        self.assertIsNone(issuer_mismatch(self.tokens, "https://as.example"))
+        self.assertIsNone(client_mismatch(self.tokens, "cid"))
+        self.assertIn("different authorization server", issuer_mismatch(self.tokens, "https://evil.example") or "")
+        self.assertIn("log in again", client_mismatch(self.tokens, "other") or "")
 
     def test_a_token_that_expires_during_the_call_it_authorizes_is_not_fresh(self):
         self.assertTrue(self.tokens.fresh(now=3_999_999_000))
