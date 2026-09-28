@@ -120,12 +120,8 @@ class _StoreCases:
                 transaction.save_checkpoint("done", AgentState("done", "g"), 1, owner=owner)
         with store.transaction() as transaction:
             transaction.save_checkpoint("owned", AgentState("owned", "g"), 0, owner=("user:alice", "agent:demo"))
-        self.assertEqual(store.checkpoint_owner("owned"), ("user:alice", "agent:demo"))
-        # Rewriting the owner (PM-001 takeover by a store writer): refused before the owner compare,
-        # and the owner accessor never returns the edited value.
+        # Rewriting the owner (PM-001 takeover by a store writer): refused before the owner compare.
         self._set_column("owned", "owner_issuer", "user:mallory")
-        with self.assertRaisesRegex(CheckpointCryptoError, "failed authentication"):
-            store.checkpoint_owner("owned")
         with self.assertRaisesRegex(CheckpointCryptoError, "failed authentication"):
             store.load_checkpoint("owned")
         with self.assertRaisesRegex(CheckpointCryptoError, "failed authentication"):

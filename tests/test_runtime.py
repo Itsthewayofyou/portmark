@@ -75,6 +75,7 @@ from portmark.tools import (
 )
 from examples.tools import http_fetch
 from asgi_test_server import serve_asgi
+from store_probes import nonce_is_consumed
 from fuzz_a2a_parser import run_fuzz_cases
 
 # Section 7 PR 2b: a side-effecting tool now requires an acknowledged IsolationProfile on the
@@ -2986,7 +2987,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(checkpoint["status"], "ready")  # closed source, migrated away
             self.assertEqual(checkpoint["memory"], {})  # working state dropped under budget pressure
             self.assertIn("checkpoint.terminalized", [event["event"] for event in result.audit])
-            self.assertTrue(store.verify_audit_chain(result.task_id))
+            self.assertTrue(store.verify_audit_chain_status(result.task_id).valid)
 
     def test_host_enforced_projection_hides_undeclared_fields_from_in_process_provider(self):
         # Finding #4: a grant's output_projection is enforced at the host boundary, so
@@ -3461,7 +3462,7 @@ class RuntimeTests(unittest.TestCase):
                         tr.join(timeout=30)
                         tc.join(timeout=30)
                         self.assertTrue(store.is_task_cancelled(task_id))
-                        self.assertEqual(store.consumed_nonce_exists(nonce), outcome["redeemed"])
+                        self.assertEqual(nonce_is_consumed(store, nonce), outcome["redeemed"])
 
     def test_cancel_during_tool_launch_does_not_prevent_effect_best_effort_limit(self):
         # Section 5 #3 — the documented BEST-EFFORT boundary, asserted (not just documented). Tier 3:
@@ -3890,7 +3891,7 @@ class RuntimeTests(unittest.TestCase):
                     self.assertEqual(checkpoint["result"], result.result)
                     self.assertEqual(store.audit_head(result.task_id), (result.audit[-1]["hash"], result.audit[-1]["sequence"] + 1))
                     self.assertEqual(store.verify_audit_chain_status(result.task_id).status, "valid")
-                    self.assertTrue(store.verify_audit_chain(result.task_id))
+                    self.assertTrue(store.verify_audit_chain_status(result.task_id).valid)
 
                     unverifiable = self._reopen_store(backend, store)
                     self.assertEqual(unverifiable.verify_audit_chain_status(result.task_id).status, "unverifiable")
@@ -3918,7 +3919,7 @@ class RuntimeTests(unittest.TestCase):
                                 outcomes.append("rejected")
                     self.assertEqual(outcomes.count("completed"), 1)
                     self.assertEqual(outcomes.count("rejected"), 1)
-                    self.assertTrue(store.consumed_nonce_exists(envelope.permit.nonce))
+                    self.assertTrue(nonce_is_consumed(store, envelope.permit.nonce))
 
     def test_runtime_store_contract_detects_audit_chain_corruption(self):
         signer = EnvelopeSigner.generate("contract-corrupt-key", "host:local-demo", ("host:local-demo",))
@@ -3927,12 +3928,12 @@ class RuntimeTests(unittest.TestCase):
                 with self.subTest(backend=backend):
                     host = make_host(signer=signer, store=store, allow_ephemeral_signing_key=True)
                     result = host.run(make_demo_envelope(host, f"{backend} corrupt"))
-                    self.assertTrue(store.verify_audit_chain(result.task_id))
+                    self.assertTrue(store.verify_audit_chain_status(result.task_id).valid)
                     self._corrupt_store_audit(store, result.task_id, backend)
                     verification = store.verify_audit_chain_status(result.task_id)
                     self.assertEqual(verification.status, "invalid")
                     self.assertEqual(verification.reason, "stored audit head does not match audit events")
-                    self.assertFalse(store.verify_audit_chain(result.task_id))
+                    self.assertFalse(store.verify_audit_chain_status(result.task_id).valid)
 
     def test_runtime_store_contract_detects_audit_host_id_tamper(self):
         # Altering a stored event's host_id must break verification: host_id is
@@ -3944,12 +3945,12 @@ class RuntimeTests(unittest.TestCase):
                 with self.subTest(backend=backend):
                     host = make_host(signer=signer, store=store, allow_ephemeral_signing_key=True)
                     result = host.run(make_demo_envelope(host, f"{backend} host tamper"))
-                    self.assertTrue(store.verify_audit_chain(result.task_id))
+                    self.assertTrue(store.verify_audit_chain_status(result.task_id).valid)
                     self._tamper_store_host_id(store, result.task_id, backend)
                     verification = store.verify_audit_chain_status(result.task_id)
                     self.assertEqual(verification.status, "invalid")
                     self.assertEqual(verification.reason, "audit event hash is invalid")
-                    self.assertFalse(store.verify_audit_chain(result.task_id))
+                    self.assertFalse(store.verify_audit_chain_status(result.task_id).valid)
 
     def test_audit_event_hash_commits_to_format_version(self):
         # The per-event hash covers hash_version, so the audit format is
@@ -3989,14 +3990,14 @@ class RuntimeTests(unittest.TestCase):
 
                     first = source.run(envelope)
                     self.assertEqual(source_store.load_checkpoint(first.task_id)["status"], "ready")
-                    self.assertTrue(source_store.verify_audit_chain(first.task_id))
+                    self.assertTrue(source_store.verify_audit_chain_status(first.task_id).valid)
                     self.assertIsNotNone(first.migration_envelope)
 
                     migrated = envelope_from_dict(first.migration_envelope)
                     second = destination.run(migrated)
                     self.assertEqual(second.status, "completed")
                     self.assertEqual(destination_store.load_checkpoint(second.task_id)["status"], "completed")
-                    self.assertTrue(destination_store.verify_audit_chain(second.task_id))
+                    self.assertTrue(destination_store.verify_audit_chain_status(second.task_id).valid)
 
                     # Finding #3: the destination's local sequence restarts at 0, so
                     # the verified prior anchor is recorded in the first event's
@@ -4177,7 +4178,7 @@ class RuntimeTests(unittest.TestCase):
             refused = store.verify_audit_chain_status(second.task_id)
             self.assertEqual((refused.status, refused.anchor_status), ("unverifiable", "legacy-anchor"), refused.reason)
             self.assertIn("cannot be independently reverified", refused.reason)
-            self.assertFalse(store.verify_audit_chain(second.task_id))
+            self.assertFalse(store.verify_audit_chain_status(second.task_id).valid)
             allowed = store.verify_audit_chain_status(second.task_id, allow_legacy_anchor=True)
             self.assertEqual((allowed.status, allowed.anchor_status), ("valid", "legacy-anchor"), allowed.reason)
             self.assertIn("NOT independently reverified", allowed.reason)
@@ -4365,7 +4366,7 @@ class RuntimeTests(unittest.TestCase):
                     second = destination.run(migrated)
                     self.assertEqual(second.status, "completed")
                     self.assertEqual(destination_store.load_checkpoint(second.task_id)["status"], "completed")
-                    self.assertTrue(destination_store.verify_audit_chain(second.task_id))
+                    self.assertTrue(destination_store.verify_audit_chain_status(second.task_id).valid)
 
     def test_project_state_for_migration_branches(self):
         # Section 4 #6 unit pins for project_state_for_migration:
@@ -4577,7 +4578,7 @@ class RuntimeTests(unittest.TestCase):
             checkpoint = store.load_checkpoint(envelope.state.task_id)
             self.assertIsNotNone(checkpoint)
             self.assertEqual(checkpoint["status"], "failed")  # durable terminal, not running
-            self.assertTrue(store.verify_audit_chain(envelope.state.task_id))  # closed chain intact
+            self.assertTrue(store.verify_audit_chain_status(envelope.state.task_id).valid)  # closed chain intact
 
     def test_strict_json_rejects_duplicate_keys(self):
         # Section 8 finding #4: a JSON object with duplicate keys parses silently last-wins in
@@ -4932,8 +4933,8 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(resB.status, "completed")
             # Two distinct resident tasks, two verifying chains, distinct namespaced ids.
             self.assertNotEqual(resA.task_id, resB.task_id)
-            self.assertTrue(dest_store.verify_audit_chain(resA.task_id))
-            self.assertTrue(dest_store.verify_audit_chain(resB.task_id))
+            self.assertTrue(dest_store.verify_audit_chain_status(resA.task_id).valid)
+            self.assertTrue(dest_store.verify_audit_chain_status(resB.task_id).valid)
             self.assertEqual(dest_store.load_checkpoint(resA.task_id)["status"], "completed")
             self.assertEqual(dest_store.load_checkpoint(resB.task_id)["status"], "completed")
             # The original (source-chosen) id is NOT a stored key at the destination.
@@ -5208,7 +5209,7 @@ class RuntimeTests(unittest.TestCase):
             # in-process cache.
             with self.assertRaisesRegex(SecurityError, "closed"):
                 second_host.run(replay)
-            self.assertTrue(second_host.store.consumed_nonce_exists(replay.permit.nonce))
+            self.assertTrue(nonce_is_consumed(second_host.store, replay.permit.nonce))
 
     def test_captured_suspended_envelope_rejected_after_resume_advances_generation(self):
         # Finding EV-008, the reviewer's adversarial sequence: a suspended envelope
@@ -5330,7 +5331,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertIsNotNone(checkpoint)
             self.assertEqual(checkpoint["status"], "completed")
             self.assertEqual(checkpoint["result"], result.result)
-            self.assertTrue(store.verify_audit_chain(result.task_id))
+            self.assertTrue(store.verify_audit_chain_status(result.task_id).valid)
             self.assertEqual(store.audit_head(result.task_id), (result.audit[-1]["hash"], result.audit[-1]["sequence"] + 1))
 
     def test_sqlite_store_closes_connections_after_reads(self):
@@ -5355,7 +5356,6 @@ class RuntimeTests(unittest.TestCase):
                 return connection
 
             with patch("portmark.storage.sqlite3.connect", side_effect=tracking_connect):
-                store.consumed_nonce_exists("no-such-nonce")
                 store.load_checkpoint(result.task_id)
                 store.audit_head(result.task_id)
                 store.verify_audit_chain_status(result.task_id)
@@ -5419,7 +5419,7 @@ class RuntimeTests(unittest.TestCase):
                 self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 0)
 
             store = SQLiteRuntimeStore(path)
-            self.assertTrue(store.consumed_nonce_exists("legacy-nonce"))
+            self.assertTrue(nonce_is_consumed(store, "legacy-nonce"))
             with self._raw_sqlite(path) as connection:
                 self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SQLITE_SCHEMA_VERSION)
 
@@ -5496,16 +5496,16 @@ class RuntimeTests(unittest.TestCase):
                     store = SQLiteRuntimeStore(path)
                     host = make_host(store=store, allow_ephemeral_signing_key=True)
                     result = host.run(make_demo_envelope(host, f"audit tamper {name}"))
-                    self.assertTrue(store.verify_audit_chain(result.task_id))
+                    self.assertTrue(store.verify_audit_chain_status(result.task_id).valid)
                     with self._raw_sqlite(path) as connection:
                         connection.execute(statement, (result.task_id,))
                     self.assertEqual(store.verify_audit_chain_status(result.task_id).status, "invalid")
-                    self.assertFalse(store.verify_audit_chain(result.task_id))
+                    self.assertFalse(store.verify_audit_chain_status(result.task_id).valid)
 
         with tempfile.TemporaryDirectory() as directory:
             store = SQLiteRuntimeStore(Path(directory) / "runtime.sqlite")
             self.assertEqual(store.verify_audit_chain_status("missing-task").status, "invalid")
-            self.assertFalse(store.verify_audit_chain("missing-task"))
+            self.assertFalse(store.verify_audit_chain_status("missing-task").valid)
 
     def test_sqlite_audit_chain_rejects_fabricated_consistent_history(self):
         def event(sequence, name, details, previous):
@@ -5556,15 +5556,15 @@ class RuntimeTests(unittest.TestCase):
                     ("task-forged", previous, len(fabricated), "host:local-demo", "", "", int(time.time())),
                 )
 
-            self.assertFalse(store.verify_audit_chain("task-forged"))
+            self.assertFalse(store.verify_audit_chain_status("task-forged").valid)
 
             host = make_host(signer=signer, store=store, allow_ephemeral_signing_key=True)
             result = host.run(make_demo_envelope(host, "signed history"))
-            self.assertTrue(store.verify_audit_chain(result.task_id))
+            self.assertTrue(store.verify_audit_chain_status(result.task_id).valid)
             with self._raw_sqlite(path) as connection:
                 connection.execute("UPDATE audit_heads SET signature = 'tampered' WHERE task_id = ?", (result.task_id,))
             self.assertEqual(store.verify_audit_chain_status(result.task_id).status, "invalid")
-            self.assertFalse(store.verify_audit_chain(result.task_id))
+            self.assertFalse(store.verify_audit_chain_status(result.task_id).valid)
 
     def test_sqlite_audit_chain_status_reports_unverifiable_without_trust_registry(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -5582,7 +5582,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(unverifiable.status, "unverifiable")
             self.assertIn("trust registry", unverifiable.reason)
             self.assertFalse(unverifiable.valid)
-            self.assertFalse(SQLiteRuntimeStore(path).verify_audit_chain(result.task_id))
+            self.assertFalse(SQLiteRuntimeStore(path).verify_audit_chain_status(result.task_id).valid)
 
     def test_verify_audit_cli_reports_valid_invalid_unverifiable_and_missing_chains(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -5727,7 +5727,7 @@ class RuntimeTests(unittest.TestCase):
                 with store.transaction() as transaction:
                     transaction.consume_nonce("nonce-1", "agent:demo", "host:local-demo", "task-1")
                     transaction.append_audit_events("task-1", "host:local-demo", (event, event))
-            self.assertFalse(store.consumed_nonce_exists("nonce-1"))
+            self.assertFalse(nonce_is_consumed(store, "nonce-1"))
             self.assertIsNone(store.load_checkpoint("task-1"))
             self.assertIsNone(store.audit_head("task-1"))
 
@@ -5761,7 +5761,7 @@ class RuntimeTests(unittest.TestCase):
             source_checkpoint = source_store.load_checkpoint(first.task_id)
             self.assertEqual(source_checkpoint["status"], "ready")
             self.assertEqual(source_checkpoint["memory"]["migration"], {"from": "host:source", "to": "host:destination"})
-            self.assertTrue(source_store.verify_audit_chain(first.task_id))
+            self.assertTrue(source_store.verify_audit_chain_status(first.task_id).valid)
             self.assertEqual(first.migration_envelope["previous_audit_host_id"], "host:source")
             self.assertEqual(first.migration_envelope["previous_audit_signature_key_id"], source_signer.key_id)
             self.assertTrue(first.migration_envelope["previous_audit_signature"])
@@ -5770,7 +5770,7 @@ class RuntimeTests(unittest.TestCase):
             second = destination.run(envelope_from_dict(first.migration_envelope))
             self.assertEqual(second.status, "completed")
             self.assertEqual(destination_store.load_checkpoint(second.task_id)["status"], "completed")
-            self.assertTrue(destination_store.verify_audit_chain(second.task_id))
+            self.assertTrue(destination_store.verify_audit_chain_status(second.task_id).valid)
 
     def test_sqlite_store_rejects_concurrent_replay(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -5814,8 +5814,8 @@ class RuntimeTests(unittest.TestCase):
             store = SQLiteRuntimeStore(path, signer)
             nonces_by_task = {envelope.state.task_id: envelope.permit.nonce for envelope in envelopes}
             for result in results:
-                self.assertTrue(store.verify_audit_chain(result.task_id))
-                self.assertTrue(store.consumed_nonce_exists(nonces_by_task[result.task_id]))
+                self.assertTrue(store.verify_audit_chain_status(result.task_id).valid)
+                self.assertTrue(nonce_is_consumed(store, nonces_by_task[result.task_id]))
             with self._raw_sqlite(path) as connection:
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM consumed_nonces").fetchone()[0], len(envelopes))
                 rows = connection.execute(
@@ -6569,7 +6569,7 @@ class RuntimeTests(unittest.TestCase):
 
             self.assertIsNone(destination.store.load_checkpoint(task_id))
             self.assertIsNone(destination.store.audit_head(task_id))
-            self.assertFalse(destination.store.consumed_nonce_exists(migrated.permit.nonce))
+            self.assertFalse(nonce_is_consumed(destination.store, migrated.permit.nonce))
             self.assertIsNone(destination.store.get_migration_receipt(task_id))
 
     # ---- Section 4 part 3a: outbox reliability (#3 claim/lease, #4 dead-letter, #8 conflict) ----

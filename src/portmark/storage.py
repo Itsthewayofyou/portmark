@@ -692,28 +692,13 @@ class RuntimeStore(Protocol):
         two concurrent reconcile executions. Returns True iff the lease was extended."""
         ...
 
-    def consumed_nonce_exists(self, nonce: str) -> bool:
-        ...
-
     def load_checkpoint(self, task_id: str) -> dict[str, Any] | None:
-        ...
-
-    def checkpoint_owner(self, task_id: str) -> tuple[str | None, str | None] | None:
-        """PM-001: the stored `(issuer, subject)` of this task, or None when there is no checkpoint.
-
-        `(None, None)` means the row predates the owner column. The host reads this to refuse a
-        foreign resume BEFORE anything is written; `save_checkpoint` re-checks it durably, inside
-        the transaction that does the generation CAS, so this read is a courtesy, not the gate.
-        """
         ...
 
     def audit_head(self, task_id: str) -> tuple[str, int] | None:
         ...
 
     def verify_audit_chain_status(self, task_id: str, allow_legacy_anchor: bool = False) -> AuditVerificationResult:
-        ...
-
-    def verify_audit_chain(self, task_id: str) -> bool:
         ...
 
     def audit_export_page(
@@ -1207,20 +1192,11 @@ class InMemoryRuntimeStore:
         # In-memory: no external dependency to probe, always ready.
         return None
 
-    def consumed_nonce_exists(self, nonce: str) -> bool:
-        with self._lock:
-            return nonce in self._nonces
-
     def load_checkpoint(self, task_id: str) -> dict[str, Any] | None:
         with self._lock:
             row = self._checkpoints.get(task_id)
             # Stored rows are {generation, closed, state}; callers see the state blob.
             return json.loads(json.dumps(row["state"])) if row is not None else None
-
-    def checkpoint_owner(self, task_id: str) -> tuple[str | None, str | None] | None:
-        with self._lock:
-            row = self._checkpoints.get(task_id)
-            return None if row is None else (row.get("owner_issuer"), row.get("owner_subject"))
 
     def audit_head(self, task_id: str) -> tuple[str, int] | None:
         with self._lock:
@@ -1240,9 +1216,6 @@ class InMemoryRuntimeStore:
                 for event in events
             ]
             return _verify_audit_rows(self._audit_head_verifier, task_id, rows, head, allow_legacy_anchor)
-
-    def verify_audit_chain(self, task_id: str) -> bool:
-        return self.verify_audit_chain_status(task_id).valid
 
     # -- Section 10 PR B: audit-floor support (reads + the per-host marker) ------------------
     def audit_heads_for_host(self, host_id: str) -> list[tuple[str, str, int]]:
@@ -2400,22 +2373,10 @@ class SQLiteRuntimeStore:
         if version != SQLITE_SCHEMA_VERSION:
             raise RuntimeError(f"SQLite store schema version {version} is not the supported version {SQLITE_SCHEMA_VERSION}")
 
-    def consumed_nonce_exists(self, nonce: str) -> bool:
-        with self._connection() as connection:
-            row = connection.execute("SELECT 1 FROM consumed_nonces WHERE nonce = ?", (nonce,)).fetchone()
-            return row is not None
-
     def load_checkpoint(self, task_id: str) -> dict[str, Any] | None:
         with self._connection() as connection:
             row = connection.execute(f"SELECT {_CHECKPOINT_ROW} FROM checkpoints WHERE task_id = ?", (task_id,)).fetchone()  # nosec B608 -- constant column list
         return _decode_row(self.checkpoint_codec, task_id, row) if row is not None else None
-
-    def checkpoint_owner(self, task_id: str) -> tuple[str | None, str | None] | None:
-        with self._connection() as connection:
-            row = connection.execute(
-                f"SELECT {_CHECKPOINT_ROW} FROM checkpoints WHERE task_id = ?", (task_id,)  # nosec B608 -- constant column list
-            ).fetchone()
-        return _authenticated_owner(self.checkpoint_codec, task_id, row)
 
     def audit_head(self, task_id: str) -> tuple[str, int] | None:
         with self._connection() as connection:
@@ -2440,9 +2401,6 @@ class SQLiteRuntimeStore:
                 (task_id,),
             ).fetchone()
         return _verify_audit_rows(self._audit_head_verifier, task_id, rows, head, allow_legacy_anchor)
-
-    def verify_audit_chain(self, task_id: str) -> bool:
-        return self.verify_audit_chain_status(task_id).valid
 
     # -- Section 10 PR B: audit-floor support (reads + the per-host marker) ------------------
     def audit_heads_for_host(self, host_id: str) -> list[tuple[str, str, int]]:
@@ -3165,22 +3123,10 @@ class PostgresRuntimeStore:
         if version != POSTGRES_SCHEMA_VERSION:
             raise RuntimeError(f"Postgres store schema version {version} is not the supported version {POSTGRES_SCHEMA_VERSION}")
 
-    def consumed_nonce_exists(self, nonce: str) -> bool:
-        with self._connect() as connection:
-            row = connection.execute("SELECT 1 FROM consumed_nonces WHERE nonce = %s", (nonce,)).fetchone()
-            return row is not None
-
     def load_checkpoint(self, task_id: str) -> dict[str, Any] | None:
         with self._connect() as connection:
             row = connection.execute(f"SELECT {_CHECKPOINT_ROW} FROM checkpoints WHERE task_id = %s", (task_id,)).fetchone()  # nosec B608 -- constant column list
         return _decode_row(self.checkpoint_codec, task_id, row) if row is not None else None
-
-    def checkpoint_owner(self, task_id: str) -> tuple[str | None, str | None] | None:
-        with self._connect() as connection:
-            row = connection.execute(
-                f"SELECT {_CHECKPOINT_ROW} FROM checkpoints WHERE task_id = %s", (task_id,)  # nosec B608 -- constant column list
-            ).fetchone()
-        return _authenticated_owner(self.checkpoint_codec, task_id, row)
 
     def audit_head(self, task_id: str) -> tuple[str, int] | None:
         with self._connect() as connection:
@@ -3207,9 +3153,6 @@ class PostgresRuntimeStore:
                 (task_id,),
             ).fetchone()
         return _verify_audit_rows(self._audit_head_verifier, task_id, rows, head, allow_legacy_anchor)
-
-    def verify_audit_chain(self, task_id: str) -> bool:
-        return self.verify_audit_chain_status(task_id).valid
 
     # -- Section 10 PR B: audit-floor support (reads + the per-host marker) ------------------
     def audit_heads_for_host(self, host_id: str) -> list[tuple[str, str, int]]:
@@ -3584,16 +3527,6 @@ def _decode_row(codec: CheckpointCodec | None, task_id: str, row: Any) -> dict[s
     blob = json.loads(_open_row(codec, task_id, row))
     _check_sealed_status(task_id, blob, row)
     return blob
-
-
-def _authenticated_owner(codec: CheckpointCodec | None, task_id: str, row: Any) -> tuple[str | None, str | None] | None:
-    # EV-006: with a keyring the owner columns are returned only after the row authenticates, so an
-    # edited owner is refused here like in load_checkpoint and save_checkpoint.
-    if row is None:
-        return None
-    if codec is not None:
-        _decode_row(codec, task_id, row)
-    return (row["owner_issuer"], row["owner_subject"])
 
 
 def _check_sealed_status(task_id: str, blob: dict[str, Any], row: Any) -> None:
