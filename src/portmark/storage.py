@@ -3217,12 +3217,7 @@ class _PostgresTransaction:
                 "SELECT head_hash, sequence FROM audit_heads WHERE task_id = %s FOR UPDATE",
                 (task_id,),
             ).fetchone()
-            expected_sequence = int(head["sequence"]) if head is not None else 0
-            expected_previous = head["head_hash"] if head is not None else event["previous"]
-            if event["sequence"] != expected_sequence:
-                raise SecurityError("audit event sequence is not contiguous")
-            if event["previous"] != expected_previous:
-                raise SecurityError("audit event previous hash does not match stored head")
+            _check_audit_link(head, event)
             try:
                 self._connection.execute(
                     """
@@ -3230,16 +3225,7 @@ class _PostgresTransaction:
                         (task_id, sequence, host_id, event, details_json, previous_hash, hash, created_at)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     """,
-                    (
-                        task_id,
-                        event["sequence"],
-                        host_id,
-                        event["event"],
-                        json.dumps(event["details"], sort_keys=True, separators=(",", ":")),
-                        event["previous"],
-                        event["hash"],
-                        int(time.time()),
-                    ),
+                    _audit_event_row(task_id, host_id, event),
                 )
             except errors.UniqueViolation as error:
                 raise SecurityError("audit event already exists") from error
@@ -3560,12 +3546,7 @@ class _SQLiteTransaction:
                 "SELECT head_hash, sequence FROM audit_heads WHERE task_id = ?",
                 (task_id,),
             ).fetchone()
-            expected_sequence = int(head["sequence"]) if head is not None else 0
-            expected_previous = head["head_hash"] if head is not None else event["previous"]
-            if event["sequence"] != expected_sequence:
-                raise SecurityError("audit event sequence is not contiguous")
-            if event["previous"] != expected_previous:
-                raise SecurityError("audit event previous hash does not match stored head")
+            _check_audit_link(head, event)
             try:
                 self._connection.execute(
                     """
@@ -3573,16 +3554,7 @@ class _SQLiteTransaction:
                         (task_id, sequence, host_id, event, details_json, previous_hash, hash, created_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (
-                        task_id,
-                        event["sequence"],
-                        host_id,
-                        event["event"],
-                        json.dumps(event["details"], sort_keys=True, separators=(",", ":")),
-                        event["previous"],
-                        event["hash"],
-                        int(time.time()),
-                    ),
+                    _audit_event_row(task_id, host_id, event),
                 )
             except sqlite3.IntegrityError as error:
                 raise SecurityError("audit event already exists") from error
@@ -3773,6 +3745,31 @@ LEGACY_ANCHOR_ALLOWED_REASON = (
     "legacy migration anchor accepted by --allow-legacy-anchor: the source proof was NOT independently "
     "reverified (compatibility mode, not an equivalent security mode)"
 )
+
+
+def _check_audit_link(head: Any, event: dict[str, Any]) -> None:
+    """Refuse an event that does not extend the stored head: the chain rule both SQL backends enforce
+    inside their locked write, so it is written once."""
+    expected_sequence = int(head["sequence"]) if head is not None else 0
+    expected_previous = head["head_hash"] if head is not None else event["previous"]
+    if event["sequence"] != expected_sequence:
+        raise SecurityError("audit event sequence is not contiguous")
+    if event["previous"] != expected_previous:
+        raise SecurityError("audit event previous hash does not match stored head")
+
+
+def _audit_event_row(task_id: str, host_id: str, event: dict[str, Any]) -> tuple[Any, ...]:
+    """The audit_events row for `event`. details_json is the compact sorted form the verifier re-reads."""
+    return (
+        task_id,
+        event["sequence"],
+        host_id,
+        event["event"],
+        json.dumps(event["details"], sort_keys=True, separators=(",", ":")),
+        event["previous"],
+        event["hash"],
+        int(time.time()),
+    )
 
 
 def _verify_audit_rows(
