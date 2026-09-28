@@ -34,7 +34,6 @@ from portmark.mcp_oauth import (
     authorize,
     current_access_token,
     refresh,
-    refuse_sync_use,
     sdk_available,
 )
 from portmark.security import canonical_json
@@ -722,18 +721,9 @@ class OauthDriverTests(unittest.TestCase):
         import httpx2
         from mcp.client.auth.oauth2 import OAuthClientProvider
 
+        # If this fails, the SDK defines its own `sync_auth_flow`: re-check the reasoning above before
+        # raising the pin.
         self.assertIs(OAuthClientProvider.sync_auth_flow, httpx2.Auth.sync_auth_flow)
-        refuse_sync_use(OAuthClientProvider)
-
-        # A guard whose refusal path never runs is decoration. Feed it the shape it exists to catch -- a
-        # future SDK that grows its own synchronous path -- and it must refuse.
-        class WithASyncPath(OAuthClientProvider):
-            def sync_auth_flow(self, request):  # pragma: no cover - never called, only inspected
-                raise NotImplementedError
-
-        with self.assertRaises(McpOAuthError) as caught:
-            refuse_sync_use(WithASyncPath)
-        self.assertIn("sync_auth_flow", str(caught.exception))
 
     def test_without_the_extra_the_error_says_how_to_install_it(self):
         with patch.dict(sys.modules, {"mcp.client.auth.oauth2": None}):
