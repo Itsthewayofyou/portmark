@@ -34,6 +34,11 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
   the local card round-tripped through the pinned SDK (a test asserts the round trip is exact). The A2A card
   and task are built as literals; the parsing types are unchanged and the output is identical. The Wasm
   provider's worker is the process tree itself, which also reaps the child on an error path.
+- **SQLite and PostgreSQL share what they run identically.** 19 single-statement store methods that were the
+  same in both backends (apart from `?`/`%s`) live once in a shared base; everything with a lock,
+  `FOR UPDATE`, `RETURNING`, the database clock or a backend exception stays per backend. No transaction
+  method qualified, so there is no shared transaction class; the audit-chain link rule and the event row
+  are written once instead, and a new cross-store test pins the rule (it had no test before).
 - Removed unused names: `mcp_token_store.binding_error`, `mcp_oauth.redact`, `CheckpointCodec.key_ids`,
   `_run_progress.PHASES`, `witness_server.DEFAULT_PORT`.
 - **Less duplicated code, same behaviour.** The three stores check the audit chain in one function;
