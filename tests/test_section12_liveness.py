@@ -30,14 +30,13 @@ from portmark import _run_progress
 from portmark.a2a import (
     MAX_BODY_READ_TIMEOUT_SECONDS,
     MAX_SHUTDOWN_GRACE_SECONDS,
-    BoundedReferenceHTTPServer,
     HttpResponse,
     make_asgi_app,
-    make_handler,
     run_uvicorn,
     validate_timeout_seconds,
 )
 from portmark.factory import make_demo_envelope, make_host
+from asgi_test_server import serve_asgi
 from portmark.storage import (
     InMemoryRuntimeStore,
     PostgresRuntimeStore,
@@ -207,8 +206,6 @@ class TimeoutValidationTests(unittest.TestCase):
                        {"body_read_timeout_seconds": MAX_BODY_READ_TIMEOUT_SECONDS + 1}):
             with self.subTest(**kwargs), self.assertRaises(ValueError):
                 _app(**kwargs)
-        with self.assertRaises(ValueError):
-            make_handler(make_host(None), None, allow_anonymous=True, body_read_timeout_seconds=0)
 
 
 class AsgiBodyDeadlineTests(unittest.TestCase):
@@ -267,19 +264,14 @@ class AsgiBodyDeadlineTests(unittest.TestCase):
         self.assertLess(elapsed, 2.0)
 
 
-@unittest.skipIf(os.name == "nt", "the reference server test uses POSIX socket timing")
-class ReferenceServerBodyDeadlineTests(unittest.TestCase):
-    """Finding #2, the second transport: the loopback reference http.server."""
+@unittest.skipIf(os.name == "nt", "the body deadline test uses POSIX socket timing")
+class ServedBodyDeadlineTests(unittest.TestCase):
+    """Finding #2 over real sockets: the deadline holds when uvicorn delivers the body in pieces."""
 
     def test_a_dripping_body_gets_408_within_one_absolute_deadline(self):
-        handler = make_handler(make_host(None), None, allow_anonymous=True, max_concurrent_requests=1,
-                               body_read_timeout_seconds=0.6)
-        handler.a2a_router.dispatch_post = lambda body: handler.a2a_router.response(200, {"ok": True})
-        server = BoundedReferenceHTTPServer(("127.0.0.1", 0), handler, max_connections=1)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        port = server.server_address[1]
-        try:
+        app = _app(max_concurrent_requests=1, body_read_timeout_seconds=0.6)
+        app.a2a_router.dispatch_post = lambda body: app.a2a_router.response(200, {"ok": True})
+        with serve_asgi(app) as port:
             with socket.create_connection(("127.0.0.1", port), timeout=10) as client:
                 client.sendall(
                     b"POST /message:send HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
@@ -301,32 +293,20 @@ class ReferenceServerBodyDeadlineTests(unittest.TestCase):
                     except TimeoutError:
                         continue
                 elapsed = time.monotonic() - started
-            self.assertTrue(reply.startswith(b"HTTP/1.0 408") or reply.startswith(b"HTTP/1.1 408"), reply[:60])
+            self.assertTrue(reply.startswith(b"HTTP/1.1 408"), reply[:60])
             self.assertLess(elapsed, 3.0)
-            # The single connection slot comes back once the handler thread ends (just after it wrote
-            # the 408), and a normal request is then served.
-            for _ in range(300):
-                if _free_permits(server._connection_slots) == 1:
-                    break
-                time.sleep(0.01)
-            self.assertEqual(_free_permits(server._connection_slots), 1)
+            # The single admission slot came back with the 408, so a normal request is then served.
             request = urllib.request.Request(
                 f"http://127.0.0.1:{port}/message:send", data=b"{}", headers={"Content-Type": "application/json"}
             )
             with urllib.request.urlopen(request, timeout=10) as response:  # nosec B310 -- loopback test server
                 self.assertEqual(response.status, 200)
-        finally:
-            server.shutdown()
-            server.server_close()
 
     def test_a_read_that_stalls_near_the_deadline_waits_only_the_time_left(self):
         # Drip for most of the deadline, then stop sending. Each read may wait only for the time LEFT;
         # a per-read timeout of the full body timeout would answer about one timeout too late.
-        handler = make_handler(make_host(None), None, allow_anonymous=True, body_read_timeout_seconds=2.0)
-        server = BoundedReferenceHTTPServer(("127.0.0.1", 0), handler, max_connections=1)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        try:
-            with socket.create_connection(("127.0.0.1", server.server_address[1]), timeout=10) as client:
+        with serve_asgi(_app(body_read_timeout_seconds=2.0)) as port:
+            with socket.create_connection(("127.0.0.1", port), timeout=10) as client:
                 client.sendall(
                     b"POST /message:send HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
                     b"Content-Length: 100\r\n\r\n"
@@ -338,9 +318,6 @@ class ReferenceServerBodyDeadlineTests(unittest.TestCase):
                 client.settimeout(10)
                 reply = client.recv(4096)  # now silent: the server must answer at its deadline
                 elapsed = time.monotonic() - started
-        finally:
-            server.shutdown()
-            server.server_close()
         self.assertTrue(reply.split(b" ", 2)[1:2] == [b"408"], reply[:60])
         self.assertGreater(elapsed, 1.7)
         self.assertLess(elapsed, 3.0)  # a full per-read timeout would answer at about 3.8 s

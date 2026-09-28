@@ -30,12 +30,11 @@ import urllib.request
 from dataclasses import FrozenInstanceError, asdict
 from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from http.client import HTTPResponse
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
-from portmark.a2a import MAX_REQUEST_BYTES, DEFAULT_MAX_CONCURRENT_REQUESTS, A2AAuthConfig, BoundedReferenceHTTPServer, RateLimiter, envelope_from_dict, is_loopback_bind, make_asgi_app, make_handler, serve
+from portmark.a2a import MAX_REQUEST_BYTES, DEFAULT_MAX_CONCURRENT_REQUESTS, A2AAuthConfig, RateLimiter, envelope_from_dict, is_loopback_bind, make_asgi_app, serve
 from portmark.a2a_types import make_agent_card
 from portmark.config import RuntimeConfig
 from portmark.factory import build_envelope, make_demo_envelope, make_host, signer_from_environment
@@ -77,6 +76,7 @@ from portmark.tools import (
     _has_tree_termination_primitive,
 )
 from examples.tools import http_fetch
+from asgi_test_server import serve_asgi
 from fuzz_a2a_parser import run_fuzz_cases
 
 # Section 7 PR 2b: a side-effecting tool now requires an acknowledged IsolationProfile on the
@@ -7143,11 +7143,8 @@ class RuntimeTests(unittest.TestCase):
 
     def test_a2a_agent_card_and_signed_submission(self):
         host = make_host()
-        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(host, A2AAuthConfig("a2a-secret")))
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        base = f"http://127.0.0.1:{server.server_port}"
-        try:
+        with serve_asgi(make_asgi_app(host, A2AAuthConfig("a2a-secret"))) as port:
+            base = f"http://127.0.0.1:{port}"
             with urllib.request.urlopen(base + "/.well-known/agent-card.json") as response:  # nosec B310
                 card = json.load(response)
             self.assertNotIn("protocolVersion", card)  # not an AgentCard field
@@ -7170,9 +7167,6 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(result["id"], "req-1")
             self.assertEqual(result["result"]["status"]["state"], "completed")
             self.assertEqual(result["result"]["metadata"]["portmark_status"], "completed")
-        finally:
-            server.shutdown()
-            server.server_close()
 
     def test_a2a_result_artifact_excludes_checkpoint_and_audit(self):
         # Finding #4: the A2A egress must not hand the caller the internal
@@ -7200,31 +7194,19 @@ class RuntimeTests(unittest.TestCase):
     def test_a2a_sdk_adapter_emits_official_agent_card_shape(self):
         with self._fake_official_a2a_sdk():
             host = make_host()
-            server = ThreadingHTTPServer(
-                ("127.0.0.1", 0),
-                make_handler(host, A2AAuthConfig("a2a-secret"), a2a_adapter="sdk"),
-            )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            base = f"http://127.0.0.1:{server.server_port}"
-            try:
+            with serve_asgi(make_asgi_app(host, A2AAuthConfig("a2a-secret"), a2a_adapter="sdk")) as port:
+                base = f"http://127.0.0.1:{port}"
                 with urllib.request.urlopen(base + "/.well-known/agent-card.json") as response:  # nosec B310
                     card = json.load(response)
                 self.assertEqual(card["securitySchemes"]["bearer"]["httpAuthSecurityScheme"]["scheme"], "bearer")
                 self.assertEqual(card["securityRequirements"], [{"schemes": {"bearer": {}}}])
                 self.assertEqual(card["supportedInterfaces"][0]["protocolBinding"], "JSONRPC")
-            finally:
-                server.shutdown()
-                server.server_close()
 
     def test_a2a_sdk_adapter_rejects_request_parts_before_host_execution(self):
         with self._fake_official_a2a_sdk():
             host = make_host()
-            server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(host, a2a_adapter="sdk"))
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            base = f"http://127.0.0.1:{server.server_port}"
-            try:
+            with serve_asgi(make_asgi_app(host, a2a_adapter="sdk")) as port:
+                base = f"http://127.0.0.1:{port}"
                 body = json.loads(self._a2a_request_body(host, "sdk invalid part").decode())
                 body["params"]["message"]["parts"] = [{"kind": "unknown", "payload": "locally accepted"}]
                 request = urllib.request.Request(
@@ -7238,9 +7220,6 @@ class RuntimeTests(unittest.TestCase):
                 self.assertEqual(raised.exception.code, 400)
                 self.assertEqual(json.load(raised.exception)["error"]["code"], -32602)
                 run.assert_not_called()
-            finally:
-                server.shutdown()
-                server.server_close()
 
     def test_a2a_sdk_adapter_requires_optional_dependency(self):
         original_import = __import__
@@ -7252,15 +7231,12 @@ class RuntimeTests(unittest.TestCase):
 
         with patch("builtins.__import__", side_effect=blocked_import):
             with self.assertRaisesRegex(RuntimeError, "portmark\\[a2a\\]"):
-                make_handler(make_host(), a2a_adapter="sdk")
+                make_asgi_app(make_host(), a2a_adapter="sdk")
 
     def test_a2a_security_headers_are_set_with_opt_in_hsts(self):
         host = make_host()
-        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(host, enable_hsts=True))
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        base = f"http://127.0.0.1:{server.server_port}"
-        try:
+        with serve_asgi(make_asgi_app(host, enable_hsts=True)) as port:
+            base = f"http://127.0.0.1:{port}"
             with urllib.request.urlopen(base + "/.well-known/agent-card.json") as response:  # nosec B310
                 self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
                 self.assertEqual(response.headers["Referrer-Policy"], "no-referrer")
@@ -7268,20 +7244,11 @@ class RuntimeTests(unittest.TestCase):
                 self.assertIn("default-src 'none'", response.headers["Content-Security-Policy"])
                 self.assertIn("geolocation=()", response.headers["Permissions-Policy"])
                 self.assertEqual(response.headers["Strict-Transport-Security"], "max-age=31536000")
-        finally:
-            server.shutdown()
-            server.server_close()
 
     def test_a2a_metrics_endpoint_requires_bearer_auth_and_returns_snapshot(self):
         host = make_host()
-        server = ThreadingHTTPServer(
-            ("127.0.0.1", 0),
-            make_handler(host, A2AAuthConfig("metrics-secret"), rate_limit_per_ip=100),
-        )
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        base = f"http://127.0.0.1:{server.server_port}"
-        try:
+        with serve_asgi(make_asgi_app(host, A2AAuthConfig("metrics-secret"), rate_limit_per_ip=100)) as port:
+            base = f"http://127.0.0.1:{port}"
             body = self._a2a_request_body(host, "metrics endpoint")
             submit = urllib.request.Request(
                 base + "/message:send",
@@ -7322,20 +7289,11 @@ class RuntimeTests(unittest.TestCase):
             self.assertIn("portmark_provider_decision_duration_seconds_count 2", text)
             self.assertIn("portmark_tool_invocation_duration_seconds_count 1", text)
             self.assertIn("portmark_a2a_request_duration_seconds_count 1", text)
-        finally:
-            server.shutdown()
-            server.server_close()
 
     def test_a2a_metrics_endpoint_is_rate_limited_separately(self):
         host = make_host()
-        server = ThreadingHTTPServer(
-            ("127.0.0.1", 0),
-            make_handler(host, A2AAuthConfig("metrics-secret"), rate_limit_per_ip=1, rate_limit_window_seconds=60),
-        )
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        base = f"http://127.0.0.1:{server.server_port}"
-        try:
+        with serve_asgi(make_asgi_app(host, A2AAuthConfig("metrics-secret"), rate_limit_per_ip=1, rate_limit_window_seconds=60)) as port:
+            base = f"http://127.0.0.1:{port}"
             request = urllib.request.Request(base + "/metrics", headers={"Authorization": "Bearer metrics-secret"})
             with urllib.request.urlopen(request) as response:  # nosec B310
                 self.assertEqual(json.load(response), {"counters": {}})
@@ -7346,26 +7304,17 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, 429)
             self.assertEqual(raised.exception.headers["Retry-After"], "60")
             self.assertEqual(json.load(raised.exception)["error"], {"code": -32002, "message": "rate limit exceeded"})
-        finally:
-            server.shutdown()
-            server.server_close()
 
     def test_a2a_metrics_endpoint_is_not_open_when_message_auth_is_disabled(self):
         host = make_host()
-        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(host))
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        base = f"http://127.0.0.1:{server.server_port}"
-        try:
+        with serve_asgi(make_asgi_app(host)) as port:
+            base = f"http://127.0.0.1:{port}"
             with self.assertRaises(urllib.error.HTTPError) as raised:
                 urllib.request.urlopen(base + "/metrics")  # nosec B310
             self.assertEqual(raised.exception.code, 401)
             payload = json.load(raised.exception)
             self.assertEqual(payload["error"], {"code": -32001, "message": "unauthorized"})
             self.assertEqual(raised.exception.headers["WWW-Authenticate"], 'Bearer realm="portmark"')
-        finally:
-            server.shutdown()
-            server.server_close()
 
     def test_a2a_serve_requires_loopback_even_when_direct_exposure_flag_is_set(self):
         public_bind = ".".join(("0", "0", "0", "0"))
@@ -7374,7 +7323,6 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(is_loopback_bind("localhost"))
         self.assertFalse(is_loopback_bind(public_bind))
         self.assertFalse(is_loopback_bind("192.0.2.10"))
-        self.assertFalse(issubclass(BoundedReferenceHTTPServer, ThreadingHTTPServer))
 
         host = make_host()
         with patch("portmark.a2a.run_uvicorn") as run:
@@ -8127,11 +8075,8 @@ class RuntimeTests(unittest.TestCase):
 
     def test_a2a_errors_do_not_expose_internal_exception_details(self):
         host = make_host()
-        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(host))
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        base = f"http://127.0.0.1:{server.server_port}"
-        try:
+        with serve_asgi(make_asgi_app(host)) as port:
+            base = f"http://127.0.0.1:{port}"
             envelope = make_demo_envelope(host, "A2A tamper")
             envelope.state.goal = "tampered after signing"
             body = self._a2a_request_body(host, "A2A tamper", envelope=envelope)
@@ -8142,9 +8087,6 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(payload, {"jsonrpc": "2.0", "id": "req-1", "error": {"code": -32000, "message": "message submission failed"}})
             self.assertNotIn("SecurityError", json.dumps(payload))
             self.assertNotIn("signature", json.dumps(payload))
-        finally:
-            server.shutdown()
-            server.server_close()
 
     def test_a2a_errors_are_classified_by_who_caused_them(self):
         # Audit plan 007: a server failure is a 5xx, a refused request stays 400, and the body is the same
@@ -8164,38 +8106,27 @@ class RuntimeTests(unittest.TestCase):
         ]
         host = make_host()
         app = make_asgi_app(host, A2AAuthConfig("secret"))
-        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(host, A2AAuthConfig("secret")))
-        threading.Thread(target=server.serve_forever, daemon=True).start()
         body = self._a2a_request_body(host, "classified")
         headers = {"Content-Type": "application/json", "Content-Length": str(len(body)), "Authorization": "Bearer secret"}
-        try:
-            for label, error, expected in cases:
-                with self.subTest(label), patch.object(host, "run", side_effect=error), patch("portmark.a2a.logger.exception"):
-                    status, response_headers, payload = self._asgi_call(app, "POST", "/message:send", headers, body)
-                    request = urllib.request.Request(f"http://127.0.0.1:{server.server_port}/message:send", data=body, headers=headers)
-                    with self.assertRaises(urllib.error.HTTPError) as raised:
-                        urllib.request.urlopen(request)  # nosec B310
-                    local_status, local_payload = raised.exception.code, raised.exception.read()
-                self.assertEqual((status, local_status), (expected, expected))  # both transports share the router
-                self.assertNotIn(sentinel.encode(), payload + local_payload)
-                decoded = json.loads(payload)["error"]
-                if expected == 503:
-                    self.assertEqual(decoded, {"code": -32003, "message": "service temporarily unavailable"})
-                    self.assertEqual(dict(response_headers).get("retry-after", dict(response_headers).get("Retry-After")),
-                                     str(WITNESS_RETRY_AFTER_SECONDS))
-                else:
-                    self.assertEqual(decoded, {"code": -32000, "message": "message submission failed"})
-            # A structurally malformed envelope (valid JSON, past auth) is the CLIENT's fault through the real
-            # parser: still 400, never reclassified as a server failure by the 500 default.
-            malformed = json.loads(body)
-            del malformed["params"]["metadata"]["portmark_envelope"]["signature"]
-            malformed_body = json.dumps(malformed).encode()
-            status, _, payload = self._asgi_call(app, "POST", "/message:send", {**headers, "Content-Length": str(len(malformed_body))},
-                                                 malformed_body)
-            self.assertEqual((status, json.loads(payload)["error"]["code"]), (400, -32602))
-        finally:
-            server.shutdown()
-            server.server_close()
+        for label, error, expected in cases:
+            with self.subTest(label), patch.object(host, "run", side_effect=error), patch("portmark.a2a.logger.exception"):
+                status, response_headers, payload = self._asgi_call(app, "POST", "/message:send", headers, body)
+            self.assertEqual(status, expected)
+            self.assertNotIn(sentinel.encode(), payload)
+            decoded = json.loads(payload)["error"]
+            if expected == 503:
+                self.assertEqual(decoded, {"code": -32003, "message": "service temporarily unavailable"})
+                self.assertEqual(response_headers.get("retry-after"), str(WITNESS_RETRY_AFTER_SECONDS))
+            else:
+                self.assertEqual(decoded, {"code": -32000, "message": "message submission failed"})
+        # A structurally malformed envelope (valid JSON, past auth) is the CLIENT's fault through the real
+        # parser: still 400, never reclassified as a server failure by the 500 default.
+        malformed = json.loads(body)
+        del malformed["params"]["metadata"]["portmark_envelope"]["signature"]
+        malformed_body = json.dumps(malformed).encode()
+        status, _, payload = self._asgi_call(app, "POST", "/message:send", {**headers, "Content-Length": str(len(malformed_body))},
+                                             malformed_body)
+        self.assertEqual((status, json.loads(payload)["error"]["code"]), (400, -32602))
         metrics = host.metrics.prometheus_text()
         self.assertIn('reason="witness_unavailable"', metrics)
         self.assertIn('reason="internal"', metrics)
@@ -8238,11 +8169,8 @@ class RuntimeTests(unittest.TestCase):
 
     def test_a2a_requires_bearer_auth_before_envelope_parsing(self):
         host = make_host()
-        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(host, A2AAuthConfig("a2a-secret")))
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        base = f"http://127.0.0.1:{server.server_port}"
-        try:
+        with serve_asgi(make_asgi_app(host, A2AAuthConfig("a2a-secret"))) as port:
+            base = f"http://127.0.0.1:{port}"
             body = json.dumps({
                 "jsonrpc": "2.0",
                 "id": "req-1",
@@ -8269,17 +8197,11 @@ class RuntimeTests(unittest.TestCase):
             with self.assertRaises(urllib.error.HTTPError) as raised:
                 urllib.request.urlopen(request)  # nosec B310
             self.assertEqual(raised.exception.code, 401)
-        finally:
-            server.shutdown()
-            server.server_close()
 
     def test_a2a_rejects_malformed_unsupported_oversized_and_wrong_content_type(self):
         host = make_host()
-        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(host))
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        base = f"http://127.0.0.1:{server.server_port}"
-        try:
+        with serve_asgi(make_asgi_app(host)) as port:
+            base = f"http://127.0.0.1:{port}"
             cases = [
                 (b"{", {"Content-Type": "application/json"}, 400, -32700),
                 # Section 8 finding #4: unsafe-but-valid JSON must reject as a parse error (-32700),
@@ -8313,21 +8235,15 @@ class RuntimeTests(unittest.TestCase):
                     self.assertEqual(payload["jsonrpc"], "2.0")
                     self.assertEqual(payload["error"]["code"], code)
             with self.subTest(status=413, code=-32600):
-                self.assertEqual(self._oversized_rejection(server.server_port), (413, -32600))
-        finally:
-            server.shutdown()
-            server.server_close()
+                self.assertEqual(self._oversized_rejection(port), (413, -32600))
 
     def test_a2a_parser_fuzz_target_fails_closed(self):
         run_fuzz_cases(iterations=200)
 
     def test_a2a_rate_limits_message_submissions_per_ip(self):
         host = make_host()
-        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(host, rate_limit_per_ip=1, rate_limit_window_seconds=60))
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        base = f"http://127.0.0.1:{server.server_port}"
-        try:
+        with serve_asgi(make_asgi_app(host, rate_limit_per_ip=1, rate_limit_window_seconds=60)) as port:
+            base = f"http://127.0.0.1:{port}"
             first = urllib.request.Request(
                 base + "/message:send",
                 data=self._a2a_request_body(host, "first limited task"),
@@ -8347,20 +8263,11 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(raised.exception.headers["Retry-After"], "60")
             payload = json.load(raised.exception)
             self.assertEqual(payload["error"], {"code": -32002, "message": "rate limit exceeded"})
-        finally:
-            server.shutdown()
-            server.server_close()
 
     def test_a2a_rate_limits_agent_card_per_ip(self):
         host = make_host()
-        server = ThreadingHTTPServer(
-            ("127.0.0.1", 0),
-            make_handler(host, agent_card_rate_limit_per_ip=1, agent_card_rate_limit_window_seconds=60),
-        )
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        base = f"http://127.0.0.1:{server.server_port}"
-        try:
+        with serve_asgi(make_asgi_app(host, agent_card_rate_limit_per_ip=1, agent_card_rate_limit_window_seconds=60)) as port:
+            base = f"http://127.0.0.1:{port}"
             with urllib.request.urlopen(base + "/.well-known/agent-card.json") as response:  # nosec B310
                 self.assertEqual(json.load(response)["supportedInterfaces"][0]["protocolVersion"], "1.0")
 
@@ -8370,9 +8277,6 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(raised.exception.headers["Retry-After"], "60")
             payload = json.load(raised.exception)
             self.assertEqual(payload["error"], {"code": -32002, "message": "rate limit exceeded"})
-        finally:
-            server.shutdown()
-            server.server_close()
 
     def test_a2a_bounded_reference_server_handles_concurrent_loopback_load(self):
         """Concurrent requests all complete and none are cross-contaminated.
@@ -8386,93 +8290,57 @@ class RuntimeTests(unittest.TestCase):
         """
         workers = 8
         host = make_host()
-        server = BoundedReferenceHTTPServer(
-            ("127.0.0.1", 0),
-            make_handler(
-                host,
-                max_concurrent_requests=workers * 2,
-                rate_limit_per_ip=100,
-                agent_card_rate_limit_per_ip=100,
-            ),
-            max_connections=workers * 2,
-        )
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        base = f"http://127.0.0.1:{server.server_port}"
+        with serve_asgi(make_asgi_app(host, max_concurrent_requests=workers * 2, rate_limit_per_ip=100, agent_card_rate_limit_per_ip=100,)) as port:
+            base = f"http://127.0.0.1:{port}"
 
-        def submit(index):
-            body = self._a2a_request_body(host, f"load task {index}")
-            request = urllib.request.Request(base + "/message:send", data=body, headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(request, timeout=10) as response:  # nosec B310
-                payload = json.load(response)
-            return payload["result"]["status"]["state"]
+            def submit(index):
+                body = self._a2a_request_body(host, f"load task {index}")
+                request = urllib.request.Request(base + "/message:send", data=body, headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(request, timeout=10) as response:  # nosec B310
+                    payload = json.load(response)
+                return payload["result"]["status"]["state"]
 
-        def get_card(_):
-            with urllib.request.urlopen(base + "/.well-known/agent-card.json", timeout=10) as response:  # nosec B310
-                return json.load(response)["supportedInterfaces"][0]["protocolVersion"]
+            def get_card(_):
+                with urllib.request.urlopen(base + "/.well-known/agent-card.json", timeout=10) as response:  # nosec B310
+                    return json.load(response)["supportedInterfaces"][0]["protocolVersion"]
 
-        try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
                 message_states = list(executor.map(submit, range(12)))
                 card_versions = list(executor.map(get_card, range(12)))
             self.assertEqual(message_states, ["completed"] * 12)
             self.assertEqual(card_versions, ["1.0"] * 12)
-        finally:
-            server.shutdown()
-            server.server_close()
 
-    @unittest.skipIf(
-        sys.platform == "win32",
-        "connection cap holds on Windows, but a saturated listener aborts the socket "
-        "(WinError 10053) instead of returning a clean 503 body; this test asserts the "
-        "POSIX rejection shape. The cap itself is Linux-verified.",
-    )
-    def test_a2a_connection_cap_rejects_saturated_message_submissions(self):
+    def test_a2a_admission_cap_rejects_saturated_message_submissions(self):
         host = make_host()
         entered = threading.Event()
         release = threading.Event()
         host.providers["blocker"] = BlockingProvider(entered, release)
-        server = BoundedReferenceHTTPServer(
-            ("127.0.0.1", 0),
-            make_handler(host, max_concurrent_requests=100, rate_limit_per_ip=100),
-            max_connections=1,
-        )
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        base = f"http://127.0.0.1:{server.server_port}"
+        with serve_asgi(make_asgi_app(host, max_concurrent_requests=1, rate_limit_per_ip=100)) as port:
+            base = f"http://127.0.0.1:{port}"
 
-        def submit_blocking_request():
-            request = urllib.request.Request(
-                base + "/message:send",
-                data=self._a2a_request_body(host, "blocking task", make_demo_envelope(host, "blocking task", "blocker")),
-                headers={"Content-Type": "application/json"},
-            )
-            with urllib.request.urlopen(request) as response:  # nosec B310
-                return json.load(response)
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(submit_blocking_request)
-            try:
-                # Generous budgets on purpose: the connection-cap logic is
-                # race-free (the first request holds its semaphore slot until its
-                # thread finishes), so the only way this test fails is a starved
-                # runner not scheduling the blocked request in time. Wide timeouts
-                # keep it deterministic under a loaded full-suite run; a healthy
-                # machine still returns the instant the events fire.
-                self.assertTrue(entered.wait(30))
-                second = urllib.request.Request(
+            def submit_blocking_request():
+                request = urllib.request.Request(
                     base + "/message:send",
-                    data=self._a2a_request_body(host, "busy task"),
+                    data=self._a2a_request_body(host, "blocking task", make_demo_envelope(host, "blocking task", "blocker")),
                     headers={"Content-Type": "application/json"},
                 )
-                status, payload = self._busy_rejection(server.server_port, second.data)
-                self.assertEqual(status, 503)
-                self.assertEqual(payload["error"], {"code": -32003, "message": "server busy"})
-            finally:
-                release.set()
-                server.shutdown()
-                server.server_close()
-            self.assertEqual(future.result(timeout=30)["result"]["status"]["state"], "completed")
+                with urllib.request.urlopen(request) as response:  # nosec B310
+                    return json.load(response)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(submit_blocking_request)
+                try:
+                    # Generous budgets on purpose: the admission cap is race-free (the first run holds its
+                    # permit until the run ends), so the only way this test fails is a starved runner not
+                    # scheduling the blocked request in time. A healthy machine returns the instant the
+                    # events fire.
+                    self.assertTrue(entered.wait(30))
+                    status, payload = self._busy_rejection(port, self._a2a_request_body(host, "busy task"))
+                    self.assertEqual(status, 503)
+                    self.assertEqual(payload["error"], {"code": -32003, "message": "server busy"})
+                finally:
+                    release.set()
+                self.assertEqual(future.result(timeout=30)["result"]["status"]["state"], "completed")
 
     def _busy_rejection(self, port, body):
         sock = socket.create_connection(("127.0.0.1", port), timeout=30)
