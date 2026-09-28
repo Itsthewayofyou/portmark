@@ -347,7 +347,7 @@ pending. Without a dispatcher a migration stays durably pending and is never del
 Portmark is **reference-complete with six named substitution points**. Signing and trust,
 transactional persistence, the A2A 1.0 surface, external policy with approval gates, WIT-shaped
 Wasm execution, and confidential-computing attestation are all implemented and covered by the
-regression suite. [PRODUCTION_TASKS.md](https://github.com/Itsthewayofyou/portmark/blob/main/PRODUCTION_TASKS.md) holds the task-level record.
+regression suite. [CHANGELOG.md](CHANGELOG.md) holds the task-level record.
 
 It is a reference implementation: read it, fork it, and substitute the seams below. It is not
 intended as a drop-in production dependency.
