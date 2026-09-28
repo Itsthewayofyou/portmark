@@ -12,7 +12,8 @@ from .metrics import RuntimeMetrics
 from .models import AgentEnvelope, AgentManifest, AgentState, Permit, ResourceBudget, ToolGrant
 from .policy import load_host_policy
 from .providers import DeterministicProvider, GenericHttpProvider, ModelProvider, NativeWasmtimeComponentProvider, WasmDecisionProvider
-from .security import AttestationPolicy, EnvelopeSigner, EnvelopeSigningIdentity, ExternalAttestationVerifier, ExternalMigrationPreflight, HostPolicy, MigrationAttesterProtocol, MigrationPreflightProtocol, TrustRegistry, TrustSource, _b64url_decode, normalize_output_projection, validate_constraints
+from ._encoding import b64url_decode as _b64url_decode
+from .security import AttestationPolicy, EnvelopeSigner, EnvelopeSigningIdentity, ExternalAttestationVerifier, ExternalMigrationPreflight, HostPolicy, MigrationAttesterProtocol, MigrationPreflightProtocol, TrustRegistry, TrustSource, normalize_output_projection, validate_constraints
 from .storage import RuntimeStore, create_runtime_store
 from .tools import ToolRegistry, demo_registry
 from ._clock import ClockRollbackError, TimeFloorError, check_time_floor, clock_tolerance_from_environment, configure_default_clock, trusted_now

@@ -77,7 +77,6 @@ from .security import canonical_json
 
 ENROLMENT_FORMAT = "portmark.witness.enrolment.v1"
 PUBLIC_MODE_ACK = "behind-tls-proxy"
-DEFAULT_PORT = 8787
 SCHEMA_VERSION = 1
 # ONE absolute deadline for the whole request body (not per chunk: a client sending a byte just under
 # every per-chunk timeout would hold the connection forever). Checked before authentication.

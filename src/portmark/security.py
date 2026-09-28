@@ -6,9 +6,6 @@ import json
 import math
 import subprocess  # nosec B404
 import tempfile
-import base64
-import binascii
-import string
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -18,6 +15,10 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat, PublicFormat
 
+from ._encoding import b64url_decode as _b64url_decode
+from ._encoding import b64url_encode as _b64url_encode
+from ._encoding import decode_raw_key as _decode_raw_key
+from ._encoding import required_string as _required_string
 from .models import AgentEnvelope, AgentManifest, ApprovalToken, AttestationEvidence, Permit, ResourceBudget, ToolGrant
 
 
@@ -318,37 +319,6 @@ def _finite_number(value: Any) -> bool:
     # (True == 1) and NaN/Infinity defeat every `<`/`>` bound (all comparisons with
     # NaN are False), so exclude both. Finding #2.
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
-
-
-def _b64url_encode(value: bytes) -> str:
-    return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
-
-
-_B64URL_ALPHABET = frozenset(string.ascii_letters + string.digits + "-_")
-
-
-def _b64url_decode(value: str) -> bytes:
-    # Strict, canonical unpadded Base64URL only (Codex audit finding #6). The lenient
-    # form accepted non-alphabet characters, added padding and non-canonical trailing
-    # bits, so byte-for-byte-different strings decoded to the same signature/key bytes
-    # and could evade a naive tamper check or signature-string cache. We reject anything
-    # that does not re-encode to exactly the input. Raises ValueError so the existing
-    # (InvalidSignature, ValueError) handlers at every verify call site convert it to a
-    # SecurityError, and load_trust_registry surfaces it as a validation error.
-    if not isinstance(value, str):
-        raise ValueError("base64url value must be a string")
-    if len(value) % 4 == 1:
-        raise ValueError("base64url value has an impossible length")
-    if any(ch not in _B64URL_ALPHABET for ch in value):
-        raise ValueError("base64url value contains a non-alphabet character")
-    padding = "=" * (-len(value) % 4)
-    try:
-        decoded = base64.urlsafe_b64decode(value + padding)
-    except (binascii.Error, ValueError) as error:
-        raise ValueError("base64url value is not decodable") from error
-    if _b64url_encode(decoded) != value:
-        raise ValueError("base64url value is not canonically encoded")
-    return decoded
 
 
 @dataclass(frozen=True)
@@ -790,20 +760,6 @@ class TrustSource:
 
 def _issuer_matches(signing_issuer: str, permit_issuer: str) -> bool:
     return permit_issuer == signing_issuer
-
-
-def _required_string(value: dict[str, Any], name: str, label: str) -> str:
-    result = value.get(name)
-    if not isinstance(result, str) or not result:
-        raise ValueError(f"{label} {name} must be a non-empty string")
-    return result
-
-
-def _decode_raw_key(value: str, label: str) -> bytes:
-    decoded = _b64url_decode(value)
-    if len(decoded) != 32:
-        raise ValueError(f"{label} must be 32 raw bytes")
-    return decoded
 
 
 def _string_tuple(value: Any, label: str) -> tuple[str, ...]:

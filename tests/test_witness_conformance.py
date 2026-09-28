@@ -25,7 +25,7 @@ from witness_fixtures import CONFORMANCE_HOST, HOST, WitnessCase, asgi_transport
 from portmark import witness_server
 from portmark.cli import main as cli_main
 from portmark.remote_witness import Decision, WitnessUnavailable, public_key_bytes, sign_answer, state_body
-from portmark.security import _b64url_encode
+from portmark._encoding import b64url_encode as _b64url_encode
 from portmark.witness_conformance import run_witness_conformance
 
 SRC = str(Path(__file__).resolve().parents[1] / "src")

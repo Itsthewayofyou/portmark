@@ -294,7 +294,9 @@ class KeyringTests(unittest.TestCase):
     def test_the_first_key_seals_and_urlsafe_or_standard_base64_both_parse(self):
         url_key = generate_key()
         codec = parse_keyring(f"new:{url_key}\nold:{KEY_A}")
-        self.assertEqual((codec.current_key_id, codec.key_ids), ("new", ("new", "old")))
+        self.assertEqual(codec.current_key_id, "new")
+        sealed_by_old = parse_keyring(f"old:{KEY_A}").seal("t", 1, "checkpoint")
+        self.assertEqual(codec.open("t", 1, sealed_by_old), "checkpoint")  # the second key is in the ring
 
     def test_environment_sources(self):
         self.assertIsNone(codec_from_environment({}))

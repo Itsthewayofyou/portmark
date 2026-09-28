@@ -75,10 +75,6 @@ class CheckpointCodec:
         self._keys = {key_id: AESGCM(key) for key_id, key in keys}
         self.current_key_id = keys[0][0]
 
-    @property
-    def key_ids(self) -> tuple[str, ...]:
-        return tuple(self._keys)
-
     def seal(self, task_id: str, generation: int, plaintext: str, row: Mapping[str, Any] | None = None) -> str:
         nonce = secrets.token_bytes(_NONCE_BYTES)
         sealed = self._keys[self.current_key_id].encrypt(

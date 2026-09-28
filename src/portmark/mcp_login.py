@@ -24,7 +24,7 @@ import time
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-from .mcp_config import McpConfigError, McpServerConfig, load_config
+from .mcp_config import McpConfigError, McpServerConfig, load_config, oauth_client_credentials
 from .mcp_token_store import clear_tokens, write_tokens
 
 # The redirect the MCP specification's own example uses. RFC 8252 section 7.3 is why it is a literal address
@@ -128,12 +128,12 @@ def _client(server: McpServerConfig) -> tuple[str, str]:
     """The client id, and the secret when one is configured. Both by NAME from the environment."""
     oauth = server.oauth
     assert oauth is not None  # nosec B101 - the only caller checks
-    client_id = os.environ.get(oauth.client_id_env, "")
+    client_id, client_secret = oauth_client_credentials(oauth, os.environ)
     if not client_id:
         raise McpConfigError(
             f"the client id is read from {oauth.client_id_env}, and that variable is unset or empty"
         )
-    return client_id, os.environ.get(oauth.client_secret_env, "") if oauth.client_secret_env else ""
+    return client_id, client_secret
 
 
 def result_from_redirect(url: str) -> Any:

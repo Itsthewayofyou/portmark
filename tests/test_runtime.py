@@ -4856,6 +4856,28 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(timed_out, "deadline not enforced while the stdin write blocked")
         self.assertLess(elapsed, 3.0, "stdin write bypassed the execution deadline")
 
+    def test_wasm_bounded_releases_the_worker_on_start_failure_and_on_an_error_after_launch(self):
+        # The launched process tree owns cleanup. A child that cannot start raises and leaves nothing
+        # behind; an error after launch (here the reader threads cannot start) still stops the child
+        # AND reaps it, so no zombie outlives the failed call.
+        from portmark import providers
+
+        with self.assertRaises(OSError):
+            providers._run_bounded([str(Path(tempfile.gettempdir()) / "no-such-portmark-worker")], b"",
+                                   timeout=1, max_output_bytes=10, env=dict(os.environ))
+        launched = []
+
+        def launch(argv, popen_kwargs):
+            launched.append(providers._launch_plain(argv, popen_kwargs))
+            return launched[-1]
+
+        env = dict(os.environ, PROD_SLEEP="30")  # would outlive the test if nothing stopped it
+        with patch.object(threading.Thread, "start", side_effect=RuntimeError("can't start new thread")):
+            with self.assertRaisesRegex(RuntimeError, "can't start new thread"):
+                providers._run_bounded([sys.executable, self._write_producer()], b"", timeout=30,
+                                       max_output_bytes=10, env=env, launch=launch)
+        self.assertIsNotNone(launched[0].returncode, "the child was not stopped and reaped")
+
     @contextmanager
     def _three_store_context(self, backend):
         # Three stores (2 sources + 1 destination) on one backend, for the section 4 #7
@@ -8000,8 +8022,9 @@ class RuntimeTests(unittest.TestCase):
     def test_local_and_sdk_agent_cards_are_identical(self):
         """Both adapters must serve the same card.
 
-        The card is swapped rather than stacked when --a2a-adapter changes, so
-        without this the two modes can silently diverge.
+        The SDK adapter serves the local card after a round trip through the SDK's
+        strict AgentCard. This asserts the round trip is exact: the pinned SDK
+        neither drops nor adds a field, with or without bearer auth.
         """
         for require_auth in (True, False):
             with self.subTest(require_auth=require_auth):
@@ -9493,6 +9516,10 @@ class AgentSideToolingTests(unittest.TestCase):
                 ("missing_tools_module:registry", "could not load --tools"),
                 ("custom_tools:missing_registry", "could not load --tools"),
                 ("custom_tools", "module:function"),
+                ("custom_tools:", "module:function"),  # resolve_name would return the module itself
+                ("custom_tools:registry.", "could not load --tools"),
+                ("custom_tools:registry:extra", "could not load --tools"),
+                (".custom_tools:registry", "could not load --tools"),
             ]
             self._tool_module(directory, "from portmark.tools import ToolRegistry\n\ndef registry():\n    return ToolRegistry()\n")
             with patch.dict(os.environ, {}, clear=True):
@@ -9507,6 +9534,24 @@ class AgentSideToolingTests(unittest.TestCase):
                                         cli_main()
                             self.assertEqual(caught.exception.code, 2)
                             self.assertIn(message, stderr.getvalue())
+
+    def test_tools_loader_resolves_dotted_attributes_and_imports_nothing_else(self):
+        from portmark.tool_loading import ToolLoaderError, load_tools
+
+        with tempfile.TemporaryDirectory() as directory:
+            self._tool_module(directory, (
+                "from portmark.tools import ToolRegistry\n\n"
+                "class holder:\n    registry = staticmethod(lambda: ToolRegistry())\n"
+            ))
+            marker = Path(directory) / "imported.marker"
+            # A module whose name is not an identifier. The strict syntax must refuse it before any import.
+            (Path(directory) / "custom-tools.py").write_text(f"open({str(marker)!r}, 'w').close()\nregistry = None\n")
+            with patch.object(sys, "path", [directory, *sys.path]):
+                sys.modules.pop("custom_tools", None)
+                self.assertIsInstance(load_tools("custom_tools:holder.registry"), ToolRegistry)
+                with self.assertRaisesRegex(ToolLoaderError, "could not load --tools"):
+                    load_tools("custom-tools:registry")
+            self.assertFalse(marker.exists())
 
     def test_cli_rejects_tools_loader_returning_the_wrong_type(self):
         with tempfile.TemporaryDirectory() as directory:

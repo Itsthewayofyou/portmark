@@ -55,6 +55,7 @@ from portmark.mcp_client import McpError
 from portmark.mcp_config import (
     McpConfigError,
     McpOAuthConfig,
+    oauth_client_credentials,
     McpServerConfig,
     config_from_bytes,
     definition_digest,
@@ -68,8 +69,9 @@ from portmark.mcp_token_store import (
     STORE_VERSION,
     StoredTokens,
     TokenStoreError,
-    binding_error,
     clear_tokens,
+    client_mismatch,
+    issuer_mismatch,
     read_tokens,
     write_tokens,
 )
@@ -98,6 +100,20 @@ class OauthConfigTests(unittest.TestCase):
         with self.assertRaises(McpConfigError) as caught:
             self.load(oauth, **server_changes)
         return str(caught.exception)
+
+    def test_client_credentials_are_read_by_name_from_the_environment_given(self):
+        oauth = McpOAuthConfig("CID", "/t.json", client_secret_env="SECRET")  # nosec B106 - variable NAMES
+        cases = [
+            ({"CID": "id", "SECRET": "shh"}, ("id", "shh")),  # nosec B105 - fixture values
+            ({"CID": "id"}, ("id", "")),                      # the named secret is unset
+            ({}, ("", "")),                                   # each caller decides what an empty id means
+        ]
+        for environ, expected in cases:
+            with self.subTest(environ=sorted(environ)):
+                self.assertEqual(oauth_client_credentials(oauth, environ), expected)
+        # No secret configured: a variable that happens to exist is never read.
+        public = McpOAuthConfig("CID", "/t.json")
+        self.assertEqual(oauth_client_credentials(public, {"CID": "id", "": "x"}), ("id", ""))
 
     def test_an_oauth_block_carries_names_and_a_path_and_never_a_secret(self):
         config = self.load(dict(OAUTH, client_secret_env="EXAMPLE_SECRET", scopes=["files:read"]))  # nosec B106 - an environment variable NAME, which is the whole point of the test
@@ -482,9 +498,10 @@ class TokenStoreTests(unittest.TestCase):
     def test_tokens_from_a_different_authorization_server_or_client_are_refused(self):
         # The specification's MUST: credentials are keyed by issuer, and a server that starts naming a
         # different authorization server is either being reconfigured or attacked. Both look the same here.
-        self.assertIsNone(binding_error(self.tokens, "https://as.example", "cid"))
-        self.assertIn("different authorization server", binding_error(self.tokens, "https://evil.example", "cid") or "")
-        self.assertIn("log in again", binding_error(self.tokens, "https://as.example", "other") or "")
+        self.assertIsNone(issuer_mismatch(self.tokens, "https://as.example"))
+        self.assertIsNone(client_mismatch(self.tokens, "cid"))
+        self.assertIn("different authorization server", issuer_mismatch(self.tokens, "https://evil.example") or "")
+        self.assertIn("log in again", client_mismatch(self.tokens, "other") or "")
 
     def test_a_token_that_expires_during_the_call_it_authorizes_is_not_fresh(self):
         self.assertTrue(self.tokens.fresh(now=3_999_999_000))

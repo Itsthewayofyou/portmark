@@ -66,6 +66,16 @@ class McpOAuthConfig:
     scopes: tuple[str, ...] = ()
 
 
+def oauth_client_credentials(oauth: McpOAuthConfig, environ: Mapping[str, str]) -> tuple[str, str]:
+    """The client id and secret the config NAMES, read from `environ`: ("", "") for whatever is unset.
+
+    The config stays inert -- names only -- and the caller passes the environment it means to read, so
+    where a secret comes from is visible at the call site. Each caller decides what an empty id means.
+    """
+    client_id = environ.get(oauth.client_id_env, "")
+    return client_id, environ.get(oauth.client_secret_env, "") if oauth.client_secret_env else ""
+
+
 def server_digest(server: "McpServerConfig") -> str:
     """How one server is REACHED: which program runs, or which endpoint is called, and under what terms.
 
