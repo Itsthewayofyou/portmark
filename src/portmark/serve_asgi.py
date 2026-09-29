@@ -25,9 +25,8 @@ from __future__ import annotations
 import os
 import sys
 from collections.abc import Mapping
-from typing import Any
 
-from .a2a import is_loopback_bind, parse_trusted_proxies, run_uvicorn, validate_public_base_url
+from .a2a import is_loopback_bind, parse_trusted_proxies, run_uvicorn, uvicorn_options, validate_public_base_url
 from .config import RuntimeConfig
 from .logging_config import configure_logging
 
@@ -102,21 +101,6 @@ def bind_from_environment(environ: Mapping[str, str]) -> tuple[str, int]:
     if not 1 <= port <= 65535:
         raise ValueError(f"{BIND_PORT_ENV} must be between 1 and 65535, got {port}")
     return host, port
-
-
-def uvicorn_options(host: str, port: int) -> dict[str, Any]:
-    return {
-        "host": host,
-        "port": port,
-        # Section 11 #6: Portmark's trusted-proxy policy is the single authority over X-Forwarded-*.
-        "proxy_headers": False,
-        # Section 11 #2: keep the one redacting root handler; uvicorn installs none of its own.
-        "log_config": None,
-        "log_level": "warning",
-        "access_log": False,
-        "limit_concurrency": 32,
-        "timeout_keep_alive": 5,
-    }
 
 
 def main(environ: Mapping[str, str] | None = None) -> int:

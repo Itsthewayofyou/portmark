@@ -1512,9 +1512,8 @@ class AgentHost:
         # to previous_audit_host_id (via the payload host_id check on the Ed25519 path); without
         # this line an anchor validly signed by a DIFFERENT trusted, migration-capable host could
         # be spliced onto this permit and recorded as false lineage. Together this makes
-        # previous_audit_host_id == permit.issuer == identity.issuer. NOTE: legacy
-        # HmacEnvelopeSigner.verify_audit_head checks neither host_id nor usage, so on that
-        # (demo/non-production) path this equality is the ONLY provenance binding.
+        # previous_audit_host_id == permit.issuer == identity.issuer. A custom signer whose
+        # verify_audit_head checks neither host_id nor usage relies on this equality alone.
         if envelope.previous_audit_host_id != envelope.permit.issuer:
             raise SecurityError("migration audit host does not match permit issuer")
         # A migration handoff is a distinct purpose from ordinary audit-head signing
@@ -1611,7 +1610,7 @@ class AgentHost:
                 # invalid from birth. Raising inside the transaction rolls back the nonce, the
                 # audit append, and the checkpoint together -- a closing _persist that trips this
                 # leaves the task in its prior (resumable) state, to be completed after a restart
-                # with a usable key. Legacy HMAC has no key lifecycle and exposes no registry.
+                # with a usable key. A custom signer that exposes no registry is not checked here.
                 audit_trust = getattr(self.signer, "registry", None)
                 if audit_trust is not None and hasattr(audit_trust, "audit_signing_reason"):
                     signing_reason = audit_trust.audit_signing_reason(self.signer.key_id, now=head_signed_at)

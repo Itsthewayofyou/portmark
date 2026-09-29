@@ -992,6 +992,10 @@ class _ProcessTree:
     def stdout(self) -> Any:
         return self._process.stdout
 
+    @property
+    def stderr(self) -> Any:
+        return self._process.stderr
+
     def poll(self) -> int | None:
         return self._process.poll()
 

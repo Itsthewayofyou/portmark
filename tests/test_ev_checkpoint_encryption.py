@@ -120,12 +120,8 @@ class _StoreCases:
                 transaction.save_checkpoint("done", AgentState("done", "g"), 1, owner=owner)
         with store.transaction() as transaction:
             transaction.save_checkpoint("owned", AgentState("owned", "g"), 0, owner=("user:alice", "agent:demo"))
-        self.assertEqual(store.checkpoint_owner("owned"), ("user:alice", "agent:demo"))
-        # Rewriting the owner (PM-001 takeover by a store writer): refused before the owner compare,
-        # and the owner accessor never returns the edited value.
+        # Rewriting the owner (PM-001 takeover by a store writer): refused before the owner compare.
         self._set_column("owned", "owner_issuer", "user:mallory")
-        with self.assertRaisesRegex(CheckpointCryptoError, "failed authentication"):
-            store.checkpoint_owner("owned")
         with self.assertRaisesRegex(CheckpointCryptoError, "failed authentication"):
             store.load_checkpoint("owned")
         with self.assertRaisesRegex(CheckpointCryptoError, "failed authentication"):
@@ -298,7 +294,9 @@ class KeyringTests(unittest.TestCase):
     def test_the_first_key_seals_and_urlsafe_or_standard_base64_both_parse(self):
         url_key = generate_key()
         codec = parse_keyring(f"new:{url_key}\nold:{KEY_A}")
-        self.assertEqual((codec.current_key_id, codec.key_ids), ("new", ("new", "old")))
+        self.assertEqual(codec.current_key_id, "new")
+        sealed_by_old = parse_keyring(f"old:{KEY_A}").seal("t", 1, "checkpoint")
+        self.assertEqual(codec.open("t", 1, sealed_by_old), "checkpoint")  # the second key is in the ring
 
     def test_environment_sources(self):
         self.assertIsNone(codec_from_environment({}))

@@ -24,8 +24,8 @@ hostile tool can write to fd 1 directly, past the Python-level redirect.
 """
 from __future__ import annotations
 
-import importlib
 import inspect
+import pkgutil
 import functools
 import json
 import re
@@ -281,11 +281,10 @@ def _import_and_run(
     """
     with redirect_stdout(sink):
         try:
-            loaded: Any = importlib.import_module(module_name)
-            for part in object_path.split("."):
-                if not part:
-                    raise AttributeError
-                loaded = getattr(loaded, part)
+            # Every dotted part a plain identifier, so resolve_name only ever sees a module:attribute path.
+            if not all(part.isidentifier() for part in (*module_name.split("."), *object_path.split("."))):
+                raise ImportError(module_name)
+            loaded: Any = pkgutil.resolve_name(f"{module_name}:{object_path}")
         except (ImportError, AttributeError):
             return False, "could not import tool target", None
         except BaseException as error:  # noqa: BLE001 - module-scope code failed; fail closed

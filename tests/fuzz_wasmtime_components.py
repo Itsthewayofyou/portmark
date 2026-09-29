@@ -284,7 +284,7 @@ def inproc_cap_status() -> str:
 
 def _launch_inproc_child(argv: list[str]) -> Any:
     """Start the child; on Windows inside a kill-on-close Job Object with the 512 MiB memory limit
-    (the same race-free launcher the native provider uses). Returns a providers._Worker."""
+    (the same race-free launcher the native provider uses). Returns a tools._ProcessTree."""
     from portmark import _windows_job
     from portmark.providers import _launch_plain, _windows_job_launcher
 
@@ -297,8 +297,9 @@ def _launch_inproc_child(argv: list[str]) -> Any:
 def _run_child_streaming(argv: list[str], watchdog: float) -> tuple[list[dict[str, Any]], int | None, bool, str]:
     """Run one child, reading its per-case lines as they arrive. If no line arrives within
     `watchdog` seconds, the child is killed (hung). Returns (records, returncode, hung, stderr_tail)."""
-    worker = _launch_inproc_child(argv)
-    process = worker.process
+    from portmark.providers import _release, _stop
+
+    process = _launch_inproc_child(argv)
     lines: queue.Queue[bytes | None] = queue.Queue()
     stderr_tail: list[bytes] = []
 
@@ -322,7 +323,7 @@ def _run_child_streaming(argv: list[str], watchdog: float) -> tuple[list[dict[st
                 line = lines.get(timeout=watchdog)
             except queue.Empty:
                 hung = True
-                worker.kill()
+                _stop(process)
                 break
             if line is None:
                 break
@@ -331,7 +332,7 @@ def _run_child_streaming(argv: list[str], watchdog: float) -> tuple[list[dict[st
         try:
             process.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            worker.kill()
+            _stop(process)
         for reader in readers:
             reader.join(timeout=5)
     finally:
@@ -341,7 +342,7 @@ def _run_child_streaming(argv: list[str], watchdog: float) -> tuple[list[dict[st
                     stream.close()
                 except OSError:
                     pass
-        worker.close()
+        _release(process)
     tail = (b"".join(stderr_tail).decode("utf-8", "replace").strip().splitlines() or [""])[-1][:160]
     return records, process.returncode, hung, tail
 

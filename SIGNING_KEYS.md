@@ -1,6 +1,6 @@
 # Signing Keys And Trust Registry
 
-Portmark signs envelopes with Ed25519 by default. HMAC remains available only as an explicit legacy demo mode and should not be used for production trust domains.
+Portmark signs envelopes with Ed25519. The legacy HMAC signer was removed; setting `PORTMARK_ALLOW_LEGACY_HMAC` now stops the host at boot instead of falling back to a generated key.
 
 ## Signed Envelope Metadata
 
@@ -36,9 +36,8 @@ The host verifier uses a `TrustRegistry` containing `TrustedIdentity` records:
   anchor key's `identity.issuer == previous_audit_host_id` (enforced by audit-head verification), the
   lineage is bound to the host that actually delegated the migration
   (`previous_audit_host_id == permit.issuer == identity.issuer`). This stops a valid anchor signed by a
-  *different* trusted, migration-capable host from being spliced onto another host's permit. Caveat: the
-  legacy `HmacEnvelopeSigner` checks neither host nor usage, so on that demo/non-production path the
-  `permit.issuer` equality is the sole provenance binding.
+  *different* trusted, migration-capable host from being spliced onto another host's permit. Caveat: a
+  custom signer that checks neither host nor usage relies on the `permit.issuer` equality alone.
 
   **Migration delivery receipts (`receipt` usage).** When a destination admits a migrated task it
   issues a `portmark.migration-receipt.v1` signed with its key, in the SAME transaction that commits
@@ -73,7 +72,7 @@ or the same version with different content. See OPERATIONS.md, Audit Floor.
 **Audit floor signature.** The host signs its audit floor with its audit key, so that key needs the
 `audit` purpose (absent `usages` = unrestricted). Verification is authenticity only (the key is
 re-used every save), but a **revoked** key is refused: a compromised key could otherwise sign a
-lowered floor. The legacy HMAC signer produces a MAC, which only a holder of the same key can check.
+lowered floor.
 
 `not_before`/`expires_at` must be integers (a JSON boolean is rejected, not coerced) and `revoked`
 must be a boolean; a duplicate `key_id` in a registry is rejected, not silently collapsed.
@@ -150,8 +149,8 @@ key is, in the registry the host verifies audit heads against, currently trusted
 *reports* a bad key; startup enforcement is what stops a host from admitting a direct request and
 returning results whose audit head is invalid from birth. The same check re-runs before every audit
 head is signed, so a key that expires mid-process fails the run closed (the checkpoint stays
-resumable) rather than writing unverifiable evidence. Legacy HMAC signing has no key lifecycle and is
-exempt.
+resumable) rather than writing unverifiable evidence. A custom signer that exposes no trust registry
+has no key lifecycle to check and is exempt.
 
 ## Revoke A Key
 
@@ -286,9 +285,6 @@ keys than a JSON file can sensibly carry.
 
 Comparison performed 2026-08-31 against spiffe.io documentation of that date.
 
-## Legacy HMAC Mode
+## Legacy HMAC Mode (removed)
 
-Set `PORTMARK_ALLOW_LEGACY_HMAC=unsafe-test-only` and a non-empty
-`PORTMARK_SIGNING_KEY` to use the dependency-free HMAC signer for tests or
-demos. This mode uses shared secret verification and does not provide
-asymmetric workload identity. Do not enable it in production.
+The legacy HMAC signer was removed; setting `PORTMARK_ALLOW_LEGACY_HMAC` now stops the host at boot instead of falling back to a generated key. Unset it and configure an Ed25519 key.

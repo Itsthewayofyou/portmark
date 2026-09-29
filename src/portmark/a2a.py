@@ -13,8 +13,6 @@ import time
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from socketserver import ThreadingMixIn
 from collections.abc import Callable
 from typing import Any, Iterator
 from urllib.parse import urlsplit
@@ -144,13 +142,6 @@ def resolve_client_ip(peer_ip: str, forwarded_for: str, trusted_proxies: tuple[i
             return candidate
     return peer_ip
 A2A_ADAPTERS = ("local", "sdk")
-BUSY_RESPONSE = (
-    b"HTTP/1.1 503 Service Unavailable\r\n"
-    b"Content-Type: application/json\r\n"
-    b"Connection: close\r\n"
-    b"X-Content-Type-Options: nosniff\r\n"
-    b"Retry-After: 1\r\n"
-)
 
 
 def envelope_from_dict(value: dict[str, Any]) -> AgentEnvelope:
@@ -327,41 +318,6 @@ class _RunTracker:
         # abandon() returns the report snapshot under the same lock that begin() takes, so each report
         # names exactly the operation in flight at the deadline, and nothing can begin afterwards.
         return [progress.abandon() for progress in leftovers]
-
-
-class BoundedReferenceHTTPServer(ThreadingMixIn, HTTPServer):
-    daemon_threads = True
-
-    def __init__(self, server_address, RequestHandlerClass, max_connections: int = DEFAULT_MAX_CONCURRENT_REQUESTS):
-        if max_connections < 1:
-            raise ValueError("max_connections must be at least 1")
-        self._connection_slots = threading.BoundedSemaphore(max_connections)
-        super().__init__(server_address, RequestHandlerClass)
-
-    def process_request(self, request, client_address) -> None:
-        if not self._connection_slots.acquire(blocking=False):
-            self._reject_busy(request)
-            self.shutdown_request(request)
-            return
-        try:
-            super().process_request(request, client_address)
-        except Exception:
-            self._connection_slots.release()
-            raise
-
-    def process_request_thread(self, request, client_address) -> None:
-        try:
-            super().process_request_thread(request, client_address)
-        finally:
-            self._connection_slots.release()
-
-    def _reject_busy(self, request) -> None:
-        payload = json.dumps(error_response(None, -32003, "server busy")).encode()
-        try:
-            request.sendall(BUSY_RESPONSE + f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload)
-        except OSError:
-            logger.debug("failed to write busy response", exc_info=True)
-
 
 
 SECURITY_HEADERS = {
@@ -711,108 +667,6 @@ class A2ARouter:
             return self.response(400 if refused else 500, error_response(request_id, -32000, "message submission failed"))
 
 
-def make_handler(host: AgentHost, auth: A2AAuthConfig | None = None, enable_hsts: bool = False, **kwargs: Any):
-    """BaseHTTPRequestHandler transport over A2ARouter.
-
-    Retained for tests and local development. Production serving uses the ASGI
-    application; both share the router above, so the security logic has one
-    implementation.
-    """
-    # trusted_proxies is an ASGI transport concern (section 2, finding #3). The
-    # reference handler is loopback-dev only and keeps peer-only client identity, so
-    # accept-and-ignore the kwarg rather than letting it reach A2ARouter as an error.
-    kwargs.pop("trusted_proxies", None)
-    body_timeout = validate_timeout_seconds(
-        "body_read_timeout_seconds",
-        kwargs.pop("body_read_timeout_seconds", DEFAULT_BODY_READ_TIMEOUT_SECONDS),
-        MAX_BODY_READ_TIMEOUT_SECONDS,
-    )
-    router = A2ARouter(host, auth, enable_hsts, **kwargs)
-
-    class A2AHandler(BaseHTTPRequestHandler):
-        server_version = "PortableAgentA2A/1.0"
-        a2a_router = router
-
-        def _send(self, response: HttpResponse) -> None:
-            self.send_response(response.status)
-            for key, value in response.headers.items():
-                self.send_header(key, value)
-            self.end_headers()
-            self.wfile.write(response.payload)
-
-        def _client_ip(self) -> str:
-            if isinstance(self.client_address, tuple) and self.client_address:
-                return str(self.client_address[0])
-            return "unknown"
-
-        def _read_body(self, size: int) -> bytes | None:
-            """Read exactly `size` bytes within ONE absolute deadline (Section 12 #2), or None on timeout.
-
-            A per-read socket timeout alone resets on every dribbled byte; setting it to the time LEFT
-            before each read makes the whole body share one deadline. A short body (EOF) is returned
-            as read, and the caller refuses it as a framing error.
-            """
-            deadline = time.monotonic() + body_timeout
-            body = bytearray()
-            try:
-                while len(body) < size:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        return None
-                    self.connection.settimeout(remaining)
-                    chunk = self.rfile.read1(min(65_536, size - len(body)))
-                    if not chunk:
-                        break
-                    body.extend(chunk)
-            except TimeoutError:
-                return None
-            return bytes(body)
-
-        def do_GET(self) -> None:
-            self._send(router.handle_get(
-                self.path,
-                self.headers.get("Host", "127.0.0.1"),
-                self._client_ip(),
-                self.headers.get("Authorization", ""),
-                self.headers.get("Accept", ""),
-            ))
-
-        def do_POST(self) -> None:
-            started = time.monotonic()
-            router.note_forwarded_proto(self.headers.get("X-Forwarded-Proto", ""))
-            try:
-                with router.admit_post(
-                    self.path,
-                    self.headers.get("Content-Type", ""),
-                    self.headers.get("Content-Length", "0"),
-                    self.headers.get("Authorization", ""),
-                    self._client_ip(),
-                ) as (rejection, size):
-                    if rejection is not None:
-                        self._send(rejection)
-                        return
-                    body = self._read_body(size)
-                    if body is None:
-                        router.host.metrics.increment_refusal("request_timeout")
-                        self.close_connection = True
-                        self._send(router.response(408, error_response(None, -32600, "request body timeout"), {"Connection": "close"}))
-                        return
-                    if len(body) != size:
-                        router.host.metrics.increment_refusal("invalid_request")
-                        self.close_connection = True
-                        self._send(router.response(400, error_response(None, -32600, "invalid request")))
-                        return
-                    self._send(router.dispatch_post(body))
-            finally:
-                router.host.metrics.observe_duration("a2a_request_duration_seconds", time.monotonic() - started)
-
-        def log_message(self, format: str, *args: Any) -> None:
-            return
-
-    return A2AHandler
-
-
-
 def auth_from_environment() -> A2AAuthConfig:
     return A2AAuthConfig(os.environ.get("PORTMARK_A2A_TOKEN"))
 
@@ -1123,6 +977,25 @@ def _shutdown_hook(app: Any) -> Any:
     raise RuntimeError("the ASGI application has no Portmark shutdown hook (make_asgi_app)")
 
 
+def uvicorn_options(host: str, port: int) -> dict[str, Any]:
+    """The uvicorn settings every Portmark entry point runs with."""
+    return {
+        "host": host,
+        "port": port,
+        # Section 11 #6: uvicorn's default proxy_headers=True rewrites the peer from X-Forwarded-For (for
+        # 127.0.0.1) BEFORE Portmark's trusted-proxy policy runs; that policy is the single authority.
+        "proxy_headers": False,
+        # Section 11 #2: a uvicorn Config re-applies uvicorn's default dictConfig AFTER configure_logging(),
+        # reinstalling non-propagating, unredacted handlers. log_config=None keeps the one redacting root
+        # handler in charge.
+        "log_config": None,
+        "log_level": "warning",
+        "access_log": False,
+        "limit_concurrency": 32,
+        "timeout_keep_alive": 5,
+    }
+
+
 def run_uvicorn(app: Any, options: dict[str, Any]) -> None:
     """Run uvicorn as uvicorn.run() does for one worker without reload, plus Section 12 #1.
 
@@ -1210,21 +1083,4 @@ def serve(
         # tokenless loopback server is an acknowledged configuration here.
         allow_anonymous=True,
     )
-    run_uvicorn(
-        app,
-        {
-            "host": bind,
-            "port": port,
-            "log_level": "warning",
-            # Section 11 #2 (auditor round 2): a uvicorn Config re-applies uvicorn's default
-            # dictConfig AFTER the CLI's configure_logging(), reinstalling non-propagating, unredacted
-            # handlers. log_config=None keeps the one redacting root handler in charge.
-            "log_config": None,
-            # Section 11 #6: uvicorn's default proxy_headers=True rewrites the peer from
-            # X-Forwarded-For (for 127.0.0.1) BEFORE Portmark's trusted-proxy policy runs.
-            "proxy_headers": False,
-            "limit_concurrency": max_concurrent_requests,
-            "timeout_keep_alive": 5,
-            "access_log": False,
-        },
-    )
+    run_uvicorn(app, uvicorn_options(bind, port) | {"limit_concurrency": max_concurrent_requests})

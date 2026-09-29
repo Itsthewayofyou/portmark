@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 import shlex
@@ -13,7 +12,8 @@ from .metrics import RuntimeMetrics
 from .models import AgentEnvelope, AgentManifest, AgentState, Permit, ResourceBudget, ToolGrant
 from .policy import load_host_policy
 from .providers import DeterministicProvider, GenericHttpProvider, ModelProvider, NativeWasmtimeComponentProvider, WasmDecisionProvider
-from .security import AttestationPolicy, EnvelopeSigner, EnvelopeSigningIdentity, ExternalAttestationVerifier, ExternalMigrationPreflight, HmacEnvelopeSigner, HostPolicy, MigrationAttesterProtocol, MigrationPreflightProtocol, TrustRegistry, TrustSource, _b64url_decode, normalize_output_projection, validate_constraints
+from ._encoding import b64url_decode as _b64url_decode
+from .security import AttestationPolicy, EnvelopeSigner, EnvelopeSigningIdentity, ExternalAttestationVerifier, ExternalMigrationPreflight, HostPolicy, MigrationAttesterProtocol, MigrationPreflightProtocol, TrustRegistry, TrustSource, normalize_output_projection, validate_constraints
 from .storage import RuntimeStore, create_runtime_store
 from .tools import ToolRegistry, demo_registry
 from ._clock import ClockRollbackError, TimeFloorError, check_time_floor, clock_tolerance_from_environment, configure_default_clock, trusted_now
@@ -58,13 +58,10 @@ def signer_from_environment(
             tuple(os.environ.get("PORTMARK_ALLOWED_AUDIENCES", host_id).split(",")),
             registry,
         )
-    if os.environ.get("PORTMARK_ALLOW_LEGACY_HMAC") == "unsafe-test-only":
-        raw = os.environ.get("PORTMARK_SIGNING_KEY")
-        if not raw:
-            raise RuntimeError("legacy HMAC signing requires PORTMARK_SIGNING_KEY")
-        return HmacEnvelopeSigner(hashlib.sha256(raw.encode()).digest())
+    # The legacy HMAC signer was removed. Refuse its old switch rather than quietly falling through to
+    # a generated key, so a host that relied on it fails at boot instead of signing with another key.
     if os.environ.get("PORTMARK_ALLOW_LEGACY_HMAC"):
-        raise RuntimeError("legacy HMAC signing requires PORTMARK_ALLOW_LEGACY_HMAC=unsafe-test-only")
+        raise RuntimeError("the legacy HMAC signer was removed; unset PORTMARK_ALLOW_LEGACY_HMAC and use Ed25519")
     return EnvelopeSigner.generate(issuer=host_id, allowed_audiences=(host_id,), registry=registry)
 
 
@@ -223,7 +220,7 @@ def make_host(
     # Stability must be AFFIRMATIVE: only a signer that declares ephemeral=False (a key
     # loaded from stable bytes via from_private_key_bytes) counts as stable. A generated
     # key (ephemeral=True) OR any signer that does not declare its stability (e.g. a
-    # randomly-generated HMAC or custom signer, ephemeral absent) is NOT presumed stable,
+    # custom signer, ephemeral absent) is NOT presumed stable,
     # so a durable store refuses it unless the caller explicitly opts in.
     signer_is_stable = getattr(host_signer, "ephemeral", None) is False
     if getattr(configured_store, "is_durable", False) and not signer_is_stable and not allow_ephemeral_signing_key:
@@ -238,8 +235,8 @@ def make_host(
     # accept. Readiness reports such a key but does not block work -- a direct client would
     # still submit a request and get back results whose audit head is invalid from birth
     # (signed-after-revocation / expired). Enforce fail-closed at boot against the very
-    # trust the signer verifies audit heads with. Legacy HMAC has no key lifecycle or
-    # usages, exposes no registry, and is skipped (documented in SIGNING_KEYS.md).
+    # trust the signer verifies audit heads with. A custom signer that exposes no registry
+    # has no key lifecycle to check here, and is skipped.
     audit_trust = getattr(host_signer, "registry", None)
     audit_key_id = getattr(host_signer, "key_id", None)
     if audit_trust is not None and audit_key_id is not None and hasattr(audit_trust, "audit_signing_reason"):

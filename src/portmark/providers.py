@@ -493,16 +493,6 @@ def _read_component_file(path: str, max_component_bytes: int) -> bytes:
     return component
 
 
-def _kill_process(process: subprocess.Popen) -> None:
-    """Best-effort terminate; a process that already exited is left alone."""
-    if process.poll() is not None:
-        return
-    try:
-        process.kill()
-    except OSError:
-        pass
-
-
 # A child that proves the POSIX address-space cap is ENFORCED, not merely accepted: it caps
 # itself, then allocates twice the cap. Exit 0 only if that allocation is refused.
 _CAP_SELF_CHECK = (
@@ -543,31 +533,11 @@ def _worker_memory_cap_enforceable() -> bool:
     return result.returncode == 0
 
 
-class _Worker:
-    """A launched worker: the process, how to kill it, and how to release it."""
+def _launch_plain(argv: list[str], popen_kwargs: dict[str, Any]) -> Any:
+    """A plain child; stopping it kills only the child itself (see the debt note in _run_bounded)."""
+    from .tools import _UnmanagedProcessTree
 
-    def __init__(self, process: subprocess.Popen, kill: Any = None, close: Any = None) -> None:
-        self.process = process
-        self._kill = kill or (lambda: _kill_process(process))
-        self._close = close or (lambda: None)
-
-    def kill(self) -> None:
-        if self.process.poll() is not None:
-            return
-        try:
-            self._kill()
-        except OSError:
-            pass
-
-    def close(self) -> None:
-        try:
-            self._close()
-        except OSError:
-            pass
-
-
-def _launch_plain(argv: list[str], popen_kwargs: dict[str, Any]) -> _Worker:
-    return _Worker(subprocess.Popen(argv, **popen_kwargs))  # nosec B603
+    return _UnmanagedProcessTree(subprocess.Popen(argv, **popen_kwargs))  # nosec B603
 
 
 def _windows_job_launcher(process_memory_limit: int) -> Any:
@@ -578,11 +548,25 @@ def _windows_job_launcher(process_memory_limit: int) -> Any:
     """
     from .tools import _launch_windows_job_tree
 
-    def launch(argv: list[str], popen_kwargs: dict[str, Any]) -> _Worker:
-        tree = _launch_windows_job_tree(argv, popen_kwargs, process_memory_limit=process_memory_limit)
-        return _Worker(tree._process, kill=tree.terminate_tree, close=tree.close)
+    return functools.partial(_launch_windows_job_tree, process_memory_limit=process_memory_limit)
 
-    return launch
+
+def _stop(worker: Any) -> None:
+    """Stop a launched worker (a tools._ProcessTree). One that already exited is left alone; its job,
+    if it has one, is released by close()."""
+    if worker.poll() is not None:
+        return
+    try:
+        worker.terminate_tree()
+    except OSError:
+        pass
+
+
+def _release(worker: Any) -> None:
+    try:
+        worker.close()
+    except OSError:
+        pass
 
 
 def _run_bounded(
@@ -613,7 +597,7 @@ def _run_bounded(
     blocked writer unblocks with ``BrokenPipeError``. Every wait derives its budget from that one
     deadline, so no phase can re-spend the full timeout.
 
-    ``launch(argv, popen_kwargs) -> _Worker`` selects how the child starts and is killed; the
+    ``launch(argv, popen_kwargs) -> _ProcessTree`` selects how the child starts and is killed; the
     default is a plain ``Popen``. The native Wasmtime provider passes a Job Object launcher on
     Windows so the worker runs under a per-process memory ceiling (Section 9, #1).
 
@@ -625,11 +609,10 @@ def _run_bounded(
     kill-tree) if the runner ever gains spawn/exec capability.
     """
     deadline = time.monotonic() + timeout
-    worker = (launch or _launch_plain)(
+    process = (launch or _launch_plain)(
         argv,
         {"stdin": subprocess.PIPE, "stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "env": env},
     )
-    process = worker.process
     stdout_buffer = bytearray()
     stderr_buffer = bytearray()
     overflow = threading.Event()
@@ -646,7 +629,7 @@ def _run_bounded(
                 stdout_buffer.extend(chunk)
                 if len(stdout_buffer) > max_output_bytes:
                     overflow.set()
-                    worker.kill()
+                    _stop(process)
                     break
         except (OSError, ValueError):
             pass
@@ -688,7 +671,7 @@ def _run_bounded(
             process.wait(timeout=max(0.0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             timed_out = True
-            worker.kill()
+            _stop(process)
             try:
                 process.wait(timeout=2.0)
             except subprocess.TimeoutExpired:
@@ -703,14 +686,14 @@ def _run_bounded(
         err_reader.join(timeout=2.0)
         writer.join(timeout=2.0)
     finally:
-        worker.kill()
+        _stop(process)
         for stream in (process.stdin, process.stdout, process.stderr):
             if stream is not None:
                 try:
                     stream.close()
                 except OSError:
                     pass
-        worker.close()
+        _release(process)
     stderr_text = bytes(stderr_buffer).decode("utf-8", "replace").strip()
     return process.returncode, bytes(stdout_buffer), stderr_text, timed_out, overflow.is_set()
 

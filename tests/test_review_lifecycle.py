@@ -25,7 +25,8 @@ from dataclasses import asdict
 
 from portmark.models import ProviderDecision, ResourceBudget, ToolGrant
 from portmark.providers import ModelProvider
-from portmark.security import ApprovalAuthority, HostPolicy, PermitExpiredError, SecurityError
+from portmark.security import HostPolicy, PermitExpiredError, SecurityError
+from authority_fixtures import ApprovalAuthority
 from portmark.storage import SQLiteRuntimeStore
 from test_section12_capacity_clock import FakeTime
 
@@ -92,7 +93,7 @@ class ReviewLifecycleTests(unittest.TestCase):
         checkpoint = store.load_checkpoint(task_id)
         self.assertIsNotNone(checkpoint)
         self.assertEqual(checkpoint["status"], "failed")  # durable terminal, never left `running`
-        self.assertTrue(store.verify_audit_chain(task_id))
+        self.assertTrue(store.verify_audit_chain_status(task_id).valid)
         self.assertIn(event, [entry["event"] for entry in self._events(task_id)])
         # Closed in the durable row, so the lineage cannot be resumed at this host again.
         with contextlib.closing(sqlite3.connect(str(self.root / "runtime.sqlite"))) as connection:

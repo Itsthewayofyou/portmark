@@ -6,7 +6,8 @@ from pathlib import Path
 from typing import Any
 
 from .models import ResourceBudget, ToolGrant
-from .security import HostPolicy, MigrationPolicy, TrustedApprover, _b64url_decode as _strict_b64url_decode, canonical_json, normalize_output_projection, validate_constraints
+from ._encoding import decode_raw_key, required_string
+from .security import HostPolicy, MigrationPolicy, TrustedApprover, canonical_json, normalize_output_projection, validate_constraints
 
 
 VALID_IMPACTS = {"low", "medium", "high", "destructive", "external-payment", "credentialed", "data-exfiltration"}
@@ -18,7 +19,7 @@ def load_host_policy(path: str | Path, audience: str) -> HostPolicy:
 
 
 def policy_from_dict(value: dict[str, Any], audience: str) -> HostPolicy:
-    version = _required_string(value, "version")
+    version = required_string(value, "version", "policy")
     tools = _required_object(value, "tools")
     budget = _budget(value.get("budget", {}))
     grants = []
@@ -110,9 +111,9 @@ def _approval_authorities(value: Any) -> tuple[TrustedApprover, ...]:
             raise ValueError("approval authority entries must be objects")
         authorities.append(
             TrustedApprover(
-                key_id=_required_string(item, "key_id"),
-                approver=_required_string(item, "approver"),
-                public_key=_b64url_decode(_required_string(item, "public_key_b64")),
+                key_id=required_string(item, "key_id", "policy"),
+                approver=required_string(item, "approver", "policy"),
+                public_key=decode_raw_key(required_string(item, "public_key_b64", "policy"), "approval public keys"),
                 not_before=int(item.get("not_before", 0)),
                 expires_at=int(item["expires_at"]) if item.get("expires_at") is not None else None,
                 revoked=bool(item.get("revoked", False)),
@@ -135,13 +136,6 @@ def _output_projection(value: Any, tool: str) -> tuple[str, ...] | None:
     return normalize_output_projection(value, f"policy tool {tool!r}")
 
 
-def _required_string(value: dict[str, Any], name: str) -> str:
-    result = value.get(name)
-    if not isinstance(result, str) or not result:
-        raise ValueError(f"policy {name} must be a non-empty string")
-    return result
-
-
 def _required_object(value: dict[str, Any], name: str) -> dict[str, Any]:
     result = value.get(name)
     if not isinstance(result, dict):
@@ -149,11 +143,3 @@ def _required_object(value: dict[str, Any], name: str) -> dict[str, Any]:
     return result
 
 
-def _b64url_decode(value: str) -> bytes:
-    # Strict, canonical Base64URL (finding #6) — the same decoder used for signatures
-    # and trust-registry keys, so an approval/attestation public key cannot slip in via
-    # a non-canonical encoding either.
-    decoded = _strict_b64url_decode(value)
-    if len(decoded) != 32:
-        raise ValueError("approval public keys must be 32 raw bytes")
-    return decoded

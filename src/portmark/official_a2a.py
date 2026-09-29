@@ -4,33 +4,15 @@ from typing import Any
 
 
 def make_sdk_agent_card(base_url: str, require_bearer_auth: bool) -> dict[str, Any]:
+    """The local card, parsed by the official SDK's strict AgentCard and serialised back out.
+
+    One source for the card's content; the SDK only checks its shape. The conformance lane asserts the
+    round trip returns exactly the local card, so the SDK can neither drop nor add a field unnoticed.
+    """
+    from .a2a_types import make_agent_card  # noqa: PLC0415 - a2a_types stays free of the optional SDK
+
     types, parse_dict, message_to_dict = _sdk()
-    payload: dict[str, Any] = {
-        "name": "Portable Wasm Agent Host",
-        "description": "Runs signed, capability-limited portable agents",
-        "supportedInterfaces": [{
-            "url": f"{base_url}/message:send",
-            "protocolBinding": "JSONRPC",
-            "protocolVersion": "1.0",
-        }],
-        "version": "0.1.0",
-        "capabilities": {},
-        "defaultInputModes": ["application/json"],
-        "defaultOutputModes": ["application/json"],
-        "skills": [{
-            "id": "portmark",
-            "name": "Portmark agent execution",
-            "description": "Execute a signed Portmark agent envelope",
-            "inputModes": ["application/json"],
-            "outputModes": ["application/json"],
-        }],
-    }
-    if require_bearer_auth:
-        payload["securitySchemes"] = {
-            "bearer": {"httpAuthSecurityScheme": {"scheme": "bearer", "bearerFormat": "opaque"}}
-        }
-        payload["securityRequirements"] = [{"schemes": {"bearer": {}}}]
-    card = parse_dict(payload, types.AgentCard())
+    card = parse_dict(make_agent_card(base_url, require_bearer_auth), types.AgentCard())
     return message_to_dict(card, preserving_proto_field_name=False)
 
 

@@ -30,7 +30,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -589,33 +589,6 @@ async def _no_callback() -> Any:
     raise McpOAuthError("no way to receive the authorization result was offered")
 
 
-def refuse_sync_use(provider: Any) -> None:  # noqa: D401
-    """Assert the SDK still has no synchronous auth path.
-
-    Not defensive decoration. `httpx2`'s base `auth_flow` yields the request unchanged, and the SDK overrides
-    only `async_auth_flow`, so attaching this provider to a SYNCHRONOUS client sends an unauthenticated
-    request and raises nothing -- authorization silently becomes a no-op. Portmark never builds an `httpx2`
-    client, but a future SDK that grows a `sync_auth_flow` would change what this module is reasoning about,
-    and that must be noticed deliberately rather than inherited."""
-    candidate = provider if isinstance(provider, type) else type(provider)
-    if candidate.sync_auth_flow is not _base_sync_auth_flow():
-        raise McpOAuthError(
-            "this version of the MCP SDK defines its own `sync_auth_flow`; Portmark's reasoning about the "
-            "synchronous path no longer holds and must be re-checked before the pin is raised"
-        )
-
-
-def _base_sync_auth_flow() -> Any:
-    httpx2 = _sdk()[0]
-    return httpx2.Auth.sync_auth_flow
-
-
-def redact(headers: Mapping[str, str]) -> dict[str, str]:
-    """Headers with any credential replaced. For logging a request that failed."""
-    return {name: ("<redacted>" if name.lower() in ("authorization", "cookie") else value)
-            for name, value in headers.items()}
-
-
 __all__ = [
     "EXTRA_HINT",
     "Authorization",
@@ -623,8 +596,6 @@ __all__ = [
     "McpOAuthRefused",
     "authorize",
     "current_access_token",
-    "redact",
     "refresh",
-    "refuse_sync_use",
     "sdk_available",
 ]

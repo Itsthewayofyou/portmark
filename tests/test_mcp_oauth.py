@@ -34,7 +34,6 @@ from portmark.mcp_oauth import (
     authorize,
     current_access_token,
     refresh,
-    refuse_sync_use,
     sdk_available,
 )
 from portmark.security import canonical_json
@@ -43,7 +42,6 @@ from portmark.cli import _finite_seconds, _install_mcp_tools, _run_mcp
 from portmark.mcp import (
     MIN_REFRESH_SLEEP_SECONDS,
     MIN_RENEWAL_INTERVAL_SECONDS,
-    UNMAINTAINABLE_LIFETIME_SECONDS,
     REFRESH_AHEAD_SECONDS,
     REFRESH_RETRY_SECONDS,
     McpStartupError,
@@ -57,6 +55,7 @@ from portmark.mcp_client import McpError
 from portmark.mcp_config import (
     McpConfigError,
     McpOAuthConfig,
+    oauth_client_credentials,
     McpServerConfig,
     config_from_bytes,
     definition_digest,
@@ -70,8 +69,9 @@ from portmark.mcp_token_store import (
     STORE_VERSION,
     StoredTokens,
     TokenStoreError,
-    binding_error,
     clear_tokens,
+    client_mismatch,
+    issuer_mismatch,
     read_tokens,
     write_tokens,
 )
@@ -100,6 +100,20 @@ class OauthConfigTests(unittest.TestCase):
         with self.assertRaises(McpConfigError) as caught:
             self.load(oauth, **server_changes)
         return str(caught.exception)
+
+    def test_client_credentials_are_read_by_name_from_the_environment_given(self):
+        oauth = McpOAuthConfig("CID", "/t.json", client_secret_env="SECRET")  # nosec B106 - variable NAMES
+        cases = [
+            ({"CID": "id", "SECRET": "shh"}, ("id", "shh")),  # nosec B105 - fixture values
+            ({"CID": "id"}, ("id", "")),                      # the named secret is unset
+            ({}, ("", "")),                                   # each caller decides what an empty id means
+        ]
+        for environ, expected in cases:
+            with self.subTest(environ=sorted(environ)):
+                self.assertEqual(oauth_client_credentials(oauth, environ), expected)
+        # No secret configured: a variable that happens to exist is never read.
+        public = McpOAuthConfig("CID", "/t.json")
+        self.assertEqual(oauth_client_credentials(public, {"CID": "id", "": "x"}), ("id", ""))
 
     def test_an_oauth_block_carries_names_and_a_path_and_never_a_secret(self):
         config = self.load(dict(OAUTH, client_secret_env="EXAMPLE_SECRET", scopes=["files:read"]))  # nosec B106 - an environment variable NAME, which is the whole point of the test
@@ -484,9 +498,10 @@ class TokenStoreTests(unittest.TestCase):
     def test_tokens_from_a_different_authorization_server_or_client_are_refused(self):
         # The specification's MUST: credentials are keyed by issuer, and a server that starts naming a
         # different authorization server is either being reconfigured or attacked. Both look the same here.
-        self.assertIsNone(binding_error(self.tokens, "https://as.example", "cid"))
-        self.assertIn("different authorization server", binding_error(self.tokens, "https://evil.example", "cid") or "")
-        self.assertIn("log in again", binding_error(self.tokens, "https://as.example", "other") or "")
+        self.assertIsNone(issuer_mismatch(self.tokens, "https://as.example"))
+        self.assertIsNone(client_mismatch(self.tokens, "cid"))
+        self.assertIn("different authorization server", issuer_mismatch(self.tokens, "https://evil.example") or "")
+        self.assertIn("log in again", client_mismatch(self.tokens, "other") or "")
 
     def test_a_token_that_expires_during_the_call_it_authorizes_is_not_fresh(self):
         self.assertTrue(self.tokens.fresh(now=3_999_999_000))
@@ -722,18 +737,9 @@ class OauthDriverTests(unittest.TestCase):
         import httpx2
         from mcp.client.auth.oauth2 import OAuthClientProvider
 
+        # If this fails, the SDK defines its own `sync_auth_flow`: re-check the reasoning above before
+        # raising the pin.
         self.assertIs(OAuthClientProvider.sync_auth_flow, httpx2.Auth.sync_auth_flow)
-        refuse_sync_use(OAuthClientProvider)
-
-        # A guard whose refusal path never runs is decoration. Feed it the shape it exists to catch -- a
-        # future SDK that grows its own synchronous path -- and it must refuse.
-        class WithASyncPath(OAuthClientProvider):
-            def sync_auth_flow(self, request):  # pragma: no cover - never called, only inspected
-                raise NotImplementedError
-
-        with self.assertRaises(McpOAuthError) as caught:
-            refuse_sync_use(WithASyncPath)
-        self.assertIn("sync_auth_flow", str(caught.exception))
 
     def test_without_the_extra_the_error_says_how_to_install_it(self):
         with patch.dict(sys.modules, {"mcp.client.auth.oauth2": None}):
@@ -1248,6 +1254,27 @@ class McpCommandErrorTests(unittest.TestCase):
         self.assertIn("group readable", complaint.getvalue())
 
 
+def _scripted_clock(*ticks: float):
+    """A stand-in for `time.monotonic` that returns each tick in turn, then holds the last one.
+
+    Sleeping for real and asserting on the measured duration is a flake, not a test. `_renew` reads the
+    clock once before the renewal and once after, and on Windows that clock is coarse enough that
+    `time.sleep(0.05)` measures slightly SHORT of 0.05 -- CI recorded 0.04699999999996862 and failed a
+    `>= 0.05` assertion on Python 3.11. What these tests own is that the cost is measured at all and that
+    the schedule is built from the later reading; neither property is about the host's ability to sleep
+    accurately. So the clock is scripted and the sleep is gone.
+
+    The last tick is held rather than exhausted, so an unrelated caller inside the patched window cannot
+    turn a wrong answer into a `StopIteration` that looks like a different failure.
+    """
+    remaining = list(ticks)
+
+    def clock() -> float:
+        return remaining.pop(0) if len(remaining) > 1 else remaining[0]
+
+    return clock
+
+
 class TokenRefresherTests(unittest.TestCase):
     """Renewing on a timer, in the host. The clock is passed in, so each decision is tested at an instant.
 
@@ -1459,7 +1486,6 @@ class TokenRefresherTests(unittest.TestCase):
         Renewing harder cannot help, so saying so once is the useful act. It must also not turn into a
         renewal on every tick, which would be a storm against the authorization server on top of an outage.
         """
-        self.assertLessEqual(60, UNMAINTAINABLE_LIFETIME_SECONDS)
         refresher = self.refresher()
         self.store_expiring_in(60)
         refresher._last_renewal["files"] = self.NOW
@@ -1474,6 +1500,20 @@ class TokenRefresherTests(unittest.TestCase):
         self.assertEqual(len(said), 1, logged.output)
         # And it backs off rather than spinning. How far is the interval's business, not this test's.
         self.assertGreater(slept, MIN_REFRESH_SLEEP_SECONDS)
+
+    def test_the_unmaintainable_boundary_is_seventy_seconds_with_quick_renewals(self):
+        """The exact edge: margin 60 + slack 5 + the loop's 5-second wake. 70 is kept usable, 69 is named."""
+        for lifetime, named in ((69, True), (70, False)):
+            with self.subTest(lifetime=lifetime):
+                refresher = self.refresher()
+                self.store_expiring_in(lifetime)
+                refresher._last_renewal["files"] = self.NOW
+                with patch("portmark.mcp_oauth.current_access_token"), \
+                        self.assertLogs("portmark.mcp", level="DEBUG") as logged:
+                    refresher.tick(self.NOW)
+                    logging.getLogger("portmark.mcp").debug("tick done")  # assertLogs needs one record
+                said = any("no renewal schedule can keep one usable" in line for line in logged.output)
+                self.assertEqual(said, named, logged.output)
 
     def test_a_login_that_reuses_the_refresh_token_still_resumes_renewal(self):
         """Some authorization servers hand back the SAME refresh token when the operator authorizes again.
@@ -1552,15 +1592,16 @@ class TokenRefresherTests(unittest.TestCase):
         self.store_expiring_in(0)
 
         def slow_renewal(**_):
-            time.sleep(0.05)
             write_tokens(self.store, StoredTokens(
                 "https://issuer.example", "cid", "renewed", self.NOW + 3600, "a-refresh-token"))
             return "renewed"
 
         refresher = self.refresher()
-        with patch("portmark.mcp_oauth.current_access_token", side_effect=slow_renewal):
+        with patch("portmark.mcp_oauth.current_access_token", side_effect=slow_renewal), \
+                patch("portmark.mcp.time.monotonic", _scripted_clock(100.0, 107.0)):
             refresher.tick(self.NOW)
-        self.assertGreaterEqual(refresher._renewal_cost.get("files", 0.0), 0.05)
+        self.assertEqual(refresher._renewal_cost.get("files", 0.0), 7.0,
+                         "the renewal spanned seven seconds of the clock, and all seven are remembered")
 
     def test_the_wait_after_a_renewal_counts_the_time_the_renewal_took(self):
         """The wait is served from the moment the renewal FINISHED, not the moment it started.
@@ -1574,12 +1615,12 @@ class TokenRefresherTests(unittest.TestCase):
         self.store_expiring_in(0)
 
         def slow_renewal(**_):
-            time.sleep(0.05)
             write_tokens(self.store, StoredTokens(
                 "https://issuer.example", "cid", "renewed", self.NOW + 100, "a-refresh-token"))
             return "renewed"
 
-        with patch("portmark.mcp_oauth.current_access_token", side_effect=slow_renewal):
+        with patch("portmark.mcp_oauth.current_access_token", side_effect=slow_renewal), \
+                patch("portmark.mcp.time.monotonic", _scripted_clock(100.0, 100.05)):
             refresher.tick(self.NOW)
         # What is asserted is the CLOCK the schedule is built from, not the wait it produces. The wait also
         # depends on the deadline and on reading the new expiry back, each of which has its own test;

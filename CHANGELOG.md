@@ -4,6 +4,23 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 ## Unreleased
 
+### Removed
+
+- **The legacy HMAC envelope signer.** `HmacEnvelopeSigner` was a test-only demo signer behind
+  `PORTMARK_ALLOW_LEGACY_HMAC=unsafe-test-only`. It is gone, and setting `PORTMARK_ALLOW_LEGACY_HMAC` to any
+  value now stops the host at boot instead of falling through to a generated key. Use Ed25519
+  (`PORTMARK_ED25519_PRIVATE_KEY_B64`); see SIGNING_KEYS.md.
+- **The stdlib `http.server` A2A transport** (`make_handler`, `BoundedReferenceHTTPServer`). Nothing outside
+  the tests used it; `portmark serve` runs the ASGI app on uvicorn. The tests that drove it over real sockets
+  now drive the ASGI app on a real uvicorn server.
+- **Test-only code in the runtime**: the demo `AttestationAuthority` and `ApprovalAuthority` issuers (now
+  `tests/authority_fixtures.py`), the store readers `consumed_nonce_exists`, `checkpoint_owner` and
+  `verify_audit_chain` (use `verify_audit_chain_status(...).valid`), `mcp_oauth.refuse_sync_use` (its check
+  is an assertion in the test now), and `mcp.UNMAINTAINABLE_LIFETIME_SECONDS` (a new test pins the real
+  70-second boundary instead).
+- **Four plan documents whose work has shipped**: MCP_OAUTH_PLAN.md, SECURITY_0.4.0_PLAN.md,
+  "Production Hardening Plan.md" and PRODUCTION_TASKS.md. This changelog is the record.
+
 ### Changed
 
 - **Portmark moves from MIT to the Elastic License 2.0**, and gains a trademark policy, contribution
@@ -20,6 +37,32 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
   functional change -- Portmark is dormant, and if a public request for confirmation then goes thirty
   days unanswered, the most recent release becomes additionally available under Apache-2.0. Taking the
   repository down does not defeat that. See `NOTICE`, `TRADEMARKS.md` and `CONTRIBUTING.md`.
+- **`--tools` and isolated-tool targets must be plain dotted identifiers.** Both now resolve
+  `module:attribute` with `pkgutil.resolve_name`, behind Portmark's own syntax check plus a rule that every
+  dotted part is an identifier. This is narrower, never broader: a module name such as `custom-tools` used
+  to be imported and is now refused before any import.
+- **Guarded clean-ups, same behaviour.** The strict Base64URL codec and two field validators moved from
+  `security.py` to a neutral `_encoding.py` that policy, the witness client and the CLI import instead of
+  `security.py`'s private helpers (`_encoding.py` has its own CI coverage gate). OAuth client
+  credentials are read through one small resolver; `McpOAuthConfig` stays names only. The SDK agent card is
+  the local card round-tripped through the pinned SDK (a test asserts the round trip is exact). The A2A card
+  and task are built as literals; the parsing types are unchanged and the output is identical. The Wasm
+  provider's worker is the process tree itself, which also reaps the child on an error path.
+- **SQLite and PostgreSQL share what they run identically.** 19 single-statement store methods that were the
+  same in both backends (apart from `?`/`%s`) live once in a shared base; everything with a lock,
+  `FOR UPDATE`, `RETURNING`, the database clock or a backend exception stays per backend. No transaction
+  method qualified, so there is no shared transaction class; the audit-chain link rule and the event row
+  are written once instead, and a new cross-store test pins the rule (it had no test before).
+- Removed unused names: `mcp_token_store.binding_error`, `mcp_oauth.redact`, `CheckpointCodec.key_ids`,
+  `_run_progress.PHASES`, `witness_server.DEFAULT_PORT`.
+- **Less duplicated code, same behaviour.** The three stores check the audit chain in one function;
+  `TrustSource` routes every lookup through one helper, still verifying the registry file first (now pinned
+  by a test for keys only the boot overlay holds); the verifier and witness conformance kits share one
+  result type (their JSON is byte-for-byte unchanged); both entry points build their uvicorn options in one
+  place; the MCP and export config loaders share one unknown-key check; and `RuntimeConfig.merged_with_args`
+  is a table and `dataclasses.replace` (pinned field by field by a new test). The current run is tracked in
+  a `ContextVar` rather than a thread-local, so two runs interleaved on one event-loop thread no longer share
+  a progress record.
 
 - **The MCP scope decisions are written down rather than merely true.** `portmark.asgi:create_app` installs
   no MCP tools, and that is now stated as a decision with its reason: it is an importable factory, and

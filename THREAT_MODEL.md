@@ -268,7 +268,7 @@ flowchart LR
 - Critical: unauthenticated remote execution; arbitrary host code execution from provider data; bypass of signature verification for trusted envelopes; silent audit verification success after fabricated history.
 - High: high-impact tool execution without policy/approval; migration to untrusted host due to bad attestation; custom tool SSRF that can reach credentials; leakage of signing keys or A2A token.
 - Medium: request or provider DoS bounded by process limits; metrics or logs losing security signal; replay rejected only after consuming availability; HTTP provider used without TLS on a non-loopback network.
-- Low: agent-card metadata disclosure; generic readiness status disclosure; local demo-only HMAC misuse when unsafe flag is not enabled.
+- Low: agent-card metadata disclosure; generic readiness status disclosure.
 
 ## Focus Paths For Security Review
 

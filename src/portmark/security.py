@@ -4,12 +4,8 @@ import hashlib
 import hmac
 import json
 import math
-import secrets
 import subprocess  # nosec B404
 import tempfile
-import base64
-import binascii
-import string
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -19,6 +15,10 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat, PublicFormat
 
+from ._encoding import b64url_decode as _b64url_decode
+from ._encoding import b64url_encode as _b64url_encode
+from ._encoding import decode_raw_key as _decode_raw_key
+from ._encoding import required_string as _required_string
 from .models import AgentEnvelope, AgentManifest, ApprovalToken, AttestationEvidence, Permit, ResourceBudget, ToolGrant
 
 
@@ -319,37 +319,6 @@ def _finite_number(value: Any) -> bool:
     # (True == 1) and NaN/Infinity defeat every `<`/`>` bound (all comparisons with
     # NaN are False), so exclude both. Finding #2.
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
-
-
-def _b64url_encode(value: bytes) -> str:
-    return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
-
-
-_B64URL_ALPHABET = frozenset(string.ascii_letters + string.digits + "-_")
-
-
-def _b64url_decode(value: str) -> bytes:
-    # Strict, canonical unpadded Base64URL only (Codex audit finding #6). The lenient
-    # form accepted non-alphabet characters, added padding and non-canonical trailing
-    # bits, so byte-for-byte-different strings decoded to the same signature/key bytes
-    # and could evade a naive tamper check or signature-string cache. We reject anything
-    # that does not re-encode to exactly the input. Raises ValueError so the existing
-    # (InvalidSignature, ValueError) handlers at every verify call site convert it to a
-    # SecurityError, and load_trust_registry surfaces it as a validation error.
-    if not isinstance(value, str):
-        raise ValueError("base64url value must be a string")
-    if len(value) % 4 == 1:
-        raise ValueError("base64url value has an impossible length")
-    if any(ch not in _B64URL_ALPHABET for ch in value):
-        raise ValueError("base64url value contains a non-alphabet character")
-    padding = "=" * (-len(value) % 4)
-    try:
-        decoded = base64.urlsafe_b64decode(value + padding)
-    except (binascii.Error, ValueError) as error:
-        raise ValueError("base64url value is not decodable") from error
-    if _b64url_encode(decoded) != value:
-        raise ValueError("base64url value is not canonically encoded")
-    return decoded
 
 
 @dataclass(frozen=True)
@@ -753,77 +722,44 @@ class TrustSource:
         self._overlay.add(identity)
 
     # -- verification interface (fails closed on any on-disk change) --------------------
-    def identity(self, key_id: str) -> TrustedIdentity | None:
+    def _registry_for(self, key_id: Any) -> TrustRegistry:
+        """The registry that answers for `key_id`: the boot overlay if it holds the key, else the file.
+
+        The file is verified FIRST on every call, so a changed or missing file fails closed even for a
+        key the overlay holds.
+        """
         registry = self._verified_file()
-        return self._overlay.identity(key_id) or registry.identity(key_id)
+        return self._overlay if isinstance(key_id, str) and self._overlay.has_key(key_id) else registry
+
+    def identity(self, key_id: str) -> TrustedIdentity | None:
+        return self._registry_for(key_id).identity(key_id)
 
     def has_key(self, key_id: str) -> bool:
-        registry = self._verified_file()
-        return self._overlay.has_key(key_id) or registry.has_key(key_id)
+        return self._registry_for(key_id).has_key(key_id)
 
     def is_usable(self, key_id: str, now: int | None = None) -> bool:
-        registry = self._verified_file()
-        if self._overlay.has_key(key_id):
-            return self._overlay.is_usable(key_id, now)
-        return registry.is_usable(key_id, now)
+        return self._registry_for(key_id).is_usable(key_id, now)
 
     def audit_signing_reason(self, key_id: str, now: int | None = None) -> str | None:
-        registry = self._verified_file()
-        if self._overlay.has_key(key_id):
-            return self._overlay.audit_signing_reason(key_id, now)
-        return registry.audit_signing_reason(key_id, now)
+        return self._registry_for(key_id).audit_signing_reason(key_id, now)
 
     def require_identity(self, envelope: AgentEnvelope, now: int | None = None) -> TrustedIdentity:
-        registry = self._verified_file()
-        if envelope.signature_key_id and self._overlay.has_key(envelope.signature_key_id):
-            return self._overlay.require_identity(envelope, now)
-        return registry.require_identity(envelope, now)
+        return self._registry_for(envelope.signature_key_id or None).require_identity(envelope, now)
 
     def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None, required_usage: str = "audit") -> None:
-        registry = self._verified_file()
-        if self._overlay.has_key(key_id):
-            self._overlay.verify_audit_head(key_id, payload, signature, now, required_usage=required_usage)
-        else:
-            registry.verify_audit_head(key_id, payload, signature, now, required_usage=required_usage)
+        self._registry_for(key_id).verify_audit_head(key_id, payload, signature, now, required_usage=required_usage)
 
     def verify_audit_floor(self, key_id: str, body: dict[str, Any], signature: str) -> None:
-        registry = self._verified_file()
-        if self._overlay.has_key(key_id):
-            self._overlay.verify_audit_floor(key_id, body, signature)
-        else:
-            registry.verify_audit_floor(key_id, body, signature)
+        self._registry_for(key_id).verify_audit_floor(key_id, body, signature)
 
     def evaluate_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None, required_usage: str = "audit") -> AuditHeadEvaluation:
-        registry = self._verified_file()
-        if self._overlay.has_key(key_id):
-            return self._overlay.evaluate_audit_head(key_id, payload, signature, now, required_usage=required_usage)
-        return registry.evaluate_audit_head(key_id, payload, signature, now, required_usage=required_usage)
+        return self._registry_for(key_id).evaluate_audit_head(key_id, payload, signature, now, required_usage=required_usage)
 
     def verify_migration_receipt(self, receipt: dict[str, Any], now: int | None = None) -> None:
-        registry = self._verified_file()
-        key_id = receipt.get("signature_key_id")
-        if isinstance(key_id, str) and self._overlay.has_key(key_id):
-            self._overlay.verify_migration_receipt(receipt, now)
-        else:
-            registry.verify_migration_receipt(receipt, now)
-
+        self._registry_for(receipt.get("signature_key_id")).verify_migration_receipt(receipt, now)
 
 def _issuer_matches(signing_issuer: str, permit_issuer: str) -> bool:
     return permit_issuer == signing_issuer
-
-
-def _required_string(value: dict[str, Any], name: str, label: str) -> str:
-    result = value.get(name)
-    if not isinstance(result, str) or not result:
-        raise ValueError(f"{label} {name} must be a non-empty string")
-    return result
-
-
-def _decode_raw_key(value: str, label: str) -> bytes:
-    decoded = _b64url_decode(value)
-    if len(decoded) != 32:
-        raise ValueError(f"{label} must be 32 raw bytes")
-    return decoded
 
 
 def _string_tuple(value: Any, label: str) -> tuple[str, ...]:
@@ -832,48 +768,6 @@ def _string_tuple(value: Any, label: str) -> tuple[str, ...]:
     if not all(isinstance(item, str) and item for item in value):
         raise ValueError(f"{label} entries must be non-empty strings")
     return tuple(value)
-
-
-class AttestationAuthority:
-    def __init__(self, key_id: str, verifier: str, private_key: Ed25519PrivateKey) -> None:
-        self.key_id = key_id
-        self.verifier = verifier
-        self._private_key = private_key
-
-    @classmethod
-    def generate(cls, key_id: str = "demo-attestation-key", verifier: str = "verifier:demo") -> "AttestationAuthority":
-        return cls(key_id, verifier, Ed25519PrivateKey.generate())
-
-    def issue(
-        self,
-        subject: str,
-        audience: str,
-        measurement: str,
-        expires_at: int,
-        nonce: str = "",
-        claims: dict[str, Any] | None = None,
-        issued_at: int | None = None,
-    ) -> AttestationEvidence:
-        evidence = AttestationEvidence(
-            verifier=self.verifier,
-            subject=subject,
-            audience=audience,
-            measurement=measurement,
-            issued_at=_decision_time(issued_at),
-            expires_at=expires_at,
-            nonce=nonce,
-            claims=claims or {},
-            signature_key_id=self.key_id,
-        )
-        signature = _b64url_encode(self._private_key.sign(canonical_json(evidence.unsigned_dict())))
-        return AttestationEvidence(**{**evidence.unsigned_dict(), "signature": signature})
-
-    def trusted_authority(self) -> TrustedAttestationAuthority:
-        return TrustedAttestationAuthority(
-            self.key_id,
-            self.verifier,
-            self._private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw),
-        )
 
 
 class AttestationPolicy:
@@ -1240,59 +1134,6 @@ def effect_id(task_id: str, sequence: int) -> str:
     return hashlib.sha256(canonical_json(material)).hexdigest()
 
 
-class ApprovalAuthority:
-    def __init__(self, key_id: str, approver: str, private_key: Ed25519PrivateKey) -> None:
-        self.key_id = key_id
-        self.approver = approver
-        self._private_key = private_key
-
-    @classmethod
-    def generate(cls, key_id: str = "demo-approval-key", approver: str = "approver:demo") -> "ApprovalAuthority":
-        return cls(key_id, approver, Ed25519PrivateKey.generate())
-
-    def issue(
-        self,
-        tool: str,
-        subject: str,
-        audience: str,
-        task_id: str,
-        permit_nonce: str,
-        arguments: dict[str, Any],
-        policy_hash: str,
-        expires_at: int,
-        checkpoint_generation: int,
-        issued_at: int | None = None,
-        approval_id: str | None = None,
-    ) -> ApprovalToken:
-        token = ApprovalToken(
-            approval_id=approval_id or secrets.token_hex(16),
-            tool=tool,
-            subject=subject,
-            audience=audience,
-            task_id=task_id,
-            permit_nonce=permit_nonce,
-            checkpoint_generation=checkpoint_generation,
-            arguments_hash=arguments_hash(arguments),
-            policy_hash=policy_hash,
-            approved_by=self.approver,
-            issued_at=_decision_time(issued_at),
-            expires_at=expires_at,
-            signature_key_id=self.key_id,
-        )
-        signature = _b64url_encode(self._private_key.sign(canonical_json(token.unsigned_dict())))
-        return ApprovalToken(**{**token.unsigned_dict(), "signature": signature})
-
-    def trusted_approver(self) -> TrustedApprover:
-        return TrustedApprover(
-            self.key_id,
-            self.approver,
-            self._private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw),
-        )
-
-    def public_key_b64(self) -> str:
-        return _b64url_encode(self._private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw))
-
-
 def generate_signing_material(
     key_id: str,
     issuer: str,
@@ -1476,86 +1317,6 @@ class EnvelopeSigner:
 
     def verify_audit_floor(self, key_id: str, body: dict[str, Any], signature: str) -> None:
         self.registry.verify_audit_floor(key_id, body, signature)
-
-
-class HmacEnvelopeSigner:
-    """Legacy dependency-free demo signer. Do not use for production trust domains."""
-
-    def __init__(self, key: bytes, key_id: str = "legacy-hmac-demo-key") -> None:
-        if len(key) < 32:
-            raise ValueError("signing keys must contain at least 32 bytes")
-        self.key_id = key_id
-        self._key = key
-
-    @classmethod
-    def generate(cls) -> "HmacEnvelopeSigner":
-        return cls(secrets.token_bytes(32))
-
-    def sign(self, envelope: AgentEnvelope) -> str:
-        return hmac.new(self._key, canonical_json(envelope.unsigned_dict()), hashlib.sha256).hexdigest()
-
-    def seal(self, envelope: AgentEnvelope) -> AgentEnvelope:
-        envelope.signature_key_id = self.key_id
-        envelope.signature = self.sign(envelope)
-        return envelope
-
-    def verify(self, envelope: AgentEnvelope) -> None:
-        if envelope.signature_key_id != self.key_id:
-            raise SecurityError("agent envelope signature key id is not trusted")
-        expected = self.sign(envelope)
-        if not hmac.compare_digest(expected, envelope.signature):
-            raise SecurityError("agent envelope signature is invalid")
-
-    def sign_audit_head(self, task_id: str, host_id: str, head_hash: str, sequence: int, signed_at: int | None = None) -> str:
-        return hmac.new(self._key, canonical_json(_audit_head_payload_for(task_id, host_id, head_hash, sequence, signed_at)), hashlib.sha256).hexdigest()
-
-    def verify_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None, required_usage: str = "audit") -> None:
-        # Legacy HMAC has no per-key usages or lifecycle; now/required_usage are accepted for interface parity.
-        if key_id != self.key_id:
-            raise SecurityError("audit head signing key is not trusted")
-        expected = hmac.new(self._key, canonical_json(payload), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(expected, signature):
-            raise SecurityError("audit head signature is invalid")
-
-    def sign_audit_floor(self, body: dict[str, Any]) -> str:
-        return hmac.new(self._key, canonical_json(audit_floor_payload(body)), hashlib.sha256).hexdigest()
-
-    def verify_audit_floor(self, key_id: str, body: dict[str, Any], signature: str) -> None:
-        # A MAC, not a signature: only a holder of the same key can check it (so an offline
-        # auditor without the key cannot). Legacy demo path, documented in SIGNING_KEYS.md.
-        if key_id != self.key_id:
-            raise SecurityError("audit floor signing key is not trusted")
-        expected = hmac.new(self._key, canonical_json(audit_floor_payload(body)), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(expected, signature):
-            raise SecurityError("audit floor signature is invalid")
-
-    def evaluate_audit_head(self, key_id: str, payload: dict[str, Any], signature: str, now: int | None = None, required_usage: str = "audit") -> AuditHeadEvaluation:
-        # Legacy HMAC has no trust registry, revocation, key lifecycle, or usages (required_usage
-        # is accepted for interface parity) -- authenticity is all it can attest. Distinguish only signature validity; a valid v1 head is legacy.
-        if key_id != self.key_id:
-            return AuditHeadEvaluation(False, "untrusted", "audit head signing key is not trusted")
-        expected = hmac.new(self._key, canonical_json(payload), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(expected, signature):
-            return AuditHeadEvaluation(False, "signature-invalid", "audit head signature is invalid")
-        if payload.get("type") == "portmark.audit-head.v2":
-            return AuditHeadEvaluation(True, "valid", "audit head verified (legacy HMAC)")
-        return AuditHeadEvaluation(True, "valid-legacy-v1", "v1 audit head verified (legacy HMAC)")
-
-    def sign_migration_receipt(self, payload: dict[str, Any]) -> dict[str, Any]:
-        body = _migration_receipt_body(payload)
-        signature = hmac.new(self._key, canonical_json(body), hashlib.sha256).hexdigest()
-        return {**body, "signature": signature, "signature_key_id": self.key_id}
-
-    def verify_migration_receipt(self, receipt: dict[str, Any], now: int | None = None) -> None:
-        # Legacy HMAC has no per-key issuer/usage; it only attests MAC authenticity. Reject unsigned
-        # extra fields the same way the Ed25519 path does (finding S4-#2 follow-up).
-        body = _verified_migration_receipt_shape(receipt)
-        if receipt.get("signature_key_id") != self.key_id:
-            raise SecurityError("migration receipt signing key is not trusted")
-        signature = receipt.get("signature")
-        expected = hmac.new(self._key, canonical_json(body), hashlib.sha256).hexdigest()
-        if not isinstance(signature, str) or not hmac.compare_digest(expected, signature):
-            raise SecurityError("migration receipt signature is invalid")
 
 
 RESERVED_CONSTRAINT_KEYS = frozenset({"arguments", "required", "additional_arguments"})
