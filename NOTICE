@@ -1,11 +1,12 @@
 Portmark
-Copyright (c) 2026 Josh (Itsthewayofyou)
+Copyright (c) 2026 Josh McPhail
 
-The licensor of Portmark, for the purposes of the Elastic License 2.0 in LICENSE,
-is Josh (Itsthewayofyou).
+The licensor of Portmark, for the purposes of the Elastic License 2.0, is named in
+LICENSE itself, above the license text.
 
 Contributors retain copyright in their own contributions, and license them to the
-licensor on the terms in CONTRIBUTING.md.
+licensor under the agreement in CLA.md, which must be signed before a contribution
+is merged.
 
 --------------------------------------------------------------------------------
 Current license
@@ -45,14 +46,26 @@ The Elastic License 2.0 applies only to commits made after the `last-mit` tag,
 and to releases made from them.
 
 --------------------------------------------------------------------------------
-Abandonment pledge
+Additional grant: the dormancy grant
 --------------------------------------------------------------------------------
 
-Portmark is a security boundary. Depending on one is a long commitment, so the
-licensor makes the following additional grant. It is made here rather than in
-LICENSE, and it adds to the Elastic License 2.0 without altering it.
+Portmark is a security boundary. Depending on one is a long commitment, so every
+recipient of Portmark receives the following additional license at the same moment,
+and on the same terms, as the license in LICENSE. It adds to that license and
+narrows nothing in it.
 
-A **Qualifying Maintenance Event** is either of the following, applied to Portmark
+**The grant.** The licensor grants you, now and irrevocably, a perpetual,
+worldwide, non-exclusive, royalty-free license under the Apache License, Version
+2.0, to the release of Portmark you received and to every earlier release of it.
+That license is granted to you when you receive Portmark. You may exercise it only
+once Portmark is dormant, as defined below, and from then on you may exercise it in
+full.
+
+Because this license is granted at the moment you receive Portmark, it does not
+depend on the licensor doing anything later, and a subsequent owner of the
+copyright takes subject to it.
+
+**A Qualifying Maintenance Event** is either of the following, applied to Portmark
 itself rather than to the material around it:
 
   (a) the publication of a release of Portmark; or
@@ -66,33 +79,28 @@ default branch: automated dependency updates; changes only to documentation,
 comments, formatting, tests, licensing or project metadata; and changes made by
 automation without human review.
 
-If twelve consecutive months pass with no Qualifying Maintenance Event, Portmark
-is **dormant**. Any person may then publish a written request for confirmation
-that Portmark is still maintained, by opening a public issue at
-<https://github.com/Itsthewayofyou/portmark/issues> or by writing to the licensor.
+**Portmark is dormant** when both of the following have happened:
 
-If no Qualifying Maintenance Event occurs within thirty days after such a request,
-then at the end of those thirty days the most recent release of Portmark existing
-at that point becomes additionally available under the Apache License 2.0, at the
-option of any recipient, and without further action by anyone, including the
-licensor.
+  (i)  twelve consecutive months have passed with no Qualifying Maintenance Event;
+       and
+  (ii) a person has published a written request for confirmation that Portmark is
+       still maintained -- by opening a public issue at
+       <https://github.com/Itsthewayofyou/portmark/issues> or by writing to the
+       licensor -- and thirty days have passed after that request with still no
+       Qualifying Maintenance Event.
 
 If the repository named above is unavailable, or no means of making the request is
-published, the thirty days are not required and those rights vest at the end of
-the twelve months.
+published, (ii) is not required and Portmark is dormant at the end of the twelve
+months.
 
-The thirty days exist only so that the grant cannot vest while nobody has yet
-noticed that Portmark is dormant. They are not an opportunity to defeat it: the
-request may be made by anyone, at any time once Portmark is dormant, and as often
-as necessary.
+The thirty days exist only so that the grant cannot become exercisable while nobody
+has yet noticed that Portmark is dormant. They are not an opportunity to defeat it:
+the request may be made by anyone, at any time once the twelve months have passed,
+and as often as necessary.
 
-This is a present and irrevocable grant of those Apache License 2.0 rights,
-conditioned only on the objective events described above, and not a promise to
-grant them in future. It applies to every release of Portmark made under the
-Elastic License 2.0. It binds the licensor and the licensor's successors,
-assigns, heirs and any later owner of the copyright in Portmark, and it survives
-the licensor's death, incapacity, or sale or transfer of the project. It is a
-floor, not a ceiling: the licensor may always grant broader terms.
+**Once Portmark is dormant it stays dormant.** Maintenance resuming afterwards does
+not withdraw a license that has already become exercisable, and cannot: the license
+was granted when you received Portmark, and the licensor cannot revoke it.
 
 --------------------------------------------------------------------------------
 Trademarks

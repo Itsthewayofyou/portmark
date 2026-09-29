@@ -3,41 +3,24 @@
 Contributions are welcome. Portmark is a security boundary, so the bar for a change is higher than
 for ordinary application code, and this file says what that bar is before you spend time on a patch.
 
-## Contribution terms
+## Sign the CLA first
 
-**Please read this section before opening a pull request.** By submitting a contribution you agree
-to it.
+**A pull request is not merged until a Contributor License Agreement is on record for you.** The
+agreement is [CLA.md](CLA.md). You sign once, and it covers everything you contribute afterwards.
 
-1. **You own what you send.** You confirm that you wrote the contribution, or that you have the
-   right to submit it, and that submitting it does not breach an agreement with an employer or
-   anyone else. If your employer has rights in your work, get their sign-off first.
+You keep the copyright in your own work — the CLA is a licence to the project, not an assignment.
+What it adds is the right to distribute your contribution under terms that may change later,
+including more permissive ones. Without that, a single unreachable contributor can freeze Portmark's
+licensing permanently.
 
-2. **Copyright license.** You grant the licensor named in NOTICE a perpetual, worldwide,
-   non-exclusive, royalty-free, irrevocable license to use, reproduce, modify, prepare derivative
-   works of, publicly display, sublicense and distribute your contribution and derivative works of
-   it, **under any license terms**, including the Elastic License 2.0, a commercial license, or a
-   future open-source license.
+Sign electronically through the CLA check on your pull request, or send a signed copy if you prefer a
+paper record. **If you are contributing for your employer, sign as the entity** — an individual
+signature does not bind a company.
 
-3. **Patent license.** You grant the licensor and every recipient of Portmark a perpetual,
-   worldwide, non-exclusive, royalty-free, irrevocable patent license to make, have made, use, offer
-   to sell, sell, import and otherwise transfer Portmark, covering only those patent claims you own
-   or control that are necessarily infringed by your contribution alone or by its combination with
-   Portmark. If you start patent litigation alleging that Portmark infringes a patent, this grant to
-   you ends.
+### Sign your commits off too
 
-4. **You keep your copyright.** This is a license to the licensor, not an assignment. You may
-   continue to use your own contribution however you like.
-
-5. **No warranty.** You provide the contribution as is, without warranties of any kind.
-
-Point 2 exists for one reason, stated plainly: it keeps it possible to change Portmark's licensing
-later — including moving to a more permissive license — without having to track down every past
-contributor. Without it, a single unreachable contributor can freeze the project's licensing
-permanently.
-
-### Sign your commits off
-
-Every commit must carry a `Signed-off-by` line certifying the
+The CLA records who agreed. The sign-off records who wrote each commit. Both are wanted. Every commit
+must carry a `Signed-off-by` line certifying the
 [Developer Certificate of Origin](https://developercertificate.org/):
 
 ```

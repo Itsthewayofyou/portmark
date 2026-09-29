@@ -388,15 +388,17 @@ Two commitments go with it:
 - **Earlier versions stay MIT, permanently.** Everything up to the `last-mit` tag — including PyPI
   releases 0.1.0 through 0.9.2 — was released under the MIT License, and that grant is not withdrawn.
   The text is kept in [LICENSE-MIT](https://github.com/Itsthewayofyou/portmark/blob/main/LICENSE-MIT).
-- **An abandonment pledge.** If twelve consecutive months pass with no substantive maintenance — no
-  release, and no merged fix or functional change — Portmark is dormant. Anyone may then ask, in
-  public, whether it is still maintained; if thirty more days pass with still no maintenance, the most
-  recent release becomes additionally available under Apache-2.0, automatically, and the grant binds
-  whoever owns Portmark by then. Depending on a security boundary is a long commitment, and this is
-  the floor under it. `NOTICE` has the exact wording: a typo fix or a dependency bump does not reset
-  the clock, and taking the repository down does not defeat the grant.
+- **A dormancy grant.** When you receive Portmark you also receive, then and irrevocably, an
+  Apache-2.0 licence to it that you may exercise once Portmark goes dormant. Dormant means twelve
+  consecutive months with no substantive maintenance — no release, no merged fix or functional
+  change — followed by a public request for confirmation that goes thirty days unanswered. Because
+  the licence is granted to you up front, it does not depend on anyone acting later, and a subsequent
+  owner of Portmark takes subject to it. Depending on a security boundary is a long commitment, and
+  this is the floor under it. `NOTICE` has the exact wording: a typo fix or a dependency bump does not
+  reset the clock, and taking the repository down does not defeat the grant.
 
 The license grants no trademark rights; see
 [TRADEMARKS.md](https://github.com/Itsthewayofyou/portmark/blob/main/TRADEMARKS.md) for what you may
-do with the name without asking. Contribution terms are in
-[CONTRIBUTING.md](https://github.com/Itsthewayofyou/portmark/blob/main/CONTRIBUTING.md).
+do with the name without asking. Contributors sign a
+[CLA](https://github.com/Itsthewayofyou/portmark/blob/main/CLA.md) once, keeping copyright in their
+own work; see [CONTRIBUTING.md](https://github.com/Itsthewayofyou/portmark/blob/main/CONTRIBUTING.md).

@@ -1,7 +1,7 @@
 # Portmark trademark policy
 
-"Portmark", the Portmark logo, and confusingly similar marks are trademarks of Josh
-(Itsthewayofyou), the licensor named in NOTICE.
+"Portmark", the Portmark logo, and confusingly similar marks are trademarks of Josh McPhail,
+the licensor named in LICENSE.
 
 The license in LICENSE covers copyright and patents. It grants **no** trademark rights, and neither
 does any other license Portmark may be offered under. This file says what you may do with the name
