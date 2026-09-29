@@ -1,9 +1,5 @@
 # Portmark Contributor License Agreement
 
-> **Draft, pending review by counsel.** This follows the structure of the widely used Apache
-> Contributor License Agreements. It is not legal advice. The governing-law clause names Wisconsin;
-> confirm that before relying on it.
-
 Portmark uses Contributor License Agreements so that the rights in outside contributions are clear.
 Sign **once** — it covers everything you contribute afterwards, and a contribution is not merged until
 a signature is on record.
@@ -235,4 +231,6 @@ Corporate only — individuals authorised to Submit on the entity's behalf
     ______________________________________________________________
 ```
 
-**Version 1.1 — draft, pending review by counsel.**
+**Version 1.0**, effective 2026-09-29. If this agreement is ever revised, a signature already on record
+stays valid for the version it was given against; the Project Owner will ask again only if a later
+version needs it.
