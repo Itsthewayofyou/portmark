@@ -1,7 +1,7 @@
 # Portmark
 
 [![CI](https://github.com/Itsthewayofyou/portmark/actions/workflows/ci.yml/badge.svg)](https://github.com/Itsthewayofyou/portmark/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/Itsthewayofyou/portmark/blob/main/LICENSE)
+[![License: Elastic 2.0](https://img.shields.io/badge/license-Elastic--2.0-blue.svg)](https://github.com/Itsthewayofyou/portmark/blob/main/LICENSE)
 
 **A signed leash for AI agents that go out and act — enforced by the host, not the prompt.**
 
@@ -370,4 +370,35 @@ stable interface to substitute against.
 
 ## License
 
-MIT. See [LICENSE](https://github.com/Itsthewayofyou/portmark/blob/main/LICENSE).
+**Elastic License 2.0.** See [LICENSE](https://github.com/Itsthewayofyou/portmark/blob/main/LICENSE)
+for the text and [NOTICE](https://github.com/Itsthewayofyou/portmark/blob/main/NOTICE) for what it
+means here.
+
+Use it, modify it, ship it inside your own product, and deploy it inside your own organization at any
+scale — free, with no revenue test and nobody to ask. The one thing the license withholds is
+providing Portmark to third parties as a hosted or managed service where the service gives users
+access to any substantial set of Portmark's features or functionality. That summary does not replace
+`LICENSE`, which governs.
+
+This is a **source-available** license, not an OSI-approved open-source one, because it restricts a
+field of use. Portmark says so rather than calling itself open source.
+
+Two commitments go with it:
+
+- **Earlier versions stay MIT, permanently.** Everything up to the `last-mit` tag — including PyPI
+  releases 0.1.0 through 0.9.2 — was released under the MIT License, and that grant is not withdrawn.
+  The text is kept in [LICENSE-MIT](https://github.com/Itsthewayofyou/portmark/blob/main/LICENSE-MIT).
+- **A dormancy grant.** When you receive Portmark you also receive, then and irrevocably, an
+  Apache-2.0 licence to it that you may exercise once Portmark goes dormant. Dormant means twelve
+  consecutive months with no substantive maintenance — no release, no merged fix or functional
+  change — followed by a public request for confirmation that goes thirty days unanswered. Because
+  the licence is granted to you up front, it does not depend on anyone acting later, and a subsequent
+  owner of Portmark takes subject to it. Depending on a security boundary is a long commitment, and
+  this is the floor under it. `NOTICE` has the exact wording: a typo fix or a dependency bump does not
+  reset the clock, and taking the repository down does not defeat the grant.
+
+The license grants no trademark rights; see
+[TRADEMARKS.md](https://github.com/Itsthewayofyou/portmark/blob/main/TRADEMARKS.md) for what you may
+do with the name without asking. Contributors sign a
+[CLA](https://github.com/Itsthewayofyou/portmark/blob/main/CLA.md) once, keeping copyright in their
+own work; see [CONTRIBUTING.md](https://github.com/Itsthewayofyou/portmark/blob/main/CONTRIBUTING.md).

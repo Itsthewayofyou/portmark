@@ -8,8 +8,8 @@ version = "0.9.2"
 description = "Provider-neutral, capability-secured portable agent reference runtime"
 authors = [{ name = "Itsthewayofyou" }]
 readme = "README.md"
-license = "MIT"
-license-files = ["LICENSE"]
+license = "Elastic-2.0"
+license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.11"
 keywords = ["agent", "a2a", "capability", "security", "audit", "wasm", "sandbox"]
 classifiers = [
