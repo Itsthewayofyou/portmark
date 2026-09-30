@@ -5,14 +5,20 @@ name: CLA
 # enforces a permit rather than requesting one politely: an unsigned contribution that gets merged
 # cannot be un-merged, and it is the one thing that could freeze Portmark's licensing permanently.
 #
-# `pull_request_target` is used because a fork's token cannot read the signature record. It runs with
-# the base repository's permissions, so this workflow NEVER checks out, builds, or executes anything
-# from the pull request -- it reads two things from the API and compares strings. Every value taken
-# from the event goes through `env` and is only ever referenced as a quoted shell variable, so no
-# field of the event can reach the shell as code. Both the signature record and the file list are read
-# at the BASE commit, so a pull request cannot sign itself by editing the record it is checked against.
+# `pull_request`, deliberately, and NOT `pull_request_target`. Everything this check needs is readable:
+# the signature record and the list of changed files. A fork's token on a public repository is read-only,
+# which is exactly enough, so there is no reason to take the elevated token -- and two good reasons not
+# to. `pull_request_target` runs only from the BASE branch's copy of the file, so it cannot run at all
+# until it is merged, which makes it impossible to test on the pull request that adds it; and it attaches
+# its result to the base commit rather than to the pull request's head, which is awkward to require.
+#
+# This workflow still never checks out, builds, or executes anything from the pull request -- it reads
+# two API responses and compares strings. Every value taken from the event goes through `env` and is only
+# ever referenced as a quoted shell variable, so no field of the event can reach the shell as code. Both
+# the signature record and the file list are read at the BASE commit, so a pull request cannot sign
+# itself by editing the record it is checked against.
 on:
-  pull_request_target:
+  pull_request:
     types: [opened, reopened, synchronize]
 
 permissions:
