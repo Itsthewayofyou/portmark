@@ -66,20 +66,33 @@ jobs:
           fi
 
           # Read the record at the BASE commit, as raw bytes. Reading it from the merge result would let
-          # a pull request add its own author and pass its own check. A missing or unreadable record
-          # fails the job rather than waving the contribution through.
-          record=$(gh api "repos/$REPO/contents/$RECORD?ref=$BASE_SHA" \
-                     -H "Accept: application/vnd.github.raw")
+          # a pull request add its own author and pass its own check.
+          #
+          # Both failures below are reported rather than left to `set -e`. A job that aborts looks
+          # identical to a job that broke for an unrelated reason, so each refusal says which one it is
+          # -- both for whoever has to fix it, and so a test can tell a decision from a collapse.
+          if ! record=$(gh api "repos/$REPO/contents/$RECORD?ref=$BASE_SHA" \
+                          -H "Accept: application/vnd.github.raw" 2>&1); then
+            printf '::error::Could not read %s at the base commit. Refusing, because a check that cannot see the signature record cannot clear anybody.\n' "$RECORD"
+            exit 1
+          fi
 
           # Read with python3 rather than jq: it is preinstalled on the runner, it is what the rest of
           # Portmark is written in, and it is available anywhere this step is tested. The author's name
           # reaches it through the environment, never as code. Malformed JSON raises, and the bare
           # assignment means `set -e` aborts on it -- a record that cannot be parsed refuses the
           # contribution rather than passing it.
+          # Read with python3 rather than jq: it is preinstalled on the runner, it is what the rest of
+          # Portmark is written in, and it is available anywhere this step is tested. The author's name
+          # reaches it through the environment, never as code.
+          #
           # Logins are compared case-insensitively, because GitHub treats them that way: somebody who
           # signs as `Some-Dev` and opens a pull request as `some-dev` is the same person, and refusing
           # them would be a false refusal that looks like a broken gate.
-          version=$(printf '%s' "$record" | python3 -c 'import json, os, sys; a = os.environ["AUTHOR"].casefold(); print(next(((e.get("agreement_version") or "unrecorded") for e in (json.load(sys.stdin).get("signatures") or []) if (e.get("login") or "").casefold() == a), ""), end="")')
+          if ! version=$(printf '%s' "$record" | python3 -c 'import json, os, sys; a = os.environ["AUTHOR"].casefold(); print(next(((e.get("agreement_version") or "unrecorded") for e in (json.load(sys.stdin).get("signatures") or []) if (e.get("login") or "").casefold() == a), ""), end="")' 2>&1); then
+            printf '::error::%s could not be read as a signature record. Refusing, because an unreadable record clears nobody.\n' "$RECORD"
+            exit 1
+          fi
 
           if [ -n "$version" ]; then
             printf '::notice::%s signed CLA.md version %s.\n' "$AUTHOR" "$version"

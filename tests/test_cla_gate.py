@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess  # nosec B404 - runs bash on a script read from this repository
+import sys
 import tempfile
 import unittest
 
@@ -42,13 +43,21 @@ exit 3
 
 
 def _step_script() -> str:
-    """The workflow's single `run:` block, dedented into runnable bash."""
-    raw = open(WORKFLOW, encoding="utf-8").read()
+    """The workflow's single `run:` block, dedented into runnable bash.
+
+    Carriage returns are stripped. A checkout that converts line endings hands bash a script whose every
+    line ends in `\\r`, and bash then fails on lines it cannot parse -- which looks exactly like the gate
+    refusing. That is how a broken script passes a test that only checks the exit status, so the
+    assertions below check WHY the gate refused, not merely that it did.
+    """
+    with open(WORKFLOW, encoding="utf-8") as handle:
+        raw = handle.read()
     marker = "        run: |\n"
     if raw.count(marker) != 1:
         raise AssertionError("expected exactly one run: block in the CLA workflow")
     lines = []
     for line in raw.split(marker, 1)[1].split("\n"):
+        line = line.rstrip("\r")
         if line.strip() == "":
             lines.append("")
             continue
@@ -58,6 +67,11 @@ def _step_script() -> str:
     return "\n".join(lines)
 
 
+@unittest.skipUnless(
+    sys.platform.startswith("linux"),
+    "the step under test declares `runs-on: ubuntu-latest`, so only Linux is a real configuration for "
+    "it; driving it elsewhere tests a shell, a `gh` stub and a `python3` that the gate never meets",
+)
 class ClaGateTests(unittest.TestCase):
     """Every branch of the gate, including the ones GitHub never runs."""
 
@@ -71,9 +85,29 @@ class ClaGateTests(unittest.TestCase):
         if "BASE_SHA" not in cls.script:
             raise AssertionError("the CLA step no longer reads the record at the base commit")
 
+    def refused(self, reason: str = "has not signed", **kwargs) -> None:
+        """The gate refused, AND it refused for the stated reason rather than by falling over.
+
+        Checking only the exit status is not enough: any breakage in the script exits non-zero under
+        `set -e`, so a script that cannot run at all would score as a working gate. This caught exactly
+        that -- the whole file "passed" its refusing cases on Windows while every passing case failed,
+        because a CRLF checkout made bash fail on every line. Each refusal must therefore name its own
+        reason, and the gate reports all three rather than leaving any to `set -e`.
+        """
+        code, output = self.gate(**kwargs)
+        self.assertEqual(code, 1, output)
+        self.assertIn("::error::", output, output)
+        self.assertIn(reason, output, output)
+
+    def allowed(self, **kwargs) -> None:
+        """The gate allowed it, and said which rule allowed it."""
+        code, output = self.gate(**kwargs)
+        self.assertEqual(code, 0, output)
+        self.assertIn("::notice::", output, output)
+
     def gate(self, *, files, record=SIGNED, author="a-stranger", author_type="User",
-             raw_record=None, owner="Itsthewayofyou") -> int:
-        """Run the step and return its exit status. `record=None` makes reading the record fail."""
+             raw_record=None, owner="Itsthewayofyou") -> tuple[int, str]:
+        """Run the step. Returns its exit status and its output. `record=None` fails the record read."""
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = os.path.join(tmp, "bin")
             os.makedirs(bin_dir)
@@ -100,14 +134,14 @@ class ClaGateTests(unittest.TestCase):
                 ["bash", "-c", self.script],
                 capture_output=True, text=True, env=env, timeout=120, check=False,
             )
-            return done.returncode
+            return done.returncode, done.stdout + done.stderr
 
     def test_an_author_who_has_not_signed_is_refused(self):
         """The whole point: an unsigned contribution must not be mergeable."""
-        self.assertEqual(self.gate(files=["src/portmark/mcp.py"]), 1)
+        self.refused(files=["src/portmark/mcp.py"])
 
     def test_an_author_who_has_signed_passes(self):
-        self.assertEqual(self.gate(files=["src/portmark/mcp.py"], author="has-signed"), 0)
+        self.allowed(files=["src/portmark/mcp.py"], author="has-signed")
 
     def test_a_pull_request_cannot_sign_itself(self):
         """Editing the record ALONGSIDE code must not pass.
@@ -116,48 +150,42 @@ class ClaGateTests(unittest.TestCase):
         nothing the check looks at. Only a pull request that touches the record and NOTHING else is
         treated as a signature, and that one still has to be merged by the Project Owner.
         """
-        self.assertEqual(self.gate(files=[RECORD, "src/portmark/mcp.py"]), 1)
+        self.refused(files=[RECORD, "src/portmark/mcp.py"])
 
     def test_a_signature_on_its_own_is_allowed_through(self):
         """Signing cannot require a signature first, or nobody could ever sign."""
-        self.assertEqual(self.gate(files=[RECORD]), 0)
+        self.allowed(files=[RECORD])
 
     def test_a_record_that_cannot_be_read_refuses(self):
         """A gate that passes when it cannot see the record is not a gate."""
-        self.assertEqual(self.gate(files=["src/portmark/mcp.py"], author="has-signed", record=None), 1)
+        self.refused(reason="Could not read", files=["src/portmark/mcp.py"], author="has-signed",
+                     record=None)
 
     def test_a_record_that_cannot_be_parsed_refuses(self):
-        self.assertEqual(
-            self.gate(files=["src/portmark/mcp.py"], author="has-signed",
-                      record=None, raw_record="{ not json"),
-            1,
-        )
+        self.refused(reason="could not be read as a signature record",
+                     files=["src/portmark/mcp.py"], author="has-signed",
+                     record=None, raw_record="{ not json")
 
     def test_a_record_with_no_signatures_refuses(self):
-        self.assertEqual(
-            self.gate(files=["src/portmark/mcp.py"], author="has-signed",
-                      record={"agreement": "CLA.md"}),
-            1,
-        )
+        self.refused(files=["src/portmark/mcp.py"], author="has-signed",
+                     record={"agreement": "CLA.md"})
 
     def test_automation_needs_no_agreement(self):
         """Dependabot holds no copyright, so it has nothing to license."""
-        self.assertEqual(self.gate(files=["uv.lock"], author="dependabot[bot]", author_type="Bot"), 0)
+        self.allowed(files=["uv.lock"], author="dependabot[bot]", author_type="Bot")
 
     def test_a_human_named_like_a_bot_still_needs_to_sign(self):
         """The exemption is on the account type the API reports, not on a name anyone can choose."""
-        self.assertEqual(
-            self.gate(files=["src/portmark/mcp.py"], author="dependabot[bot]", author_type="User"),
-            1,
-        )
+        self.refused(files=["src/portmark/mcp.py"], author="dependabot[bot]",
+                     author_type="User")
 
     def test_the_project_owner_needs_no_agreement(self):
         """The licensor does not sign an agreement with himself."""
-        self.assertEqual(self.gate(files=["README.md"], author="Itsthewayofyou"), 0)
+        self.allowed(files=["README.md"], author="Itsthewayofyou")
 
     def test_a_login_differing_only_in_case_is_the_same_person(self):
         """GitHub logins are case-insensitive; refusing over case would be a false refusal."""
-        self.assertEqual(self.gate(files=["src/portmark/mcp.py"], author="HAS-SIGNED"), 0)
+        self.allowed(files=["src/portmark/mcp.py"], author="HAS-SIGNED")
 
 
 class ClaRecordTests(unittest.TestCase):
