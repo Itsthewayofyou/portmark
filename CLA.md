@@ -203,8 +203,10 @@ the exclusive jurisdiction of such courts.
 
 A Contribution is not merged until a signature is on record.
 
-1. **Electronically**, through the CLA check on your pull request, which records your identity, the
-   agreement version, and the date; or
+1. **In the repository**, by opening a pull request that adds you to `.cla-signatures.json` and changes
+   nothing else. That file is the signature record: it names the account your signature covers, the
+   version of this agreement you signed, and the date. It lives here, in git, with its own history —
+   no third-party service holds it. `CONTRIBUTING.md` has the exact shape of an entry.
 2. **On paper**, by signing below and sending a copy to the Project Owner. Use this route if you are
    signing for a legal entity and prefer a signed record.
 
