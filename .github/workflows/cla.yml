@@ -1,0 +1,110 @@
+name: CLA
+
+# A contribution may only be merged once its author has signed the agreement in CLA.md. Portmark
+# enforces that here rather than asking for it in CONTRIBUTING.md, for the same reason the runtime
+# enforces a permit rather than requesting one politely: an unsigned contribution that gets merged
+# cannot be un-merged, and it is the one thing that could freeze Portmark's licensing permanently.
+#
+# `pull_request_target` is used because a fork's token cannot read the signature record. It runs with
+# the base repository's permissions, so this workflow NEVER checks out, builds, or executes anything
+# from the pull request -- it reads two things from the API and compares strings. Every value taken
+# from the event goes through `env` and is only ever referenced as a quoted shell variable, so no
+# field of the event can reach the shell as code. Both the signature record and the file list are read
+# at the BASE commit, so a pull request cannot sign itself by editing the record it is checked against.
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: cla-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  signed:
+    name: contributor has signed the CLA
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the signature record
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          PR: ${{ github.event.pull_request.number }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          RECORD: .cla-signatures.json
+        run: |
+          set -euo pipefail
+
+          printf 'author: %s (%s)\n' "$AUTHOR" "$AUTHOR_TYPE"
+
+          # Automation holds no copyright, so it has nothing to license. Matched on the account type the
+          # API reports rather than on a name, which anyone can choose for themselves.
+          if [ "$AUTHOR_TYPE" = "Bot" ]; then
+            printf '::notice::%s is automation; no agreement is needed.\n' "$AUTHOR"
+            exit 0
+          fi
+
+          # The licensor does not sign an agreement with himself.
+          if [ "$AUTHOR" = "$OWNER" ]; then
+            printf '::notice::%s is the Project Owner; no agreement is needed.\n' "$AUTHOR"
+            exit 0
+          fi
+
+          # A pull request that only adds a signature is how someone signs, so it cannot require a
+          # signature first. It still has to be reviewed and merged by the Project Owner, who confirms
+          # the signer and the author are the same person -- that confirmation is the real gate here.
+          changed=$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[].filename' | sort -u)
+          if [ "$changed" = "$RECORD" ]; then
+            printf '::notice::This pull request only adds a signature. The Project Owner must confirm the signer is %s before merging.\n' "$AUTHOR"
+            exit 0
+          fi
+
+          # Read the record at the BASE commit, as raw bytes. Reading it from the merge result would let
+          # a pull request add its own author and pass its own check. A missing or unreadable record
+          # fails the job rather than waving the contribution through.
+          record=$(gh api "repos/$REPO/contents/$RECORD?ref=$BASE_SHA" \
+                     -H "Accept: application/vnd.github.raw")
+
+          # Read with python3 rather than jq: it is preinstalled on the runner, it is what the rest of
+          # Portmark is written in, and it is available anywhere this step is tested. The author's name
+          # reaches it through the environment, never as code. Malformed JSON raises, and the bare
+          # assignment means `set -e` aborts on it -- a record that cannot be parsed refuses the
+          # contribution rather than passing it.
+          # Logins are compared case-insensitively, because GitHub treats them that way: somebody who
+          # signs as `Some-Dev` and opens a pull request as `some-dev` is the same person, and refusing
+          # them would be a false refusal that looks like a broken gate.
+          version=$(printf '%s' "$record" | python3 -c 'import json, os, sys; a = os.environ["AUTHOR"].casefold(); print(next(((e.get("agreement_version") or "unrecorded") for e in (json.load(sys.stdin).get("signatures") or []) if (e.get("login") or "").casefold() == a), ""), end="")')
+
+          if [ -n "$version" ]; then
+            printf '::notice::%s signed CLA.md version %s.\n' "$AUTHOR" "$version"
+            exit 0
+          fi
+
+          printf '::error::%s has not signed the Portmark Contributor License Agreement.\n' "$AUTHOR"
+          cat <<'MESSAGE'
+
+          This pull request cannot be merged yet.
+
+          Portmark needs a Contributor License Agreement on record for every contributor. You keep the
+          copyright in your own work; the agreement is in CLA.md, and you sign it once.
+
+          To sign, open a pull request that adds you to .cla-signatures.json and changes nothing else:
+
+              {
+                "login": "<your GitHub username>",
+                "name": "<your full legal name>",
+                "kind": "individual",
+                "agreement_version": "1.0",
+                "date": "<YYYY-MM-DD>"
+              }
+
+          Use "kind": "corporate" instead if your employer owns the work, and sign as the entity. See
+          CONTRIBUTING.md.
+          MESSAGE
+          exit 1

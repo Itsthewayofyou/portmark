@@ -1,0 +1,6 @@
+{
+  "agreement": "CLA.md",
+  "current_version": "1.0",
+  "comment": "One entry per signer. `login` is the GitHub account whose pull requests the signature covers, and is what the CLA check matches on. `record` points at where the signature was given. The Project Owner does not appear here: he is the licensor, and does not sign an agreement with himself.",
+  "signatures": []
+}

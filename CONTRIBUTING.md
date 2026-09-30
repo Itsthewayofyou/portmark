@@ -13,9 +13,32 @@ What it adds is the right to distribute your contribution under terms that may c
 including more permissive ones. Without that, a single unreachable contributor can freeze Portmark's
 licensing permanently.
 
-Sign electronically through the CLA check on your pull request, or send a signed copy if you prefer a
-paper record. **If you are contributing for your employer, sign as the entity** — an individual
-signature does not bind a company.
+**If you are contributing for your employer, sign as the entity** — an individual signature does not
+bind a company.
+
+### How to sign
+
+Open a pull request that adds you to `.cla-signatures.json` and **changes nothing else**:
+
+```json
+{
+  "login": "your-github-username",
+  "name": "Your Full Legal Name",
+  "kind": "individual",
+  "agreement_version": "1.0",
+  "date": "2026-09-29"
+}
+```
+
+Use `"kind": "corporate"` if your employer owns the work, and add an `"entity"` field naming it.
+
+A signature-only pull request is the one case the CLA check lets through unsigned, because otherwise
+nobody could ever sign. The Project Owner reviews it and confirms you are who the signature says before
+merging, so that review is the real check. Prefer a paper signature? Ask, and send a signed copy of
+`CLA.md` instead.
+
+Your signature is then a plain file in this repository, with git history behind it. No third-party
+service holds it.
 
 ### Sign your commits off too
 
