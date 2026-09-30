@@ -32,7 +32,7 @@ Earlier versions remain MIT, permanently
 --------------------------------------------------------------------------------
 
 Every version of Portmark up to and including the commit tagged `last-mit` was
-released under the MIT License, whose text is preserved in LICENSE-MIT. That
+released under the MIT License, whose text is preserved in legal/LICENSE-MIT. That
 grant is perpetual and is not withdrawn by this change. It covers:
 
   * every commit up to and including the `last-mit` tag; and

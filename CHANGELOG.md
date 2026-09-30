@@ -8,7 +8,7 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 **The first release published under the Elastic License 2.0.** Everything up to and including 0.9.2
 remains under the MIT License, permanently, and that grant is not withdrawn — see `NOTICE` and
-`LICENSE-MIT`. From this release on, Portmark is source-available rather than OSI open source: you may
+`legal/LICENSE-MIT`. From this release on, Portmark is source-available rather than OSI open source: you may
 use, modify and redistribute it, ship it inside your own commercial product, and run it inside your own
 organization at any scale, free and without asking. The one thing withheld is providing Portmark to
 third parties as a hosted or managed service that gives users access to any substantial set of its
@@ -48,7 +48,7 @@ export to a SIEM, and Python 3.14 support. Each of those is its own entry below.
   functionality. This is a source-available license, not an OSI-approved open-source one, and
   Portmark says so rather than calling itself open source. **Every version up to the `last-mit` tag
   stays MIT permanently**, including PyPI releases 0.1.0 through 0.9.2; that grant is not withdrawn
-  and the text is kept in `LICENSE-MIT`. Alongside it, a **dormancy grant**: every recipient also
+  and the text is kept in `legal/LICENSE-MIT`. Alongside it, a **dormancy grant**: every recipient also
   receives, at that moment and irrevocably, an Apache-2.0 licence to Portmark, exercisable once
   Portmark goes dormant -- twelve consecutive months with no substantive maintenance, then a public
   request for confirmation that goes thirty days unanswered. Granting it up front rather than promising

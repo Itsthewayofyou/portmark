@@ -89,11 +89,15 @@ jobs:
       # Section 11 #4: a CycloneDX SBOM of the released package's dependencies (runtime + every
       # extra), exported from the same uv.lock the build installed from. Kept out of dist/ so the
       # publish step uploads only distributions.
+      # The name is FIXED rather than versioned, because `actions/attest-sbom` now delegates to
+      # `actions/attest`, which does not expand a glob in `sbom-path` -- a versioned name would have to
+      # be rebuilt as an expression in two places to be passed literally. The version is inside the
+      # document, and the artifact is per-run.
       - name: Generate SBOM
         run: |
           mkdir -p sbom
-          uv export --frozen --preview-features sbom-export --format cyclonedx1.5 --no-default-groups --all-extras --output-file "sbom/portmark-${GITHUB_REF_NAME#v}.cdx.json"
-          python -c "import json, sys; d = json.load(open(sys.argv[1])); assert d['bomFormat'] == 'CycloneDX' and d['components'], 'empty SBOM'" sbom/*.cdx.json
+          uv export --frozen --preview-features sbom-export --format cyclonedx1.5 --no-default-groups --all-extras --output-file sbom/portmark.cdx.json
+          python -c "import json, sys; d = json.load(open(sys.argv[1])); assert d['bomFormat'] == 'CycloneDX' and d['components'], 'empty SBOM'" sbom/portmark.cdx.json
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -131,10 +135,16 @@ jobs:
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/*
+      # `sbom-path` must be a literal path. This action is a deprecation shim over `actions/attest`,
+      # which globs `subject-path` but NOT `sbom-path`: with `sbom/*.cdx.json` it fails "SBOM file not
+      # found" AFTER the provenance attestation succeeds, which skips publishing and looks like the
+      # release itself broke. That is how v0.10.0's first attempt failed.
+      # debt: on the deprecation shim; ceiling = it is removed and this step stops running; upgrade when
+      # the deprecation warning becomes an error, by moving to `actions/attest` with `predicate-type`.
       - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
         with:
           subject-path: dist/*
-          sbom-path: sbom/*.cdx.json
+          sbom-path: sbom/portmark.cdx.json
 
   publish:
     name: Publish to PyPI

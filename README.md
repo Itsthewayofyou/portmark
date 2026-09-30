@@ -387,7 +387,8 @@ Two commitments go with it:
 
 - **Earlier versions stay MIT, permanently.** Everything up to the `last-mit` tag — including PyPI
   releases 0.1.0 through 0.9.2 — was released under the MIT License, and that grant is not withdrawn.
-  The text is kept in [LICENSE-MIT](https://github.com/Itsthewayofyou/portmark/blob/main/LICENSE-MIT).
+  The text is kept in
+  [legal/LICENSE-MIT](https://github.com/Itsthewayofyou/portmark/blob/main/legal/LICENSE-MIT).
 - **A dormancy grant.** When you receive Portmark you also receive, then and irrevocably, an
   Apache-2.0 licence to it that you may exercise once Portmark goes dormant. Dormant means twelve
   consecutive months with no substantive maintenance — no release, no merged fix or functional
