@@ -26,7 +26,11 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: cla-${{ github.event.pull_request.number }}
+  # Keyed on the event as well as the pull request, so a run is only ever cancelled by a newer run of
+  # the same kind. Keyed on the number alone, the `pull_request` run and the `pull_request_target` run
+  # that both exist while this trigger is being changed cancel each other, and a cancelled run reports
+  # as a failure -- a red mark for a check that did its job.
+  group: cla-${{ github.event_name }}-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
