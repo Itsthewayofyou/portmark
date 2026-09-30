@@ -176,11 +176,13 @@ def _engine_config(max_memory_bytes: int) -> Any:
     config.wasm_relaxed_simd = True
     config.wasm_relaxed_simd_deterministic = True
     config.cranelift_nan_canonicalization = True
-    # Lock the proposal set: EVERY proposal setter wasmtime-py 48 exposes is assigned here, so none
+    # Lock the proposal set: EVERY proposal setter wasmtime-py 49 exposes is assigned here, so none
     # inherits a default that can drift on upgrade. Off: host-dependent or unneeded surface. Each
-    # "off" below that Wasmtime 48 enables by default is proven refused by a test (threads,
+    # "off" below that Wasmtime enables by default is proven refused by a test (threads,
     # memory64, multi-memory, gc, exceptions, tail call, typed function references); the rest are
-    # already off by default and pinned here.
+    # already off by default and pinned here. A proposal added by a later Wasmtime fails
+    # `test_real_native_wasmtime_engine_config_assigns_every_proposal_setter` until it is decided
+    # here, on purpose -- an upgrade must not switch a WebAssembly feature on behind the sandbox.
     config.wasm_threads = False
     config.shared_memory = False
     config.wasm_memory64 = False
@@ -194,6 +196,10 @@ def _engine_config(max_memory_bytes: int) -> Any:
     config.wasm_wide_arithmetic = False
     config.wasm_custom_page_sizes = False
     config.wasm_component_model_map = False  # component-model map types proposal
+    # New in Wasmtime 49, and refused for the same reason as the map proposal: Portmark's contract is
+    # one fixed component that declares no imports, so a component describing which interfaces it
+    # implements buys nothing here and is surface the guest would otherwise inherit switched on.
+    config.wasm_component_model_implements = False
     # On: what the Component Model contract needs.
     config.wasm_component_model = True
     config.wasm_multi_value = True
