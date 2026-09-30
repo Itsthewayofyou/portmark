@@ -4,6 +4,22 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 ## Unreleased
 
+## 0.10.0 — 2026-09-30
+
+**The first release published under the Elastic License 2.0.** Everything up to and including 0.9.2
+remains under the MIT License, permanently, and that grant is not withdrawn — see `NOTICE` and
+`LICENSE-MIT`. From this release on, Portmark is source-available rather than OSI open source: you may
+use, modify and redistribute it, ship it inside your own commercial product, and run it inside your own
+organization at any scale, free and without asking. The one thing withheld is providing Portmark to
+third parties as a hosted or managed service that gives users access to any substantial set of its
+features. Contributors now sign a CLA (`CLA.md`), and the name is covered by `TRADEMARKS.md`.
+
+This is also the release that carries the **twelve-section security audit** end to end, from the
+PostgreSQL failure modes in section 1 to the long-running reliability work in section 12, together with
+the external-validation items (EV-001, EV-004, EV-006, EV-007, EV-013), the completeness review
+(PM-001 to PM-005), the boundary audit, MCP tool support over stdio and HTTP including OAuth, audit
+export to a SIEM, and Python 3.14 support. Each of those is its own entry below.
+
 ### Removed
 
 - **The legacy HMAC envelope signer.** `HmacEnvelopeSigner` was a test-only demo signer behind
