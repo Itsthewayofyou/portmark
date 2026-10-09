@@ -24,7 +24,7 @@ classifiers = [
     "Topic :: Security",
     "Topic :: Software Development :: Libraries :: Application Frameworks",
 ]
-dependencies = ["cryptography==50.0.1", "uvicorn==0.54.0"]
+dependencies = ["cryptography==50.0.2", "uvicorn==0.54.0"]
 
 [project.urls]
 Homepage = "https://github.com/Itsthewayofyou/portmark"
@@ -33,10 +33,10 @@ Issues = "https://github.com/Itsthewayofyou/portmark/issues"
 Changelog = "https://github.com/Itsthewayofyou/portmark/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
-a2a = ["a2a-sdk==1.1.5"]
+a2a = ["a2a-sdk==1.2.1"]
 # The official MCP SDK, used ONLY to know the OAuth protocol -- Portmark performs every request itself
 # (src/portmark/mcp_oauth.py). Pinned exactly, never a range: a range breaks `lock_requirements.py --check`.
-mcp-oauth = ["mcp==2.2.0"]
+mcp-oauth = ["mcp==2.3.0"]
 postgres = ["psycopg[binary]==3.3.6"]
 wasmtime = ["wasmtime==49.0.0"]
 
@@ -45,8 +45,8 @@ wasmtime = ["wasmtime==49.0.0"]
 # requirements/*.txt are hash-pinned exports of uv.lock (scripts/lock_requirements.py); Docker, CI, and
 # release install them with `pip install --require-hashes --no-deps`. Not part of the package metadata.
 bootstrap = ["pip==26.2.1", "setuptools==84.0.0"]
-ci = ["bandit==1.9.4", "coverage==7.16.1", "pip-audit==2.10.1"]
-release = ["build==1.6.1", "twine==7.0.0", "uv==0.12.19"]
+ci = ["bandit==1.9.4", "coverage==7.16.2", "pip-audit==2.10.1"]
+release = ["build==1.6.1", "twine==7.0.0", "uv==0.12.22"]
 
 [project.scripts]
 portmark = "portmark.cli:main"
