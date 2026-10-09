@@ -29,8 +29,8 @@ from .security import (
 )
 
 
-SQLITE_SCHEMA_VERSION = 15
-POSTGRES_SCHEMA_VERSION = 13
+SQLITE_SCHEMA_VERSION = 16
+POSTGRES_SCHEMA_VERSION = 14
 
 # Section 4 #3: a migration lease is bounded. Zero/negative would defeat exclusivity (two workers
 # could claim the same row at the same instant); an unbounded lease would let a dead worker hold a
@@ -560,7 +560,10 @@ class RuntimeTransaction(Protocol):
     def append_audit_events(self, task_id: str, host_id: str, events: tuple[dict[str, Any], ...], sign_head: AuditHeadSigner | None = None) -> None:
         ...
 
-    def save_checkpoint(self, task_id: str, state: AgentState, expected_generation: int, closed: bool = False, owner: tuple[str, str] | None = None) -> int:
+    def save_checkpoint(
+        self, task_id: str, state: AgentState, expected_generation: int, closed: bool = False,
+        owner: tuple[str, str] | None = None, authority_ceiling: str | None = None,
+    ) -> int:
         """Atomically admit and persist a checkpoint, returning its new generation.
 
         Compare-and-swap on the store-owned generation (finding EV-008). The store
@@ -693,6 +696,13 @@ class RuntimeStore(Protocol):
         ...
 
     def load_checkpoint(self, task_id: str) -> dict[str, Any] | None:
+        ...
+
+    def load_authority_ceiling(self, task_id: str) -> str | None:
+        """U7: the authority ceiling recorded when a migrated task was admitted (canonical JSON), or None.
+
+        Written on the checkpoint CREATE and never changed, so reading it outside the save transaction is
+        safe. A sealed row authenticates the column with the rest of the row; a mismatch raises."""
         ...
 
     def audit_head(self, task_id: str) -> tuple[str, int] | None:
@@ -1198,6 +1208,11 @@ class InMemoryRuntimeStore:
             # Stored rows are {generation, closed, state}; callers see the state blob.
             return json.loads(json.dumps(row["state"])) if row is not None else None
 
+    def load_authority_ceiling(self, task_id: str) -> str | None:
+        with self._lock:
+            row = self._checkpoints.get(task_id)
+            return row.get("authority_ceiling") if row is not None else None
+
     def audit_head(self, task_id: str) -> tuple[str, int] | None:
         with self._lock:
             events = self._audit_events.get(task_id)
@@ -1364,7 +1379,10 @@ class _InMemoryTransaction:
                 "signed_at": signed_at,
             }
 
-    def save_checkpoint(self, task_id: str, state: AgentState, expected_generation: int, closed: bool = False, owner: tuple[str, str] | None = None) -> int:
+    def save_checkpoint(
+        self, task_id: str, state: AgentState, expected_generation: int, closed: bool = False,
+        owner: tuple[str, str] | None = None, authority_ceiling: str | None = None,
+    ) -> int:
         row = self._store._checkpoints.get(task_id)
         if row is None:
             if expected_generation != 0:
@@ -1387,6 +1405,7 @@ class _InMemoryTransaction:
             # Recorded on the CREATE and never rewritten afterwards.
             "owner_issuer": row["owner_issuer"] if row is not None else (owner[0] if owner else None),
             "owner_subject": row["owner_subject"] if row is not None else (owner[1] if owner else None),
+            "authority_ceiling": row.get("authority_ceiling") if row is not None else authority_ceiling,
         }
         return new_generation
 
@@ -1727,6 +1746,14 @@ class _SQLRuntimeStore:
             row = connection.execute(f"SELECT {_CHECKPOINT_ROW} FROM checkpoints WHERE task_id = ?", (task_id,)).fetchone()  # nosec B608 -- constant column list
         return _decode_row(self.checkpoint_codec, task_id, row) if row is not None else None
 
+    def load_authority_ceiling(self, task_id: str) -> str | None:
+        with self._session() as connection:
+            row = connection.execute(f"SELECT {_CHECKPOINT_ROW} FROM checkpoints WHERE task_id = ?", (task_id,)).fetchone()  # nosec B608 -- constant column list
+        if row is None:
+            return None
+        _decode_row(self.checkpoint_codec, task_id, row)  # authenticates the column on a sealed row
+        return row["authority_ceiling"]
+
     def audit_head(self, task_id: str) -> tuple[str, int] | None:
         with self._session() as connection:
             row = connection.execute("SELECT head_hash, sequence FROM audit_heads WHERE task_id = ?", (task_id,)).fetchone()
@@ -1872,6 +1899,7 @@ class SQLiteRuntimeStore(_SQLRuntimeStore):
             12: self._migrate_to_v13,
             13: self._migrate_to_v14,
             14: self._migrate_to_v15,
+            15: self._migrate_to_v16,
         }
 
     @staticmethod
@@ -2109,6 +2137,14 @@ class SQLiteRuntimeStore(_SQLRuntimeStore):
         # rather than let the first caller claim it. A closed one is unaffected -- it is evidence.
         self._add_column(connection, "checkpoints", "owner_issuer", "TEXT")
         self._add_column(connection, "checkpoints", "owner_subject", "TEXT")
+
+    def _migrate_to_v16(self, connection: sqlite3.Connection) -> None:
+        # U7: the authority a MIGRATED task arrived with (its effective grants, budget, expiry and
+        # component, as canonical JSON), recorded on the CREATE of a migration admission and never
+        # rewritten. Every later resume is capped to it, so a re-signed resume permit cannot widen what
+        # the handoff narrowed. Existing rows stay NULL; an OPEN migrated row with no ceiling refuses
+        # to resume rather than run uncapped (the same rule PM-001 applies to an ownerless row).
+        self._add_column(connection, "checkpoints", "authority_ceiling", "TEXT")
 
     def _migrate_to_v15(self, connection: sqlite3.Connection) -> None:
         # EV-013: the newest remote-witness receipt this database committed, one row per host, written in
@@ -2617,6 +2653,8 @@ class PostgresRuntimeStore(_SQLRuntimeStore):
         # letting the first caller claim it would preserve the very takeover this closes.
         connection.execute("ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS owner_issuer TEXT")
         connection.execute("ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS owner_subject TEXT")
+        # U7 (schema v14): the authority a migrated task arrived with; see SQLite _migrate_to_v16.
+        connection.execute("ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS authority_ceiling TEXT")
         # An already-terminal checkpoint from before this column existed must be
         # closed so a pre-EV-008 envelope (default generation 0) cannot re-run it.
         connection.execute("UPDATE checkpoints SET closed = TRUE WHERE closed = FALSE AND status IN ('completed', 'failed')")
@@ -3247,7 +3285,10 @@ class _PostgresTransaction:
                 (task_id, event["hash"], sequence, host_id, signature_key_id, signature, signed_at, int(time.time())),
             )
 
-    def save_checkpoint(self, task_id: str, state: AgentState, expected_generation: int, closed: bool = False, owner: tuple[str, str] | None = None) -> int:
+    def save_checkpoint(
+        self, task_id: str, state: AgentState, expected_generation: int, closed: bool = False,
+        owner: tuple[str, str] | None = None, authority_ceiling: str | None = None,
+    ) -> int:
         if self._connection is None:
             raise RuntimeError("Postgres transaction was not opened")
         row = self._connection.execute(
@@ -3259,16 +3300,18 @@ class _PostgresTransaction:
             new_generation = 1
             result = self._connection.execute(
                 """
-                INSERT INTO checkpoints (task_id, status, checkpoint_json, generation, closed, updated_at, owner_issuer, owner_subject)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO checkpoints (task_id, status, checkpoint_json, generation, closed, updated_at, owner_issuer, owner_subject, authority_ceiling)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (task_id) DO NOTHING
                 RETURNING generation
                 """,
                 (
-                    task_id, state.status, _encode_checkpoint(self._store.checkpoint_codec, task_id, state, new_generation, closed, owner), new_generation,
+                    task_id, state.status, _encode_checkpoint(self._store.checkpoint_codec, task_id, state, new_generation, closed, owner, authority_ceiling), new_generation,
                     bool(closed), int(time.time()),
                     # PM-001: the owner is recorded on the CREATE, inside the admission transaction.
                     owner[0] if owner else None, owner[1] if owner else None,
+                    # U7: the migrated task's authority ceiling, likewise CREATE-only.
+                    authority_ceiling,
                 ),
             ).fetchone()
             if result is None:
@@ -3294,7 +3337,7 @@ class _PostgresTransaction:
             WHERE task_id = %s AND generation = %s AND closed = FALSE
             RETURNING generation
             """,
-            (new_generation, state.status, _encode_checkpoint(self._store.checkpoint_codec, task_id, state, new_generation, closed, (row["owner_issuer"], row["owner_subject"])), bool(closed), int(time.time()), task_id, expected_generation),
+            (new_generation, state.status, _encode_checkpoint(self._store.checkpoint_codec, task_id, state, new_generation, closed, (row["owner_issuer"], row["owner_subject"]), row["authority_ceiling"]), bool(closed), int(time.time()), task_id, expected_generation),
         ).fetchone()
         if result is None:
             raise SecurityError("stale checkpoint generation")
@@ -3377,7 +3420,7 @@ def create_runtime_store(
 
 
 # Every checkpoint column a read authenticates: the sealed state plus the plaintext columns it gates on.
-_CHECKPOINT_ROW = "checkpoint_json, generation, status, closed, owner_issuer, owner_subject"
+_CHECKPOINT_ROW = "checkpoint_json, generation, status, closed, owner_issuer, owner_subject, authority_ceiling"
 
 
 _TERMINAL_STATUSES = ("completed", "failed")
@@ -3391,22 +3434,30 @@ def _effective_closed(closed: Any, status: str) -> bool:
     return bool(closed) or status in _TERMINAL_STATUSES
 
 
-def _row_binding(closed: Any, status: str, owner: tuple[str | None, str | None] | None) -> dict[str, Any]:
+def _row_binding(
+    closed: Any, status: str, owner: tuple[str | None, str | None] | None, authority_ceiling: str | None = None,
+) -> dict[str, Any]:
     issuer, subject = owner if owner else (None, None)
-    return {"closed": _effective_closed(closed, status), "owner": [issuer, subject]}
+    binding: dict[str, Any] = {"closed": _effective_closed(closed, status), "owner": [issuer, subject]}
+    # U7: bound only when present, so a row sealed before the column existed (NULL) keeps the exact
+    # binding it was sealed with; on a sealed row, adding, clearing or editing the ceiling is refused.
+    if authority_ceiling is not None:
+        binding["authority_ceiling"] = authority_ceiling
+    return binding
 
 
 def _encode_checkpoint(
     codec: CheckpointCodec | None, task_id: str, state: AgentState, generation: int, closed: Any, owner: tuple[str | None, str | None] | None,
+    authority_ceiling: str | None = None,
 ) -> str:
     blob = asdict(state)
     blob["checkpoint_generation"] = generation
     text = json.dumps(blob, sort_keys=True, separators=(",", ":"))
-    return codec.seal(task_id, generation, text, _row_binding(closed, state.status, owner)) if codec is not None else text
+    return codec.seal(task_id, generation, text, _row_binding(closed, state.status, owner, authority_ceiling)) if codec is not None else text
 
 
 def _open_row(codec: CheckpointCodec, task_id: str, row: Any, strict: bool = True) -> str:
-    binding = _row_binding(row["closed"], row["status"], (row["owner_issuer"], row["owner_subject"]))
+    binding = _row_binding(row["closed"], row["status"], (row["owner_issuer"], row["owner_subject"]), row["authority_ceiling"])
     opener = codec.open_stored if strict else codec.open
     return opener(task_id, int(row["generation"]), row["checkpoint_json"], binding)
 
@@ -3439,7 +3490,7 @@ def _plan_checkpoint_encryption(codec: CheckpointCodec, rows: list[Any]) -> tupl
     report = {"encrypted": 0, "rekeyed": 0, "verified": 0, "key_id": codec.current_key_id}
     for row in rows:
         task_id, generation, stored = row["task_id"], int(row["generation"]), row["checkpoint_json"]
-        binding = _row_binding(row["closed"], row["status"], (row["owner_issuer"], row["owner_subject"]))
+        binding = _row_binding(row["closed"], row["status"], (row["owner_issuer"], row["owner_subject"]), row["authority_ceiling"])
         try:
             if not is_sealed(stored):
                 _check_sealed_status(task_id, json.loads(stored), row)
@@ -3576,7 +3627,10 @@ class _SQLiteTransaction:
                 (task_id, event["hash"], sequence, host_id, signature_key_id, signature, signed_at, int(time.time())),
             )
 
-    def save_checkpoint(self, task_id: str, state: AgentState, expected_generation: int, closed: bool = False, owner: tuple[str, str] | None = None) -> int:
+    def save_checkpoint(
+        self, task_id: str, state: AgentState, expected_generation: int, closed: bool = False,
+        owner: tuple[str, str] | None = None, authority_ceiling: str | None = None,
+    ) -> int:
         if self._connection is None:
             raise RuntimeError("SQLite transaction was not opened")
         row = self._connection.execute(
@@ -3588,15 +3642,17 @@ class _SQLiteTransaction:
             new_generation = 1
             cursor = self._connection.execute(
                 """
-                INSERT INTO checkpoints (task_id, status, checkpoint_json, generation, closed, updated_at, owner_issuer, owner_subject)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO checkpoints (task_id, status, checkpoint_json, generation, closed, updated_at, owner_issuer, owner_subject, authority_ceiling)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(task_id) DO NOTHING
                 """,
                 (
-                    task_id, state.status, _encode_checkpoint(self._store.checkpoint_codec, task_id, state, new_generation, closed, owner), new_generation,
+                    task_id, state.status, _encode_checkpoint(self._store.checkpoint_codec, task_id, state, new_generation, closed, owner, authority_ceiling), new_generation,
                     1 if closed else 0, int(time.time()),
                     # PM-001: the owner is recorded on the CREATE, inside the admission transaction.
                     owner[0] if owner else None, owner[1] if owner else None,
+                    # U7: the migrated task's authority ceiling, likewise CREATE-only.
+                    authority_ceiling,
                 ),
             )
             if cursor.rowcount != 1:
@@ -3621,7 +3677,7 @@ class _SQLiteTransaction:
             SET generation = ?, status = ?, checkpoint_json = ?, closed = ?, updated_at = ?
             WHERE task_id = ? AND generation = ? AND closed = 0
             """,
-            (new_generation, state.status, _encode_checkpoint(self._store.checkpoint_codec, task_id, state, new_generation, closed, (row["owner_issuer"], row["owner_subject"])), 1 if closed else 0, int(time.time()), task_id, expected_generation),
+            (new_generation, state.status, _encode_checkpoint(self._store.checkpoint_codec, task_id, state, new_generation, closed, (row["owner_issuer"], row["owner_subject"]), row["authority_ceiling"]), 1 if closed else 0, int(time.time()), task_id, expected_generation),
         )
         if cursor.rowcount != 1:
             raise SecurityError("stale checkpoint generation")

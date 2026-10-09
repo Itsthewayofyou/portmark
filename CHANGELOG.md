@@ -6,6 +6,24 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 ### Security
 
+- **A migrated task can no longer be resumed with more authority than it arrived with (U7).** A resume
+  recomputed authority from the permit it carried, and the checkpoint owner check binds only the issuer
+  and subject. So the source host could re-sign a resume permit for a suspended migrated task with wider
+  grants (for example a higher `max_limit`), a larger budget, a later expiry, a different agent component,
+  or `delegation_allowed` set, and the destination ran it. The destination's own policy still capped the
+  result, but the narrowing the handoff promised was lost. Found by an independent Codex attack and
+  reproduced end to end.
+  - The destination now records the authority a migrated task arrived with in a new checkpoint column,
+    `authority_ceiling`, on the create of the migration admission, and never rewrites it.
+  - Every later resume is capped to it: grants and budget intersect, the expiry takes the earlier, the
+    agent provider and component digest must match, and delegation is forced off (no second hop).
+  - When checkpoint encryption is on, the column is sealed with the row: editing, clearing or adding it
+    fails authentication.
+  - **Behavior change:** an open migrated task with no recorded ceiling (admitted before this release)
+    refuses to resume, the same rule PM-001 applies to an open task with no owner. Let such tasks finish
+    or fail before upgrading, or re-migrate them.
+  - Schema: SQLite version 16, PostgreSQL version 14 (a nullable column; existing rows read as NULL).
+
 - **Tool arguments are checked on the same values the tool receives.** An in-process provider could
   return its arguments as a `dict` subclass whose `.get()` differed from `[]`. `check_constraints`
   reads `.get()` and a tool reads `[]`, so a grant of `max_amount: 10` passed on `amount=1` while the
@@ -1415,6 +1433,8 @@ External-audit remediation, held unreleased (no version bump / tag) until the fu
   - Scope bound: this closes the squat at the migration-admission boundary, where it occurs. A full
     resume of a migrated task that suspends is governed by the existing delegated-permit auth model
     (the permit names the source as issuer) and is unaffected by this change.
+    *Corrected later:* that model did not cap the resume. See "A migrated task can no longer be resumed
+    with more authority than it arrived with" under Unreleased.
 
 ### Section 4 (part 3b) — provider projection fail-closed parity
 

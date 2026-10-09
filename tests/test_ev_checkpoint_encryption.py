@@ -133,6 +133,30 @@ class _StoreCases:
         with self.assertRaisesRegex(CheckpointCryptoError, "status column does not match"):
             store.load_checkpoint("running")
 
+    def test_the_authority_ceiling_is_create_only_and_sealed(self):
+        # U7: a migrated task's authority ceiling caps every resume, so a store writer must not be able
+        # to widen, clear or add it, and a resume save must not replace it.
+        store = self._open(_ring(f"a:{KEY_A}"))
+        owner = ("host:source", "agent:demo")
+        ceiling = '{"version":1}'
+        with store.transaction() as transaction:
+            transaction.save_checkpoint("mig", AgentState("mig", "g"), 0, owner=owner, authority_ceiling=ceiling)
+        with store.transaction() as transaction:
+            transaction.save_checkpoint("mig", AgentState("mig", "g"), 1, owner=owner, authority_ceiling='{"version":2}')
+        self.assertEqual(store.load_authority_ceiling("mig"), ceiling)  # the CREATE value, not the resume's
+        for edited in ('{"version":1,"wider":true}', None):
+            self._set_column("mig", "authority_ceiling", edited)
+            with self.assertRaisesRegex(CheckpointCryptoError, "failed authentication"):
+                store.load_authority_ceiling("mig")
+            with self.assertRaisesRegex(CheckpointCryptoError, "failed authentication"):
+                store.load_checkpoint("mig")
+        # A row sealed with no ceiling (every row from before the column) still opens; adding one does not.
+        _save(store, "plain")
+        self.assertIsNone(store.load_authority_ceiling("plain"))
+        self._set_column("plain", "authority_ceiling", ceiling)
+        with self.assertRaisesRegex(CheckpointCryptoError, "failed authentication"):
+            store.load_checkpoint("plain")
+
     def test_closing_a_live_task_by_editing_the_column_fails_closed(self):
         store = self._open(_ring(f"a:{KEY_A}"))
         _save(store, "live")
@@ -238,7 +262,7 @@ class SQLiteCheckpointEncryptionTests(_StoreCases, unittest.TestCase):
         self._query("UPDATE checkpoints SET generation = ? WHERE task_id = ?", (generation, task_id))
 
     def _set_column(self, task_id, column, value):
-        if column not in {"closed", "status", "owner_issuer"}:
+        if column not in {"closed", "status", "owner_issuer", "authority_ceiling"}:
             raise ValueError(column)
         self._query(f"UPDATE checkpoints SET {column} = ? WHERE task_id = ?", (int(value) if column == "closed" else value, task_id))  # nosec B608 -- fixed column set
 
@@ -271,7 +295,7 @@ class PostgresCheckpointEncryptionTests(_StoreCases, unittest.TestCase):
         self._query("UPDATE checkpoints SET generation = %s WHERE task_id = %s", (generation, task_id))
 
     def _set_column(self, task_id, column, value):
-        if column not in {"closed", "status", "owner_issuer"}:
+        if column not in {"closed", "status", "owner_issuer", "authority_ceiling"}:
             raise ValueError(column)
         self._query(f"UPDATE checkpoints SET {column} = %s WHERE task_id = %s", (value, task_id))  # nosec B608 -- fixed column set
 

@@ -169,14 +169,14 @@ class TaskOwnershipTests(unittest.TestCase):
                 "VALUES ('old-task', 'awaiting_input', '{}', 1, 1, 0)"
             )
             connection.commit()
-        store = SQLiteRuntimeStore(path)  # upgrades through v14 (owner columns) to v15 (EV-013) on open
+        store = SQLiteRuntimeStore(path)  # upgrades through v14 (owner columns), v15 (EV-013) and v16 (U7) on open
         # No owner was invented: a caller that asserts one is refused as a legacy row, not as a foreign one.
         with self.assertRaisesRegex(SecurityError, "legacy checkpoint has no stored owner"):
             with store.transaction() as transaction:
                 transaction.save_checkpoint("old-task", AgentState("old-task", "goal"), 1, owner=("user:alice", "agent:demo"))
         with contextlib.closing(sqlite3.connect(str(path))) as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-        self.assertEqual(version, 15)
+        self.assertEqual(version, 16)
 
 
 class OwnershipStoreContractTests(unittest.TestCase):
