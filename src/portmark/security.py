@@ -314,6 +314,19 @@ def canonical_json(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()
 
 
+def detached_json(value: Any) -> Any:
+    """A plain copy of `value` built from its canonical JSON: only dict, list, str, int, float, bool, None.
+
+    Tool arguments are read in several places -- the constraint check (`.get`), the approval hash and
+    the audit record (`canonical_json`, which reads `.items()`), and the tool itself (`[]`). A dict
+    SUBCLASS can answer each of those differently, so a check can pass on one value while the tool
+    acts on another. Rebuilding the value from the bytes that are hashed gives every reader the same
+    object: what was checked, approved and recorded is exactly what the tool receives. Raises
+    whatever `canonical_json` raises for a value that is not JSON.
+    """
+    return json.loads(canonical_json(value))
+
+
 def _finite_number(value: Any) -> bool:
     # A real, comparable number for a numeric limit: a bool is an int subclass
     # (True == 1) and NaN/Infinity defeat every `<`/`>` bound (all comparisons with

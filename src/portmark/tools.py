@@ -16,7 +16,7 @@ from typing import Any
 
 from . import _windows_job, safe_paths
 from .models import Permit, validate_tool_name
-from .security import SecurityError, canonical_json, check_constraints
+from .security import SecurityError, canonical_json, check_constraints, detached_json
 
 
 Tool = Callable[[dict[str, Any]], Any]
@@ -620,6 +620,15 @@ class ToolRegistry:
         return tuple(sorted(set(self._tools) | set(self._isolated)))
 
     def invoke(self, permit: Permit, name: str, arguments: dict[str, Any], max_output_bytes: int | None = None, launch_capability: str | None = None) -> Any:
+        # Check, hash and run ONE plain copy of the arguments (see detached_json): a dict subclass
+        # must not show check_constraints one value and the tool another. The host already passes a
+        # detached copy; this covers a direct caller of the registry.
+        if not isinstance(arguments, dict):
+            raise SecurityError("tool arguments must be an object")
+        try:
+            arguments = detached_json(arguments)
+        except (TypeError, ValueError, RecursionError) as error:  # RecursionError: nesting too deep to encode
+            raise SecurityError("tool arguments must be JSON") from error
         grant = next((grant for grant in permit.grants if grant.name == name), None)
         if grant is None:
             # Only the effective permit is visible here, so this cannot say which
