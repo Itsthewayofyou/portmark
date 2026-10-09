@@ -23,7 +23,8 @@ from portmark import _clock
 from portmark.factory import make_demo_envelope, make_host
 from dataclasses import asdict
 
-from portmark.models import ProviderDecision, ResourceBudget, ToolGrant
+from portmark.models import Permit, ProviderDecision, ResourceBudget, ToolGrant
+from portmark.tools import ToolRegistry
 from portmark.providers import ModelProvider
 from portmark.security import HostPolicy, PermitExpiredError, SecurityError
 from authority_fixtures import ApprovalAuthority
@@ -464,6 +465,35 @@ class ReviewLifecycleTests(unittest.TestCase):
             host.run(envelope)
         self._closed_failed(store, host, probe, "decision.refused")
 
+    def test_a_dict_subclass_cannot_show_the_check_one_amount_and_the_tool_another(self):
+        # An in-process provider is untrusted too. Its arguments may be a dict SUBCLASS whose .get()
+        # (what check_constraints reads) differs from [] (what a tool reads): before the fix the
+        # check passed on amount=1 and the tool charged 100. The host now rebuilds the arguments
+        # from their canonical JSON, so the check sees the real 100 and refuses.
+        store = self._store()
+        charged = []
+
+        class TwoFaced(dict):
+            def get(self, key, default=None):
+                return 1 if key == "amount" else super().get(key, default)
+
+        class TwoFacedProvider(ModelProvider):
+            def decide(self, state, available_tools, grants=()):
+                return ProviderDecision("tool", "catalog.search", TwoFaced(amount=100))
+
+        host = self._host(TwoFacedProvider(), store)
+        grant = ToolGrant("catalog.search", {"max_amount": 10})
+        host.policy = HostPolicy("host:local-demo", (grant,), ResourceBudget())
+        host.tools.register("catalog.search", lambda args: charged.append(args["amount"]))
+        envelope, probe = self._envelope(host, "two-faced arguments")
+        object.__setattr__(envelope.permit, "grants", (grant,))
+        host.signer.seal(envelope)
+        probe = copy.deepcopy(envelope)
+        with self.assertRaisesRegex(SecurityError, "amount"):
+            host.run(envelope)
+        self.assertEqual(charged, [])
+        self._closed_failed(store, host, probe, "decision.refused")
+
     def test_a_decision_shape_refusal_never_reaches_the_tool_or_the_ledger(self):
         # A refused shape must not run anything or write an effect row.
         store = self._store()
@@ -544,6 +574,52 @@ class ReviewLifecycleTests(unittest.TestCase):
             host.run(envelope)
         blob = repr(self._events(envelope.state.task_id)) + repr(store.load_checkpoint(envelope.state.task_id))
         self.assertNotIn(marker, blob)
+
+
+class RegistryArgumentDetachTests(unittest.TestCase):
+    """ToolRegistry.invoke checks and runs ONE plain copy of the arguments (detached_json)."""
+
+    def _permit(self, constraints):
+        return Permit("issuer", "subject", "host", 2**40, "nonce", (ToolGrant("payments.reserve", constraints),))
+
+    def test_a_two_faced_dict_is_checked_on_the_value_the_tool_receives(self):
+        class TwoFaced(dict):
+            def get(self, key, default=None):
+                return 1 if key == "amount" else super().get(key, default)
+
+        charged = []
+        tools = ToolRegistry()
+        tools.register("payments.reserve", lambda args: charged.append(args["amount"]))
+        with self.assertRaisesRegex(SecurityError, "amount"):
+            tools.invoke(self._permit({"max_amount": 10}), "payments.reserve", TwoFaced(amount=100))
+        self.assertEqual(charged, [])
+
+    def test_the_tool_receives_plain_json_values(self):
+        seen = []
+        tools = ToolRegistry()
+        tools.register("payments.reserve", seen.append)
+
+        class Honest(dict):
+            pass
+
+        tools.invoke(self._permit({}), "payments.reserve", Honest(amount=5, tags=("a", "b")))
+        self.assertIs(type(seen[0]), dict)
+        self.assertEqual(seen[0], {"amount": 5, "tags": ["a", "b"]})
+
+    def test_arguments_that_are_not_json_are_refused_before_the_tool_runs(self):
+        ran = []
+        tools = ToolRegistry()
+        tools.register("payments.reserve", ran.append)
+        with self.assertRaisesRegex(SecurityError, "must be JSON"):
+            tools.invoke(self._permit({}), "payments.reserve", {"amount": float("nan")})
+        with self.assertRaisesRegex(SecurityError, "must be an object"):
+            tools.invoke(self._permit({}), "payments.reserve", [("amount", 5)])
+        deep = {}
+        for _ in range(100_000):  # deeper than the JSON encoder can recurse
+            deep = {"x": deep}
+        with self.assertRaisesRegex(SecurityError, "must be JSON"):
+            tools.invoke(self._permit({}), "payments.reserve", deep)
+        self.assertEqual(ran, [])
 
 
 if __name__ == "__main__":

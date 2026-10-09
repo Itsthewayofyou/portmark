@@ -4,6 +4,23 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 ## Unreleased
 
+### Security
+
+- **Tool arguments are checked on the same values the tool receives.** An in-process provider could
+  return its arguments as a `dict` subclass whose `.get()` differed from `[]`. `check_constraints`
+  reads `.get()` and a tool reads `[]`, so a grant of `max_amount: 10` passed on `amount=1` while the
+  tool charged `100`. The host now rebuilds a provider decision's arguments from their canonical JSON
+  (`detached_json`) before any check, and `ToolRegistry.invoke` does the same for a direct caller, so
+  the constraint check, the approval hash, the audit record and the tool all read one plain copy.
+  Approval binding was not affected: the approval hash is taken over the canonical JSON, which reads
+  the real values. Remote HTTP and Wasm providers were not affected: their decisions are strictly
+  decoded into plain values. A side effect for in-process tools: tuples in arguments now arrive as
+  lists, as they would from any other provider. `ToolRegistry.invoke` now refuses non-object or
+  non-JSON arguments before the tool runs.
+- **THREAT_MODEL now states where approval is enforced.** It listed approval tokens among the
+  guarantees for any registered tool. Approval is checked when the host runs a provider decision;
+  `ToolRegistry.invoke` called directly checks the grant and constraints only.
+
 ## 0.10.0 — 2026-09-30
 
 **The first release published under the Elastic License 2.0.** Everything up to and including 0.9.2

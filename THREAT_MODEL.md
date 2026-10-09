@@ -40,7 +40,13 @@ profile supplied by the deployment.** This contract is deliberate; do not descri
 as containment.
 
 What Portmark's runtime **does** guarantee for a registered tool:
-- Authorization (grant intersection, policy, approval tokens) and argument constraints.
+- Authorization (grant intersection, policy, approval tokens) and argument constraints, for a call
+  the host makes (`AgentHost` running a provider decision). `ToolRegistry.invoke` on its own checks
+  only the permit's grant and argument constraints: it has no `HostPolicy`, so it never asks for an
+  approval token. Code that embeds Portmark and calls the registry directly owns that gate.
+- The constraint check, the approval hash, the audit record and the tool all read **one plain copy**
+  of the arguments, rebuilt from their canonical JSON (`detached_json`), so a provider cannot hand
+  the check one value and the tool another (for example with a `dict` subclass).
 - A hard wall-clock **deadline**, enforced by running each isolated tool in a separate process the
   host terminates at the deadline.
 - Bounded output (the parent reads the response stream bounded and re-checks the size cap) and

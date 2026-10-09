@@ -15,7 +15,7 @@ from .metrics import RuntimeMetrics
 from .models import AgentEnvelope, ApprovalToken, AttestationEvidence, ProviderDecision, RunResult
 from .projection import project_state_for_migration, provider_view
 from .providers import ModelProvider
-from .security import _MIGRATION_RECEIPT_FIELDS, _OPTIONAL_MIGRATION_RECEIPT_FIELDS, AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, MigrationAttesterProtocol, MigrationPreflightProtocol, PermitExpiredError, SecurityError, arguments_hash, audit_head_payload, canonical_json, effect_id, migration_envelope_digest, migration_receipt_payload, require_unexpired, verified_approval_token
+from .security import _MIGRATION_RECEIPT_FIELDS, _OPTIONAL_MIGRATION_RECEIPT_FIELDS, AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, MigrationAttesterProtocol, MigrationPreflightProtocol, PermitExpiredError, SecurityError, arguments_hash, audit_head_payload, canonical_json, detached_json, effect_id, migration_envelope_digest, migration_receipt_payload, require_unexpired, verified_approval_token
 from .storage import InMemoryRuntimeStore, RuntimeStore
 from .tools import ToolExecutionError, ToolKilledError, ToolRegistry, tool_error_code
 
@@ -80,7 +80,7 @@ def failed_after_admission(error: BaseException) -> bool:
     return getattr(error, _FAILED_AFTER_ADMISSION, False) is True
 
 
-def _require_wellformed_decision(decision: Any) -> None:
+def _require_wellformed_decision(decision: Any) -> ProviderDecision:
     """A provider decision is UNTRUSTED input, so check its shape once, up front (auditor round 2).
 
     The loop used to trust the shape and only meet a bad value where it happened to be hashed,
@@ -99,6 +99,7 @@ def _require_wellformed_decision(decision: Any) -> None:
         tool = decision.tool
         arguments = decision.arguments
         destination = decision.destination
+        content = decision.content
     except BaseException as error:  # a missing field, or a property that raises on access
         raise SecurityError("provider decision fields could not be read") from error
     if not isinstance(kind, str):
@@ -115,9 +116,13 @@ def _require_wellformed_decision(decision: Any) -> None:
     # result that does not raise), and duplicating it here would turn that clean failure into a raise.
     if arguments is not None:
         try:
-            canonical_json(arguments)
+            arguments = detached_json(arguments)
         except BaseException as error:
             raise SecurityError("provider decision arguments cannot be recorded") from error
+    # The host acts on this copy, never on the provider's objects: arguments rebuilt from their
+    # canonical JSON (see detached_json), so a dict subclass cannot show the constraint check one
+    # value and the tool another.
+    return ProviderDecision(kind=kind, tool=tool, arguments=arguments, content=content, destination=destination)
 
 
 def _recordable_label(source: Any, name: str) -> str | None:
@@ -640,7 +645,7 @@ class AgentHost:
                 # that raise used to happen here, outside every handler -- stranding the checkpoint at
                 # `running`, the very class PM-004 closes. Round 2: check the SHAPE before reading
                 # it anywhere, so a malformed field cannot escape by a later side door instead.
-                _require_wellformed_decision(decision)
+                decision = _require_wellformed_decision(decision)
                 audit.append("provider.proposed", {"kind": decision.kind, "tool": decision.tool})
                 finished, migration = self._apply_decision(decision, state, effective, audit, envelope, active_policy, admission_generation)
             except Exception as error:
