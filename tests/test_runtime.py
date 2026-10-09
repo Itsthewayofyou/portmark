@@ -40,7 +40,7 @@ from portmark.config import RuntimeConfig
 from portmark.factory import build_envelope, make_demo_envelope, make_host, signer_from_environment
 from portmark.metrics import RuntimeMetrics
 from portmark.logging_config import JsonLogFormatter
-from portmark.models import AgentState, AttestationEvidence, Permit, ProviderDecision, ResourceBudget, ToolGrant
+from portmark.models import AgentManifest, AgentState, AttestationEvidence, Permit, ProviderDecision, ResourceBudget, ToolGrant
 from portmark.projection import project_state_for_migration, provider_state, provider_view
 from portmark.providers import GenericHttpProvider, ModelProvider, NativeWasmtimeComponentProvider, ProviderError
 from portmark.policy import load_host_policy
@@ -140,6 +140,30 @@ class MigrateThenCompleteProvider(ModelProvider):
         if not state.migrated:
             return ProviderDecision("migrate", destination=self.destination)
         return ProviderDecision("complete", content={"resumed_on": self.destination})
+
+
+class MigratePauseThenSearchProvider(ModelProvider):
+    """U7: migrates, pauses once on the destination, then searches with `limit` (or migrates on, if `hop`)."""
+
+    def __init__(self, destination, limit, hop=None):
+        self.destination = destination
+        self.limit = limit
+        self.hop = hop
+        self.paused = False
+        self.searched = []
+
+    def decide(self, state, available_tools, grants=()):
+        if not state.migrated:
+            return ProviderDecision("migrate", destination=self.destination)
+        if not self.paused:
+            self.paused = True
+            return ProviderDecision("await_input", content={"need": "go-ahead"})
+        if self.hop:
+            return ProviderDecision("migrate", destination=self.hop)
+        if "catalog.search" not in state.tool_results:
+            self.searched.append(self.limit)
+            return ProviderDecision("tool", "catalog.search", {"query": "x", "limit": self.limit})
+        return ProviderDecision("complete", content={"done": True})
 
 
 class AttestedMigrateThenCompleteProvider(ModelProvider):
@@ -3591,6 +3615,36 @@ class RuntimeTests(unittest.TestCase):
         os.environ.get("PORTMARK_TEST_POSTGRES_DSN") and PostgresRuntimeStore.available(),
         "needs a live Postgres (PORTMARK_TEST_POSTGRES_DSN)",
     )
+    def test_postgres_v13_to_v14_upgrade_adds_the_authority_ceiling(self):
+        # U7 (upgrade path, Postgres): a v13 schema re-initialized by v14 code gains the nullable
+        # authority_ceiling column, existing rows read as NULL, and a new CREATE records a ceiling.
+        import psycopg
+        dsn = os.environ["PORTMARK_TEST_POSTGRES_DSN"]
+        schema = "portmark_upgrade_" + secrets.token_hex(8)
+        try:
+            store = PostgresRuntimeStore(dsn, schema=schema)
+            with store.transaction() as transaction:
+                transaction.save_checkpoint("old", AgentState("old", "g"), 0, owner=("i", "s"))
+            with psycopg.connect(dsn) as connection:
+                connection.execute(f'SET search_path TO "{schema}"')
+                connection.execute("ALTER TABLE checkpoints DROP COLUMN authority_ceiling")
+                connection.execute("UPDATE portmark_schema SET version = 13")
+                connection.commit()
+            store = PostgresRuntimeStore(dsn, schema=schema)  # re-initialize as v14
+            with psycopg.connect(dsn) as connection:
+                connection.execute(f'SET search_path TO "{schema}"')
+                self.assertEqual(connection.execute("SELECT version FROM portmark_schema").fetchone()[0], POSTGRES_SCHEMA_VERSION)
+            self.assertIsNone(store.load_authority_ceiling("old"))
+            with store.transaction() as transaction:
+                transaction.save_checkpoint("new", AgentState("new", "g"), 0, owner=("i", "s"), authority_ceiling='{"version":1}')
+            self.assertEqual(store.load_authority_ceiling("new"), '{"version":1}')
+        finally:
+            self._drop_postgres_schema(dsn, schema)
+
+    @unittest.skipUnless(
+        os.environ.get("PORTMARK_TEST_POSTGRES_DSN") and PostgresRuntimeStore.available(),
+        "needs a live Postgres (PORTMARK_TEST_POSTGRES_DSN)",
+    )
     def test_postgres_v6_to_v7_upgrade_adds_cancellations(self):
         # Section 5 #3 (G8, upgrade path, Postgres). A v6 schema re-initialized by v7 code creates
         # task_cancellations idempotently and bumps the recorded version to 7.
@@ -5883,6 +5937,113 @@ class RuntimeTests(unittest.TestCase):
         second = destination.run(migrated)
         self.assertEqual(second.status, "completed")
         self.assertEqual(second.result["resumed_on"], destination.host_id)
+
+    # ---- U7: a resume of a migrated task is capped to the authority it arrived with -------------------
+
+    def _u7_migrated_and_paused(self, provider, source_store=None, destination_store=None):
+        """Migrate a demo task (catalog.search max_limit 3; destination policy allows 5) and pause it on
+        the destination. Returns (source, destination, resume envelope addressed to the paused task)."""
+        source_signer = EnvelopeSigner.generate("u7-source", "host:source", ("host:source", "host:destination"))
+        destination_signer = trust_signer(EnvelopeSigner.generate("u7-dest", "host:destination", ("host:destination",)), source_signer)
+        source = make_host(host_id="host:source", signer=source_signer, store=source_store, allow_ephemeral_signing_key=True)
+        destination = make_host(host_id="host:destination", signer=destination_signer, store=destination_store, allow_ephemeral_signing_key=True)
+        source.policy.migration = MigrationPolicy(allowed=True, destinations=(destination.host_id,))
+        source.providers["migrator"] = provider
+        destination.providers["migrator"] = provider
+        envelope = make_demo_envelope(source, "u7", "migrator")
+        object.__setattr__(envelope.permit, "delegation_allowed", True)
+        source.signer.seal(envelope)
+        migrated = envelope_from_dict(source.run(envelope).migration_envelope)
+        self.assertEqual([(g.name, g.constraints["max_limit"]) for g in migrated.permit.grants], [("catalog.search", 3)])
+        paused = destination.run(migrated)
+        self.assertEqual(paused.status, "awaiting_input")
+        # An ordinary resume of the destination's checkpoint: its id and generation, no migration provenance.
+        resume = copy.deepcopy(migrated)
+        resume.state.task_id = paused.task_id
+        resume.state.checkpoint_generation = paused.checkpoint["checkpoint_generation"]
+        for field in ("previous_audit_hash", "previous_audit_sequence", "previous_audit_host_id",
+                      "previous_audit_signature_key_id", "previous_audit_signature"):
+            setattr(resume, field, None)
+        return source, destination, resume
+
+    def _u7_grants(self, max_limit):
+        return (ToolGrant("catalog.search", {"max_limit": max_limit, "arguments": {"query": {"type": "string"}}}, ("id", "title")),)
+
+    def _u7_store_cases(self):
+        yield "in-memory", None, None
+        for context in self._dual_store_case_contexts():
+            with context as (backend, source_store, destination_store):
+                yield backend, source_store, destination_store
+
+    def test_u7_a_re_signed_resume_cannot_widen_a_migrated_task_on_any_store(self):
+        for backend, source_store, destination_store in self._u7_store_cases():
+            with self.subTest(backend=backend):
+                provider = MigratePauseThenSearchProvider("host:destination", limit=4)
+                source, destination, resume = self._u7_migrated_and_paused(provider, source_store, destination_store)
+                object.__setattr__(resume.permit, "grants", self._u7_grants(5))  # wider than the handoff's 3
+                source.signer.seal(resume)
+                with self.assertRaisesRegex(SecurityError, "exceeds its permitted maximum"):
+                    destination.run(resume)
+                self.assertEqual(provider.searched, [4])  # asked, and refused by the host, never run
+
+    def test_u7_a_resume_under_the_arrived_permit_completes_and_a_narrower_one_narrows(self):
+        provider = MigratePauseThenSearchProvider("host:destination", limit=3)
+        source, destination, resume = self._u7_migrated_and_paused(provider)
+        source.signer.seal(resume)
+        self.assertEqual(destination.run(resume).status, "completed")
+        provider = MigratePauseThenSearchProvider("host:destination", limit=3)
+        source, destination, resume = self._u7_migrated_and_paused(provider)
+        object.__setattr__(resume.permit, "grants", self._u7_grants(2))
+        source.signer.seal(resume)
+        with self.assertRaisesRegex(SecurityError, "exceeds its permitted maximum"):
+            destination.run(resume)
+
+    def test_u7_a_re_signed_resume_cannot_turn_on_a_second_hop(self):
+        provider = MigratePauseThenSearchProvider("host:destination", limit=3, hop="host:third")
+        source, destination, resume = self._u7_migrated_and_paused(provider)
+        destination.policy.migration = MigrationPolicy(allowed=True, destinations=("host:third",))
+        object.__setattr__(resume.permit, "delegation_allowed", True)
+        source.signer.seal(resume)
+        with self.assertRaisesRegex(SecurityError, "permit does not allow migration"):
+            destination.run(resume)
+
+    def test_u7_a_migrated_task_with_no_recorded_ceiling_refuses_to_resume(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "destination.sqlite"
+            provider = MigratePauseThenSearchProvider("host:destination", limit=3)
+            source, destination, resume = self._u7_migrated_and_paused(provider, destination_store=SQLiteRuntimeStore(path))
+            # As if admitted before the column existed (or cleared by a store writer, with no codec to notice).
+            connection = sqlite3.connect(path)
+            try:
+                with connection:
+                    connection.execute("UPDATE checkpoints SET authority_ceiling = NULL WHERE task_id = ?", (resume.state.task_id,))
+            finally:
+                connection.close()
+            source.signer.seal(resume)
+            with self.assertRaisesRegex(SecurityError, "no recorded authority ceiling"):
+                destination.run(resume)
+            self.assertEqual(provider.searched, [])
+
+    def test_u7_the_cap_covers_budget_expiry_tools_and_component(self):
+        from dataclasses import replace
+        from portmark.host import _authority_ceiling_json, _cap_to_ceiling
+        manifest = AgentManifest("agent:demo", "1.0.0", "migrator", ("catalog.search", "payments.reserve"))
+        arrived = Permit("host:source", "agent:demo", "host:destination", 1_000, "n1", self._u7_grants(3),
+                         ResourceBudget(max_steps=4, max_tool_calls=2, max_output_bytes=1_000))
+        ceiling = _authority_ceiling_json(arrived, manifest)
+        wider = Permit("host:source", "agent:demo", "host:destination", 9_000, "n2",
+                       self._u7_grants(5) + (ToolGrant("payments.reserve", {"max_amount": 100}),),
+                       ResourceBudget(max_steps=40, max_tool_calls=20, max_output_bytes=10_000))
+        capped = _cap_to_ceiling(wider, ceiling, manifest)
+        self.assertEqual([(g.name, g.constraints["max_limit"]) for g in capped.grants], [("catalog.search", 3)])
+        self.assertEqual(capped.budget, arrived.budget)
+        self.assertEqual(capped.expires_at, 1_000)
+        narrower = replace(arrived, expires_at=500, budget=ResourceBudget(max_steps=1, max_tool_calls=1, max_output_bytes=10))
+        self.assertEqual(_cap_to_ceiling(narrower, ceiling, manifest).budget, narrower.budget)
+        self.assertEqual(_cap_to_ceiling(narrower, ceiling, manifest).expires_at, 500)
+        for swapped in (replace(manifest, provider="other"), replace(manifest, component_digest="sha256:" + "0" * 64)):
+            with self.assertRaisesRegex(SecurityError, "agent component it was admitted with"):
+                _cap_to_ceiling(arrived, ceiling, swapped)
 
     def test_migration_provenance_cannot_be_spliced_between_trusted_hosts(self):
         # Section 4 finding #1 (High): the destination verified the anchor signature and its

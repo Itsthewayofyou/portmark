@@ -12,10 +12,10 @@ from typing import Any
 from . import _run_progress
 from ._clock import trusted_now
 from .metrics import RuntimeMetrics
-from .models import AgentEnvelope, ApprovalToken, AttestationEvidence, ProviderDecision, RunResult
+from .models import AgentEnvelope, AgentManifest, ApprovalToken, AttestationEvidence, Permit, ProviderDecision, ResourceBudget, RunResult, ToolGrant
 from .projection import project_state_for_migration, provider_view
 from .providers import ModelProvider
-from .security import _MIGRATION_RECEIPT_FIELDS, _OPTIONAL_MIGRATION_RECEIPT_FIELDS, AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, MigrationAttesterProtocol, MigrationPreflightProtocol, PermitExpiredError, SecurityError, arguments_hash, audit_head_payload, canonical_json, detached_json, effect_id, migration_envelope_digest, migration_receipt_payload, require_unexpired, verified_approval_token
+from .security import _MIGRATION_RECEIPT_FIELDS, _OPTIONAL_MIGRATION_RECEIPT_FIELDS, AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, MigrationAttesterProtocol, MigrationPreflightProtocol, PermitExpiredError, SecurityError, arguments_hash, audit_head_payload, canonical_json, detached_json, effect_id, intersect_grants, migration_envelope_digest, migration_receipt_payload, require_unexpired, verified_approval_token
 from .storage import InMemoryRuntimeStore, RuntimeStore
 from .tools import ToolExecutionError, ToolKilledError, ToolRegistry, tool_error_code
 
@@ -78,6 +78,55 @@ def mark_failed_after_admission(error: BaseException) -> None:
 
 def failed_after_admission(error: BaseException) -> bool:
     return getattr(error, _FAILED_AFTER_ADMISSION, False) is True
+
+
+def _authority_ceiling_json(effective: Permit, manifest: AgentManifest) -> str:
+    """U7: the authority a migrated task arrived with, recorded once when the destination admits it.
+
+    The effective permit at the migration admission (already the delegated permit narrowed by this host's
+    policy), plus the agent component it was admitted to run. Stored on the checkpoint CREATE and never
+    rewritten, it caps every later resume of the task: see `_cap_to_ceiling`.
+    """
+    return canonical_json({
+        "version": 1,
+        "grants": [
+            {"name": grant.name, "constraints": grant.constraints,
+             "output_projection": list(grant.output_projection) if grant.output_projection is not None else None}
+            for grant in effective.grants
+        ],
+        "budget": asdict(effective.budget),
+        "expires_at": effective.expires_at,
+        "provider": manifest.provider,
+        "component_digest": manifest.component_digest,
+    }).decode("utf-8")
+
+
+def _cap_to_ceiling(effective: Permit, ceiling_json: str, manifest: AgentManifest) -> Permit:
+    """U7: cap a resume of a migrated task to the authority it was admitted with.
+
+    A resume recomputes authority from the permit it carries, and the checkpoint owner check binds only
+    (issuer, subject). Without this cap the source issuer could re-sign a resume permit with wider grants,
+    a larger budget or a later expiry, and the migrated task would run with more than the handoff allowed.
+    Every authority field a resume takes from its envelope is capped here: grants and budget intersect
+    (so they can only narrow), the expiry takes the earlier, and the agent component must be the one that
+    was admitted. Delegation is switched off by the caller, so a migrated task can never migrate again.
+    """
+    ceiling = json.loads(ceiling_json)
+    if manifest.provider != ceiling["provider"] or manifest.component_digest != ceiling["component_digest"]:
+        raise SecurityError("a migrated task must resume with the agent component it was admitted with")
+    ceiling_grants = tuple(
+        ToolGrant(
+            grant["name"], grant["constraints"],
+            tuple(grant["output_projection"]) if grant["output_projection"] is not None else None,
+        )
+        for grant in ceiling["grants"]
+    )
+    return replace(
+        effective,
+        grants=intersect_grants(effective.grants, ceiling_grants),
+        budget=effective.budget.intersect(ResourceBudget(**ceiling["budget"])),
+        expires_at=min(effective.expires_at, int(ceiling["expires_at"])),
+    )
 
 
 def _require_wellformed_decision(decision: Any) -> ProviderDecision:
@@ -547,6 +596,20 @@ class AgentHost:
             self._require_nonnegative_counters(state)
             consume_nonce: str | None = envelope.permit.nonce
         else:
+            # U7: a resume of a MIGRATED task is capped to the authority it arrived with. The cap
+            # is read before the first persist, so a refusal writes nothing and runs nothing; the
+            # column is written on the checkpoint CREATE only, so reading it outside the CAS
+            # transaction cannot race a change.
+            ceiling = self.store.load_authority_ceiling(state.task_id)
+            if ceiling is not None:
+                effective = _cap_to_ceiling(effective, ceiling, envelope.manifest)
+                require_unexpired(effective, "at admission")
+                # No second hop: whatever the resume permit says, a migrated task may not migrate on.
+                envelope.permit = replace(envelope.permit, delegation_allowed=False)
+            elif state.task_id.startswith(_MIGRATION_TASK_NAMESPACE):
+                # Admitted before the ceiling existed, or the column was cleared: refuse rather than
+                # run uncapped (PM-001 treats an ownerless open row the same way).
+                raise SecurityError("migrated task has no recorded authority ceiling; refusing to resume")
             # Local resume: the durable checkpoint is the sole authority on how much
             # budget has been spent. Rebind the counters from the store so a resume
             # envelope cannot under-report step/tool_calls to win extra budget.
@@ -1639,6 +1702,11 @@ class AgentHost:
                     # PM-001: recorded on the CREATE, compared on every later save, in this same
                     # transaction as the generation CAS.
                     owner=(envelope.permit.issuer, envelope.permit.subject),
+                    # U7: on a migration admission, the authority the task arrived with. The store
+                    # keeps it from the CREATE only, so passing it on later saves changes nothing.
+                    authority_ceiling=(
+                        _authority_ceiling_json(effective, envelope.manifest) if envelope.previous_audit_hash else None
+                    ),
                 )
                 # Section 4 #2: the destination issues a signed migration receipt in the SAME
                 # transaction that commits the admission checkpoint, so a crash can never leave a
