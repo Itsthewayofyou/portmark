@@ -6,6 +6,15 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 ### Security
 
+- **The default Node Wasm runner no longer gives a capsule a host clock (U6).** The runner refused
+  modules with imports, but Node enables Wasm threads by default. A module could define a shared memory
+  with no import, then call `memory.atomic.wait` with a timeout: the guest could sleep and time itself
+  against the host. That contradicted the documented "no ambient clock". Found by an independent Codex
+  probe and reproduced (a 300 ms wait ran to its timeout). The runner now refuses any module that defines
+  a shared memory, before it is instantiated. The native Wasmtime engine already disabled threads and
+  shared memory, so it is unchanged.
+  - **Behavior change:** a Node capsule that declares a shared memory now fails with "components with
+    shared memory are forbidden". The Portmark WIT world never needed one.
 - **A migrated task can no longer be resumed with more authority than it arrived with (U7).** A resume
   recomputed authority from the permit it carried, and the checkpoint owner check binds only the issuer
   and subject. So the source host could re-sign a resume permit for a suspended migrated task with wider
