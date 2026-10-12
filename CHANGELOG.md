@@ -17,7 +17,8 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
     either policy requires it, and a migration must pass both.
   - Approver trust and the policy hash an approval binds to come from the current policy.
   - A reload is honored at the next check. It is not synchronized with the checks, so one that lands in
-    the short gap after a check does not stop what that check already cleared.
+    the gap after a check does not stop what that check already cleared. The gap includes the host's own
+    store writes before a tool launches (approval redemption, the effect ledger), which can wait on a lock.
   - A reload that shrinks the output budget below the current checkpoint fails the task, which closes
     under the last budget that admitted it (it never stays open at `running`).
   - The narrowing lasts for one `run()` call. A paused task resumed later is admitted under the policy
