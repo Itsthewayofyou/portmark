@@ -91,6 +91,8 @@ WASM_MALFORMED_JSON = "AGFzbQEAAAABCQFgBH9/f38BfgMCAQAFAwEAAQcTAgZtZW1vcnkCAAZyZ
 WASM_TIMEOUT = "AGFzbQEAAAABCQFgBH9/f38BfgMCAQAFAwEAAQcTAgZtZW1vcnkCAAZyZXN1bWUAAAoLAQkAA0AMAAtCAAs="
 WASM_FORBIDDEN_IMPORT = "AGFzbQEAAAABDAJgAABgBH9/f38BfgIJAQNlbnYBeAAAAwIBAQUDAQABBxMCBm1lbW9yeQIABnJlc3VtZQABCgYBBABCAAs="
 WASM_MISSING_RESUME = "AGFzbQEAAAAFAwEAAQcKAQZtZW1vcnkCAA=="
+# WASM_TOOL_REQUEST with its memory declared shared (min 1, max 1) and a custom section in front.
+WASM_SHARED_MEMORY = "AGFzbQEAAAAABQRub3RlAQkBYAR/f39/AX4DAgEABQQBAwEBBxMCBm1lbW9yeQIABnJlc3VtZQAACgsBCQBC74CAgIACCwt1AQBBEAtveyJvdXRjb21lIjoidG9vbCIsInJlcXVlc3QiOnsibmFtZSI6ImNhdGFsb2cuc2VhcmNoIiwiYXJndW1lbnRzX2pzb24iOiJ7XCJxdWVyeVwiOlwiZnJvbSB3YXNtXCIsXCJsaW1pdFwiOjN9In19"
 HAS_REAL_WASMTIME = importlib.util.find_spec("wasmtime") is not None
 # The runner refuses anything that is not a BINARY Component Model artifact (fuzz finding), so
 # fake-wasmtime tests put this real header in front of their made-up component bytes; the fake
@@ -9549,6 +9551,18 @@ class RuntimeTests(unittest.TestCase):
         provider = WasmDecisionProvider(hostile)
         with self.assertRaisesRegex(RuntimeError, "ambient imports"):
             provider.decide(provider_view(AgentState("task", "goal")), ())
+
+    def test_wasm_with_shared_memory_cannot_run(self):
+        # A shared memory needs no import, but it makes memory.atomic.wait legal, and the wait's
+        # timeout is a host clock. The control is the same module with unshared memory.
+        _skip_if_declared_no_node_environment()
+        from portmark.providers import WasmDecisionProvider
+        view = provider_view(AgentState("task", "goal"), (ToolGrant("catalog.search"),))
+        control = WasmDecisionProvider(base64.b64decode(WASM_TOOL_REQUEST)).decide(view, ("catalog.search",))
+        self.assertEqual(control.kind, "tool")
+        provider = WasmDecisionProvider(base64.b64decode(WASM_SHARED_MEMORY))
+        with self.assertRaisesRegex(RuntimeError, "shared memory"):
+            provider.decide(view, ("catalog.search",))
 
     def test_wit_world_declares_no_host_imports(self):
         # Invariant tripwire: a Portmark component is a pure decision function.

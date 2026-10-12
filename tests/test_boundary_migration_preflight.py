@@ -38,7 +38,8 @@ class StubPreflight:
     """Stands in for the deployment's preflight command. Knobs forge each dimension the source checks."""
 
     def __init__(self, authority, store, *, measurement=MEASUREMENT, subject=None, audience=None, nonce=None,
-                 expires_in=60, fail=False, raw=None):
+                 expires_in=60, fail=False, raw=None, on_attest=None):
+        self.on_attest = on_attest
         self.authority = authority
         self.store = store
         self.measurement, self.subject, self.audience, self.nonce = measurement, subject, audience, nonce
@@ -51,6 +52,8 @@ class StubPreflight:
             "destination": destination, "relying_party": relying_party, "challenge": challenge,
             "pending_at_call": len(self.store.list_pending_migrations()),
         })
+        if self.on_attest is not None:
+            self.on_attest()
         if self.fail:
             raise SecurityError("migration preflight command failed")
         if self.raw is not None:
@@ -142,6 +145,28 @@ class MigrationPreflightTests(unittest.TestCase):
                 self.assertEqual(checkpoint["status"], "failed")
                 self.assertIn("decision.refused", self.events(task_id))
                 self.assertNotIn("agent.migrating", self.events(task_id))
+
+    def test_a_reload_that_closes_migration_during_the_preflight_releases_nothing(self):
+        # U1: the preflight reaches the destination, a window as long as a provider call. With
+        # reload_policy on, a policy that closes migration while it runs must stop the release.
+        import copy
+
+        source, _ = self.pair()
+        admitted = source.policy
+        closed = copy.copy(admitted)
+        closed.migration = MigrationPolicy()
+        closed.policy_version, closed.policy_hash = "closed", "hash-closed"
+        current = [admitted]
+        source._policy_loader = lambda: current[0]
+        source._reload_policy = True
+        self.preflight.on_attest = lambda: current.__setitem__(0, closed)
+        envelope = self.envelope(source)
+        with self.assertRaisesRegex(SecurityError, "host policy does not allow migration"):
+            source.run(envelope)
+        self.assertEqual(len(self.preflight.calls), 1)
+        self.assertEqual(source.store.list_pending_migrations(), [])
+        self.assertEqual(self.source_store.load_checkpoint(envelope.state.task_id)["status"], "failed")
+        self.assertNotIn("agent.migrating", self.events(envelope.state.task_id))
 
     def test_each_migration_gets_a_fresh_challenge(self):
         source, _ = self.pair()

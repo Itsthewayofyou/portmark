@@ -6,6 +6,39 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 ### Security
 
+- **A policy reload now narrows runs already in flight (U1).** With `--reload-policy`, the policy was
+  reloaded once when a run started, and every later step of that run kept it. A reload that removed a
+  tool, tightened a constraint, required approval or closed a migration route did not reach a run that was
+  waiting on its provider. Found by an independent Codex review and reproduced: a tool removed mid-run
+  still ran. The host now reloads twice in each step: before the provider's view is built, and after the
+  provider answers but before the host acts.
+  - A mid-run change can only narrow the run: grants, output projections and budget intersect (a step
+    budget below the current step stops the run), the expiry takes the earlier, a tool needs approval if
+    either policy requires it, and a migration must pass both.
+  - Approver trust and the policy hash an approval binds to come from the current policy.
+  - A reload is honored at the next check. It is not synchronized with the checks, so one that lands in
+    the gap after a check does not stop what that check already cleared. The gap includes the host's own
+    store writes before a tool launches (approval redemption, the effect ledger), which can wait on a lock.
+  - A reload that shrinks the output budget below the current checkpoint fails the task, which closes
+    under the last budget that admitted it (it never stays open at `running`).
+  - The narrowing lasts for one `run()` call. A paused task resumed later is admitted under the policy
+    current then, as before.
+  - The change is recorded as a new `policy.reloaded` audit event (version and hash).
+  - A migration also re-checks after its preflight (which reaches the destination), before anything
+    is sealed or released.
+  - A reload that fails mid-run ends the task as failed, the same as any other refused step. Replace the
+    policy file atomically (write a temporary file, then rename it): a half-written file now fails every
+    run in flight, not only new ones.
+  - Without `--reload-policy` nothing changes.
+- **The default Node Wasm runner no longer gives a capsule a host clock (U6).** The runner refused
+  modules with imports, but Node enables Wasm threads by default. A module could define a shared memory
+  with no import, then call `memory.atomic.wait` with a timeout: the guest could sleep and time itself
+  against the host. That contradicted the documented "no ambient clock". Found by an independent Codex
+  probe and reproduced (a 300 ms wait ran to its timeout). The runner now refuses any module that defines
+  a shared memory, before it is instantiated. The native Wasmtime engine already disabled threads and
+  shared memory, so it is unchanged.
+  - **Behavior change:** a Node capsule that declares a shared memory now fails with "components with
+    shared memory are forbidden". The Portmark WIT world never needed one.
 - **A migrated task can no longer be resumed with more authority than it arrived with (U7).** A resume
   recomputed authority from the permit it carried, and the checkpoint owner check binds only the issuer
   and subject. So the source host could re-sign a resume permit for a suspended migrated task with wider

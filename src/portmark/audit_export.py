@@ -62,6 +62,7 @@ BUILTIN_EVENT_FIELDS: dict[str, tuple[str, ...]] = {
     "agent.migrating": ("destination",),
     "provider.proposed": ("kind", "tool"),
     "provider.failed": ("error",),
+    "policy.reloaded": ("policy_version", "policy_hash"),
     "tool.executed": ("tool",),
     "tool.replayed": ("tool", "effect_id"),
     "tool.failed": ("tool", "effect_status", "isolation_profile"),

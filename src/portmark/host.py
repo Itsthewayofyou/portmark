@@ -12,7 +12,7 @@ from typing import Any
 from . import _run_progress
 from ._clock import trusted_now
 from .metrics import RuntimeMetrics
-from .models import AgentEnvelope, AgentManifest, ApprovalToken, AttestationEvidence, Permit, ProviderDecision, ResourceBudget, RunResult, ToolGrant
+from .models import AgentEnvelope, AgentManifest, AgentState, ApprovalToken, AttestationEvidence, Permit, ProviderDecision, ResourceBudget, RunResult, ToolGrant
 from .projection import project_state_for_migration, provider_view
 from .providers import ModelProvider
 from .security import _MIGRATION_RECEIPT_FIELDS, _OPTIONAL_MIGRATION_RECEIPT_FIELDS, AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, MigrationAttesterProtocol, MigrationPreflightProtocol, PermitExpiredError, SecurityError, arguments_hash, audit_head_payload, canonical_json, detached_json, effect_id, intersect_grants, migration_envelope_digest, migration_receipt_payload, require_unexpired, verified_approval_token
@@ -126,6 +126,39 @@ def _cap_to_ceiling(effective: Permit, ceiling_json: str, manifest: AgentManifes
         grants=intersect_grants(effective.grants, ceiling_grants),
         budget=effective.budget.intersect(ResourceBudget(**ceiling["budget"])),
         expires_at=min(effective.expires_at, int(ceiling["expires_at"])),
+    )
+
+
+class _ReloadedPolicy:
+    """U1: the policy a run checks against after a policy reload lands while it is in flight.
+
+    It is the fresh policy (its approvers, hash and version), but never looser than the policy the run
+    already ran under: a tool needs approval if either one requires it, and a migration must pass both.
+    The run's grants, budget and expiry are narrowed separately, by intersection, in _narrow_permit.
+    """
+
+    def __init__(self, previous: "HostPolicy | _ReloadedPolicy", fresh: HostPolicy) -> None:
+        self._previous = previous
+        self._fresh = fresh
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._fresh, name)
+
+    def requires_approval(self, tool: str) -> bool:
+        return self._previous.requires_approval(tool) or self._fresh.requires_approval(tool)
+
+    def authorize_migration(self, permit: Permit, destination: str) -> None:
+        self._previous.authorize_migration(permit, destination)
+        self._fresh.authorize_migration(permit, destination)
+
+
+def _narrow_permit(effective: Permit, fresh: Permit) -> Permit:
+    """U1: what both the run's current authority and a reloaded policy allow. Can only narrow."""
+    return replace(
+        effective,
+        grants=intersect_grants(effective.grants, fresh.grants),
+        budget=effective.budget.intersect(fresh.budget),
+        expires_at=min(effective.expires_at, fresh.expires_at),
     )
 
 
@@ -663,8 +696,6 @@ class AgentHost:
                 receipt_binding["destination_attestation"] = self._produce_challenge_evidence(envelope)
         audit.append("agent.accepted", accepted_details)
         persisted_events = self._persist(envelope, effective, state, audit, 0, consume_nonce=consume_nonce, receipt_binding=receipt_binding)
-        tool_names = tuple(grant.name for grant in effective.grants)
-
         while state.step < effective.budget.max_steps:
             decision_started = time.monotonic()
             # Section 12 #1: atomically refuse (abandoned run) or record the provider call as in flight.
@@ -678,6 +709,10 @@ class AgentHost:
                 # Build the view INSIDE the failure boundary too (defense in depth): even
                 # though admission now rejects a malformed messages list, any exception while
                 # constructing the view must terminalize the task, never strand it as running.
+                # U1: re-check the policy BEFORE the provider sees anything too, so an output
+                # projection or grant a reload removed is not disclosed in this step's view.
+                active_policy, effective = self._recheck_reloaded_policy(envelope, active_policy, effective, state, audit)
+                tool_names = tuple(grant.name for grant in effective.grants)
                 view = provider_view(state, effective.grants)
                 try:
                     decision = provider.decide(view, tool_names)
@@ -709,6 +744,7 @@ class AgentHost:
                 # `running`, the very class PM-004 closes. Round 2: check the SHAPE before reading
                 # it anywhere, so a malformed field cannot escape by a later side door instead.
                 decision = _require_wellformed_decision(decision)
+                active_policy, effective = self._recheck_reloaded_policy(envelope, active_policy, effective, state, audit)
                 audit.append("provider.proposed", {"kind": decision.kind, "tool": decision.tool})
                 finished, migration = self._apply_decision(decision, state, effective, audit, envelope, active_policy, admission_generation)
             except Exception as error:
@@ -1032,6 +1068,10 @@ class AgentHost:
                     preflight_evidence, challenge, decision.destination, self.host_id
                 )
                 preflight_measurement = preflight_evidence.get("measurement")
+                # U1: the preflight reaches the destination, so it is a long window like the provider
+                # call. Re-check a reloaded policy before anything is sealed or released.
+                active_policy, effective = self._recheck_reloaded_policy(envelope, active_policy, effective, state, audit)
+                active_policy.authorize_migration(envelope.permit, decision.destination)
             state.status = "ready"
             state.memory["migration"] = {"from": self.host_id, "to": decision.destination}
             if destination_attestation is not None:
@@ -1111,6 +1151,30 @@ class AgentHost:
         state.result = decision.content or {"error": "provider failed"}
         audit.append("agent.failed", {"result": state.result})
         return True, None
+
+    def _recheck_reloaded_policy(self, envelope, active_policy, effective: Permit, state: AgentState, audit: AuditLog):
+        """U1: with reload_policy on, reload twice per step: before the provider view is built (so nothing
+        a reload removed is disclosed), and after the provider answers, before the host acts (the provider
+        call is the long window where a reload lands). Without this the run kept the authority it was
+        admitted with. The result can only narrow the run. Both calls sit inside a failure boundary, so a
+        loader that raises or a policy for another audience ends the task as failed."""
+        if self._policy_loader is None or not self._reload_policy:
+            return active_policy, effective
+        fresh = self._active_policy()
+        if (fresh.policy_version, fresh.policy_hash) == (active_policy.policy_version, active_policy.policy_hash):
+            return active_policy, effective
+        narrowed = _narrow_permit(effective, fresh.effective_permit(envelope.manifest, envelope.permit))
+        audit.append("policy.reloaded", {"policy_version": fresh.policy_version, "policy_hash": fresh.policy_hash})
+        # The loop tests the step budget only at the top; a reload can shrink it below the current step.
+        if state.step >= narrowed.budget.max_steps:
+            raise SecurityError("step budget exhausted by a policy reload")
+        # The terminalizer's guarantee rests on the CURRENT ceiling having admitted the checkpoint. A
+        # reload can shrink it below the checkpoint as it stands, so refuse here, before adopting it:
+        # the failure path then closes the task under the last ceiling that did admit it, instead of
+        # every close attempt failing and leaving the task open at `running`.
+        if not self._checkpoint_fits(narrowed, state):
+            raise SecurityError("checkpoint exceeds the output budget of a reloaded policy")
+        return _ReloadedPolicy(active_policy, fresh), narrowed
 
     def _active_policy(self) -> HostPolicy:
         if self._policy_loader is not None and self._reload_policy:

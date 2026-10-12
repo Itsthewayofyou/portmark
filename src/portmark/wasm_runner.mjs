@@ -33,6 +33,51 @@ function readReturnedString(memory, encodedPointerLength) {
   return textDecoder.decode(view.subarray(pointer, pointer + length));
 }
 
+function readUnsigned(bytes, cursor) {
+  let value = 0;
+  for (let shift = 0; shift < 70; shift += 7) {
+    if (cursor.offset >= bytes.length) {
+      throw new Error("truncated Wasm module");
+    }
+    const byte = bytes[cursor.offset++];
+    value += (byte & 0x7f) * 2 ** shift;
+    if ((byte & 0x80) === 0) {
+      return value;
+    }
+  }
+  throw new Error("malformed Wasm LEB128");
+}
+
+// A shared memory makes memory.atomic.wait legal, and its timeout is a host clock the guest can read
+// without any import. Node enables threads by default, so refuse every defined shared memory here
+// (imported memories are already refused with the other imports). Runs after WebAssembly.Module has
+// validated the binary.
+function rejectSharedMemory(bytes) {
+  const cursor = { offset: 8 };
+  while (cursor.offset < bytes.length) {
+    const id = bytes[cursor.offset++];
+    const size = readUnsigned(bytes, cursor);
+    const end = cursor.offset + size;
+    if (end > bytes.length) {
+      throw new Error("truncated Wasm module");
+    }
+    if (id === 5) {
+      const count = readUnsigned(bytes, cursor);
+      for (let index = 0; index < count; index++) {
+        const flags = readUnsigned(bytes, cursor);
+        if (flags & 0x02) {
+          throw new Error("components with shared memory are forbidden");
+        }
+        readUnsigned(bytes, cursor);
+        if (flags & 0x01) {
+          readUnsigned(bytes, cursor);
+        }
+      }
+    }
+    cursor.offset = end;
+  }
+}
+
 try {
   const bytes = Buffer.from(encoded, "base64");
   const module = new WebAssembly.Module(bytes);
@@ -40,6 +85,7 @@ try {
   if (imports.length !== 0) {
     throw new Error("components with ambient imports are forbidden");
   }
+  rejectSharedMemory(bytes);
   const instance = new WebAssembly.Instance(module, {});
   if (!(instance.exports.memory instanceof WebAssembly.Memory)) {
     throw new Error("component must export memory");

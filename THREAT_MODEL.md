@@ -362,6 +362,9 @@ The `portmark` WIT world (`wit/portmark.wit`) exports one function, `resume`,
 and imports nothing. The native runner instantiates the component against an
 empty `wasmtime.component.Linker` (`src/portmark/wasmtime_component_runner.py`),
 so a component cannot open a socket, touch the filesystem, or read host memory.
+The native engine also disables threads and shared memory. The default Node runner
+cannot turn threads off, so it refuses any module that defines a shared memory: that
+memory would let `memory.atomic.wait` time out against the host clock with no import.
 Its only channel to the outside world is *returning* a `tool-request`, which the
 host then scopes through permit ∩ policy tool grants and `check_constraints`
 (`allowed_*`, `max_*`, argument schema) in `src/portmark/security.py`.
