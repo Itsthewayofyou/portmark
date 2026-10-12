@@ -23,7 +23,11 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
   - The narrowing lasts for one `run()` call. A paused task resumed later is admitted under the policy
     current then, as before.
   - The change is recorded as a new `policy.reloaded` audit event (version and hash).
-  - A reload that fails mid-run ends the task as failed, the same as any other refused step.
+  - A migration also re-checks after its preflight (which reaches the destination), before anything
+    is sealed or released.
+  - A reload that fails mid-run ends the task as failed, the same as any other refused step. Replace the
+    policy file atomically (write a temporary file, then rename it): a half-written file now fails every
+    run in flight, not only new ones.
   - Without `--reload-policy` nothing changes.
 - **The default Node Wasm runner no longer gives a capsule a host clock (U6).** The runner refused
   modules with imports, but Node enables Wasm threads by default. A module could define a shared memory

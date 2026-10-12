@@ -1068,6 +1068,10 @@ class AgentHost:
                     preflight_evidence, challenge, decision.destination, self.host_id
                 )
                 preflight_measurement = preflight_evidence.get("measurement")
+                # U1: the preflight reaches the destination, so it is a long window like the provider
+                # call. Re-check a reloaded policy before anything is sealed or released.
+                active_policy, effective = self._recheck_reloaded_policy(envelope, active_policy, effective, state, audit)
+                active_policy.authorize_migration(envelope.permit, decision.destination)
             state.status = "ready"
             state.memory["migration"] = {"from": self.host_id, "to": decision.destination}
             if destination_attestation is not None:
