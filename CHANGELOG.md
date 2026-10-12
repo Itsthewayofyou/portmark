@@ -10,9 +10,14 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
   reloaded once when a run started, and every later step of that run kept it. A reload that removed a
   tool, tightened a constraint, required approval or closed a migration route did not reach a run that was
   waiting on its provider. Found by an independent Codex review and reproduced: a tool removed mid-run
-  still ran. The host now reloads before each step, after the provider answers and before it acts.
-  - A mid-run change can only narrow the run: grants and budget intersect, the expiry takes the earlier,
-    a tool needs approval if either policy requires it, and a migration must pass both.
+  still ran. The host now reloads twice in each step: before the provider's view is built, and after the
+  provider answers but before the host acts.
+  - A mid-run change can only narrow the run: grants, output projections and budget intersect (a step
+    budget below the current step stops the run), the expiry takes the earlier, a tool needs approval if
+    either policy requires it, and a migration must pass both.
+  - Approver trust and the policy hash an approval binds to come from the current policy.
+  - The narrowing lasts for one `run()` call. A paused task resumed later is admitted under the policy
+    current then, as before.
   - The change is recorded as a new `policy.reloaded` audit event (version and hash).
   - A reload that fails mid-run ends the task as failed, the same as any other refused step.
   - Without `--reload-policy` nothing changes.

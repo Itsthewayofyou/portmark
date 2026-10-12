@@ -50,6 +50,24 @@ class MigrateAfterHook(ModelProvider):
         return ProviderDecision("migrate", destination="host:peer")
 
 
+class TwoSearches(ModelProvider):
+    """Searches, then (after `hook`) records what it can see of the first result and searches again."""
+
+    def __init__(self, hook):
+        self.hook = hook
+        self.decisions = 0
+        self.seen = None
+
+    def decide(self, view, available_tools, grants=()):
+        self.decisions += 1
+        if self.decisions == 1:
+            return ProviderDecision("tool", "catalog.search", {"query": "widgets", "limit": 1})
+        if self.decisions == 2:
+            self.seen = view.tool_results.get("catalog.search")
+            return ProviderDecision("tool", "catalog.search", {"query": "gadgets", "limit": 1})
+        return ProviderDecision("complete", content={"done": True})
+
+
 class PolicyReloadMidRunTests(unittest.TestCase):
     def _run(self, swap_to=None, admitted=None, limit=2, reload_policy=True, migrate=False):
         """Returns (RunResult or the raised error, stored checkpoint status, tools actually launched)."""
@@ -143,6 +161,50 @@ class PolicyReloadMidRunTests(unittest.TestCase):
         error, status, launched = self._run(swap_to=broken)
         self.assertIsInstance(error, ValueError)
         self.assertEqual((status, launched), ("failed", []))
+
+    def _two_searches(self, after_first_tool):
+        """Swap the policy right after the first tool runs, so it lands BEFORE the second view is built."""
+        current = [_policy("v1", (_search(5), RESERVE))]
+        host = make_host(attestation_policy=None, allow_ephemeral_signing_key=True)
+        host._policy_loader = lambda: current[0]
+        host._reload_policy = True
+        provider = TwoSearches(lambda: None)
+        host.providers["reloader"] = provider
+        envelope = make_demo_envelope(host, "search", "reloader")
+        launched = []
+        invoke = host.tools.invoke
+
+        def recording_invoke(permit, name, *args, **kwargs):
+            output = invoke(permit, name, *args, **kwargs)
+            launched.append(name)
+            if len(launched) == 1 and after_first_tool is not None:
+                current[0] = after_first_tool
+            return output
+
+        with patch.object(host.tools, "invoke", recording_invoke):
+            try:
+                host.run(envelope)
+            except SecurityError:
+                pass
+        return provider, host.store.load_checkpoint(envelope.state.task_id)["status"], launched
+
+    def test_projection_narrowed_by_a_reload_applies_before_the_provider_sees_the_view(self):
+        control, _, _ = self._two_searches(None)
+        self.assertIn("title", control.seen[0])
+        id_only = ToolGrant("catalog.search", {"max_limit": 5, "arguments": {"query": {"type": "string"}}}, ("id",))
+        provider, _, _ = self._two_searches(_policy("v2", (id_only, RESERVE)))
+        self.assertNotIn("title", provider.seen[0])
+        self.assertIn("id", provider.seen[0])
+
+    def test_step_budget_shrunk_below_the_current_step_stops_the_next_action(self):
+        _, status, launched = self._two_searches(None)
+        self.assertEqual((status, launched), ("completed", ["catalog.search", "catalog.search"]))
+        one_step = HostPolicy(
+            "host:local-demo", (_search(5), RESERVE), ResourceBudget(max_steps=1, max_tool_calls=5, max_output_bytes=65_536),
+            "v2", "hash-v2", {"catalog.search": "low", "payments.reserve": "external-payment"},
+        )
+        _, status, launched = self._two_searches(one_step)
+        self.assertEqual((status, launched), ("failed", ["catalog.search"]))
 
     def test_reload_off_is_unchanged(self):
         result, status, launched = self._run(swap_to=_policy("v2", (RESERVE,)), reload_policy=False)
