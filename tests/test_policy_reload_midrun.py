@@ -206,6 +206,15 @@ class PolicyReloadMidRunTests(unittest.TestCase):
         _, status, launched = self._two_searches(one_step)
         self.assertEqual((status, launched), ("failed", ["catalog.search"]))
 
+    def test_output_budget_shrunk_below_the_checkpoint_closes_the_task(self):
+        tiny = HostPolicy(
+            "host:local-demo", (_search(5), RESERVE), ResourceBudget(max_steps=10, max_tool_calls=5, max_output_bytes=16),
+            "v2", "hash-v2", {"catalog.search": "low", "payments.reserve": "external-payment"},
+        )
+        error, status, launched = self._run(swap_to=tiny)
+        self.assertIsInstance(error, SecurityError)
+        self.assertEqual((status, launched), ("failed", []))
+
     def test_reload_off_is_unchanged(self):
         result, status, launched = self._run(swap_to=_policy("v2", (RESERVE,)), reload_policy=False)
         self.assertEqual((status, launched), ("completed", ["catalog.search"]))

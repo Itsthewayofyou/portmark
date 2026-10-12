@@ -1164,6 +1164,12 @@ class AgentHost:
         # The loop tests the step budget only at the top; a reload can shrink it below the current step.
         if state.step >= narrowed.budget.max_steps:
             raise SecurityError("step budget exhausted by a policy reload")
+        # The terminalizer's guarantee rests on the CURRENT ceiling having admitted the checkpoint. A
+        # reload can shrink it below the checkpoint as it stands, so refuse here, before adopting it:
+        # the failure path then closes the task under the last ceiling that did admit it, instead of
+        # every close attempt failing and leaving the task open at `running`.
+        if not self._checkpoint_fits(narrowed, state):
+            raise SecurityError("checkpoint exceeds the output budget of a reloaded policy")
         return _ReloadedPolicy(active_policy, fresh), narrowed
 
     def _active_policy(self) -> HostPolicy:
