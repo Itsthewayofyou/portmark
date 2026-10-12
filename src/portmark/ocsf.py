@@ -84,6 +84,7 @@ EVENT_STATUS: dict[str, int] = {
     "agent.failed": STATUS_FAILURE,
     "provider.proposed": STATUS_SUCCESS,
     "provider.failed": STATUS_FAILURE,
+    "policy.reloaded": STATUS_UNKNOWN,
     "tool.executed": STATUS_SUCCESS,
     "tool.replayed": STATUS_SUCCESS,
     "tool.failed": STATUS_FAILURE,

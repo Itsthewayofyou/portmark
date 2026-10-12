@@ -129,6 +129,39 @@ def _cap_to_ceiling(effective: Permit, ceiling_json: str, manifest: AgentManifes
     )
 
 
+class _ReloadedPolicy:
+    """U1: the policy a run checks against after a policy reload lands while it is in flight.
+
+    It is the fresh policy (its approvers, hash and version), but never looser than the policy the run
+    already ran under: a tool needs approval if either one requires it, and a migration must pass both.
+    The run's grants, budget and expiry are narrowed separately, by intersection, in _narrow_permit.
+    """
+
+    def __init__(self, previous: "HostPolicy | _ReloadedPolicy", fresh: HostPolicy) -> None:
+        self._previous = previous
+        self._fresh = fresh
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._fresh, name)
+
+    def requires_approval(self, tool: str) -> bool:
+        return self._previous.requires_approval(tool) or self._fresh.requires_approval(tool)
+
+    def authorize_migration(self, permit: Permit, destination: str) -> None:
+        self._previous.authorize_migration(permit, destination)
+        self._fresh.authorize_migration(permit, destination)
+
+
+def _narrow_permit(effective: Permit, fresh: Permit) -> Permit:
+    """U1: what both the run's current authority and a reloaded policy allow. Can only narrow."""
+    return replace(
+        effective,
+        grants=intersect_grants(effective.grants, fresh.grants),
+        budget=effective.budget.intersect(fresh.budget),
+        expires_at=min(effective.expires_at, fresh.expires_at),
+    )
+
+
 def _require_wellformed_decision(decision: Any) -> ProviderDecision:
     """A provider decision is UNTRUSTED input, so check its shape once, up front (auditor round 2).
 
@@ -663,9 +696,9 @@ class AgentHost:
                 receipt_binding["destination_attestation"] = self._produce_challenge_evidence(envelope)
         audit.append("agent.accepted", accepted_details)
         persisted_events = self._persist(envelope, effective, state, audit, 0, consume_nonce=consume_nonce, receipt_binding=receipt_binding)
-        tool_names = tuple(grant.name for grant in effective.grants)
-
         while state.step < effective.budget.max_steps:
+            # U1: recomputed every step, because a mid-run policy reload can narrow the grants.
+            tool_names = tuple(grant.name for grant in effective.grants)
             decision_started = time.monotonic()
             # Section 12 #1: atomically refuse (abandoned run) or record the provider call as in flight.
             _run_progress.begin("deciding")
@@ -709,6 +742,7 @@ class AgentHost:
                 # `running`, the very class PM-004 closes. Round 2: check the SHAPE before reading
                 # it anywhere, so a malformed field cannot escape by a later side door instead.
                 decision = _require_wellformed_decision(decision)
+                active_policy, effective = self._recheck_reloaded_policy(envelope, active_policy, effective, audit)
                 audit.append("provider.proposed", {"kind": decision.kind, "tool": decision.tool})
                 finished, migration = self._apply_decision(decision, state, effective, audit, envelope, active_policy, admission_generation)
             except Exception as error:
@@ -1111,6 +1145,21 @@ class AgentHost:
         state.result = decision.content or {"error": "provider failed"}
         audit.append("agent.failed", {"result": state.result})
         return True, None
+
+    def _recheck_reloaded_policy(self, envelope, active_policy, effective: Permit, audit: AuditLog):
+        """U1: with reload_policy on, reload once per step, after the provider answers and before the host
+        acts. The provider call is the long window in a run, so this is where a reload that narrowed the
+        host policy can land; without it the run kept the authority it was admitted with. The result can
+        only narrow the run. Runs inside the decision failure boundary, so a loader that raises or a
+        policy for another audience ends the task as failed."""
+        if self._policy_loader is None or not self._reload_policy:
+            return active_policy, effective
+        fresh = self._active_policy()
+        if (fresh.policy_version, fresh.policy_hash) == (active_policy.policy_version, active_policy.policy_hash):
+            return active_policy, effective
+        narrowed = _narrow_permit(effective, fresh.effective_permit(envelope.manifest, envelope.permit))
+        audit.append("policy.reloaded", {"policy_version": fresh.policy_version, "policy_hash": fresh.policy_hash})
+        return _ReloadedPolicy(active_policy, fresh), narrowed
 
     def _active_policy(self) -> HostPolicy:
         if self._policy_loader is not None and self._reload_policy:

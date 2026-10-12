@@ -106,7 +106,7 @@ python -m portmark.cli --policy-path host-policy.json demo "research mobile agen
 
 Or set `PORTMARK_POLICY_PATH`.
 
-By default the policy is loaded at startup and changes require restart. Pass `--reload-policy` to reload the file before each run. Approval tokens are bound to the policy hash, so a token issued for an older policy is rejected after reload.
+By default the policy is loaded at startup and changes require restart. Pass `--reload-policy` to reload the file before each run, and again before each step of a run in flight, after the provider answers and before the host acts on it. A change that lands mid-run can only narrow that run: its grants and budget become what both policies allow, its expiry takes the earlier, a tool needs approval if either policy requires it, and a migration must pass both. The change is recorded as a `policy.reloaded` audit event, and a reload that fails ends the task as failed. Approval tokens are bound to the policy hash, so a token issued for an older policy is rejected after reload.
 
 ## Approval Tokens
 

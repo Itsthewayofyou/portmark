@@ -6,6 +6,16 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 ### Security
 
+- **A policy reload now narrows runs already in flight (U1).** With `--reload-policy`, the policy was
+  reloaded once when a run started, and every later step of that run kept it. A reload that removed a
+  tool, tightened a constraint, required approval or closed a migration route did not reach a run that was
+  waiting on its provider. Found by an independent Codex review and reproduced: a tool removed mid-run
+  still ran. The host now reloads before each step, after the provider answers and before it acts.
+  - A mid-run change can only narrow the run: grants and budget intersect, the expiry takes the earlier,
+    a tool needs approval if either policy requires it, and a migration must pass both.
+  - The change is recorded as a new `policy.reloaded` audit event (version and hash).
+  - A reload that fails mid-run ends the task as failed, the same as any other refused step.
+  - Without `--reload-policy` nothing changes.
 - **The default Node Wasm runner no longer gives a capsule a host clock (U6).** The runner refused
   modules with imports, but Node enables Wasm threads by default. A module could define a shared memory
   with no import, then call `memory.atomic.wait` with a timeout: the guest could sleep and time itself
