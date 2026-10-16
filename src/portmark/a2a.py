@@ -51,6 +51,9 @@ DEFAULT_MAX_CONCURRENT_REQUESTS = 32
 # including the arriving one, so a limit equal to the run cap refused the last run slot and answered
 # /healthz with 503 whenever the runs filled up. The uvicorn limit sits this far above the run cap; the
 # app's own semaphore (NetworkGuard) stays the run limit.
+# debt: ~16 idle or slow-header connections still fill the headroom and starve health again; upgrade
+# (separate health listener, or a header-read timeout) when the backend is reachable without the proxy's
+# header timeouts, or when health 503s show up under load.
 A2A_CONNECTION_HEADROOM = 16
 DEFAULT_RATE_LIMIT_PER_IP = 120
 DEFAULT_RATE_LIMIT_WINDOW_SECONDS = 60
@@ -872,7 +875,8 @@ def make_asgi_app(host: AgentHost, auth: A2AAuthConfig | None = None, enable_hst
                 response = await loop.run_in_executor(None, lambda: router.handle_get(*get_args))
             else:
                 # healthz, agent card, metrics are cheap and must NOT queue behind
-                # agent work, so they stay on the loop and off the run threads.
+                # agent work, so they stay on the loop and off the run threads. They still
+                # need a free uvicorn connection: see A2A_CONNECTION_HEADROOM.
                 response = router.handle_get(*get_args)
             await _send(send, response)
             return

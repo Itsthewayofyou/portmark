@@ -107,8 +107,12 @@ misbehaves in production:
   as the outer bound. Leave it unset to key strictly on the direct peer.
 
 `POST /message:send` runs the agent (`host.run()`) off the event loop in a
-bounded worker pool, so a slow provider, database call, or agent run cannot block
-health probes or other requests. `GET /readyz` performs a bounded liveness probe
+bounded worker pool, so a slow provider, database call, or agent run does not
+block the event loop. Health probes also need a free connection: uvicorn's
+connection limit sits 16 above the run cap, so they still answer when every run
+slot is busy. That headroom is the limit: about 16 idle or slow-header
+connections can still fill it, so keep the proxy's header timeouts in front of
+the backend. `GET /readyz` performs a bounded liveness probe
 (a cheap query plus a schema-version check with a short database timeout) off the
 event loop — it does not construct the store or run schema migrations.
 
