@@ -162,6 +162,9 @@ def make_host(
     # other has stopped trusting, and would not fail closed together on an on-disk change.
     trust_source = TrustSource.from_path(configured_trust_registry_path) if configured_trust_registry_path else None
     policy_loader = (lambda: load_host_policy(configured_policy_path, host_id)) if configured_policy_path else None
+    if policy_loader is not None:
+        # Fix 3 (3A): wrap the loader, so the check runs on the boot load AND on every reload.
+        policy_loader = _implicit_impact_checked_loader(policy_loader, production)
     if production and policy_loader is not None:
         # Boundary audit ATT-01/ATT-02: wrap the loader, so the check runs on the boot load AND on every
         # reload (reload_policy). A reloaded policy that turns migration on without the attestation
@@ -292,6 +295,38 @@ def make_host(
     # Section 12 #6: a forward clock jump beyond the tolerance is also a metric, not only a CRITICAL log.
     clock.on_forward_jump(host.metrics.note_clock_forward_jump)
     return host
+
+
+def _implicit_impact_checked_loader(loader, production: bool):
+    """Fix 3 (3A): a policy tool with no `impact` used to run silently as "low" (no approval).
+
+    Production refuses such a policy, at boot and on a reload (a reload that raises ends the run as
+    failed). Development keeps it, at "low", and warns once per policy version: a reloading host calls
+    the loader twice per step. A side-effecting tool among them is treated as "high" (HostPolicy.impact_for).
+    """
+    warned: set[str] = set()
+
+    def load() -> HostPolicy:
+        loaded = loader()
+        names = list(loaded.implicit_impacts)
+        if not names:
+            return loaded
+        if production:
+            raise ValueError(
+                f"host policy tools {names} have no explicit impact, and the production profile refuses that: "
+                'set "impact" on each one (for example "low", or "external-payment" for a payment tool) '
+                f"so approval is a decision, not a default (set {PROFILE_ENV}={DEVELOPMENT_PROFILE} to run with a warning)"
+            )
+        if loaded.policy_hash not in warned:
+            warned.add(loaded.policy_hash)
+            logger.warning(
+                "host policy tools %s have no explicit impact: they run as \"low\" with NO approval, unless the "
+                "tool is side-effecting (then \"high\"). The production profile refuses this policy.",
+                names,
+            )
+        return loaded
+
+    return load
 
 
 def _production_policy_loader(loader, attestation_policy: AttestationPolicy | None, preflight: MigrationPreflightProtocol | None):

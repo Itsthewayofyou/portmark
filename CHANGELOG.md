@@ -6,6 +6,13 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 ### Security
 
+- **A policy tool with no `impact` no longer runs silently without approval.** `impact` defaulted to
+  `low`, so a payment tool whose policy entry omitted it ran with no approval and nothing said so. The
+  production profile now refuses such a policy at start-up and on every reload, naming the tools.
+  Development keeps the `low` default with one warning per policy version. In both profiles a
+  side-effecting tool with no explicit impact is treated as `high`, so it needs approval. **Migration:**
+  production policies must set `"impact"` on every tool entry. See POLICY.md.
+
 - **A policy reload now narrows runs already in flight (U1).** With `--reload-policy`, the policy was
   reloaded once when a run started, and every later step of that run kept it. A reload that removed a
   tool, tightened a constraint, required approval or closed a migration route did not reach a run that was

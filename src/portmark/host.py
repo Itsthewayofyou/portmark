@@ -147,6 +147,11 @@ class _ReloadedPolicy:
     def requires_approval(self, tool: str) -> bool:
         return self._previous.requires_approval(tool) or self._fresh.requires_approval(tool)
 
+    def requires_approval_for(self, tool: str, *, side_effecting: bool) -> bool:
+        return self._previous.requires_approval_for(tool, side_effecting=side_effecting) or self._fresh.requires_approval_for(
+            tool, side_effecting=side_effecting
+        )
+
     def authorize_migration(self, permit: Permit, destination: str) -> None:
         self._previous.authorize_migration(permit, destination)
         self._fresh.authorize_migration(permit, destination)
@@ -864,7 +869,7 @@ class AgentHost:
             # reconciliation pass (Section 7, tool boundary), not available here. So cancellation of an
             # already-redeemed approval is best-effort-before-launch, not a guarantee that the effect is
             # prevented. Fires only for approval-gated tools; the approval is already consumed.
-            if active_policy.requires_approval(decision.tool) and self.store.is_task_cancelled(state.task_id):
+            if self._requires_approval(active_policy, decision.tool) and self.store.is_task_cancelled(state.task_id):
                 return self._approval_failure(state, audit, "approval.denied", "cancelled")
             # Section 7 PR 2: a side-effecting tool runs under the durable effect ledger. The host
             # derives an idempotency key (effect_id) from the DURABLE admission generation and a
@@ -1184,8 +1189,13 @@ class AgentHost:
             self.policy = loaded
         return self.policy
 
+    def _requires_approval(self, policy: "HostPolicy | _ReloadedPolicy", tool: str) -> bool:
+        """The ONE approval decision, for the gate and for the pre-launch cancel re-check alike: the
+        policy's impact plus the registry's side-effecting flag (Fix 3, 3B)."""
+        return policy.requires_approval_for(tool, side_effecting=self.tools.is_side_effecting(tool))
+
     def _approval_gate(self, policy: HostPolicy, permit, state, decision: ProviderDecision, audit: AuditLog, admission_generation: int) -> tuple[bool, None] | None:
-        if decision.tool is None or not policy.requires_approval(decision.tool):
+        if decision.tool is None or not self._requires_approval(policy, decision.tool):
             return None
         # Section 5 #4: the token is loaded from untrusted mutable memory. Any malformation
         # (missing/extra keys, wrong types) is turned into a controlled approval.denied here,
@@ -1199,7 +1209,7 @@ class AgentHost:
             state.result = {
                 "approval_required": True,
                 "tool": decision.tool,
-                "impact": policy.impact_for_tool(decision.tool),
+                "impact": policy.impact_for(decision.tool, side_effecting=self.tools.is_side_effecting(decision.tool)),
                 "arguments_hash": arguments_hash(decision.arguments),
                 "policy_version": policy.policy_version,
                 "policy_hash": policy.policy_hash,
