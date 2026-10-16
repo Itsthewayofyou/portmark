@@ -10,7 +10,8 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
   `low`, so a payment tool whose policy entry omitted it ran with no approval and nothing said so. The
   production profile now refuses such a policy at start-up and on every reload, naming the tools.
   Development keeps the `low` default with one warning per policy version. In both profiles a
-  side-effecting tool with no explicit impact is treated as `high`, so it needs approval. **Migration:**
+  side-effecting tool with no explicit impact is treated as `high`, which needs approval under the
+  default `approval_required_impacts`. **Migration:**
   production policies must set `"impact"` on every tool entry. See POLICY.md.
 
 - **A policy reload now narrows runs already in flight (U1).** With `--reload-policy`, the policy was

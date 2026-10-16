@@ -109,7 +109,12 @@ class ProductionRefusesImplicitImpactTests(_PolicyFile):
         # Control: the same production app builds once the impact is explicit.
         self.write("low")
         with portmark_env(**PUBLIC, PORTMARK_POLICY_PATH=str(self.policy_path)):
-            self.assertTrue(callable(create_app()))
+            app = create_app()
+            self.assertTrue(callable(app))
+            # Readiness re-reads the policy file: an edit that drops the impact is not "ready".
+            self.write(None, version="t2")
+            with self.assertRaisesRegex(ValueError, "catalog.search.*no explicit impact"):
+                app.a2a_router.readiness_check()
 
     def test_a_production_reload_that_drops_impact_refuses_the_next_admission(self):
         self.write("low")
@@ -183,6 +188,52 @@ class SideEffectingDefaultTests(unittest.TestCase):
     def test_control_explicit_low_is_the_operators_choice_and_needs_none(self):
         result = self.run_write("low")
         self.assertNotIn("approval.requested", _events(result))
+
+    def test_the_pre_launch_cancel_recheck_uses_the_same_decision(self):
+        # test_runtime's test_cancel_after_consume_is_caught_before_tool_launch, with the payment tool
+        # side-effecting and given NO impact. The gate asks for approval (3B); the pre-launch cancel
+        # re-check must agree, or an approved, cancelled task would launch its effect.
+        from dataclasses import asdict
+
+        from authority_fixtures import ApprovalAuthority
+        from portmark.security import HostPolicy
+        from portmark.storage import InMemoryRuntimeStore
+        from test_runtime import PaymentProvider, RuntimeTests
+
+        class CancelBetween(InMemoryRuntimeStore):
+            def transaction(self):
+                txn = super().transaction()
+                txn.is_task_cancelled = lambda task_id: False  # cancel not yet committed at gate time
+                return txn
+
+        registry = ToolRegistry(isolation_profile=IsolationProfile(mechanism=IsolationMechanism.EXTERNAL_CONTAINER, acknowledged_by="test-suite"))
+        registry.register_isolated(
+            "payments.reserve", "isolated_tool_fixtures:echo", side_effecting=True,
+            reconcile="isolated_tool_fixtures:reconcile_charge",
+        )
+        store = CancelBetween()
+        authority = ApprovalAuthority.generate()
+        with portmark_env():
+            host = make_host(store=store, tools=registry, attestation_policy=None, allow_ephemeral_signing_key=True)
+        host.policy = HostPolicy(
+            "host:local-demo",
+            (ToolGrant("payments.reserve", {"max_amount": 100, "currency": "USD"}, ("reserved",)),),
+            ResourceBudget(), "policy-v1", "policy-hash", {"payments.reserve": "low"}, (authority.trusted_approver(),),
+            implicit_impacts=("payments.reserve",),
+        )
+        host.providers["payer"] = PaymentProvider()
+        helpers = RuntimeTests()
+        envelope, first = helpers._suspend_payment_envelope(host, "cancel between")
+        self.assertEqual(first.status, "awaiting_input")  # the gate: side-effecting, no impact -> approval
+        token = helpers._mint_payment_approval(authority, envelope, first.checkpoint["checkpoint_generation"])
+        envelope.state.memory["approvals"] = {"payments.reserve": asdict(token)}
+        host.signer.seal(envelope)
+        store.cancel_task(envelope.state.task_id)  # committed; the pre-launch read will observe it
+        result = host.run(envelope)
+        self.assertEqual(result.status, "failed")
+        denials = [record for record in result.audit if record["event"] == "approval.denied"]
+        self.assertEqual([denial["details"]["reason"] for denial in denials], ["cancelled"])
+        self.assertNotIn("tool.executed", _events(result))
 
 
 if __name__ == "__main__":

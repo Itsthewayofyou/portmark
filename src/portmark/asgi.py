@@ -68,7 +68,10 @@ def create_app():
         # the store once; readiness re-validates config files and does a bounded store
         # liveness probe via default_readiness_check -> store.check_ready().
         if config.policy_path:
-            load_host_policy(config.policy_path, config.host_id or HOST_ID)
+            policy = load_host_policy(config.policy_path, config.host_id or HOST_ID)
+            # Fix 3: report what a production restart (or reload) would refuse, not "ready".
+            if production and policy.implicit_impacts:
+                raise ValueError(f"host policy tools {list(policy.implicit_impacts)} have no explicit impact")
         if config.trust_registry_path:
             load_trust_registry(config.trust_registry_path)
         default_readiness_check(host)
