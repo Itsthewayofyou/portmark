@@ -47,6 +47,11 @@ logger = logging.getLogger(__name__)
 _SAFE_HOST_RE = re.compile(r"^(?:[A-Za-z0-9.\-]+|\[[0-9A-Fa-f:]+\])(?::\d{1,5})?$")
 MAX_REQUEST_BYTES = 1_000_000
 DEFAULT_MAX_CONCURRENT_REQUESTS = 32
+# uvicorn's limit_concurrency counts EVERY open connection (health probes, agent card, idle keep-alives),
+# including the arriving one, so a limit equal to the run cap refused the last run slot and answered
+# /healthz with 503 whenever the runs filled up. The uvicorn limit sits this far above the run cap; the
+# app's own semaphore (NetworkGuard) stays the run limit.
+A2A_CONNECTION_HEADROOM = 16
 DEFAULT_RATE_LIMIT_PER_IP = 120
 DEFAULT_RATE_LIMIT_WINDOW_SECONDS = 60
 DEFAULT_AGENT_CARD_RATE_LIMIT_PER_IP = 240
@@ -977,8 +982,14 @@ def _shutdown_hook(app: Any) -> Any:
     raise RuntimeError("the ASGI application has no Portmark shutdown hook (make_asgi_app)")
 
 
-def uvicorn_options(host: str, port: int) -> dict[str, Any]:
-    """The uvicorn settings every Portmark entry point runs with."""
+def uvicorn_options(
+    host: str, port: int, max_concurrent_requests: int = DEFAULT_MAX_CONCURRENT_REQUESTS
+) -> dict[str, Any]:
+    """The uvicorn settings every Portmark entry point runs with.
+
+    `max_concurrent_requests` is the app's run cap; uvicorn's connection limit is that plus
+    A2A_CONNECTION_HEADROOM, so health probes keep a connection while every run slot is busy.
+    """
     return {
         "host": host,
         "port": port,
@@ -991,7 +1002,7 @@ def uvicorn_options(host: str, port: int) -> dict[str, Any]:
         "log_config": None,
         "log_level": "warning",
         "access_log": False,
-        "limit_concurrency": 32,
+        "limit_concurrency": max_concurrent_requests + A2A_CONNECTION_HEADROOM,
         "timeout_keep_alive": 5,
     }
 
@@ -1083,4 +1094,4 @@ def serve(
         # tokenless loopback server is an acknowledged configuration here.
         allow_anonymous=True,
     )
-    run_uvicorn(app, uvicorn_options(bind, port) | {"limit_concurrency": max_concurrent_requests})
+    run_uvicorn(app, uvicorn_options(bind, port, max_concurrent_requests))

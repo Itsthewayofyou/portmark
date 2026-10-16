@@ -34,7 +34,7 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
-from portmark.a2a import MAX_REQUEST_BYTES, DEFAULT_MAX_CONCURRENT_REQUESTS, A2AAuthConfig, RateLimiter, envelope_from_dict, is_loopback_bind, make_asgi_app, serve
+from portmark.a2a import MAX_REQUEST_BYTES, A2A_CONNECTION_HEADROOM, DEFAULT_MAX_CONCURRENT_REQUESTS, A2AAuthConfig, RateLimiter, envelope_from_dict, is_loopback_bind, make_asgi_app, serve
 from portmark.a2a_types import make_agent_card
 from portmark.config import RuntimeConfig
 from portmark.factory import build_envelope, make_demo_envelope, make_host, signer_from_environment
@@ -7564,7 +7564,7 @@ class RuntimeTests(unittest.TestCase):
             serve(host, "127.0.0.1", 8080)
         run.assert_called_once()
         self.assertEqual(run.call_args.args[1]["host"], "127.0.0.1")
-        self.assertEqual(run.call_args.args[1]["limit_concurrency"], DEFAULT_MAX_CONCURRENT_REQUESTS)
+        self.assertEqual(run.call_args.args[1]["limit_concurrency"], DEFAULT_MAX_CONCURRENT_REQUESTS + A2A_CONNECTION_HEADROOM)
 
     def test_serve_warns_when_tls_not_asserted(self):
         host = make_host()
