@@ -1715,6 +1715,7 @@ class HostPolicy:
         approval_authorities: tuple[TrustedApprover, ...] = (),
         approval_required_impacts: tuple[str, ...] = DEFAULT_APPROVAL_REQUIRED_IMPACTS,
         migration: "MigrationPolicy | None" = None,
+        implicit_impacts: tuple[str, ...] = (),
     ) -> None:
         self.audience = audience
         # B-lite: normalize each policy grant so a bare one denies unnamed arguments
@@ -1726,6 +1727,9 @@ class HostPolicy:
         self.policy_hash = policy_hash
         self.tool_impacts = tool_impacts or {}
         self.approval_required_impacts = approval_required_impacts
+        # Fix 3: tools whose policy entry had no `impact` (they default to "low"). The production
+        # profile refuses such a policy; see impact_for for the side-effecting default.
+        self.implicit_impacts = implicit_impacts
         self._approval_authorities = {authority.key_id: authority for authority in approval_authorities}
         # Finding EV-009: default deny. A host that says nothing about migration
         # refuses to send agents anywhere.
@@ -1836,6 +1840,17 @@ class HostPolicy:
 
     def requires_approval(self, tool: str) -> bool:
         return self.impact_for_tool(tool) in set(self.approval_required_impacts)
+
+    def impact_for(self, tool: str, *, side_effecting: bool) -> str:
+        """The impact the host acts on. Fix 3 (3B): a side-effecting tool with no explicit impact is
+        "high", not the silent "low" default. `side_effecting` comes from the tool registry and has no
+        default, so a caller cannot forget it."""
+        if side_effecting and tool in self.implicit_impacts:
+            return "high"
+        return self.impact_for_tool(tool)
+
+    def requires_approval_for(self, tool: str, *, side_effecting: bool) -> bool:
+        return self.impact_for(tool, side_effecting=side_effecting) in set(self.approval_required_impacts)
 
     def verify_approval(
         self,

@@ -63,6 +63,14 @@ alias stays optional, for a collision or for readability, not as routine setup.
 
 The loader validates the root object, policy version, tool entries, impact levels, constraints, output projections, budget fields, and approval public keys before constructing `HostPolicy`.
 
+**Set `impact` on every tool.** A tool with no `impact` used to run silently as `low`, so a payment tool whose entry forgot it ran with no approval. Now:
+
+- The **production** profile refuses a policy with any tool that has no explicit `impact`, at start-up and on every reload. A reload that drops one fails the runs in flight, like any invalid policy.
+- The **development** profile (`PORTMARK_PROFILE=development`) keeps the tool at `low` and logs one warning each time the policy file content changes (keyed on its hash, not on `version`).
+- In both profiles, a **side-effecting** tool (registered `side_effecting=True`, or an MCP tool that is not `read_only`) with no explicit `impact` is treated as `high`, which needs approval under the default `approval_required_impacts` (a policy that drops `high` from that list drops this too).
+
+An explicit `"impact": "low"` is always honored: it is the operator's decision, and now a visible one. To migrate an existing policy, add `"impact"` to each tool entry (`"low"` for read-only tools, the matching high-impact level for the rest).
+
 Constraints are enforced immediately before tool invocation. Legacy constraints
 remain supported: `max_limit` means argument `limit` must be numeric and no
 larger than the configured value, `allowed_currency` means argument `currency`

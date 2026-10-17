@@ -15,6 +15,13 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
   The 16 spare connections are shared, not reserved: idle or slow-header connections can still fill them,
   so keep the proxy's limits in front. The reference nginx config now routes `/healthz` and `/readyz`
   (it returned 404 for both, although DEPLOYMENT.md required them), with their own rate zone.
+- **A policy tool with no `impact` no longer runs silently without approval.** `impact` defaulted to
+  `low`, so a payment tool whose policy entry omitted it ran with no approval and nothing said so. The
+  production profile now refuses such a policy at start-up and on every reload, naming the tools.
+  Development keeps the `low` default with one warning per distinct policy content. In both profiles a
+  side-effecting tool with no explicit impact is treated as `high`, which needs approval under the
+  default `approval_required_impacts`. **Migration:**
+  production policies must set `"impact"` on every tool entry. See POLICY.md.
 
 - **A policy reload now narrows runs already in flight (U1).** With `--reload-policy`, the policy was
   reloaded once when a run started, and every later step of that run kept it. A reload that removed a
