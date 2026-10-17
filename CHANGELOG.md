@@ -22,6 +22,17 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
   side-effecting tool with no explicit impact is treated as `high`, which needs approval under the
   default `approval_required_impacts`. **Migration:**
   production policies must set `"impact"` on every tool entry. See POLICY.md.
+- **Cancelling a task now stops it.** `cancel_task` was read only by the approval gate and the pre-launch
+  re-check, so a cancelled task could be resumed and run tools, keep running to completion, or migrate
+  to another host. Every store (in-memory, SQLite, Postgres) now refuses an open checkpoint save and a
+  migration enqueue for a cancelled task, inside the save transaction; a closing save stays allowed. The
+  host closes the task as `failed` with an `agent.cancelled` audit event: a resume before any provider
+  call, a running task at its next save. A task id cancelled before admission is refused. Limits: up to
+  one step of work can follow a cancel (the step in progress, including a non-approval tool it picks,
+  runs to its save); if that step ends the task another way, that outcome is recorded instead of
+  `agent.cancelled`; a migration already in the outbox is still delivered. The new `agent.cancelled`
+  event maps to OCSF Failure / Medium; the SIEM projection is unchanged (`builtin:v1`). See
+  DEPLOYMENT.md.
 
 - **A policy reload now narrows runs already in flight (U1).** With `--reload-policy`, the policy was
   reloaded once when a run started, and every later step of that run kept it. A reload that removed a

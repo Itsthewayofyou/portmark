@@ -82,6 +82,7 @@ EVENT_STATUS: dict[str, int] = {
     "agent.awaiting_input": STATUS_UNKNOWN,
     "agent.migrating": STATUS_UNKNOWN,
     "agent.failed": STATUS_FAILURE,
+    "agent.cancelled": STATUS_FAILURE,
     "provider.proposed": STATUS_SUCCESS,
     "provider.failed": STATUS_FAILURE,
     "policy.reloaded": STATUS_UNKNOWN,
@@ -106,6 +107,7 @@ EVENT_SEVERITY: dict[str, int] = {
     "tool.killed": SEVERITY_HIGH,
     "content.rejected": SEVERITY_HIGH,
     "tool.refused": SEVERITY_MEDIUM,
+    "agent.cancelled": SEVERITY_MEDIUM,
     "approval.denied": SEVERITY_MEDIUM,
     "approval.expired": SEVERITY_MEDIUM,
 }

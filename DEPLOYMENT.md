@@ -772,6 +772,24 @@ is already running — does **not** stop the effect: the tool runs and its effec
 task is now cancelled. Do not rely on `cancel_task` to prevent an in-flight external side effect;
 guaranteeing that requires per-tool idempotency keys and reconciliation (a later tool-boundary change).
 
+**A cancel stops the task at its next save.** Every store refuses to save a cancelled task open again,
+and refuses to put it in the migration outbox, inside the same transaction as the save; only a closing
+save is allowed. So a cancelled task cannot be resumed, cannot start a migration, and a running one is
+stopped at its next checkpoint save, which ends the step in progress. The host then closes it as
+`failed` with an `agent.cancelled` audit event. A task id that was cancelled before it was ever admitted
+is refused at admission.
+
+What still happens between the cancel and that save:
+
+- The step in progress finishes its work. That includes a provider decision made after the cancel
+  committed, and any tool that decision picks that is not approval-gated (approval-gated tools are
+  re-checked just before launch). One step of work can follow a cancel.
+- `agent.cancelled` is written only when the cancel is what ends the task. If that step ends the task
+  another way first (the task completes, the provider fails, a tool fails), that outcome is recorded
+  instead; the task is closed either way and cannot be resumed.
+- A migration already in the outbox when the cancel lands is still delivered: the dispatcher does not
+  check cancellation.
+
 ### Reserved migration task-id namespace (`mig::`)
 
 A destination namespaces a **migrated** task's stored identity by the source host it

@@ -22,6 +22,7 @@ from .security import (
     AUDIT_HASH_VERSION,
     AuditHeadVerifier,
     SecurityError,
+    TaskCancelledError,
     _audit_head_payload_for,
     audit_event_record,
     audit_head_payload,
@@ -1383,6 +1384,10 @@ class _InMemoryTransaction:
         self, task_id: str, state: AgentState, expected_generation: int, closed: bool = False,
         owner: tuple[str, str] | None = None, authority_ceiling: str | None = None,
     ) -> int:
+        # Fix 2: a cancelled task is never saved OPEN again (a resume, the next step), only closed. Read
+        # in this transaction, with the same lock cancel_task takes, so the check cannot race it.
+        if not closed and self.is_task_cancelled(task_id):
+            raise TaskCancelledError("task is cancelled")
         row = self._store._checkpoints.get(task_id)
         if row is None:
             if expected_generation != 0:
@@ -1410,6 +1415,9 @@ class _InMemoryTransaction:
         return new_generation
 
     def enqueue_migration(self, task_id: str, destination: str, sealed_envelope_json: str) -> None:
+        # Fix 2: a cancelled task must not leave through the migration outbox either.
+        if self.is_task_cancelled(task_id):
+            raise TaskCancelledError("task is cancelled")
         # Section 4 #8: keep-first is only safe when the collision is an exact re-enqueue of the
         # SAME sealed envelope (an idempotent retry). A same-task-id enqueue with a DIFFERENT
         # envelope is a real collision -- silently dropping it (the old ON CONFLICT DO NOTHING)
@@ -3291,6 +3299,10 @@ class _PostgresTransaction:
     ) -> int:
         if self._connection is None:
             raise RuntimeError("Postgres transaction was not opened")
+        # Fix 2: a cancelled task is never saved OPEN again (a resume, the next step), only closed. Read
+        # in this transaction, with the same lock cancel_task takes, so the check cannot race it.
+        if not closed and self.is_task_cancelled(task_id):
+            raise TaskCancelledError("task is cancelled")
         row = self._connection.execute(
             f"SELECT {_CHECKPOINT_ROW} FROM checkpoints WHERE task_id = %s", (task_id,)  # nosec B608 -- constant column list
         ).fetchone()
@@ -3346,6 +3358,9 @@ class _PostgresTransaction:
     def enqueue_migration(self, task_id: str, destination: str, sealed_envelope_json: str) -> None:
         if self._connection is None:
             raise RuntimeError("Postgres transaction was not opened")
+        # Fix 2: a cancelled task must not leave through the migration outbox either.
+        if self.is_task_cancelled(task_id):
+            raise TaskCancelledError("task is cancelled")
         # Section 4 #8, made race-safe: ONE atomic conflict-validating statement, not a SELECT then a
         # separate INSERT (two concurrent first-enqueues could each SELECT no row, and the loser's
         # ON CONFLICT DO NOTHING would silently drop its different envelope). ON CONFLICT DO UPDATE
@@ -3633,6 +3648,10 @@ class _SQLiteTransaction:
     ) -> int:
         if self._connection is None:
             raise RuntimeError("SQLite transaction was not opened")
+        # Fix 2: a cancelled task is never saved OPEN again (a resume, the next step), only closed. Read
+        # in this transaction, with the same lock cancel_task takes, so the check cannot race it.
+        if not closed and self.is_task_cancelled(task_id):
+            raise TaskCancelledError("task is cancelled")
         row = self._connection.execute(
             f"SELECT {_CHECKPOINT_ROW} FROM checkpoints WHERE task_id = ?", (task_id,)  # nosec B608 -- constant column list
         ).fetchone()
@@ -3686,6 +3705,9 @@ class _SQLiteTransaction:
     def enqueue_migration(self, task_id: str, destination: str, sealed_envelope_json: str) -> None:
         if self._connection is None:
             raise RuntimeError("SQLite transaction was not opened")
+        # Fix 2: a cancelled task must not leave through the migration outbox either.
+        if self.is_task_cancelled(task_id):
+            raise TaskCancelledError("task is cancelled")
         # Section 4 #8, made race-safe: ONE atomic conflict-validating statement (mirrors the Postgres
         # path), not a SELECT then a separate INSERT. ON CONFLICT DO UPDATE with a WHERE that matches
         # only an IDENTICAL envelope: a fresh insert or an identical re-enqueue changes one row
