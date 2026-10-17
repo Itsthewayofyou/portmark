@@ -26,6 +26,11 @@ class SecurityError(RuntimeError):
     pass
 
 
+class TaskCancelledError(SecurityError):
+    """The task is durably cancelled (Fix 2). Raised by a store, inside the save transaction, for a
+    non-closing checkpoint save or a migration enqueue. Its own class so the host can close the task."""
+
+
 def _decision_time(explicit: int | None) -> int:
     """The time a security expiry decision uses (Section 12 #6): the caller's explicit value, else the
     trusted clock, which fails closed (ClockRollbackError) if the wall clock moved back beyond the

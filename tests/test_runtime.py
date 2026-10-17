@@ -3442,10 +3442,13 @@ class RuntimeTests(unittest.TestCase):
         host.cancel_task(envelope.state.task_id)
         result = host.run(envelope)
         self.assertEqual(result.status, "failed")
-        denials = [event for event in result.audit if event["event"] == "approval.denied"]
-        self.assertTrue(denials)
-        self.assertEqual(denials[0]["details"]["reason"], "cancelled")
-        self.assertNotIn("approval.approved", [event["event"] for event in result.audit])
+        # Fix 2: the resume of a cancelled task is now closed at its first save, BEFORE the approval
+        # gate (so there is no approval.denied); the guarantees here are unchanged: the tool never
+        # runs and no approval is redeemed.
+        events = [event["event"] for event in result.audit]
+        self.assertIn("agent.cancelled", events)
+        self.assertNotIn("approval.approved", events)
+        self.assertNotIn("tool.executed", events)
 
     def test_cancel_and_redeem_are_atomic_under_concurrency(self):
         # Section 5 #3 CONCURRENT, on SQLite AND Postgres (two real connections synchronized on a
@@ -3518,8 +3521,10 @@ class RuntimeTests(unittest.TestCase):
         host.signer.seal(envelope)
         result = host.run(envelope)
 
-        # Best-effort limit: the effect happened despite the task now being cancelled.
-        self.assertEqual(result.status, "completed")
+        # Best-effort limit: the effect happened despite the task now being cancelled. Fix 2: the task
+        # then stops at the save after that step, closed as failed with agent.cancelled.
+        self.assertEqual(result.status, "failed")
+        self.assertIn("agent.cancelled", [event["event"] for event in result.audit])
         self.assertEqual(effects, ["effect"])
         self.assertTrue(store.is_task_cancelled(envelope.state.task_id))
 
@@ -3564,7 +3569,11 @@ class RuntimeTests(unittest.TestCase):
                     self.assertTrue(store.is_task_cancelled(envelope.state.task_id))
                     result = host.run(envelope)
                     self.assertEqual(result.status, "failed")
-                    self.assertIn("approval.denied", [event["event"] for event in result.audit])
+                    # Fix 2: closed at the resume's first save, before the approval gate.
+                    events = [event["event"] for event in result.audit]
+                    self.assertIn("agent.cancelled", events)
+                    self.assertNotIn("tool.executed", events)
+                    self.assertEqual(store.load_checkpoint(envelope.state.task_id)["status"], "failed")
 
     def test_stale_asserted_generation_cannot_satisfy_approval_gate(self):
         # Section 5 #1 (G2). The expected generation is sourced from the DURABLE store, so an

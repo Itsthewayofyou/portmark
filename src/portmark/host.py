@@ -15,7 +15,7 @@ from .metrics import RuntimeMetrics
 from .models import AgentEnvelope, AgentManifest, AgentState, ApprovalToken, AttestationEvidence, Permit, ProviderDecision, ResourceBudget, RunResult, ToolGrant
 from .projection import project_state_for_migration, provider_view
 from .providers import ModelProvider
-from .security import _MIGRATION_RECEIPT_FIELDS, _OPTIONAL_MIGRATION_RECEIPT_FIELDS, AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, MigrationAttesterProtocol, MigrationPreflightProtocol, PermitExpiredError, SecurityError, arguments_hash, audit_head_payload, canonical_json, detached_json, effect_id, intersect_grants, migration_envelope_digest, migration_receipt_payload, require_unexpired, verified_approval_token
+from .security import _MIGRATION_RECEIPT_FIELDS, _OPTIONAL_MIGRATION_RECEIPT_FIELDS, AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, MigrationAttesterProtocol, MigrationPreflightProtocol, PermitExpiredError, SecurityError, TaskCancelledError, arguments_hash, audit_head_payload, canonical_json, detached_json, effect_id, intersect_grants, migration_envelope_digest, migration_receipt_payload, require_unexpired, verified_approval_token
 from .storage import InMemoryRuntimeStore, RuntimeStore
 from .tools import ToolExecutionError, ToolKilledError, ToolRegistry, tool_error_code
 
@@ -342,6 +342,11 @@ class AgentHost:
         Guaranteeing "no effect after cancel" requires per-tool idempotency keys + a reconciliation
         pass (Section 7); it is not provided here. This is the supported operator entry point; a
         network-triggered cancel endpoint (with its own auth) is future work.
+
+        Fix 2: beyond the approval path, the store refuses every OPEN save and every migration enqueue of
+        a cancelled task, in the save transaction. A resume is closed before any provider call, and a
+        running task is closed (failed, `agent.cancelled`) at its next save. A tool already chosen in the
+        step the cancel lands in still runs; a step that completes the task still records `completed`.
         """
         self.store.cancel_task(task_id)
 
@@ -695,7 +700,14 @@ class AgentHost:
             if isinstance(migration_memory, dict) and migration_memory.get("challenge_required"):
                 receipt_binding["destination_attestation"] = self._produce_challenge_evidence(envelope)
         audit.append("agent.accepted", accepted_details)
-        persisted_events = self._persist(envelope, effective, state, audit, 0, consume_nonce=consume_nonce, receipt_binding=receipt_binding)
+        try:
+            persisted_events = self._persist(envelope, effective, state, audit, 0, consume_nonce=consume_nonce, receipt_binding=receipt_binding)
+        except TaskCancelledError:
+            if consume_nonce is not None:
+                # A fresh admission of a cancelled task id: nothing was admitted, no nonce burned.
+                raise
+            # Fix 2: a resume of a cancelled task. Close its open checkpoint, before any provider call.
+            return self._close_cancelled(envelope, effective, state, audit, 0)
         while state.step < effective.budget.max_steps:
             decision_started = time.monotonic()
             # Section 12 #1: atomically refuse (abandoned run) or record the provider call as in flight.
@@ -809,14 +821,19 @@ class AgentHost:
             # status="running" and resumable WHILE a sealed migrated envelope existed:
             # the source could resume AND the destination run the same work (double
             # effect). await_input is still excluded (open, not closed).
-            if not self._checkpoint_fits(effective, state) and (tool_ran or closed):
-                persisted_events = self._terminalize_over_budget(
-                    envelope, effective, state, audit, persisted_events, decision, tool_ran, migration
-                )
-                result = self._result(envelope, audit, migration)
-                self._record_run_status(result.status)
-                return result
-            persisted_events = self._persist(envelope, effective, state, audit, persisted_events, closed=closed, migration=migration)
+            try:
+                if not self._checkpoint_fits(effective, state) and (tool_ran or closed):
+                    persisted_events = self._terminalize_over_budget(
+                        envelope, effective, state, audit, persisted_events, decision, tool_ran, migration
+                    )
+                    result = self._result(envelope, audit, migration)
+                    self._record_run_status(result.status)
+                    return result
+                persisted_events = self._persist(envelope, effective, state, audit, persisted_events, closed=closed, migration=migration)
+            except TaskCancelledError:
+                # Fix 2: cancelled while this step ran. The store refused the open save (or the
+                # migration enqueue) and rolled it back; close the task here instead.
+                return self._close_cancelled(envelope, effective, state, audit, persisted_events)
             if finished:
                 result = self._result(envelope, audit, migration)
                 self._record_run_status(result.status)
@@ -1175,6 +1192,25 @@ class AgentHost:
         if not self._checkpoint_fits(narrowed, state):
             raise SecurityError("checkpoint exceeds the output budget of a reloaded policy")
         return _ReloadedPolicy(active_policy, fresh), narrowed
+
+    def _close_cancelled(self, envelope, effective: Permit, state: AgentState, audit: AuditLog, persisted_events: int) -> RunResult:
+        """Fix 2: end a cancelled task as a durable CLOSED failure with an `agent.cancelled` event.
+
+        The store refuses every open save (and migration enqueue) of a cancelled task but allows a
+        closing one, so this always lands. Events of the refused save were rolled back with it and are
+        still in `audit`; they are written here, before the cancel event. No migration is passed, so a
+        cancelled task cannot leave through the outbox.
+        """
+        state.status = "failed"
+        state.result = {"error": "task cancelled"}
+        audit.append("agent.cancelled", {"task_id": state.task_id})
+        if self._checkpoint_fits(effective, state):
+            self._persist(envelope, effective, state, audit, persisted_events, closed=True)
+        else:
+            self._terminalize_over_budget(envelope, effective, state, audit, persisted_events, None, False)
+        result = self._result(envelope, audit)
+        self._record_run_status(result.status)
+        return result
 
     def _active_policy(self) -> HostPolicy:
         if self._policy_loader is not None and self._reload_policy:
