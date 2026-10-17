@@ -34,6 +34,16 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
   event maps to OCSF Failure / Medium; the SIEM projection is unchanged (`builtin:v1`). See
   DEPLOYMENT.md.
 
+- **A replayed envelope can no longer re-run a finished task after its rows are deleted.** Someone with
+  write access to the store could delete a task's checkpoint row and consumed-nonce row, then resend the
+  original signed envelope: the admission looked fresh, the host quietly continued the existing audit
+  chain, the agent and its tools ran again, and `verify-audit` still reported the chain valid. A fresh,
+  non-migration admission can never find an audit chain already there, so it is now refused ("task already
+  has audit history"), before any work and again inside the admission transaction. Deleting the audit rows
+  too is caught by the audit floor (required in production), on a running host and at start-up; without a
+  floor (development only) that variant is not detected. `verify-audit` also reports
+  `replayed_after_finish` (with a stderr warning) for a replay already in a store written before this
+  check: report-only, it changes neither `status` nor the exit code.
 - **A policy reload now narrows runs already in flight (U1).** With `--reload-policy`, the policy was
   reloaded once when a run started, and every later step of that run kept it. A reload that removed a
   tool, tightened a constraint, required approval or closed a migration route did not reach a run that was

@@ -433,10 +433,33 @@ class AuditVerificationResult:
     # Section 10 PR B: verdict of the audit floor (verify-audit --audit-floor-path): "anchored",
     # "not-anchored", "no-floor", or a refusal code (rolled-back, forked, floor-missing, ...).
     floor_status: str = ""
+    # Fix 1 (1B, report-only): the sequence of every `agent.accepted` that follows a finish
+    # (completed / failed / cancelled). A finished task is closed, and a closed task rolls back any
+    # admission together with its events, so this pattern means the closed checkpoint was removed and
+    # the task admitted again: an insider replay written before 1A refused it. It never changes
+    # `status`: this verdict also gates saves and the floor's start-up sweep.
+    replayed_after_finish: tuple[int, ...] = ()
 
     @property
     def valid(self) -> bool:
         return self.status == "valid"
+
+
+# Events after which a task is closed. checkpoint.terminalized can legitimately FOLLOW one of these
+# (an oversized finish), so the replay signal is a later admission, never "any later event".
+_FINISH_EVENTS = frozenset({"agent.completed", "agent.failed", "agent.cancelled"})
+
+
+def _replayed_after_finish(rows: list[Any]) -> tuple[int, ...]:
+    finished = False
+    replayed: list[int] = []
+    for row in rows:
+        name = row["event"]
+        if name == "agent.accepted" and finished:
+            replayed.append(int(row["sequence"]))
+        elif name in _FINISH_EVENTS:
+            finished = True
+    return tuple(replayed)
 
 
 # SIEM export (MCP/SIEM plan, PR 1): a page of audit chains read for `portmark audit export`.
@@ -3851,6 +3874,14 @@ def _audit_event_row(task_id: str, host_id: str, event: dict[str, Any]) -> tuple
 
 
 def _verify_audit_rows(
+    verifier: AuditHeadVerifier | None, task_id: str, rows: list[Any], head: Any, allow_legacy_anchor: bool
+) -> AuditVerificationResult:
+    """The chain verdict, plus the report-only replay flag (Fix 1, 1B), from the same snapshot."""
+    result = _verify_audit_chain_rows(verifier, task_id, rows, head, allow_legacy_anchor)
+    return replace(result, replayed_after_finish=_replayed_after_finish(rows))
+
+
+def _verify_audit_chain_rows(
     verifier: AuditHeadVerifier | None, task_id: str, rows: list[Any], head: Any, allow_legacy_anchor: bool
 ) -> AuditVerificationResult:
     """Check one snapshot of a task's audit chain: every link, every event hash, the head, its signature.

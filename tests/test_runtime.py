@@ -4221,8 +4221,8 @@ class RuntimeTests(unittest.TestCase):
         source_signer, destination_signer = self._migration_signers(prefix)
         original_audit_start = AgentHost._audit_start
 
-        def audit_start(host, envelope, original_task_id):
-            previous_hash, start, anchor = original_audit_start(host, envelope, original_task_id)
+        def audit_start(host, envelope, original_task_id, **options):
+            previous_hash, start, anchor = original_audit_start(host, envelope, original_task_id, **options)
             return previous_hash, start, (rewrite_anchor(anchor) if anchor is not None else None)
 
         with self._sqlite_dual_store_case(source_signer, destination_signer) as (backend, source_store, destination_store):
@@ -5687,7 +5687,7 @@ class RuntimeTests(unittest.TestCase):
                     cli_main()
             self.assertEqual(
                 json.loads(output.getvalue()),
-                {"task_id": result.task_id, "status": "valid", "head_status": "valid", "anchor_status": "none", "floor_status": "no-floor", "remote_status": "no-remote", "reason": "audit head verified"},
+                {"task_id": result.task_id, "status": "valid", "head_status": "valid", "anchor_status": "none", "floor_status": "no-floor", "remote_status": "no-remote", "reason": "audit head verified", "replayed_after_finish": []},
             )
 
             output = io.StringIO()
@@ -5698,7 +5698,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, 2)
             self.assertEqual(
                 json.loads(output.getvalue()),
-                {"task_id": result.task_id, "status": "unverifiable", "head_status": "unverifiable", "anchor_status": "", "floor_status": "no-floor", "remote_status": "no-remote", "reason": "trust registry is not configured"},
+                {"task_id": result.task_id, "status": "unverifiable", "head_status": "unverifiable", "anchor_status": "", "floor_status": "no-floor", "remote_status": "no-remote", "reason": "trust registry is not configured", "replayed_after_finish": []},
             )
 
             with self._raw_sqlite(path) as connection:
@@ -5711,7 +5711,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, 1)
             self.assertEqual(
                 json.loads(output.getvalue()),
-                {"task_id": result.task_id, "status": "invalid", "head_status": "", "anchor_status": "", "floor_status": "no-floor", "remote_status": "no-remote", "reason": "stored audit head does not match audit events"},
+                {"task_id": result.task_id, "status": "invalid", "head_status": "", "anchor_status": "", "floor_status": "no-floor", "remote_status": "no-remote", "reason": "stored audit head does not match audit events", "replayed_after_finish": []},
             )
 
             output = io.StringIO()
@@ -5722,7 +5722,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, 1)
             self.assertEqual(
                 json.loads(output.getvalue()),
-                {"task_id": "missing-task", "status": "invalid", "head_status": "", "anchor_status": "", "floor_status": "no-floor", "remote_status": "no-remote", "reason": "audit chain is missing"},
+                {"task_id": "missing-task", "status": "invalid", "head_status": "", "anchor_status": "", "floor_status": "no-floor", "remote_status": "no-remote", "reason": "audit chain is missing", "replayed_after_finish": []},
             )
 
     def test_host_security_guards_are_directly_reachable(self):
