@@ -122,7 +122,9 @@ class SharedEdgeRateLimitTests(unittest.TestCase):
         blocks = re.findall(r"location\s+=?\s*(\S+)\s*\{(.*?)\n\s*\}", config, flags=re.DOTALL)
         forwarded = {path: body for path, body in blocks if "proxy_pass" in body}
         # The routes Portmark serves to clients; a new forwarded route must bring its own limit.
-        self.assertEqual(set(forwarded), {"/.well-known/agent-card.json", "/message:send", "/metrics"})
+        self.assertEqual(
+            set(forwarded), {"/.well-known/agent-card.json", "/message:send", "/metrics", "/healthz", "/readyz"}
+        )
         for path, body in forwarded.items():
             with self.subTest(route=path):
                 used = re.findall(r"limit_req\s+zone=(\w+)", body)

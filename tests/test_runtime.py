@@ -8222,6 +8222,10 @@ class RuntimeTests(unittest.TestCase):
             "location = /.well-known/agent-card.json",
             "location = /message:send",
             "location = /metrics",
+            # DEPLOYMENT.md requires the proxy to route both probes; the reference config returned 404.
+            "location = /healthz",
+            "location = /readyz",
+            "zone=portmark_health_rate",
             "proxy_set_header Authorization $http_authorization",
             "return 308 https://$host$request_uri",
         ]:

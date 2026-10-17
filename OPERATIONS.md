@@ -100,12 +100,15 @@ executable and trust roots owned by the deployment control plane.
 
 `portmark serve` runs the A2A boundary on **uvicorn**, an ASGI server, so a slow
 or stalled client costs a suspended coroutine rather than a blocked OS thread.
-Concurrent runs are bounded by `--max-concurrent-requests`; a saturated server
-answers further submissions with HTTP 503 "server busy". uvicorn's own connection
-limit (`limit_concurrency`) is set 16 connections above that run cap, because it
-counts every open connection, health probes included. So `/healthz`, `/readyz`,
-the agent card and `/metrics` still answer while every run slot is busy, and an
-orchestrator does not restart a server that is only busy. The container
+Concurrent runs are bounded by `--a2a-max-concurrent-requests`; a saturated
+server answers further submissions with HTTP 503 "server busy". uvicorn's own
+connection limit (`limit_concurrency`) is set 16 connections above that run cap,
+because it counts every open connection, health probes included. So when every
+run slot is busy, `/healthz`, `/readyz`, the agent card and `/metrics` still have
+16 spare connections, and an orchestrator does not restart a server that is only
+busy. The spare connections are shared, not reserved for probes: about 16 idle or
+slow-header connections can still fill them, so keep the reverse proxy's
+connection limits and header timeouts in front of the backend. The container
 entrypoint (`python -m portmark.serve_asgi`) reads the same cap from
 `PORTMARK_A2A_MAX_CONCURRENT_REQUESTS`.
 
