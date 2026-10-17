@@ -6,8 +6,9 @@ NON-closing checkpoint save, and a migration enqueue, for a cancelled task, insi
 transaction. The host turns that refusal into a durable CLOSED, failed checkpoint with an
 `agent.cancelled` audit event. A closing save stays allowed, so a cancelled task can always be closed.
 
-Known limit (asserted below, not fixed): a tool already chosen in the current step can still run; the
-task stops at its next save.
+Known limit (asserted below, not fixed): up to one step of work can follow a cancel. A provider
+decision made after the cancel committed, and a non-approval tool it picks, still run; the task stops
+at that step's save.
 """
 
 from __future__ import annotations
@@ -244,7 +245,11 @@ class CancelledTaskExportTests(test_audit_export.ExportCase):
         self.assertTrue(report.ok, report.integrity_failures)
         records = test_audit_export.lines_of(data)
         cancelled = next(record for record in records if record.get("event") == "agent.cancelled")
-        self.assertEqual(cancelled["details"], {"task_id": envelope.state.task_id})
+        # Default projection, unchanged from builtin:v1: the task id rides on the record itself, and the
+        # event's own detail is not copied (no change to what an existing projection policy exports).
+        self.assertEqual(cancelled["task_id"], envelope.state.task_id)
+        self.assertEqual(cancelled["details"], {})
+        self.assertEqual(cancelled["policy_digest"], "builtin:v1")
         level2 = self.verify(data, level2=True)
         self.assertEqual((level2.status, level2.level), ("valid", 2), level2.reasons)
         ocsf = to_ocsf(cancelled, product_version="", now_seconds=0)

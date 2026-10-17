@@ -345,8 +345,10 @@ class AgentHost:
 
         Fix 2: beyond the approval path, the store refuses every OPEN save and every migration enqueue of
         a cancelled task, in the save transaction. A resume is closed before any provider call, and a
-        running task is closed (failed, `agent.cancelled`) at its next save. A tool already chosen in the
-        step the cancel lands in still runs; a step that completes the task still records `completed`.
+        running task is closed (failed, `agent.cancelled`) at its next save. Up to one step of work can
+        follow the cancel: the step in progress runs to its save, including a provider decision made
+        after the cancel and a non-approval tool it picks. If that step ends the task another way
+        (complete, provider or tool failure), that outcome is recorded instead of `agent.cancelled`.
         """
         self.store.cancel_task(task_id)
 
