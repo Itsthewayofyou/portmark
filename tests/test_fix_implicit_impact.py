@@ -4,7 +4,7 @@
 forgot `impact` ran with no approval, and nothing said so. Now:
 
 * 3A: the policy records which tools had no explicit impact. The production profile refuses such a
-  policy (at boot and on every reload); development logs one warning per policy version.
+  policy (at boot and on every reload); development logs one warning per distinct policy file content.
 * 3B: a side-effecting tool with no explicit impact is treated as `high`, so it needs approval even in
   development.
 """
@@ -148,7 +148,7 @@ class ProductionRefusesImplicitImpactTests(_PolicyFile):
 
 
 class DevelopmentWarnsTests(_PolicyFile):
-    def test_development_starts_and_warns_once_per_policy_version(self):
+    def test_development_starts_and_warns_once_per_policy_content(self):
         self.write(None)
         with self.assertLogs("portmark", level="WARNING") as logs:
             host = self.host(production=False, reload_policy=True)

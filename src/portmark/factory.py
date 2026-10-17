@@ -301,7 +301,7 @@ def _implicit_impact_checked_loader(loader, production: bool):
     """Fix 3 (3A): a policy tool with no `impact` used to run silently as "low" (no approval).
 
     Production refuses such a policy, at boot and on a reload (a reload that raises ends the run as
-    failed). Development keeps it, at "low", and warns once per policy version: a reloading host calls
+    failed). Development keeps it, at "low", and warns once per distinct policy content (policy hash): a reloading host calls
     the loader twice per step. A side-effecting tool among them is treated as "high" (HostPolicy.impact_for).
     """
     warned: set[str] = set()

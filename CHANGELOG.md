@@ -9,7 +9,7 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 - **A policy tool with no `impact` no longer runs silently without approval.** `impact` defaulted to
   `low`, so a payment tool whose policy entry omitted it ran with no approval and nothing said so. The
   production profile now refuses such a policy at start-up and on every reload, naming the tools.
-  Development keeps the `low` default with one warning per policy version. In both profiles a
+  Development keeps the `low` default with one warning per distinct policy content. In both profiles a
   side-effecting tool with no explicit impact is treated as `high`, which needs approval under the
   default `approval_required_impacts`. **Migration:**
   production policies must set `"impact"` on every tool entry. See POLICY.md.
