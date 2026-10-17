@@ -46,6 +46,8 @@ def _is_content_digest(digest: str) -> bool:
 # yet trusted to name another source's space, so the namespace comes from the verified
 # source, not the id the source chose.
 _MIGRATION_TASK_NAMESPACE = "mig::"
+# Fix 1 (1A): the refusal for a fresh admission whose task id already has an audit chain.
+_FRESH_WITH_HISTORY = "task already has audit history; refusing a fresh admission"
 
 # Sentinel distinguishing "no confirmed effect to replay" from a genuine tool result of None
 # (a side-effecting tool may legitimately return None). Section 7 PR 2.
@@ -659,7 +661,7 @@ class AgentHost:
             state.tool_calls = int(stored["tool_calls"])
             consume_nonce = None
         state.status = "running"
-        previous_hash, start_sequence, migration_anchor = self._audit_start(envelope, original_task_id)
+        previous_hash, start_sequence, migration_anchor = self._audit_start(envelope, original_task_id, fresh=consume_nonce is not None)
         audit = AuditLog(previous_hash, start_sequence, self.host_id)
         accepted_details: dict[str, Any] = {
             "agent": envelope.manifest.agent_id,
@@ -1598,7 +1600,7 @@ class AgentHost:
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise SecurityError(f"migrated state has invalid {name} counter")
 
-    def _audit_start(self, envelope: AgentEnvelope, original_task_id: str) -> tuple[str, int, dict[str, Any] | None]:
+    def _audit_start(self, envelope: AgentEnvelope, original_task_id: str, *, fresh: bool) -> tuple[str, int, dict[str, Any] | None]:
         # `envelope.state.task_id` is the destination storage key (source-namespaced for a
         # migration, section 4 #7), so store lookups use it; `original_task_id` is the
         # source-signed id, used only to reconstruct the SOURCE's audit-head signature.
@@ -1628,6 +1630,12 @@ class AgentHost:
                 return envelope.previous_audit_hash, 0, anchor
             return envelope.previous_audit_hash, stored[1], None
         if stored is not None:
+            if fresh:
+                # Fix 1 (1A): a fresh, non-migration admission writes the task's FIRST audit events, so it
+                # can never find a chain already there. Finding one means the checkpoint and nonce rows
+                # were removed (an insider replay of the original envelope) or another task owns this id.
+                # Refuse before any work, instead of silently continuing the chain and running it again.
+                raise SecurityError(_FRESH_WITH_HISTORY)
             return stored[0], stored[1], None
         return "", 0, None
 
@@ -1721,6 +1729,12 @@ class AgentHost:
                                 f"task {state.task_id!r} is not in the audit floor and its chain does not verify "
                                 f"({verdict.status}: {verdict.reason}); refusing to witness it"
                             )
+                if consume_nonce is not None and not envelope.previous_audit_hash and transaction.audit_head(state.task_id) is not None:
+                    # Fix 1 (1A), inside the admission transaction: the same rule as _audit_start, re-read
+                    # with the nonce and the checkpoint CAS, so a chain written between that read and this
+                    # commit is refused too. A migration admission is exempt here: _audit_start already
+                    # requires its stored head, if any, to equal the envelope's previous head.
+                    raise SecurityError(_FRESH_WITH_HISTORY)
                 if consume_nonce is not None:
                     # Section 12 #4 (D2): the permit's expiry is stored with its nonce (never re-derived later).
                     transaction.consume_nonce(

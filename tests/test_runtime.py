@@ -4211,8 +4211,8 @@ class RuntimeTests(unittest.TestCase):
         source_signer, destination_signer = self._migration_signers(prefix)
         original_audit_start = AgentHost._audit_start
 
-        def audit_start(host, envelope, original_task_id):
-            previous_hash, start, anchor = original_audit_start(host, envelope, original_task_id)
+        def audit_start(host, envelope, original_task_id, **options):
+            previous_hash, start, anchor = original_audit_start(host, envelope, original_task_id, **options)
             return previous_hash, start, (rewrite_anchor(anchor) if anchor is not None else None)
 
         with self._sqlite_dual_store_case(source_signer, destination_signer) as (backend, source_store, destination_store):
