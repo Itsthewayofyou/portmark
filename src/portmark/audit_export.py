@@ -59,6 +59,7 @@ BUILTIN_EVENT_FIELDS: dict[str, tuple[str, ...]] = {
     "agent.completed": (),
     "agent.awaiting_input": (),
     "agent.failed": ("error", "source"),
+    "agent.cancelled": ("task_id",),
     "agent.migrating": ("destination",),
     "provider.proposed": ("kind", "tool"),
     "provider.failed": ("error",),

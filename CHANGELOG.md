@@ -11,8 +11,10 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
   to another host. Every store (in-memory, SQLite, Postgres) now refuses an open checkpoint save and a
   migration enqueue for a cancelled task, inside the save transaction; a closing save stays allowed. The
   host closes the task as `failed` with an `agent.cancelled` audit event: a resume before any provider
-  call, a running task at its next save. A task id cancelled before admission is refused. Limit: a tool
-  already chosen in the step the cancel lands in still runs. See DEPLOYMENT.md.
+  call, a running task at its next save. A task id cancelled before admission is refused. Limits: a tool
+  already chosen in the step the cancel lands in still runs, and a migration already in the outbox is
+  still delivered. A new `agent.cancelled` event kind is in the SIEM export (`task_id`) and maps to OCSF
+  Failure / Medium. See DEPLOYMENT.md.
 
 - **A policy reload now narrows runs already in flight (U1).** With `--reload-policy`, the policy was
   reloaded once when a run started, and every later step of that run kept it. A reload that removed a

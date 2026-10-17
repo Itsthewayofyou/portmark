@@ -774,8 +774,9 @@ guaranteeing that requires per-tool idempotency keys and reconciliation (a later
 
 **A cancel stops the task at its next save.** Every store refuses to save a cancelled task open again,
 and refuses to put it in the migration outbox, inside the same transaction as the save; only a closing
-save is allowed. So a cancelled task cannot be resumed, cannot migrate away, and a running one stops at
-the end of the step it is in. The host then closes it as `failed` with an `agent.cancelled` audit event.
+save is allowed. So a cancelled task cannot be resumed, cannot start a migration, and a running one stops
+at the end of the step it is in. A migration already in the outbox when the cancel lands is still
+delivered: the dispatcher does not check cancellation. The host then closes it as `failed` with an `agent.cancelled` audit event.
 A task id that was cancelled before it was ever admitted is refused at admission. The limit: a tool
 already chosen in the step the cancel lands in still runs (only approval-gated tools get the pre-launch
 re-check), and a step that completes the task records `completed`, not cancelled.

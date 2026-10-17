@@ -24,6 +24,7 @@ from portmark.models import AgentState, ProviderDecision
 from portmark.providers import ModelProvider
 from portmark.security import MigrationPolicy, SecurityError
 from portmark.storage import InMemoryRuntimeStore, PostgresRuntimeStore, SQLiteRuntimeStore
+import test_audit_export
 import test_runtime
 
 
@@ -188,6 +189,66 @@ class CancelStopsTaskTests(unittest.TestCase):
                 with self.assertRaisesRegex(SecurityError, "cancelled"):
                     host.run(envelope)
                 self.assertIsNone(store.load_checkpoint(envelope.state.task_id))
+
+
+class ApprovalGateCancelTests(unittest.TestCase):
+    """Tier 1 at the host: a cancel that lands MID-RUN, after admission and before redemption, is caught
+    inside the redemption transaction, so the approval is not burned. (A cancel before the resume is now
+    closed at admission and never reaches the gate, so this path needs its own test.)"""
+
+    def test_a_cancel_between_admission_and_redemption_burns_no_approval(self):
+        from dataclasses import asdict
+
+        from store_probes import nonce_is_consumed
+
+        helpers = test_runtime.RuntimeTests()
+        host, authority = helpers._approval_gated_host()
+        envelope, first = helpers._suspend_payment_envelope(host, "cancel mid-run")
+        self.assertEqual(first.status, "awaiting_input")
+        token = helpers._mint_payment_approval(authority, envelope, first.checkpoint["checkpoint_generation"])
+        envelope.state.memory["approvals"] = {"payments.reserve": asdict(token)}
+        host.signer.seal(envelope)
+        task_id = envelope.state.task_id
+
+        class CancelsThenPays(test_runtime.PaymentProvider):
+            def decide(self, state, available_tools, grants=()):
+                host.cancel_task(task_id)  # lands after the resume's admission save
+                return super().decide(state, available_tools, grants)
+
+        host.providers["payer"] = CancelsThenPays()
+        result = host.run(envelope)
+
+        events = [record["event"] for record in result.audit]
+        denials = [record for record in result.audit if record["event"] == "approval.denied"]
+        self.assertEqual([denial["details"]["reason"] for denial in denials], ["cancelled"])
+        self.assertNotIn("approval.approved", events)
+        self.assertNotIn("tool.executed", events)
+        # The gate's in-transaction check rolled the redemption back: the approval is not burned.
+        self.assertFalse(nonce_is_consumed(host.store, f"approval:{task_id}:{token.approval_id}"))
+        self.assertEqual(result.status, "failed")
+
+
+class CancelledTaskExportTests(test_audit_export.ExportCase):
+    """agent.cancelled is a new audit event kind: it exports, verifies at both levels, and maps to OCSF."""
+
+    def test_a_cancelled_task_exports_and_verifies(self):
+        from portmark.ocsf import to_ocsf
+
+        provider = _CancelsThenSearches(self.store)
+        self.host.providers["p"] = provider
+        envelope = make_demo_envelope(self.host, "cancel me", "p")
+        provider.task_id = envelope.state.task_id
+        self.assertEqual(self.host.run(envelope).status, "failed")
+
+        report, data = self.export()
+        self.assertTrue(report.ok, report.integrity_failures)
+        records = test_audit_export.lines_of(data)
+        cancelled = next(record for record in records if record.get("event") == "agent.cancelled")
+        self.assertEqual(cancelled["details"], {"task_id": envelope.state.task_id})
+        level2 = self.verify(data, level2=True)
+        self.assertEqual((level2.status, level2.level), ("valid", 2), level2.reasons)
+        ocsf = to_ocsf(cancelled, product_version="", now_seconds=0)
+        self.assertEqual((ocsf["status"], ocsf["severity"]), ("Failure", "Medium"))
 
 
 class StoreRefusalTests(unittest.TestCase):

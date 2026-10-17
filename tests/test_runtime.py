@@ -3430,10 +3430,11 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result.status, "failed")
         self.assertIn("approval.denied", [event["event"] for event in result.audit])
 
-    def test_cancelled_task_is_refused_at_approval_gate(self):
-        # Section 5 #3. A task cancelled before its approval is redeemed is refused at the gate (inside
-        # the same transaction that consumes the approval nonce); the tool never runs and, because the
-        # consume rolls back, no approval is burned.
+    def test_cancelled_task_resume_is_closed_before_the_approval_gate(self):
+        # Section 5 #3 + Fix 2. A task cancelled BEFORE its resume is closed at the resume's first save,
+        # before the approval gate: the tool never runs and no approval is redeemed. The gate's own
+        # in-transaction check (a cancel landing mid-run) is tested in test_fix_cancel_stops.py
+        # (ApprovalGateCancelTests).
         host, authority = self._approval_gated_host()
         envelope, first = self._suspend_payment_envelope(host, "cancel before redeem")
         token = self._mint_payment_approval(authority, envelope, first.checkpoint["checkpoint_generation"])
