@@ -971,7 +971,17 @@ def main() -> None:
             "floor_status": verification.floor_status,
             "remote_status": remote_status,
             "reason": verification.reason,
+            # Fix 1 (1B): report-only. Sequences of admissions that follow a finish (a replay written
+            # before the fresh-admission check existed). Does not change `status` or the exit code.
+            "replayed_after_finish": list(verification.replayed_after_finish),
         }, indent=2))
+        if verification.replayed_after_finish:
+            print(
+                "WARNING: this task was admitted again after it finished (audit sequence "
+                f"{', '.join(map(str, verification.replayed_after_finish))}): its work may have run twice. "
+                "The chain itself still verifies; investigate the store for removed checkpoint/nonce rows.",
+                file=sys.stderr,
+            )
         if verification.status == "invalid":
             raise SystemExit(1)
         if verification.status == "unverifiable":

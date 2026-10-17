@@ -385,6 +385,13 @@ directory). A durable store without a floor logs a warning at start.
 - **`verify-audit --audit-floor-path FLOOR`** adds `floor_status`: `anchored` (exit 0), `not-anchored`
   (the floor never saw this task; exit 2), or a refusal code (exit 1). Without the flag it reports
   `no-floor` and cannot detect rollback.
+- **`verify-audit` always reports `replayed_after_finish`**: the audit sequences of any `agent.accepted`
+  that follows the task's finish (`agent.completed`, `agent.failed` or `agent.cancelled`), with a warning
+  on stderr. A finished task is closed, so this only appears when its closed checkpoint was removed and
+  the task admitted again: an insider replay that ran its work twice. Hosts with the fresh-admission
+  check refuse that replay; the flag finds replays already in a store written before it. It is
+  report-only: it does not change `status` or the exit code (`[]` when clean). Events such as
+  `checkpoint.terminalized` may legitimately follow a finish and are not flagged.
 
 **Where to put it.** On storage that is NOT restored together with the database: a separate volume,
 ideally append-only or WORM (write once, read many) storage. Do not include it in the database backup.

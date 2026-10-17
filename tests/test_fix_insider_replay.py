@@ -161,5 +161,92 @@ class MigrationReplayTests(unittest.TestCase):
             self.assertEqual(destination_store.audit_head(destination_task), head_before)
 
 
+def _append_signed(store, host, task_id: str, names: list[str]) -> None:
+    """Append events to a task's chain exactly as a host save does: hashed, linked, head-signed.
+
+    Used to write the pattern the PRE-fix host wrote on a replay (a second admission after the finish),
+    which this branch's host now refuses to produce.
+    """
+    from portmark._clock import trusted_now
+    from portmark.security import AuditLog
+
+    head_hash, sequence = store.audit_head(task_id)
+    log = AuditLog(head_hash, sequence, host.host_id)
+    for name in names:
+        log.append(name, {"replayed": True})
+    signed_at = trusted_now()
+    with store.transaction() as transaction:
+        transaction.append_audit_events(
+            task_id, host.host_id, tuple(log.events),
+            lambda head, seq: (host.signer.key_id, host.signer.sign_audit_head(task_id, host.host_id, head, seq, signed_at=signed_at), signed_at),
+        )
+
+
+class _CompletesOversized(test_runtime.ModelProvider):
+    """Completes with a result bigger than the output budget: the host logs agent.completed, then
+    checkpoint.terminalized. A legitimate chain with an event AFTER the finish."""
+
+    def decide(self, view, tools, grants=()):
+        return test_runtime.ProviderDecision("complete", content="X" * 40_000)
+
+
+class ReplayedAfterFinishFlagTests(unittest.TestCase):
+    """1B, report-only: a second admission after a finish is flagged. It does not change `status`."""
+
+    def test_a_replayed_chain_is_flagged_and_status_is_unchanged(self):
+        for backend, store_case in _store_cases():
+            with self.subTest(backend=backend), store_case() as store:
+                host = make_host(store=store, allow_ephemeral_signing_key=True)
+                envelope = make_demo_envelope(host, "finish then replay")
+                self.assertEqual(host.run(envelope).status, "completed")
+                task_id = envelope.state.task_id
+                first_head = store.audit_head(task_id)
+                _append_signed(store, host, task_id, ["agent.accepted", "provider.proposed", "tool.executed"])
+
+                verdict = store.verify_audit_chain_status(task_id)
+                self.assertTrue(verdict.valid)  # report-only: never flips validity (saves and boot rely on it)
+                self.assertEqual(verdict.replayed_after_finish, (first_head[1],))
+
+    def test_control_a_clean_chain_is_not_flagged(self):
+        for backend, store_case in _store_cases():
+            with self.subTest(backend=backend), store_case() as store:
+                host = make_host(store=store, allow_ephemeral_signing_key=True)
+                envelope = make_demo_envelope(host, "plain")
+                host.run(envelope)
+                self.assertEqual(store.verify_audit_chain_status(envelope.state.task_id).replayed_after_finish, ())
+
+    def test_control_checkpoint_terminalized_after_the_finish_is_not_flagged(self):
+        for backend, store_case in _store_cases():
+            with self.subTest(backend=backend), store_case() as store:
+                host = make_host(store=store, allow_ephemeral_signing_key=True)
+                host.providers["big"] = _CompletesOversized()
+                envelope = make_demo_envelope(host, "too big", "big")
+                result = host.run(envelope)
+                events = [record["event"] for record in result.audit]
+                # The legitimate pattern a naive "nothing after the finish" rule would have failed.
+                self.assertLess(events.index("agent.completed"), events.index("checkpoint.terminalized"))
+                verdict = store.verify_audit_chain_status(envelope.state.task_id)
+                self.assertTrue(verdict.valid)
+                self.assertEqual(verdict.replayed_after_finish, ())
+
+    def test_verify_audit_cli_reports_it_without_changing_the_exit_code(self):
+        from test_audit_floor import Deployment
+
+        with tempfile.TemporaryDirectory() as directory:
+            deployment = Deployment(directory)
+            host = deployment.host(floor=False)
+            envelope = make_demo_envelope(host, "cli replay")
+            host.run(envelope)
+            task_id = envelope.state.task_id
+            code, clean = deployment.verify_cli(task_id, floor=False)
+            self.assertEqual((code, clean["replayed_after_finish"]), (0, []))
+            first_head = deployment.store().audit_head(task_id)
+            _append_signed(deployment.store(), host, task_id, ["agent.accepted", "agent.completed"])
+            code, replayed = deployment.verify_cli(task_id, floor=False)
+            self.assertEqual(code, 0)
+            self.assertEqual(replayed["status"], "valid")
+            self.assertEqual(replayed["replayed_after_finish"], [first_head[1]])
+
+
 if __name__ == "__main__":
     unittest.main()
