@@ -12,11 +12,14 @@ import uvicorn
 
 
 @contextlib.contextmanager
-def serve_asgi(app) -> Iterator[int]:
-    """Yield the port of a uvicorn server running `app`; stop the server on exit."""
+def serve_asgi(app, **config) -> Iterator[int]:
+    """Yield the port of a uvicorn server running `app`; stop the server on exit.
+
+    `config` adds uvicorn Config options (for example `limit_concurrency`) to the test defaults.
+    """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.bind(("127.0.0.1", 0))
-    server = uvicorn.Server(uvicorn.Config(app, log_config=None, log_level="warning"))
+    server = uvicorn.Server(uvicorn.Config(app, **({"log_config": None, "log_level": "warning"} | config)))
     # Off the main thread uvicorn installs no signal handlers, so the test process keeps its own.
     thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
     thread.start()

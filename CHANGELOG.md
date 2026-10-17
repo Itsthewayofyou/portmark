@@ -6,6 +6,16 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 ### Security
 
+- **Health probes keep answering when every A2A run slot is busy.** uvicorn's `limit_concurrency`
+  counts every open connection, including the arriving one, and was set equal to the run cap. So with
+  every run slot busy, `/healthz`, `/readyz`, the agent card and `/metrics` got uvicorn's own 503 (an
+  orchestrator could restart a server that was only busy), and the last run slot could never be used.
+  The connection limit is now the run cap plus 16; the app's own semaphore stays the run limit ("server
+  busy"). The container entrypoint now uses `PORTMARK_A2A_MAX_CONCURRENT_REQUESTS` instead of a fixed 32.
+  The 16 spare connections are shared, not reserved: idle or slow-header connections can still fill them,
+  so keep the proxy's limits in front. The reference nginx config now routes `/healthz` and `/readyz`
+  (it returned 404 for both, although DEPLOYMENT.md required them), with their own rate zone.
+
 - **A policy reload now narrows runs already in flight (U1).** With `--reload-policy`, the policy was
   reloaded once when a run started, and every later step of that run kept it. A reload that removed a
   tool, tightened a constraint, required approval or closed a migration route did not reach a run that was
