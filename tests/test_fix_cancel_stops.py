@@ -165,6 +165,26 @@ class CancelStopsTaskTests(unittest.TestCase):
                 checkpoint = store.load_checkpoint(envelope.state.task_id)
                 self.assertEqual((checkpoint["status"], checkpoint["tool_calls"]), ("failed", 0))
 
+    def test_a_failing_post_decision_cancel_read_still_closes_the_task(self):
+        # Codex P2 on batch 2: the re-read sat outside the run loop's failure boundary, so a store error
+        # there (a dropped database connection) left the admitted task open at `running`.
+        class ReadFails(InMemoryRuntimeStore):
+            def is_task_cancelled(self, task_id):
+                raise RuntimeError("database connection lost")
+
+        store = ReadFails()
+        host = self.host(store, _CancelsThenSearches(store))
+        host.providers["p"].calls = 1  # never cancels; only the read fails
+        envelope = make_demo_envelope(host, "run", "p")
+
+        with self.assertRaisesRegex(RuntimeError, "connection lost"):
+            host.run(copy.deepcopy(envelope))
+
+        checkpoint = store.load_checkpoint(envelope.state.task_id)
+        self.assertEqual((checkpoint["status"], checkpoint["tool_calls"]), ("failed", 0))
+        with self.assertRaisesRegex(SecurityError, "closed"):
+            host.run(envelope)  # durably closed, not resumable
+
     def test_a_cancel_during_the_tool_stops_it_at_the_next_save(self):
         # Known limit: a cancel landing while the tool runs is after the re-read, so that tool finishes.
         for backend, store_case in _store_cases():

@@ -758,24 +758,27 @@ class AgentHost:
                 mark_failed_after_admission(error)
                 raise
             self.metrics.increment("provider.decisions")
-            # Batch 2: re-read the cancellation AFTER the provider answers and BEFORE any of its decision
-            # acts. A provider call is the longest wait in a step (a remote model takes seconds), so it is
-            # where an operator's cancel usually lands; without this the decision made after the cancel,
-            # and a non-approval tool it picked, still ran. The decision is dropped unread. A cancel that
-            # lands after this read is still caught at this step's save (Fix 2).
-            if self.store.is_task_cancelled(state.task_id):
-                return self._close_cancelled(envelope, effective, state, audit, persisted_events)
             tool_calls_before = state.tool_calls
+            cancelled, finished, migration = False, False, None
             try:
-                # Auditor round 1: READING the decision is inside the boundary too. A provider that
-                # returns something that is not a ProviderDecision raises on attribute access, and
-                # that raise used to happen here, outside every handler -- stranding the checkpoint at
-                # `running`, the very class PM-004 closes. Round 2: check the SHAPE before reading
-                # it anywhere, so a malformed field cannot escape by a later side door instead.
-                decision = _require_wellformed_decision(decision)
-                active_policy, effective = self._recheck_reloaded_policy(envelope, active_policy, effective, state, audit)
-                audit.append("provider.proposed", {"kind": decision.kind, "tool": decision.tool})
-                finished, migration = self._apply_decision(decision, state, effective, audit, envelope, active_policy, admission_generation)
+                # Batch 2: re-read the cancellation AFTER the provider answers and BEFORE any of its
+                # decision acts. A provider call is the longest wait in a step (a remote model takes
+                # seconds), so it is where an operator's cancel usually lands; without this the decision
+                # made after the cancel, and a non-approval tool it picked, still ran. The decision is then
+                # dropped unread. A cancel after this read is still caught at this step's save (Fix 2).
+                # The read is a store call, so it sits INSIDE this failure boundary: a store error here
+                # must close the task like any other post-admission failure (Codex P2 on batch 2).
+                cancelled = self.store.is_task_cancelled(state.task_id)
+                if not cancelled:
+                    # Auditor round 1: READING the decision is inside the boundary too. A provider that
+                    # returns something that is not a ProviderDecision raises on attribute access, and
+                    # that raise used to happen here, outside every handler -- stranding the checkpoint
+                    # at `running`, the very class PM-004 closes. Round 2: check the SHAPE before reading
+                    # it anywhere, so a malformed field cannot escape by a later side door instead.
+                    decision = _require_wellformed_decision(decision)
+                    active_policy, effective = self._recheck_reloaded_policy(envelope, active_policy, effective, state, audit)
+                    audit.append("provider.proposed", {"kind": decision.kind, "tool": decision.tool})
+                    finished, migration = self._apply_decision(decision, state, effective, audit, envelope, active_policy, admission_generation)
             except Exception as error:
                 # PM-004: _apply_decision sat OUTSIDE every failure boundary, so a provider decision
                 # that failed host authorization (a tool with no grant, an exhausted tool-call budget,
@@ -811,6 +814,8 @@ class AgentHost:
                     # An expired permit is the request's own authority running out: it stays a refusal.
                     mark_failed_after_admission(error)
                 raise
+            if cancelled:
+                return self._close_cancelled(envelope, effective, state, audit, persisted_events)
             state.step += 1
             # Close the checkpoint's lineage at this host when the task terminates
             # (completed/failed) or migrates away, so it can never be resumed here
