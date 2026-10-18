@@ -148,10 +148,21 @@ def _classify_address(ip_str: str) -> ipaddress.IPv4Address | ipaddress.IPv6Addr
     return address
 
 
+# Batch 2: special-purpose networks Python's `is_*` flags do not all cover. `is_global` catches the shared
+# address space 100.64.0.0/10 (carrier-grade NAT, Tailscale, cloud-internal endpoints), which is neither
+# private nor reserved; the two below are named because `is_global` does not refuse them on every Python.
+_SPECIAL_NETWORKS = (
+    ipaddress.ip_network("192.88.99.0/24"),  # 6to4 relay anycast (deprecated, RFC 7526)
+    ipaddress.ip_network("fec0::/10"),  # IPv6 site-local (deprecated, RFC 3879)
+)
+
+
 def _address_is_disallowed(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     return bool(
         address.is_loopback or address.is_private or address.is_link_local
         or address.is_multicast or address.is_reserved or address.is_unspecified
+        or not address.is_global
+        or any(address in network for network in _SPECIAL_NETWORKS if network.version == address.version)
     )
 
 

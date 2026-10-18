@@ -89,7 +89,9 @@ The example tool enforces a fixed GET method, HTTPS URLs, no URL userinfo, no
 redirect following, a two-second timeout on each network operation (not a total deadline; the
 tool registry bounds the whole call at 2.5 s), and a 65 KiB response cap. The URL's
 host must also resolve only to **public** addresses: one loopback, private, link-local,
-multicast, reserved, or unspecified answer (IPv4-mapped IPv6 included) refuses the call.
+multicast, reserved, unspecified, or otherwise not globally reachable answer (IPv4-mapped
+IPv6 included; this covers the shared address space `100.64.0.0/10`, plus `192.88.99.0/24`
+and `fec0::/10`) refuses the call.
 The tool asks DNS once and connects to the address it checked, with TLS verifying the
 original name, so the name cannot be re-pointed at an internal address in between (DNS
 rebinding). There is no private-range override. The
