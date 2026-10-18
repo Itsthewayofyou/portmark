@@ -6,6 +6,24 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 ### Security
 
+- **A cancel that lands while the provider is deciding now stops the task before any tool runs.** The
+  host re-reads the cancellation right after each provider decision, before any part of it acts. A live
+  run with a real Gemini model showed the gap: the cancel landed during the model call, and the search
+  it then picked still ran. The decision is now dropped and the task closes as `failed` with
+  `agent.cancelled`. A cancel that lands after that re-read still lets that step's tool finish.
+- **`required` arguments are enforced for every grant.** The presence check sat inside the
+  `arguments`-schema branch, so a flat grant such as `{"required": ["recipient"], "max_amount": 10}`
+  accepted a call with no `recipient`, and the tool used its own default.
+- **Constraint values compare as JSON values.** Python treats `True == 1`, so `allowed_*` lists, plain
+  exact-match keys, `const`, and `enum` accepted `true` where a policy allowed `1` (and the reverse). The
+  permit and policy merge used the same equality, so merging `[1]` with `[True]` kept a value one side
+  never allowed. Both now use one JSON equality: booleans match only booleans, containers compare element
+  by element, and numbers compare by value (`1` matches `1.0`). A plain exact-match key or `allowed_*`
+  list no longer matches an absent argument when the policy value is `null`. See POLICY.md.
+- **The public-address check refuses more special-purpose networks.** Provider endpoints, MCP hosts, and
+  the example `http.fetch` tool accepted the shared address space `100.64.0.0/10` (carrier-grade NAT,
+  Tailscale, cloud-internal endpoints), which Python marks neither private nor reserved. An address must
+  now also be globally reachable, and `192.88.99.0/24` and `fec0::/10` are refused by name.
 - **Health probes keep answering when every A2A run slot is busy.** uvicorn's `limit_concurrency`
   counts every open connection, including the arriving one, and was set equal to the run cap. So with
   every run slot busy, `/healthz`, `/readyz`, the agent card and `/metrics` got uvicorn's own 503 (an
@@ -27,9 +45,9 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
   to another host. Every store (in-memory, SQLite, Postgres) now refuses an open checkpoint save and a
   migration enqueue for a cancelled task, inside the save transaction; a closing save stays allowed. The
   host closes the task as `failed` with an `agent.cancelled` audit event: a resume before any provider
-  call, a running task at its next save. A task id cancelled before admission is refused. Limits: up to
-  one step of work can follow a cancel (the step in progress, including a non-approval tool it picks,
-  runs to its save); if that step ends the task another way, that outcome is recorded instead of
+  call, a running task at its next save. A task id cancelled before admission is refused. Limits: a
+  cancel that lands after the post-decision re-read (below) does not stop that step's tool, which runs
+  to its save; if that step ends the task another way, that outcome is recorded instead of
   `agent.cancelled`; a migration already in the outbox is still delivered. The new `agent.cancelled`
   event maps to OCSF Failure / Medium; the SIEM projection is unchanged (`builtin:v1`). See
   DEPLOYMENT.md.

@@ -352,10 +352,11 @@ class AgentHost:
 
         Fix 2: beyond the approval path, the store refuses every OPEN save and every migration enqueue of
         a cancelled task, in the save transaction. A resume is closed before any provider call, and a
-        running task is closed (failed, `agent.cancelled`) at its next save. Up to one step of work can
-        follow the cancel: the step in progress runs to its save, including a provider decision made
-        after the cancel and a non-approval tool it picks. If that step ends the task another way
-        (complete, provider or tool failure), that outcome is recorded instead of `agent.cancelled`.
+        running task is closed (failed, `agent.cancelled`) at its next save. Batch 2: the run loop also
+        re-reads the cancellation right after each provider decision, before it acts, so a cancel that
+        lands while the provider decides runs no tool. A cancel after that read does not stop the step's
+        tool; the task stops at that step's save. If that step ends the task another way (complete,
+        provider or tool failure), that outcome is recorded instead of `agent.cancelled`.
         """
         self.store.cancel_task(task_id)
 
@@ -757,6 +758,13 @@ class AgentHost:
                 mark_failed_after_admission(error)
                 raise
             self.metrics.increment("provider.decisions")
+            # Batch 2: re-read the cancellation AFTER the provider answers and BEFORE any of its decision
+            # acts. A provider call is the longest wait in a step (a remote model takes seconds), so it is
+            # where an operator's cancel usually lands; without this the decision made after the cancel,
+            # and a non-approval tool it picked, still ran. The decision is dropped unread. A cancel that
+            # lands after this read is still caught at this step's save (Fix 2).
+            if self.store.is_task_cancelled(state.task_id):
+                return self._close_cancelled(envelope, effective, state, audit, persisted_events)
             tool_calls_before = state.tool_calls
             try:
                 # Auditor round 1: READING the decision is inside the boundary too. A provider that

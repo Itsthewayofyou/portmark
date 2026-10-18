@@ -3536,10 +3536,20 @@ class RuntimeTests(unittest.TestCase):
         # test_cancel_during_tool_launch_does_not_prevent_effect_best_effort_limit.) Modeled by a store
         # whose in-transaction check does not yet see the cancel while the store-level pre-launch read does.
         class _CancelBetween(InMemoryRuntimeStore):
+            hide_next_read = False
+
             def transaction(self):
                 txn = super().transaction()
                 txn.is_task_cancelled = lambda task_id: False  # cancel not yet committed at gate time
                 return txn
+
+            def is_task_cancelled(self, task_id):
+                # Batch 2's post-decision re-read comes first and must not see the cancel yet: it commits
+                # just after that read, so the pre-launch read is the one that catches it.
+                if self.hide_next_read:
+                    self.hide_next_read = False
+                    return False
+                return super().is_task_cancelled(task_id)
 
         store = _CancelBetween()
         host, authority = self._approval_gated_host(store=store)
@@ -3548,7 +3558,9 @@ class RuntimeTests(unittest.TestCase):
         envelope.state.memory["approvals"] = {"payments.reserve": asdict(token)}
         host.signer.seal(envelope)
         store.cancel_task(envelope.state.task_id)  # committed; the pre-launch read will observe it
+        store.hide_next_read = True
         result = host.run(envelope)
+        self.assertFalse(store.hide_next_read)  # the post-decision re-read ran (and missed the cancel)
         self.assertEqual(result.status, "failed")
         denials = [event for event in result.audit if event["event"] == "approval.denied"]
         self.assertTrue(denials)

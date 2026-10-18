@@ -201,10 +201,19 @@ class SideEffectingDefaultTests(unittest.TestCase):
         from test_runtime import PaymentProvider, RuntimeTests
 
         class CancelBetween(InMemoryRuntimeStore):
+            hide_next_read = False
+
             def transaction(self):
                 txn = super().transaction()
                 txn.is_task_cancelled = lambda task_id: False  # cancel not yet committed at gate time
                 return txn
+
+            def is_task_cancelled(self, task_id):
+                # Batch 2's post-decision re-read comes first; the cancel commits just after it.
+                if self.hide_next_read:
+                    self.hide_next_read = False
+                    return False
+                return super().is_task_cancelled(task_id)
 
         registry = ToolRegistry(isolation_profile=IsolationProfile(mechanism=IsolationMechanism.EXTERNAL_CONTAINER, acknowledged_by="test-suite"))
         registry.register_isolated(
@@ -229,7 +238,9 @@ class SideEffectingDefaultTests(unittest.TestCase):
         envelope.state.memory["approvals"] = {"payments.reserve": asdict(token)}
         host.signer.seal(envelope)
         store.cancel_task(envelope.state.task_id)  # committed; the pre-launch read will observe it
+        store.hide_next_read = True
         result = host.run(envelope)
+        self.assertFalse(store.hide_next_read)  # the post-decision re-read ran (and missed the cancel)
         self.assertEqual(result.status, "failed")
         denials = [record for record in result.audit if record["event"] == "approval.denied"]
         self.assertEqual([denial["details"]["reason"] for denial in denials], ["cancelled"])

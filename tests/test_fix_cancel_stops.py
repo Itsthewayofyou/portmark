@@ -6,9 +6,12 @@ NON-closing checkpoint save, and a migration enqueue, for a cancelled task, insi
 transaction. The host turns that refusal into a durable CLOSED, failed checkpoint with an
 `agent.cancelled` audit event. A closing save stays allowed, so a cancelled task can always be closed.
 
-Known limit (asserted below, not fixed): up to one step of work can follow a cancel. A provider
-decision made after the cancel committed, and a non-approval tool it picks, still run; the task stops
-at that step's save.
+Batch 2: the host also re-reads the cancellation right after the provider answers, before any part of
+the decision acts, so a cancel that lands while the provider is deciding stops the task with no tool run.
+
+Known limit (asserted below, not fixed): a cancel that lands AFTER that re-read -- while the tool runs,
+or in the short window before it launches -- does not stop that tool. The task stops at that step's
+save, and the provider is not asked again.
 """
 
 from __future__ import annotations
@@ -143,7 +146,9 @@ class CancelStopsTaskTests(unittest.TestCase):
                 self.assertEqual(result.status, "completed")
                 self.assertNotIn("agent.cancelled", _events(result))
 
-    def test_a_cancel_during_a_run_stops_it_at_the_next_save(self):
+    def test_a_cancel_during_the_provider_decision_stops_it_before_the_tool(self):
+        # The live Gemini run (2026-10-16): a cancel that landed while the model decided still let the
+        # search it picked run. Batch 2 re-reads the cancellation after the decision.
         for backend, store_case in _store_cases():
             with self.subTest(backend=backend), store_case() as store:
                 provider = _CancelsThenSearches(store)
@@ -154,12 +159,35 @@ class CancelStopsTaskTests(unittest.TestCase):
                 result = host.run(envelope)
 
                 self.assertEqual(result.status, "failed")
-                self.assertIn("agent.cancelled", _events(result))
                 self.assertEqual(provider.calls, 1)  # stopped before the next provider call
-                # Known limit: the tool chosen in the step the cancel landed in still ran.
-                self.assertIn("tool.executed", _events(result))
+                self.assertNotIn("tool.executed", _events(result))  # the decision made after the cancel never acted
+                self.assertEqual(_events(result)[-1], "agent.cancelled")
                 checkpoint = store.load_checkpoint(envelope.state.task_id)
-                self.assertEqual(checkpoint["status"], "failed")
+                self.assertEqual((checkpoint["status"], checkpoint["tool_calls"]), ("failed", 0))
+
+    def test_a_cancel_during_the_tool_stops_it_at_the_next_save(self):
+        # Known limit: a cancel landing while the tool runs is after the re-read, so that tool finishes.
+        for backend, store_case in _store_cases():
+            with self.subTest(backend=backend), store_case() as store:
+                provider = _CancelsThenSearches(store)
+                provider.calls = 1  # do not cancel from the provider; the tool does it below
+                host = self.host(store, provider)
+                envelope = make_demo_envelope(host, "run", "p")
+                invoke = host.tools.invoke
+
+                def cancelling_invoke(*args, **kwargs):
+                    output = invoke(*args, **kwargs)
+                    store.cancel_task(envelope.state.task_id)
+                    return output
+
+                host.tools.invoke = cancelling_invoke
+
+                result = host.run(envelope)
+
+                self.assertEqual(result.status, "failed")
+                self.assertEqual(provider.calls, 2)  # only the one decision; never asked again
+                self.assertEqual(_events(result).count("tool.executed"), 1)
+                self.assertEqual(_events(result)[-1], "agent.cancelled")
 
     def test_a_cancelled_task_cannot_escape_by_migrating(self):
         for backend, store_case in _store_cases():
@@ -211,13 +239,23 @@ class ApprovalGateCancelTests(unittest.TestCase):
         host.signer.seal(envelope)
         task_id = envelope.state.task_id
 
-        class CancelsThenPays(test_runtime.PaymentProvider):
-            def decide(self, state, available_tools, grants=()):
-                host.cancel_task(task_id)  # lands after the resume's admission save
-                return super().decide(state, available_tools, grants)
+        # Batch 2 re-reads the cancellation right after the provider answers, so a cancel made inside
+        # `decide` no longer reaches the gate. Land it just AFTER that re-read instead (the re-read
+        # still sees "not cancelled"), so this test keeps covering the gate's in-transaction check.
+        is_task_cancelled = host.store.is_task_cancelled
+        reads = []
 
-        host.providers["payer"] = CancelsThenPays()
+        def cancel_after_the_post_decision_read(checked_task_id):
+            cancelled = is_task_cancelled(checked_task_id)
+            reads.append(cancelled)
+            if len(reads) == 1:
+                host.cancel_task(task_id)
+            return cancelled
+
+        host.store.is_task_cancelled = cancel_after_the_post_decision_read
+        host.providers["payer"] = test_runtime.PaymentProvider()
         result = host.run(envelope)
+        self.assertEqual(reads[:1], [False])  # the post-decision re-read ran, before the cancel landed
 
         events = [record["event"] for record in result.audit]
         denials = [record for record in result.audit if record["event"] == "approval.denied"]

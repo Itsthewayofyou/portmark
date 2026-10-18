@@ -781,9 +781,12 @@ is refused at admission.
 
 What still happens between the cancel and that save:
 
-- The step in progress finishes its work. That includes a provider decision made after the cancel
-  committed, and any tool that decision picks that is not approval-gated (approval-gated tools are
-  re-checked just before launch). One step of work can follow a cancel.
+- The host re-reads the cancellation as soon as the provider answers, before any part of the decision
+  acts. So a cancel that lands while the provider is deciding (the usual case: a remote model takes
+  seconds) stops the task with no tool run, and the decision is dropped.
+- A cancel that lands after that re-read does not stop the step in progress: a tool already running, or
+  about to launch, finishes (approval-gated tools are re-checked just before launch). The task then stops
+  at that step's save, and the provider is not asked again.
 - `agent.cancelled` is written only when the cancel is what ends the task. If that step ends the task
   another way first (the task completes, the provider fails, a tool fails), that outcome is recorded
   instead; the task is closed either way and cannot be resumed.
