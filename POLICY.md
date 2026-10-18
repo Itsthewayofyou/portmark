@@ -78,7 +78,15 @@ must be in the allowed list, and a plain key such as `currency: "USD"` requires
 exact equality. Rich constraints can be placed under `constraints.arguments`
 with `type`, `const`, `enum`, `minimum`, `maximum`, `min_length`, `max_length`,
 and `pattern`. Use top-level `required` or per-argument `required: true` for
-mandatory arguments.
+mandatory arguments. Top-level `required` is enforced for every grant, with or
+without an `arguments` schema.
+
+Values compare as JSON values: a boolean never matches a number, so a policy that
+allows `[1]` refuses `true`, and `const: 0` refuses `false`. Lists and objects
+compare element by element under the same rule. Numbers compare by value, so `1`
+matches `1.0` (as in JSON Schema `enum` and `const`). A plain key such as
+`currency: "USD"`, and an `allowed_*` list, also require the argument to be
+present.
 
 **Argument names are deny-by-default.** A grant that constrains any argument
 (a schema, `required`, or a legacy `max_`/`allowed_`/exact key) admits only the

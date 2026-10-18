@@ -273,13 +273,13 @@ class NoWideningPropertyTest(unittest.TestCase):
 
 
 class DormantConstraintTest(unittest.TestCase):
-    """`required` is inert without an `arguments` schema; a merge can activate it.
+    """A merge must never lose enforcement one side had.
 
-    check_constraints only consults `required` inside `if schema is not None`, so a
-    merge that brings a schema in from one side can ACTIVATE the other side's
-    dormant `required`. Activating is narrowing and therefore safe; the direction
-    that would not be safe is a merge that loses enforcement one side had. These pin
-    both directions, because the generator cannot reliably reach them.
+    `required` used to be inert without an `arguments` schema (check_constraints only
+    consulted it inside `if schema is not None`), so a merge could only ACTIVATE it.
+    Batch 2 made `required` live for every grant shape; these tests now pin that it
+    stays enforced through a merge, and that a merge never loses enforcement either
+    way, because the generator cannot reliably reach these shapes.
     (`additional_arguments: False` is live without a schema since finding #4 — its
     test below pins that, plus the merge-preservation property.)
     """
@@ -290,13 +290,15 @@ class DormantConstraintTest(unittest.TestCase):
             self.fail("grant was dropped instead of merged")
         return merged
 
-    def test_a_schema_from_one_side_may_activate_the_others_required(self) -> None:
+    def test_required_without_a_schema_stays_enforced_through_a_merge(self) -> None:
+        # This test used to assert `accepts(right, {})`: right's `required` was dormant. Batch 2 pins it live.
         left = {"arguments": {"a": {}}}
         right = {"required": ["a"]}
         merged = self.require_merged(merge_real(left, right))
-        self.assertFalse(accepts(merged, {}), "required should now be enforced")
+        self.assertFalse(accepts(merged, {}), "the merge keeps right's required")
         self.assertTrue(accepts(left, {}), "fixture: left had no required")
-        self.assertTrue(accepts(right, {}), "fixture: right's required was dormant")
+        self.assertFalse(accepts(right, {}), "right's required is live without a schema")
+        self.assertTrue(accepts(merged, {"a": 1}), "control: the required argument is accepted")
 
     def test_enforcement_is_never_lost_when_the_schema_is_emptied(self) -> None:
         """Filtering by permitted names can empty the schema. `required` must not go inert."""

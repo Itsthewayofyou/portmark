@@ -1360,6 +1360,29 @@ _SPEC_NARROWERS: dict[str, str] = {
 }
 
 
+def _json_equal(left: Any, right: Any) -> bool:
+    """Equality of two JSON values, for every constraint check and every constraint merge.
+
+    Python's `==` says `True == 1` and `0 == False`, so a policy allowing `1` accepted `true` (deep-dive
+    A7). Here a boolean equals only a boolean, a string only a string, `null` only `null`, and lists and
+    objects compare element by element under the same rule. Numbers compare by value, so `1` equals
+    `1.0`: JSON has one number type, and JSON Schema `enum`/`const` treat them as equal.
+    """
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left == right
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return left == right
+    if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
+        return len(left) == len(right) and all(_json_equal(a, b) for a, b in zip(left, right))
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(_json_equal(left[key], right[key]) for key in left)
+    return type(left) is type(right) and left == right
+
+
+def _json_in(value: Any, items: Any) -> bool:
+    return any(_json_equal(value, item) for item in items)
+
+
 def _declares_argument_policy(constraints: dict[str, Any]) -> bool:
     """True if the grant constrains at least one argument by name (an `arguments`
     schema, `required`, or a legacy `max_`/`allowed_`/exact key).
@@ -1424,7 +1447,7 @@ def _narrow_argument_spec(left: dict[str, Any], right: dict[str, Any]) -> tuple[
         if key not in right:
             result[key] = left[key]
             continue
-        if left[key] == right[key]:
+        if _json_equal(left[key], right[key]):
             result[key] = left[key]
             continue
         if rule == "identical":
@@ -1440,7 +1463,7 @@ def _narrow_argument_spec(left: dict[str, Any], right: dict[str, Any]) -> tuple[
         if rule == "list-intersection":
             if not isinstance(left[key], list) or not isinstance(right[key], list):
                 return None, key
-            shared = [item for item in left[key] if item in right[key]]
+            shared = [item for item in left[key] if _json_in(item, right[key])]
             if not shared:
                 return None, key
             result[key] = shared
@@ -1491,12 +1514,12 @@ def _constraint_intersection(left: dict[str, Any], right: dict[str, Any]) -> tup
             result[key] = right[key]
         elif key not in right:
             result[key] = left[key]
-        elif left[key] == right[key]:
+        elif _json_equal(left[key], right[key]):
             result[key] = left[key]
         elif key.startswith("max_") and all(isinstance(v, (int, float)) for v in (left[key], right[key])):
             result[key] = min(left[key], right[key])
         elif key.startswith("allowed_") and isinstance(left[key], list) and isinstance(right[key], list):
-            shared = [v for v in left[key] if v in right[key]]
+            shared = [v for v in left[key] if _json_in(v, right[key])]
             if not shared:
                 return None, key
             result[key] = shared
@@ -1981,12 +2004,14 @@ def check_constraints(constraints: dict[str, Any], arguments: dict[str, Any]) ->
     additional = constraints.get("additional_arguments", not _declares_argument_policy(constraints))
     if not isinstance(additional, bool):
         raise SecurityError("additional_arguments constraint must be boolean")
+    # Batch 2: presence is checked for EVERY grant shape. It used to sit inside `if schema is not None`,
+    # so a flat grant ({"required": ["recipient"], "max_amount": 10}) accepted a call with no recipient.
+    for name in required:
+        if name not in arguments:
+            raise SecurityError(f"argument {name!r} is required")
     if schema is not None:
         if not isinstance(schema, dict):
             raise SecurityError("argument constraints must be an object")
-        for name in required:
-            if name not in arguments:
-                raise SecurityError(f"argument {name!r} is required")
         for argument, spec in schema.items():
             if not isinstance(argument, str) or not argument:
                 raise SecurityError("argument constraint names must be non-empty strings")
@@ -2027,9 +2052,10 @@ def check_constraints(constraints: dict[str, Any], arguments: dict[str, Any]) ->
             if not isinstance(expected, (list, tuple, set)):
                 raise SecurityError(f"{name} constraint must be a list")
             argument = name[8:]
-            if arguments.get(argument) not in expected:
+            # `argument in arguments` keeps an absent argument from matching a policy's `None`.
+            if argument not in arguments or not _json_in(arguments[argument], expected):
                 raise SecurityError(f"argument {argument!r} is outside its allowed set")
-        elif arguments.get(name) != expected:
+        elif name not in arguments or not _json_equal(arguments[name], expected):
             raise SecurityError(f"argument {name!r} does not match its required value")
 
 
@@ -2146,13 +2172,13 @@ def _check_argument_schema(name: str, value: Any, spec: dict[str, Any]) -> None:
     expected_type = spec.get("type")
     if expected_type is not None and not _matches_type(value, expected_type):
         raise SecurityError(f"argument {name!r} has invalid type")
-    if "const" in spec and value != spec["const"]:
+    if "const" in spec and not _json_equal(value, spec["const"]):
         raise SecurityError(f"argument {name!r} does not match its required value")
     enum = spec.get("enum")
     if enum is not None:
         if not isinstance(enum, list) or not enum:
             raise SecurityError(f"argument {name!r} enum constraint must be a non-empty list")
-        if value not in enum:
+        if not _json_in(value, enum):
             raise SecurityError(f"argument {name!r} is outside its allowed set")
     if "minimum" in spec:
         # Finding #2: a NaN value defeats `value < minimum` (all NaN comparisons are
