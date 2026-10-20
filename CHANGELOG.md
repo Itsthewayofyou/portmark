@@ -4,6 +4,15 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 ## Unreleased
 
+## 0.11.0 — 2026-10-20
+
+**A security release.** It ships the twelve security fixes made since 0.10.0: argument detachment (U2),
+the migration authority ceiling (U7), the mid-run policy reload and the Node Wasm shared-memory clock (U1,
+U6), and the eight fixes of PR #147 listed below. **Migration:** the production profile now refuses a host
+policy with any tool that has no explicit `impact`; set one on every tool entry before upgrading (see
+POLICY.md). Constraint checking is also stricter: a missing `required` argument, or a boolean offered where
+a number is allowed (or the reverse), is now refused.
+
 ### Security
 
 - **A cancel that lands while the provider is deciding now stops the task before any tool runs.** The
