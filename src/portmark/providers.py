@@ -150,10 +150,19 @@ def _classify_address(ip_str: str) -> ipaddress.IPv4Address | ipaddress.IPv6Addr
 
 # Batch 2: special-purpose networks Python's `is_*` flags do not all cover. `is_global` catches the shared
 # address space 100.64.0.0/10 (carrier-grade NAT, Tailscale, cloud-internal endpoints), which is neither
-# private nor reserved; the two below are named because `is_global` does not refuse them on every Python.
+# private nor reserved. The blocks below are named because Python's own tables for them differ by PATCH
+# release (CPython updated them in 3.11.10 / 3.12.4): on an older 3.11, `2002:7f00:1::1` (6to4 for
+# 127.0.0.1) is "global" and was accepted (Windows CI caught it). Naming them makes the answer the same on
+# every Python. The forms that embed an IPv4 address (6to4, NAT64) are refused outright, not decoded.
 _SPECIAL_NETWORKS = (
     ipaddress.ip_network("192.88.99.0/24"),  # 6to4 relay anycast (deprecated, RFC 7526)
     ipaddress.ip_network("fec0::/10"),  # IPv6 site-local (deprecated, RFC 3879)
+    ipaddress.ip_network("2002::/16"),  # 6to4: embeds an IPv4 address (RFC 3056)
+    ipaddress.ip_network("64:ff9b::/96"),  # NAT64 well-known prefix: embeds an IPv4 address (RFC 6052)
+    ipaddress.ip_network("64:ff9b:1::/48"),  # NAT64 local-use prefix (RFC 8215)
+    ipaddress.ip_network("2001:db8::/32"),  # documentation (RFC 3849)
+    ipaddress.ip_network("3fff::/20"),  # documentation (RFC 9637)
+    ipaddress.ip_network("5f00::/16"),  # SRv6 SIDs (RFC 9602)
 )
 
 

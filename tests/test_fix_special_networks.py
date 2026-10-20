@@ -4,9 +4,10 @@
 `is_unspecified`. Python marks the shared address space `100.64.0.0/10` (carrier-grade NAT; Tailscale
 and many cloud-internal endpoints live there) as none of those, so a provider endpoint or MCP host that
 resolved to `100.100.100.200` passed as "public". Now an address must also be globally reachable
-(`is_global`), and the deprecated site-local `fec0::/10` and the 6to4 relay anycast `192.88.99.0/24`
-are refused by name. IPv6 forms that embed an IPv4 address (6to4 `2002::/16`, NAT64 `64:ff9b::/96`)
-were already refused outright; a guard test keeps them refused.
+(`is_global`), and special blocks are refused by name: `192.88.99.0/24`, `fec0::/10`, the forms that
+embed an IPv4 address (6to4 `2002::/16`, NAT64 `64:ff9b::/96` and `64:ff9b:1::/48`), the documentation
+ranges and SRv6 SIDs. They are named because Python's own tables for them differ by patch release: on an
+older 3.11 (the Windows CI runner), `2002:7f00:1::1` -- 6to4 for 127.0.0.1 -- was "global" and accepted.
 """
 
 from __future__ import annotations
@@ -32,10 +33,31 @@ class SpecialNetworkTests(unittest.TestCase):
             with self.subTest(ip=ip):
                 self.assertTrue(disallowed(ip))
 
-    def test_guard_ipv6_that_embeds_a_private_ipv4_stays_refused(self):
-        for ip in ("2002:7f00:1::1", "2002:a00:1::1", "64:ff9b::7f00:1", "64:ff9b::a9fe:a9fe"):
-            with self.subTest(ip=ip):  # 6to4 / NAT64 of 127.0.0.1, 10.0.0.1, 169.254.169.254
+    def test_ipv6_that_embeds_an_ipv4_address_is_refused_on_every_python(self):
+        # 6to4 / NAT64 of 127.0.0.1, 10.0.0.1, 169.254.169.254, and of the public 8.8.8.8: refused outright,
+        # by name, so the answer does not depend on the running Python's patch-level address tables.
+        for ip in ("2002:7f00:1::1", "2002:a00:1::1", "64:ff9b::7f00:1", "64:ff9b::a9fe:a9fe",
+                   "2002:808:808::1", "64:ff9b::808:808", "64:ff9b:1::1"):
+            with self.subTest(ip=ip):
                 self.assertTrue(disallowed(ip))
+
+    def test_documentation_and_srv6_ranges_are_refused(self):
+        for ip in ("2001:db8::1", "3fff::1", "5f00::1"):
+            with self.subTest(ip=ip):
+                self.assertTrue(disallowed(ip))
+
+    def test_the_named_blocks_decide_without_pythons_tables(self):
+        # Simulate an older Python whose tables call these addresses global and not private/reserved: the
+        # named list alone must still refuse them. (This is how the Windows 3.11 runner behaved.)
+        from unittest import mock
+        import ipaddress as ipa
+        with mock.patch.object(ipa.IPv6Address, "is_global", new_callable=mock.PropertyMock, return_value=True), \
+                mock.patch.object(ipa.IPv6Address, "is_private", new_callable=mock.PropertyMock, return_value=False), \
+                mock.patch.object(ipa.IPv6Address, "is_reserved", new_callable=mock.PropertyMock, return_value=False):
+            for ip in ("2002:7f00:1::1", "64:ff9b::7f00:1", "64:ff9b:1::1", "fec0::1", "2001:db8::1"):
+                with self.subTest(ip=ip):
+                    self.assertTrue(disallowed(ip))
+            self.assertFalse(disallowed("2606:4700:4700::1111"))  # control: an ordinary global address passes
 
     def test_resolve_public_address_refuses_shared_address_space(self):
         with self.assertRaisesRegex(SecurityError, "non-public"):

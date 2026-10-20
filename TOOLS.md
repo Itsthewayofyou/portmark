@@ -90,8 +90,9 @@ redirect following, a two-second timeout on each network operation (not a total 
 tool registry bounds the whole call at 2.5 s), and a 65 KiB response cap. The URL's
 host must also resolve only to **public** addresses: one loopback, private, link-local,
 multicast, reserved, unspecified, or otherwise not globally reachable answer (IPv4-mapped
-IPv6 included; this covers the shared address space `100.64.0.0/10`, plus `192.88.99.0/24`
-and `fec0::/10`) refuses the call.
+IPv6 included; this covers the shared address space `100.64.0.0/10`, `192.88.99.0/24`,
+`fec0::/10`, the 6to4 and NAT64 forms that embed an IPv4 address, and the documentation
+and SRv6 ranges) refuses the call.
 The tool asks DNS once and connects to the address it checked, with TLS verifying the
 original name, so the name cannot be re-pointed at an internal address in between (DNS
 rebinding). There is no private-range override. The

@@ -141,8 +141,10 @@ what makes the SafeRoot the only reachable path.
   under Portmark's control: redirects are NOT followed (a 3xx is a controlled failure, closing the SSRF /
   cross-origin-token-forwarding vector); the endpoint address is validated (every resolved A/AAAA answer
   is rejected if loopback/private/link-local/multicast/reserved/unspecified, not globally reachable (this
-  includes the shared address space `100.64.0.0/10`), or in `192.88.99.0/24` or `fec0::/10` — mixed answers
-  fail closed — IPv4-mapped IPv6 normalized first; loopback allowed only under `allow_local_endpoint`); the connection
+  includes the shared address space `100.64.0.0/10`), or in a named special block (`192.88.99.0/24`,
+  `fec0::/10`, 6to4 `2002::/16`, NAT64 `64:ff9b::/96` and `64:ff9b:1::/48`, `2001:db8::/32`, `3fff::/20`,
+  `5f00::/16`; named so the answer does not depend on the Python patch release) — mixed answers fail
+  closed — IPv4-mapped IPv6 normalized first; loopback allowed only under `allow_local_endpoint`); the connection
   is pinned to the pre-validated IP with a `getpeername` cross-check (DNS-rebinding defense) while TLS
   cert validation stays on the hostname; and the ENTIRE synchronous transaction (DNS, TCP, TLS, request,
   response status line + headers, body) runs in a pool-capped worker thread joined on one external

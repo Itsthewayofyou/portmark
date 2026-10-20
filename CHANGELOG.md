@@ -23,7 +23,11 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 - **The public-address check refuses more special-purpose networks.** Provider endpoints, MCP hosts, and
   the example `http.fetch` tool accepted the shared address space `100.64.0.0/10` (carrier-grade NAT,
   Tailscale, cloud-internal endpoints), which Python marks neither private nor reserved. An address must
-  now also be globally reachable, and `192.88.99.0/24` and `fec0::/10` are refused by name.
+  now also be globally reachable, and these blocks are refused by name: `192.88.99.0/24`, `fec0::/10`,
+  6to4 `2002::/16` and NAT64 `64:ff9b::/96` / `64:ff9b:1::/48` (they embed an IPv4 address), the
+  documentation ranges `2001:db8::/32` and `3fff::/20`, and SRv6 `5f00::/16`. They are named because
+  Python's own tables differ by patch release: on an older Python 3.11, `2002:7f00:1::1` (6to4 for
+  `127.0.0.1`) was treated as global and accepted.
 - **Health probes keep answering when every A2A run slot is busy.** uvicorn's `limit_concurrency`
   counts every open connection, including the arriving one, and was set equal to the run cap. So with
   every run slot busy, `/healthz`, `/readyz`, the agent card and `/metrics` got uvicorn's own 503 (an
