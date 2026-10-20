@@ -48,7 +48,8 @@ class SpecialNetworkTests(unittest.TestCase):
         self.assertEqual(resolve_public_address("8.8.8.8", 443), "8.8.8.8")
 
     def test_control_already_refused_networks_stay_refused(self):
-        for ip in ("127.0.0.1", "10.0.0.1", "169.254.169.254", "::1", "::ffff:127.0.0.1", "0.0.0.0", "224.0.0.1"):
+        # The literals are addresses the check must REFUSE, not a bind; bandit B104 flags "0.0.0.0" regardless.
+        for ip in ("127.0.0.1", "10.0.0.1", "169.254.169.254", "::1", "::ffff:127.0.0.1", "0.0.0.0", "224.0.0.1"):  # nosec B104
             with self.subTest(ip=ip):
                 self.assertTrue(disallowed(ip))
 
