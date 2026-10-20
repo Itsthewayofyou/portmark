@@ -24,11 +24,16 @@ def policy_from_dict(value: dict[str, Any], audience: str) -> HostPolicy:
     budget = _budget(value.get("budget", {}))
     grants = []
     impacts: dict[str, str] = {}
+    # Fix 3: a tool with no `impact` still defaults to "low" here, but is recorded, so the production
+    # profile can refuse the policy and a side-effecting tool can be treated as "high" (HostPolicy).
+    implicit: list[str] = []
     for name, config in tools.items():
         if not isinstance(name, str) or not name:
             raise ValueError("policy tool names must be non-empty strings")
         if not isinstance(config, dict):
             raise ValueError("policy tool entries must be objects")
+        if "impact" not in config:
+            implicit.append(name)
         impact = config.get("impact", "low")
         if impact not in VALID_IMPACTS:
             raise ValueError(f"policy tool {name!r} has invalid impact")
@@ -52,6 +57,7 @@ def policy_from_dict(value: dict[str, Any], audience: str) -> HostPolicy:
         approval_authorities=_approval_authorities(value.get("approval_authorities", ())),
         approval_required_impacts=approval_required_impacts,
         migration=_migration_policy(value.get("migration")),
+        implicit_impacts=tuple(implicit),
     )
 
 

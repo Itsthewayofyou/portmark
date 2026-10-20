@@ -34,7 +34,7 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
-from portmark.a2a import MAX_REQUEST_BYTES, DEFAULT_MAX_CONCURRENT_REQUESTS, A2AAuthConfig, RateLimiter, envelope_from_dict, is_loopback_bind, make_asgi_app, serve
+from portmark.a2a import MAX_REQUEST_BYTES, A2A_CONNECTION_HEADROOM, DEFAULT_MAX_CONCURRENT_REQUESTS, A2AAuthConfig, RateLimiter, envelope_from_dict, is_loopback_bind, make_asgi_app, serve
 from portmark.a2a_types import make_agent_card
 from portmark.config import RuntimeConfig
 from portmark.factory import build_envelope, make_demo_envelope, make_host, signer_from_environment
@@ -3430,10 +3430,11 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result.status, "failed")
         self.assertIn("approval.denied", [event["event"] for event in result.audit])
 
-    def test_cancelled_task_is_refused_at_approval_gate(self):
-        # Section 5 #3. A task cancelled before its approval is redeemed is refused at the gate (inside
-        # the same transaction that consumes the approval nonce); the tool never runs and, because the
-        # consume rolls back, no approval is burned.
+    def test_cancelled_task_resume_is_closed_before_the_approval_gate(self):
+        # Section 5 #3 + Fix 2. A task cancelled BEFORE its resume is closed at the resume's first save,
+        # before the approval gate: the tool never runs and no approval is redeemed. The gate's own
+        # in-transaction check (a cancel landing mid-run) is tested in test_fix_cancel_stops.py
+        # (ApprovalGateCancelTests).
         host, authority = self._approval_gated_host()
         envelope, first = self._suspend_payment_envelope(host, "cancel before redeem")
         token = self._mint_payment_approval(authority, envelope, first.checkpoint["checkpoint_generation"])
@@ -3442,10 +3443,13 @@ class RuntimeTests(unittest.TestCase):
         host.cancel_task(envelope.state.task_id)
         result = host.run(envelope)
         self.assertEqual(result.status, "failed")
-        denials = [event for event in result.audit if event["event"] == "approval.denied"]
-        self.assertTrue(denials)
-        self.assertEqual(denials[0]["details"]["reason"], "cancelled")
-        self.assertNotIn("approval.approved", [event["event"] for event in result.audit])
+        # Fix 2: the resume of a cancelled task is now closed at its first save, BEFORE the approval
+        # gate (so there is no approval.denied); the guarantees here are unchanged: the tool never
+        # runs and no approval is redeemed.
+        events = [event["event"] for event in result.audit]
+        self.assertIn("agent.cancelled", events)
+        self.assertNotIn("approval.approved", events)
+        self.assertNotIn("tool.executed", events)
 
     def test_cancel_and_redeem_are_atomic_under_concurrency(self):
         # Section 5 #3 CONCURRENT, on SQLite AND Postgres (two real connections synchronized on a
@@ -3518,8 +3522,10 @@ class RuntimeTests(unittest.TestCase):
         host.signer.seal(envelope)
         result = host.run(envelope)
 
-        # Best-effort limit: the effect happened despite the task now being cancelled.
-        self.assertEqual(result.status, "completed")
+        # Best-effort limit: the effect happened despite the task now being cancelled. Fix 2: the task
+        # then stops at the save after that step, closed as failed with agent.cancelled.
+        self.assertEqual(result.status, "failed")
+        self.assertIn("agent.cancelled", [event["event"] for event in result.audit])
         self.assertEqual(effects, ["effect"])
         self.assertTrue(store.is_task_cancelled(envelope.state.task_id))
 
@@ -3530,10 +3536,20 @@ class RuntimeTests(unittest.TestCase):
         # test_cancel_during_tool_launch_does_not_prevent_effect_best_effort_limit.) Modeled by a store
         # whose in-transaction check does not yet see the cancel while the store-level pre-launch read does.
         class _CancelBetween(InMemoryRuntimeStore):
+            hide_next_read = False
+
             def transaction(self):
                 txn = super().transaction()
                 txn.is_task_cancelled = lambda task_id: False  # cancel not yet committed at gate time
                 return txn
+
+            def is_task_cancelled(self, task_id):
+                # Batch 2's post-decision re-read comes first and must not see the cancel yet: it commits
+                # just after that read, so the pre-launch read is the one that catches it.
+                if self.hide_next_read:
+                    self.hide_next_read = False
+                    return False
+                return super().is_task_cancelled(task_id)
 
         store = _CancelBetween()
         host, authority = self._approval_gated_host(store=store)
@@ -3542,7 +3558,9 @@ class RuntimeTests(unittest.TestCase):
         envelope.state.memory["approvals"] = {"payments.reserve": asdict(token)}
         host.signer.seal(envelope)
         store.cancel_task(envelope.state.task_id)  # committed; the pre-launch read will observe it
+        store.hide_next_read = True
         result = host.run(envelope)
+        self.assertFalse(store.hide_next_read)  # the post-decision re-read ran (and missed the cancel)
         self.assertEqual(result.status, "failed")
         denials = [event for event in result.audit if event["event"] == "approval.denied"]
         self.assertTrue(denials)
@@ -3564,7 +3582,11 @@ class RuntimeTests(unittest.TestCase):
                     self.assertTrue(store.is_task_cancelled(envelope.state.task_id))
                     result = host.run(envelope)
                     self.assertEqual(result.status, "failed")
-                    self.assertIn("approval.denied", [event["event"] for event in result.audit])
+                    # Fix 2: closed at the resume's first save, before the approval gate.
+                    events = [event["event"] for event in result.audit]
+                    self.assertIn("agent.cancelled", events)
+                    self.assertNotIn("tool.executed", events)
+                    self.assertEqual(store.load_checkpoint(envelope.state.task_id)["status"], "failed")
 
     def test_stale_asserted_generation_cannot_satisfy_approval_gate(self):
         # Section 5 #1 (G2). The expected generation is sourced from the DURABLE store, so an
@@ -4211,8 +4233,8 @@ class RuntimeTests(unittest.TestCase):
         source_signer, destination_signer = self._migration_signers(prefix)
         original_audit_start = AgentHost._audit_start
 
-        def audit_start(host, envelope, original_task_id):
-            previous_hash, start, anchor = original_audit_start(host, envelope, original_task_id)
+        def audit_start(host, envelope, original_task_id, **options):
+            previous_hash, start, anchor = original_audit_start(host, envelope, original_task_id, **options)
             return previous_hash, start, (rewrite_anchor(anchor) if anchor is not None else None)
 
         with self._sqlite_dual_store_case(source_signer, destination_signer) as (backend, source_store, destination_store):
@@ -5677,7 +5699,7 @@ class RuntimeTests(unittest.TestCase):
                     cli_main()
             self.assertEqual(
                 json.loads(output.getvalue()),
-                {"task_id": result.task_id, "status": "valid", "head_status": "valid", "anchor_status": "none", "floor_status": "no-floor", "remote_status": "no-remote", "reason": "audit head verified"},
+                {"task_id": result.task_id, "status": "valid", "head_status": "valid", "anchor_status": "none", "floor_status": "no-floor", "remote_status": "no-remote", "reason": "audit head verified", "replayed_after_finish": []},
             )
 
             output = io.StringIO()
@@ -5688,7 +5710,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, 2)
             self.assertEqual(
                 json.loads(output.getvalue()),
-                {"task_id": result.task_id, "status": "unverifiable", "head_status": "unverifiable", "anchor_status": "", "floor_status": "no-floor", "remote_status": "no-remote", "reason": "trust registry is not configured"},
+                {"task_id": result.task_id, "status": "unverifiable", "head_status": "unverifiable", "anchor_status": "", "floor_status": "no-floor", "remote_status": "no-remote", "reason": "trust registry is not configured", "replayed_after_finish": []},
             )
 
             with self._raw_sqlite(path) as connection:
@@ -5701,7 +5723,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, 1)
             self.assertEqual(
                 json.loads(output.getvalue()),
-                {"task_id": result.task_id, "status": "invalid", "head_status": "", "anchor_status": "", "floor_status": "no-floor", "remote_status": "no-remote", "reason": "stored audit head does not match audit events"},
+                {"task_id": result.task_id, "status": "invalid", "head_status": "", "anchor_status": "", "floor_status": "no-floor", "remote_status": "no-remote", "reason": "stored audit head does not match audit events", "replayed_after_finish": []},
             )
 
             output = io.StringIO()
@@ -5712,7 +5734,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, 1)
             self.assertEqual(
                 json.loads(output.getvalue()),
-                {"task_id": "missing-task", "status": "invalid", "head_status": "", "anchor_status": "", "floor_status": "no-floor", "remote_status": "no-remote", "reason": "audit chain is missing"},
+                {"task_id": "missing-task", "status": "invalid", "head_status": "", "anchor_status": "", "floor_status": "no-floor", "remote_status": "no-remote", "reason": "audit chain is missing", "replayed_after_finish": []},
             )
 
     def test_host_security_guards_are_directly_reachable(self):
@@ -7564,7 +7586,7 @@ class RuntimeTests(unittest.TestCase):
             serve(host, "127.0.0.1", 8080)
         run.assert_called_once()
         self.assertEqual(run.call_args.args[1]["host"], "127.0.0.1")
-        self.assertEqual(run.call_args.args[1]["limit_concurrency"], DEFAULT_MAX_CONCURRENT_REQUESTS)
+        self.assertEqual(run.call_args.args[1]["limit_concurrency"], DEFAULT_MAX_CONCURRENT_REQUESTS + A2A_CONNECTION_HEADROOM)
 
     def test_serve_warns_when_tls_not_asserted(self):
         host = make_host()
@@ -8222,6 +8244,10 @@ class RuntimeTests(unittest.TestCase):
             "location = /.well-known/agent-card.json",
             "location = /message:send",
             "location = /metrics",
+            # DEPLOYMENT.md requires the proxy to route both probes; the reference config returned 404.
+            "location = /healthz",
+            "location = /readyz",
+            "zone=portmark_health_rate",
             "proxy_set_header Authorization $http_authorization",
             "return 308 https://$host$request_uri",
         ]:

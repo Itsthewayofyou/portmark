@@ -140,8 +140,11 @@ what makes the SafeRoot the only reachable path.
 - **HTTP provider transport (Section 8).** `GenericHttpProvider` runs on `http.client` with the transport
   under Portmark's control: redirects are NOT followed (a 3xx is a controlled failure, closing the SSRF /
   cross-origin-token-forwarding vector); the endpoint address is validated (every resolved A/AAAA answer
-  is rejected if loopback/private/link-local/multicast/reserved/unspecified — mixed answers fail closed —
-  IPv4-mapped IPv6 normalized first; loopback allowed only under `allow_local_endpoint`); the connection
+  is rejected if loopback/private/link-local/multicast/reserved/unspecified, not globally reachable (this
+  includes the shared address space `100.64.0.0/10`), or in a named special block (`192.88.99.0/24`,
+  `fec0::/10`, 6to4 `2002::/16`, NAT64 `64:ff9b::/96` and `64:ff9b:1::/48`, `2001:db8::/32`, `3fff::/20`,
+  `5f00::/16`; named so the answer does not depend on the Python patch release) — mixed answers fail
+  closed — IPv4-mapped IPv6 normalized first; loopback allowed only under `allow_local_endpoint`); the connection
   is pinned to the pre-validated IP with a `getpeername` cross-check (DNS-rebinding defense) while TLS
   cert validation stays on the hostname; and the ENTIRE synchronous transaction (DNS, TCP, TLS, request,
   response status line + headers, body) runs in a pool-capped worker thread joined on one external
@@ -302,8 +305,10 @@ flowchart LR
 - In-process rate limiting is not sufficient as the only control in horizontally scaled deployments.
 - Provider endpoints can be configured with `http` for local gateways; production operators must keep non-loopback provider traffic protected.
 - `GET /.well-known/agent-card.json`, `/healthz`, and `/readyz` intentionally disclose limited operational metadata.
+- Cancellation (`cancel_task`) stops a task at its next checkpoint save, not instantly. Every store refuses an open save and a migration enqueue of a cancelled task in the save transaction, so a cancelled task cannot resume or start a migration, and a running task is stopped at its next save. The host also re-reads the cancellation right after each provider decision, before the decision acts, so a cancel that lands while the provider is deciding stops the task with no tool run. A cancel that lands after that re-read (while a tool runs, or just before it launches) does not stop that tool; the task stops at that step's save. Approval-gated tools are also re-checked before launch. Its effect needs the effect ledger and reconcile pass, not cancellation, to be undone. A migration already in the outbox when the cancel lands is still delivered (the dispatcher does not check cancellation).
 - A tool failing at call time ends the whole run, so one flaky upstream costs every other reading the agent had collected. Deliberate — see Recorded Decisions below.
 - The ASGI app enforces the production requirements where it is built, so every launcher gets them (boundary audit NET-02). The production profile is the default; `PORTMARK_PROFILE=development` relaxes the checks to warnings and is for local work only. TLS termination stays an operator assertion (`PORTMARK_PUBLIC_MODE=behind-tls-proxy`): a plain-HTTP `X-Forwarded-Proto` is logged, not refused, so direct access to the backend must be blocked by the network.
+- Replay by a store insider: a fresh admission of a task id that already has audit history is refused, so deleting a task's checkpoint and nonce rows and resending its original envelope runs nothing. Deleting the task's audit rows as well is caught only by the audit floor (required in production); without a floor (development) that variant runs the task again undetected.
 - Audit-history rollback is detected only relative to the surviving local audit floor (Section 10). Whole-machine rollback, copying the database with its floor, forks across hosts, a compromised host's signing, and backdating before compromise are NOT detected -- see Recorded Decisions.
 - Two constraint sets that narrow the same argument in ways Portmark cannot prove are narrower cause the grant to be dropped rather than merged. Availability is traded for the guarantee that merging never creates authority.
 - Shutdown is bounded, not graceful at any cost (Section 12, decision D1): a run still active when the shutdown grace expires is abandoned as in a crash. Each operation (provider call, approval redemption, tool launch, checkpoint write) starts through one atomic check-and-record step, so either the deadline comes first and the operation never starts, or the operation began first and the shutdown report names it, with its effect id, as in flight. An operation already under way cannot be interrupted, so a side-effecting tool reported in flight has an effect of unknown status until it is reconciled. Portmark reports the shutdown as failed and names the run; the orchestrator, not Portmark, terminates the process.

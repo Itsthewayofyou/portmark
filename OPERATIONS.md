@@ -100,8 +100,17 @@ executable and trust roots owned by the deployment control plane.
 
 `portmark serve` runs the A2A boundary on **uvicorn**, an ASGI server, so a slow
 or stalled client costs a suspended coroutine rather than a blocked OS thread.
-Connection concurrency is bounded by `--max-concurrent-requests`, which is passed
-to uvicorn as `limit_concurrency`.
+Concurrent runs are bounded by `--a2a-max-concurrent-requests`; a saturated
+server answers further submissions with HTTP 503 "server busy". uvicorn's own
+connection limit (`limit_concurrency`) is set 16 connections above that run cap,
+because it counts every open connection, health probes included. So when every
+run slot is busy, `/healthz`, `/readyz`, the agent card and `/metrics` still have
+16 spare connections, and an orchestrator does not restart a server that is only
+busy. The spare connections are shared, not reserved for probes: about 16 idle or
+slow-header connections can still fill them, so keep the reverse proxy's
+connection limits and header timeouts in front of the backend. The container
+entrypoint (`python -m portmark.serve_asgi`) reads the same cap from
+`PORTMARK_A2A_MAX_CONCURRENT_REQUESTS`.
 
 Expose the A2A listener behind a production HTTP stack for public deployments.
 TLS termination remains the proxy's responsibility. Run the reference listener on
@@ -385,6 +394,13 @@ directory). A durable store without a floor logs a warning at start.
 - **`verify-audit --audit-floor-path FLOOR`** adds `floor_status`: `anchored` (exit 0), `not-anchored`
   (the floor never saw this task; exit 2), or a refusal code (exit 1). Without the flag it reports
   `no-floor` and cannot detect rollback.
+- **`verify-audit` always reports `replayed_after_finish`**: the audit sequences of any `agent.accepted`
+  that follows the task's finish (`agent.completed`, `agent.failed` or `agent.cancelled`), with a warning
+  on stderr. A finished task is closed, so this only appears when its closed checkpoint was removed and
+  the task admitted again: an insider replay that ran its work twice. Hosts with the fresh-admission
+  check refuse that replay; the flag finds replays already in a store written before it. It is
+  report-only: it does not change `status` or the exit code (`[]` when clean). Events such as
+  `checkpoint.terminalized` may legitimately follow a finish and are not flagged.
 
 **Where to put it.** On storage that is NOT restored together with the database: a separate volume,
 ideally append-only or WORM (write once, read many) storage. Do not include it in the database backup.

@@ -15,7 +15,7 @@ from .metrics import RuntimeMetrics
 from .models import AgentEnvelope, AgentManifest, AgentState, ApprovalToken, AttestationEvidence, Permit, ProviderDecision, ResourceBudget, RunResult, ToolGrant
 from .projection import project_state_for_migration, provider_view
 from .providers import ModelProvider
-from .security import _MIGRATION_RECEIPT_FIELDS, _OPTIONAL_MIGRATION_RECEIPT_FIELDS, AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, MigrationAttesterProtocol, MigrationPreflightProtocol, PermitExpiredError, SecurityError, arguments_hash, audit_head_payload, canonical_json, detached_json, effect_id, intersect_grants, migration_envelope_digest, migration_receipt_payload, require_unexpired, verified_approval_token
+from .security import _MIGRATION_RECEIPT_FIELDS, _OPTIONAL_MIGRATION_RECEIPT_FIELDS, AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, MigrationAttesterProtocol, MigrationPreflightProtocol, PermitExpiredError, SecurityError, TaskCancelledError, arguments_hash, audit_head_payload, canonical_json, detached_json, effect_id, intersect_grants, migration_envelope_digest, migration_receipt_payload, require_unexpired, verified_approval_token
 from .storage import InMemoryRuntimeStore, RuntimeStore
 from .tools import ToolExecutionError, ToolKilledError, ToolRegistry, tool_error_code
 
@@ -46,6 +46,8 @@ def _is_content_digest(digest: str) -> bool:
 # yet trusted to name another source's space, so the namespace comes from the verified
 # source, not the id the source chose.
 _MIGRATION_TASK_NAMESPACE = "mig::"
+# Fix 1 (1A): the refusal for a fresh admission whose task id already has an audit chain.
+_FRESH_WITH_HISTORY = "task already has audit history; refusing a fresh admission"
 
 # Sentinel distinguishing "no confirmed effect to replay" from a genuine tool result of None
 # (a side-effecting tool may legitimately return None). Section 7 PR 2.
@@ -146,6 +148,11 @@ class _ReloadedPolicy:
 
     def requires_approval(self, tool: str) -> bool:
         return self._previous.requires_approval(tool) or self._fresh.requires_approval(tool)
+
+    def requires_approval_for(self, tool: str, *, side_effecting: bool) -> bool:
+        return self._previous.requires_approval_for(tool, side_effecting=side_effecting) or self._fresh.requires_approval_for(
+            tool, side_effecting=side_effecting
+        )
 
     def authorize_migration(self, permit: Permit, destination: str) -> None:
         self._previous.authorize_migration(permit, destination)
@@ -342,6 +349,14 @@ class AgentHost:
         Guaranteeing "no effect after cancel" requires per-tool idempotency keys + a reconciliation
         pass (Section 7); it is not provided here. This is the supported operator entry point; a
         network-triggered cancel endpoint (with its own auth) is future work.
+
+        Fix 2: beyond the approval path, the store refuses every OPEN save and every migration enqueue of
+        a cancelled task, in the save transaction. A resume is closed before any provider call, and a
+        running task is closed (failed, `agent.cancelled`) at its next save. Batch 2: the run loop also
+        re-reads the cancellation right after each provider decision, before it acts, so a cancel that
+        lands while the provider decides runs no tool. A cancel after that read does not stop the step's
+        tool; the task stops at that step's save. If that step ends the task another way (complete,
+        provider or tool failure), that outcome is recorded instead of `agent.cancelled`.
         """
         self.store.cancel_task(task_id)
 
@@ -659,7 +674,7 @@ class AgentHost:
             state.tool_calls = int(stored["tool_calls"])
             consume_nonce = None
         state.status = "running"
-        previous_hash, start_sequence, migration_anchor = self._audit_start(envelope, original_task_id)
+        previous_hash, start_sequence, migration_anchor = self._audit_start(envelope, original_task_id, fresh=consume_nonce is not None)
         audit = AuditLog(previous_hash, start_sequence, self.host_id)
         accepted_details: dict[str, Any] = {
             "agent": envelope.manifest.agent_id,
@@ -695,7 +710,14 @@ class AgentHost:
             if isinstance(migration_memory, dict) and migration_memory.get("challenge_required"):
                 receipt_binding["destination_attestation"] = self._produce_challenge_evidence(envelope)
         audit.append("agent.accepted", accepted_details)
-        persisted_events = self._persist(envelope, effective, state, audit, 0, consume_nonce=consume_nonce, receipt_binding=receipt_binding)
+        try:
+            persisted_events = self._persist(envelope, effective, state, audit, 0, consume_nonce=consume_nonce, receipt_binding=receipt_binding)
+        except TaskCancelledError:
+            if consume_nonce is not None:
+                # A fresh admission of a cancelled task id: nothing was admitted, no nonce burned.
+                raise
+            # Fix 2: a resume of a cancelled task. Close its open checkpoint, before any provider call.
+            return self._close_cancelled(envelope, effective, state, audit, 0)
         while state.step < effective.budget.max_steps:
             decision_started = time.monotonic()
             # Section 12 #1: atomically refuse (abandoned run) or record the provider call as in flight.
@@ -737,16 +759,26 @@ class AgentHost:
                 raise
             self.metrics.increment("provider.decisions")
             tool_calls_before = state.tool_calls
+            cancelled, finished, migration = False, False, None
             try:
-                # Auditor round 1: READING the decision is inside the boundary too. A provider that
-                # returns something that is not a ProviderDecision raises on attribute access, and
-                # that raise used to happen here, outside every handler -- stranding the checkpoint at
-                # `running`, the very class PM-004 closes. Round 2: check the SHAPE before reading
-                # it anywhere, so a malformed field cannot escape by a later side door instead.
-                decision = _require_wellformed_decision(decision)
-                active_policy, effective = self._recheck_reloaded_policy(envelope, active_policy, effective, state, audit)
-                audit.append("provider.proposed", {"kind": decision.kind, "tool": decision.tool})
-                finished, migration = self._apply_decision(decision, state, effective, audit, envelope, active_policy, admission_generation)
+                # Batch 2: re-read the cancellation AFTER the provider answers and BEFORE any of its
+                # decision acts. A provider call is the longest wait in a step (a remote model takes
+                # seconds), so it is where an operator's cancel usually lands; without this the decision
+                # made after the cancel, and a non-approval tool it picked, still ran. The decision is then
+                # dropped unread. A cancel after this read is still caught at this step's save (Fix 2).
+                # The read is a store call, so it sits INSIDE this failure boundary: a store error here
+                # must close the task like any other post-admission failure (Codex P2 on batch 2).
+                cancelled = self.store.is_task_cancelled(state.task_id)
+                if not cancelled:
+                    # Auditor round 1: READING the decision is inside the boundary too. A provider that
+                    # returns something that is not a ProviderDecision raises on attribute access, and
+                    # that raise used to happen here, outside every handler -- stranding the checkpoint
+                    # at `running`, the very class PM-004 closes. Round 2: check the SHAPE before reading
+                    # it anywhere, so a malformed field cannot escape by a later side door instead.
+                    decision = _require_wellformed_decision(decision)
+                    active_policy, effective = self._recheck_reloaded_policy(envelope, active_policy, effective, state, audit)
+                    audit.append("provider.proposed", {"kind": decision.kind, "tool": decision.tool})
+                    finished, migration = self._apply_decision(decision, state, effective, audit, envelope, active_policy, admission_generation)
             except Exception as error:
                 # PM-004: _apply_decision sat OUTSIDE every failure boundary, so a provider decision
                 # that failed host authorization (a tool with no grant, an exhausted tool-call budget,
@@ -782,6 +814,8 @@ class AgentHost:
                     # An expired permit is the request's own authority running out: it stays a refusal.
                     mark_failed_after_admission(error)
                 raise
+            if cancelled:
+                return self._close_cancelled(envelope, effective, state, audit, persisted_events)
             state.step += 1
             # Close the checkpoint's lineage at this host when the task terminates
             # (completed/failed) or migrates away, so it can never be resumed here
@@ -809,14 +843,19 @@ class AgentHost:
             # status="running" and resumable WHILE a sealed migrated envelope existed:
             # the source could resume AND the destination run the same work (double
             # effect). await_input is still excluded (open, not closed).
-            if not self._checkpoint_fits(effective, state) and (tool_ran or closed):
-                persisted_events = self._terminalize_over_budget(
-                    envelope, effective, state, audit, persisted_events, decision, tool_ran, migration
-                )
-                result = self._result(envelope, audit, migration)
-                self._record_run_status(result.status)
-                return result
-            persisted_events = self._persist(envelope, effective, state, audit, persisted_events, closed=closed, migration=migration)
+            try:
+                if not self._checkpoint_fits(effective, state) and (tool_ran or closed):
+                    persisted_events = self._terminalize_over_budget(
+                        envelope, effective, state, audit, persisted_events, decision, tool_ran, migration
+                    )
+                    result = self._result(envelope, audit, migration)
+                    self._record_run_status(result.status)
+                    return result
+                persisted_events = self._persist(envelope, effective, state, audit, persisted_events, closed=closed, migration=migration)
+            except TaskCancelledError:
+                # Fix 2: cancelled while this step ran. The store refused the open save (or the
+                # migration enqueue) and rolled it back; close the task here instead.
+                return self._close_cancelled(envelope, effective, state, audit, persisted_events)
             if finished:
                 result = self._result(envelope, audit, migration)
                 self._record_run_status(result.status)
@@ -864,7 +903,7 @@ class AgentHost:
             # reconciliation pass (Section 7, tool boundary), not available here. So cancellation of an
             # already-redeemed approval is best-effort-before-launch, not a guarantee that the effect is
             # prevented. Fires only for approval-gated tools; the approval is already consumed.
-            if active_policy.requires_approval(decision.tool) and self.store.is_task_cancelled(state.task_id):
+            if self._requires_approval(active_policy, decision.tool) and self.store.is_task_cancelled(state.task_id):
                 return self._approval_failure(state, audit, "approval.denied", "cancelled")
             # Section 7 PR 2: a side-effecting tool runs under the durable effect ledger. The host
             # derives an idempotency key (effect_id) from the DURABLE admission generation and a
@@ -1176,6 +1215,25 @@ class AgentHost:
             raise SecurityError("checkpoint exceeds the output budget of a reloaded policy")
         return _ReloadedPolicy(active_policy, fresh), narrowed
 
+    def _close_cancelled(self, envelope, effective: Permit, state: AgentState, audit: AuditLog, persisted_events: int) -> RunResult:
+        """Fix 2: end a cancelled task as a durable CLOSED failure with an `agent.cancelled` event.
+
+        The store refuses every open save (and migration enqueue) of a cancelled task but allows a
+        closing one, so this always lands. Events of the refused save were rolled back with it and are
+        still in `audit`; they are written here, before the cancel event. No migration is passed, so a
+        cancelled task cannot leave through the outbox.
+        """
+        state.status = "failed"
+        state.result = {"error": "task cancelled"}
+        audit.append("agent.cancelled", {"task_id": state.task_id})
+        if self._checkpoint_fits(effective, state):
+            self._persist(envelope, effective, state, audit, persisted_events, closed=True)
+        else:
+            self._terminalize_over_budget(envelope, effective, state, audit, persisted_events, None, False)
+        result = self._result(envelope, audit)
+        self._record_run_status(result.status)
+        return result
+
     def _active_policy(self) -> HostPolicy:
         if self._policy_loader is not None and self._reload_policy:
             loaded = self._policy_loader()
@@ -1184,8 +1242,13 @@ class AgentHost:
             self.policy = loaded
         return self.policy
 
+    def _requires_approval(self, policy: "HostPolicy | _ReloadedPolicy", tool: str) -> bool:
+        """The ONE approval decision, for the gate and for the pre-launch cancel re-check alike: the
+        policy's impact plus the registry's side-effecting flag (Fix 3, 3B)."""
+        return policy.requires_approval_for(tool, side_effecting=self.tools.is_side_effecting(tool))
+
     def _approval_gate(self, policy: HostPolicy, permit, state, decision: ProviderDecision, audit: AuditLog, admission_generation: int) -> tuple[bool, None] | None:
-        if decision.tool is None or not policy.requires_approval(decision.tool):
+        if decision.tool is None or not self._requires_approval(policy, decision.tool):
             return None
         # Section 5 #4: the token is loaded from untrusted mutable memory. Any malformation
         # (missing/extra keys, wrong types) is turned into a controlled approval.denied here,
@@ -1199,7 +1262,7 @@ class AgentHost:
             state.result = {
                 "approval_required": True,
                 "tool": decision.tool,
-                "impact": policy.impact_for_tool(decision.tool),
+                "impact": policy.impact_for(decision.tool, side_effecting=self.tools.is_side_effecting(decision.tool)),
                 "arguments_hash": arguments_hash(decision.arguments),
                 "policy_version": policy.policy_version,
                 "policy_hash": policy.policy_hash,
@@ -1598,7 +1661,7 @@ class AgentHost:
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise SecurityError(f"migrated state has invalid {name} counter")
 
-    def _audit_start(self, envelope: AgentEnvelope, original_task_id: str) -> tuple[str, int, dict[str, Any] | None]:
+    def _audit_start(self, envelope: AgentEnvelope, original_task_id: str, *, fresh: bool) -> tuple[str, int, dict[str, Any] | None]:
         # `envelope.state.task_id` is the destination storage key (source-namespaced for a
         # migration, section 4 #7), so store lookups use it; `original_task_id` is the
         # source-signed id, used only to reconstruct the SOURCE's audit-head signature.
@@ -1628,6 +1691,12 @@ class AgentHost:
                 return envelope.previous_audit_hash, 0, anchor
             return envelope.previous_audit_hash, stored[1], None
         if stored is not None:
+            if fresh:
+                # Fix 1 (1A): a fresh, non-migration admission writes the task's FIRST audit events, so it
+                # can never find a chain already there. Finding one means the checkpoint and nonce rows
+                # were removed (an insider replay of the original envelope) or another task owns this id.
+                # Refuse before any work, instead of silently continuing the chain and running it again.
+                raise SecurityError(_FRESH_WITH_HISTORY)
             return stored[0], stored[1], None
         return "", 0, None
 
@@ -1721,6 +1790,12 @@ class AgentHost:
                                 f"task {state.task_id!r} is not in the audit floor and its chain does not verify "
                                 f"({verdict.status}: {verdict.reason}); refusing to witness it"
                             )
+                if consume_nonce is not None and not envelope.previous_audit_hash and transaction.audit_head(state.task_id) is not None:
+                    # Fix 1 (1A), inside the admission transaction: the same rule as _audit_start, re-read
+                    # with the nonce and the checkpoint CAS, so a chain written between that read and this
+                    # commit is refused too. A migration admission is exempt here: _audit_start already
+                    # requires its stored head, if any, to equal the envelope's previous head.
+                    raise SecurityError(_FRESH_WITH_HISTORY)
                 if consume_nonce is not None:
                     # Section 12 #4 (D2): the permit's expiry is stored with its nonce (never re-derived later).
                     transaction.consume_nonce(

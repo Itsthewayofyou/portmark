@@ -107,8 +107,12 @@ misbehaves in production:
   as the outer bound. Leave it unset to key strictly on the direct peer.
 
 `POST /message:send` runs the agent (`host.run()`) off the event loop in a
-bounded worker pool, so a slow provider, database call, or agent run cannot block
-health probes or other requests. `GET /readyz` performs a bounded liveness probe
+bounded worker pool, so a slow provider, database call, or agent run does not
+block the event loop. Health probes also need a free connection: uvicorn's
+connection limit sits 16 above the run cap, so they still answer when every run
+slot is busy. That headroom is the limit: about 16 idle or slow-header
+connections can still fill it, so keep the proxy's header timeouts in front of
+the backend. `GET /readyz` performs a bounded liveness probe
 (a cheap query plus a schema-version check with a short database timeout) off the
 event loop — it does not construct the store or run schema migrations.
 
@@ -129,7 +133,8 @@ includes the matching `Authorization: Bearer <token>` header.
 
 - `PORTMARK_A2A_MAX_CONCURRENT_REQUESTS` / `--a2a-max-concurrent-requests`
   caps concurrent message submissions. Saturated servers return HTTP 503 with a
-  generic JSON-RPC error.
+  generic JSON-RPC error. uvicorn's connection limit is set 16 above this cap, so
+  health probes and the agent card still answer while every run slot is busy.
 - `PORTMARK_A2A_RATE_LIMIT_PER_IP` / `--a2a-rate-limit-per-ip` caps accepted
   message submissions per client IP.
 - `PORTMARK_A2A_RATE_LIMIT_WINDOW_SECONDS` /

@@ -22,6 +22,7 @@ from .security import (
     AUDIT_HASH_VERSION,
     AuditHeadVerifier,
     SecurityError,
+    TaskCancelledError,
     _audit_head_payload_for,
     audit_event_record,
     audit_head_payload,
@@ -432,10 +433,33 @@ class AuditVerificationResult:
     # Section 10 PR B: verdict of the audit floor (verify-audit --audit-floor-path): "anchored",
     # "not-anchored", "no-floor", or a refusal code (rolled-back, forked, floor-missing, ...).
     floor_status: str = ""
+    # Fix 1 (1B, report-only): the sequence of every `agent.accepted` that follows a finish
+    # (completed / failed / cancelled). A finished task is closed, and a closed task rolls back any
+    # admission together with its events, so this pattern means the closed checkpoint was removed and
+    # the task admitted again: an insider replay written before 1A refused it. It never changes
+    # `status`: this verdict also gates saves and the floor's start-up sweep.
+    replayed_after_finish: tuple[int, ...] = ()
 
     @property
     def valid(self) -> bool:
         return self.status == "valid"
+
+
+# Events after which a task is closed. checkpoint.terminalized can legitimately FOLLOW one of these
+# (an oversized finish), so the replay signal is a later admission, never "any later event".
+_FINISH_EVENTS = frozenset({"agent.completed", "agent.failed", "agent.cancelled"})
+
+
+def _replayed_after_finish(rows: list[Any]) -> tuple[int, ...]:
+    finished = False
+    replayed: list[int] = []
+    for row in rows:
+        name = row["event"]
+        if name == "agent.accepted" and finished:
+            replayed.append(int(row["sequence"]))
+        elif name in _FINISH_EVENTS:
+            finished = True
+    return tuple(replayed)
 
 
 # SIEM export (MCP/SIEM plan, PR 1): a page of audit chains read for `portmark audit export`.
@@ -1383,6 +1407,10 @@ class _InMemoryTransaction:
         self, task_id: str, state: AgentState, expected_generation: int, closed: bool = False,
         owner: tuple[str, str] | None = None, authority_ceiling: str | None = None,
     ) -> int:
+        # Fix 2: a cancelled task is never saved OPEN again (a resume, the next step), only closed. Read
+        # in this transaction, with the same lock cancel_task takes, so the check cannot race it.
+        if not closed and self.is_task_cancelled(task_id):
+            raise TaskCancelledError("task is cancelled")
         row = self._store._checkpoints.get(task_id)
         if row is None:
             if expected_generation != 0:
@@ -1410,6 +1438,9 @@ class _InMemoryTransaction:
         return new_generation
 
     def enqueue_migration(self, task_id: str, destination: str, sealed_envelope_json: str) -> None:
+        # Fix 2: a cancelled task must not leave through the migration outbox either.
+        if self.is_task_cancelled(task_id):
+            raise TaskCancelledError("task is cancelled")
         # Section 4 #8: keep-first is only safe when the collision is an exact re-enqueue of the
         # SAME sealed envelope (an idempotent retry). A same-task-id enqueue with a DIFFERENT
         # envelope is a real collision -- silently dropping it (the old ON CONFLICT DO NOTHING)
@@ -3291,6 +3322,10 @@ class _PostgresTransaction:
     ) -> int:
         if self._connection is None:
             raise RuntimeError("Postgres transaction was not opened")
+        # Fix 2: a cancelled task is never saved OPEN again (a resume, the next step), only closed. Read
+        # in this transaction, with the same lock cancel_task takes, so the check cannot race it.
+        if not closed and self.is_task_cancelled(task_id):
+            raise TaskCancelledError("task is cancelled")
         row = self._connection.execute(
             f"SELECT {_CHECKPOINT_ROW} FROM checkpoints WHERE task_id = %s", (task_id,)  # nosec B608 -- constant column list
         ).fetchone()
@@ -3346,6 +3381,9 @@ class _PostgresTransaction:
     def enqueue_migration(self, task_id: str, destination: str, sealed_envelope_json: str) -> None:
         if self._connection is None:
             raise RuntimeError("Postgres transaction was not opened")
+        # Fix 2: a cancelled task must not leave through the migration outbox either.
+        if self.is_task_cancelled(task_id):
+            raise TaskCancelledError("task is cancelled")
         # Section 4 #8, made race-safe: ONE atomic conflict-validating statement, not a SELECT then a
         # separate INSERT (two concurrent first-enqueues could each SELECT no row, and the loser's
         # ON CONFLICT DO NOTHING would silently drop its different envelope). ON CONFLICT DO UPDATE
@@ -3633,6 +3671,10 @@ class _SQLiteTransaction:
     ) -> int:
         if self._connection is None:
             raise RuntimeError("SQLite transaction was not opened")
+        # Fix 2: a cancelled task is never saved OPEN again (a resume, the next step), only closed. Read
+        # in this transaction, with the same lock cancel_task takes, so the check cannot race it.
+        if not closed and self.is_task_cancelled(task_id):
+            raise TaskCancelledError("task is cancelled")
         row = self._connection.execute(
             f"SELECT {_CHECKPOINT_ROW} FROM checkpoints WHERE task_id = ?", (task_id,)  # nosec B608 -- constant column list
         ).fetchone()
@@ -3686,6 +3728,9 @@ class _SQLiteTransaction:
     def enqueue_migration(self, task_id: str, destination: str, sealed_envelope_json: str) -> None:
         if self._connection is None:
             raise RuntimeError("SQLite transaction was not opened")
+        # Fix 2: a cancelled task must not leave through the migration outbox either.
+        if self.is_task_cancelled(task_id):
+            raise TaskCancelledError("task is cancelled")
         # Section 4 #8, made race-safe: ONE atomic conflict-validating statement (mirrors the Postgres
         # path), not a SELECT then a separate INSERT. ON CONFLICT DO UPDATE with a WHERE that matches
         # only an IDENTICAL envelope: a fresh insert or an identical re-enqueue changes one row
@@ -3829,6 +3874,14 @@ def _audit_event_row(task_id: str, host_id: str, event: dict[str, Any]) -> tuple
 
 
 def _verify_audit_rows(
+    verifier: AuditHeadVerifier | None, task_id: str, rows: list[Any], head: Any, allow_legacy_anchor: bool
+) -> AuditVerificationResult:
+    """The chain verdict, plus the report-only replay flag (Fix 1, 1B), from the same snapshot."""
+    result = _verify_audit_chain_rows(verifier, task_id, rows, head, allow_legacy_anchor)
+    return replace(result, replayed_after_finish=_replayed_after_finish(rows))
+
+
+def _verify_audit_chain_rows(
     verifier: AuditHeadVerifier | None, task_id: str, rows: list[Any], head: Any, allow_legacy_anchor: bool
 ) -> AuditVerificationResult:
     """Check one snapshot of a task's audit chain: every link, every event hash, the head, its signature.

@@ -6,6 +6,66 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 ### Security
 
+- **A cancel that lands while the provider is deciding now stops the task before any tool runs.** The
+  host re-reads the cancellation right after each provider decision, before any part of it acts. A live
+  run with a real Gemini model showed the gap: the cancel landed during the model call, and the search
+  it then picked still ran. The decision is now dropped and the task closes as `failed` with
+  `agent.cancelled`. A cancel that lands after that re-read still lets that step's tool finish.
+- **`required` arguments are enforced for every grant.** The presence check sat inside the
+  `arguments`-schema branch, so a flat grant such as `{"required": ["recipient"], "max_amount": 10}`
+  accepted a call with no `recipient`, and the tool used its own default.
+- **Constraint values compare as JSON values.** Python treats `True == 1`, so `allowed_*` lists, plain
+  exact-match keys, `const`, and `enum` accepted `true` where a policy allowed `1` (and the reverse). The
+  permit and policy merge used the same equality, so merging `[1]` with `[True]` kept a value one side
+  never allowed. Both now use one JSON equality: booleans match only booleans, containers compare element
+  by element, and numbers compare by value (`1` matches `1.0`). A plain exact-match key or `allowed_*`
+  list no longer matches an absent argument when the policy value is `null`. See POLICY.md.
+- **The public-address check refuses more special-purpose networks.** Provider endpoints, MCP hosts, and
+  the example `http.fetch` tool accepted the shared address space `100.64.0.0/10` (carrier-grade NAT,
+  Tailscale, cloud-internal endpoints), which Python marks neither private nor reserved. An address must
+  now also be globally reachable, and these blocks are refused by name: `192.88.99.0/24`, `fec0::/10`,
+  6to4 `2002::/16` and NAT64 `64:ff9b::/96` / `64:ff9b:1::/48` (they embed an IPv4 address), the
+  documentation ranges `2001:db8::/32` and `3fff::/20`, and SRv6 `5f00::/16`. They are named because
+  Python's own tables differ by patch release: on an older Python 3.11, `2002:7f00:1::1` (6to4 for
+  `127.0.0.1`) was treated as global and accepted.
+- **Health probes keep answering when every A2A run slot is busy.** uvicorn's `limit_concurrency`
+  counts every open connection, including the arriving one, and was set equal to the run cap. So with
+  every run slot busy, `/healthz`, `/readyz`, the agent card and `/metrics` got uvicorn's own 503 (an
+  orchestrator could restart a server that was only busy), and the last run slot could never be used.
+  The connection limit is now the run cap plus 16; the app's own semaphore stays the run limit ("server
+  busy"). The container entrypoint now uses `PORTMARK_A2A_MAX_CONCURRENT_REQUESTS` instead of a fixed 32.
+  The 16 spare connections are shared, not reserved: idle or slow-header connections can still fill them,
+  so keep the proxy's limits in front. The reference nginx config now routes `/healthz` and `/readyz`
+  (it returned 404 for both, although DEPLOYMENT.md required them), with their own rate zone.
+- **A policy tool with no `impact` no longer runs silently without approval.** `impact` defaulted to
+  `low`, so a payment tool whose policy entry omitted it ran with no approval and nothing said so. The
+  production profile now refuses such a policy at start-up and on every reload, naming the tools.
+  Development keeps the `low` default with one warning per distinct policy content. In both profiles a
+  side-effecting tool with no explicit impact is treated as `high`, which needs approval under the
+  default `approval_required_impacts`. **Migration:**
+  production policies must set `"impact"` on every tool entry. See POLICY.md.
+- **Cancelling a task now stops it.** `cancel_task` was read only by the approval gate and the pre-launch
+  re-check, so a cancelled task could be resumed and run tools, keep running to completion, or migrate
+  to another host. Every store (in-memory, SQLite, Postgres) now refuses an open checkpoint save and a
+  migration enqueue for a cancelled task, inside the save transaction; a closing save stays allowed. The
+  host closes the task as `failed` with an `agent.cancelled` audit event: a resume before any provider
+  call, a running task at its next save. A task id cancelled before admission is refused. Limits: a
+  cancel that lands after the post-decision re-read (below) does not stop that step's tool, which runs
+  to its save; if that step ends the task another way, that outcome is recorded instead of
+  `agent.cancelled`; a migration already in the outbox is still delivered. The new `agent.cancelled`
+  event maps to OCSF Failure / Medium; the SIEM projection is unchanged (`builtin:v1`). See
+  DEPLOYMENT.md.
+
+- **A replayed envelope can no longer re-run a finished task after its rows are deleted.** Someone with
+  write access to the store could delete a task's checkpoint row and consumed-nonce row, then resend the
+  original signed envelope: the admission looked fresh, the host quietly continued the existing audit
+  chain, the agent and its tools ran again, and `verify-audit` still reported the chain valid. A fresh,
+  non-migration admission can never find an audit chain already there, so it is now refused ("task already
+  has audit history"), before any work and again inside the admission transaction. Deleting the audit rows
+  too is caught by the audit floor (required in production), on a running host and at start-up; without a
+  floor (development only) that variant is not detected. `verify-audit` also reports
+  `replayed_after_finish` (with a stderr warning) for a replay already in a store written before this
+  check: report-only, it changes neither `status` nor the exit code.
 - **A policy reload now narrows runs already in flight (U1).** With `--reload-policy`, the policy was
   reloaded once when a run started, and every later step of that run kept it. A reload that removed a
   tool, tightened a constraint, required approval or closed a migration route did not reach a run that was
