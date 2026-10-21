@@ -3,7 +3,7 @@
 # their digests; .github/dependabot.yml limits it to 3.14.x patch releases, because a new Python
 # minor version must first be added to CI. CI's `container` job builds this image and runs the suite
 # inside it.
-FROM python:3.14.7-slim-bookworm@sha256:82bc3c539b8813ada9d68c63b40158fa002f7f33de9bf3312a3dfdc0620dff56
+FROM python:3.14.8-slim-bookworm@sha256:48b13b003dda20b16f9442b8475aa05fe21bf6579a8c881db92ffb4d8fd20f83
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
