@@ -23,6 +23,14 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
   a threshold for a run in flight, and an unusable amount is refused. The rule is per call; the cumulative
   limit is what stops a split payment. Tests: `tests/test_spend_budget.py` (amount-approval classes).
 
+### Changed
+
+- **The argument check now runs before the approval gate.** A call that breaks its grant's constraints
+  (an extra field, a disallowed value, an amount over the cap) used to reach the approval gate first, so a
+  human could be asked to approve a call that would then be refused at launch. It is now refused before
+  any approval is requested, for impact-based and amount-based approval alike. The launch-time check in
+  `ToolRegistry.invoke` still runs as the last line.
+
 ### Security
 
 - **A per-tool output cap now binds on the AgentHost path.** `register_isolated(..., max_output_bytes=N)`

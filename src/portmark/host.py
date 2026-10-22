@@ -16,7 +16,7 @@ from .models import AgentEnvelope, AgentManifest, AgentState, ApprovalToken, Att
 from .projection import project_state_for_migration, provider_view
 from .providers import ModelProvider
 from .spend import charge_for, needs_amount_approval, no_looser, period_key
-from .security import _MIGRATION_RECEIPT_FIELDS, _OPTIONAL_MIGRATION_RECEIPT_FIELDS, AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, MigrationAttesterProtocol, MigrationPreflightProtocol, PermitExpiredError, SecurityError, TaskCancelledError, arguments_hash, audit_head_payload, canonical_json, detached_json, effect_id, intersect_grants, migration_envelope_digest, migration_receipt_payload, require_unexpired, verified_approval_token
+from .security import _MIGRATION_RECEIPT_FIELDS, _OPTIONAL_MIGRATION_RECEIPT_FIELDS, AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, MigrationAttesterProtocol, MigrationPreflightProtocol, PermitExpiredError, SecurityError, TaskCancelledError, arguments_hash, audit_head_payload, canonical_json, check_constraints, detached_json, effect_id, intersect_grants, migration_envelope_digest, migration_receipt_payload, require_unexpired, verified_approval_token
 from .storage import InMemoryRuntimeStore, RuntimeStore
 from .tools import ToolExecutionError, ToolKilledError, ToolRegistry, tool_error_code
 
@@ -940,6 +940,11 @@ class AgentHost:
                 raise SecurityError(
                     active_policy.explain_missing_grant(envelope.manifest, envelope.permit, decision.tool)
                 )
+            # The argument check, BEFORE the approval gate: a call that breaks its grant's constraints can
+            # never run, so no human is asked to approve it (a queue of doomed requests trains approvers to
+            # click through). Same grant and same detached arguments as the launch-time check in
+            # tools.invoke, which still runs as the last line.
+            check_constraints(next(grant for grant in effective.grants if grant.name == decision.tool).constraints, decision.arguments)
             approval_result = self._approval_gate(active_policy, effective, state, decision, audit, admission_generation)
             if approval_result is not None:
                 return approval_result

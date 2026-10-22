@@ -414,8 +414,9 @@ class HostAmountApprovalTests(unittest.TestCase):
         self.store = SQLiteRuntimeStore(Path(self._dir.name) / "store.sqlite3")
         self.recorder = _Recorder()
 
-    def write_policy(self, spend: dict) -> None:
+    def write_policy(self, spend: dict, impact: str = "medium") -> None:
         value = _policy(spend)
+        value["tools"][PAY]["impact"] = impact
         value["approval_authorities"] = [
             {"key_id": self.authority.key_id, "approver": self.authority.approver, "public_key_b64": self.authority.public_key_b64()}
         ]
@@ -502,6 +503,31 @@ class HostAmountApprovalTests(unittest.TestCase):
                 self.assertIs(_ReloadedPolicy(previous, fresh).spend_budgets, previous.spend_budgets)
         lower = policy_from_dict(_policy({**SPEND, "approval_above": {"USD": 20}}), HOST)
         self.assertEqual(_ReloadedPolicy(previous, lower).spend_budgets.approval_above, {"USD": 20 * U})
+
+    def test_a_call_outside_its_constraints_is_refused_before_anyone_is_asked_to_approve(self):
+        # The argument check used to run only at launch, after the approval gate: a human was asked to
+        # approve a call that could never run. It now runs before the gate too, for both approval rules.
+        bad_calls = {"extra field": {**_pay(60), "note": "part 1"}, "wrong vendor": _pay(60, vendor="mallory")}
+        for rule, (spend, impact) in {"amount rule": (GATED, "medium"), "impact rule": (SPEND, "external-payment")}.items():
+            self.write_policy(spend, impact)
+            for label, call in bad_calls.items():
+                with self.subTest(rule=rule, call=label):
+                    _, _, outcome = self.start(call)
+                    self.assertIsInstance(outcome, SecurityError)
+        self.assertEqual(self.recorder.calls, [])
+
+    def test_a_valid_call_still_waits_for_approval_under_the_impact_rule(self):
+        self.write_policy(SPEND, "external-payment")
+        _, _, result = self.start(_pay(20))
+        self.assertEqual(result.status, "awaiting_input")
+        self.assertNotIn("approval_reason", result.result)
+
+    def test_calibration_the_early_check_test_bites_when_the_early_check_is_off(self):
+        # Neutralize only the early check: the bad call must then reach the approval gate and wait. If it is
+        # still refused, the test above is passing on some other check, not the early one.
+        with mock.patch("portmark.host.check_constraints"):
+            _, _, result = self.start({**_pay(60), "note": "part 1"})
+        self.assertEqual(result.status, "awaiting_input")
 
     def test_calibration_the_over_threshold_test_bites_when_the_rule_is_off(self):
         # Neutralize the rule: the 60 USD payment must then run with no approval. If it still waits, the

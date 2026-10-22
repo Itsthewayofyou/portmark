@@ -172,7 +172,9 @@ arguments, so an approval for 60 USD cannot pay 90 USD. Each currency in `approv
 The rule applies only to tools listed under `spend_budgets.tools`, and a call with an unusable amount or
 currency is refused, never let through. The rule is **per call**: splitting one large payment into calls
 under the threshold is stopped by the cumulative limit, not by this rule. A tool whose impact already
-requires approval still requires it at every amount. Like impact-based approval, the rule is read from the
+requires approval still requires it at every amount. A call that breaks its grant's constraints (an extra
+field, a wrong vendor, an amount over the cap) is refused before any approval is requested, under either
+rule, so no human is asked to approve a call that could never run. Like impact-based approval, the rule is read from the
 policy each run uses: a reload in flight cannot drop or raise a threshold, but a call that is waiting for
 approval is checked again under the policy in force when it resumes, so an operator who removes the rule
 also removes it for calls already waiting.
