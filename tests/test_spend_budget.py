@@ -17,9 +17,11 @@ import secrets
 import tempfile
 import threading
 import unittest
+from dataclasses import asdict
 from pathlib import Path
 from unittest import mock
 
+from authority_fixtures import ApprovalAuthority
 from portmark._clock import trusted_now
 from portmark.factory import make_host
 from portmark.models import AgentEnvelope, AgentManifest, AgentState, Permit, ProviderDecision, ResourceBudget, ToolGrant
@@ -372,6 +374,142 @@ class HostSpendBudgetTests(unittest.TestCase):
         with mock.patch.object(self.store, "reserve_spend", return_value=True):
             self.run_payments([_pay(99), _pay(99)])
         self.assertEqual(len(self.recorder.calls), 2)
+
+
+# --- amount-based approval: a call over a set amount needs a signed approval ------------------------
+
+GATED = {**SPEND, "approval_above": {"USD": 50}}
+
+
+class _PayOnce(ModelProvider):
+    """Proposes one payment until the tool has run, then completes (so a resumed run re-proposes it)."""
+
+    def __init__(self, payment: dict) -> None:
+        self.payment = payment
+
+    def decide(self, view, tools, grants=()):
+        if PAY not in view.tool_results:
+            return ProviderDecision("tool", PAY, self.payment)
+        return ProviderDecision("complete", content="done")
+
+
+class AmountApprovalParsingTests(unittest.TestCase):
+    def test_a_threshold_parses_to_storage_units(self):
+        self.assertEqual(parse_spend_budgets(GATED).approval_above, {"USD": 50 * U})
+        self.assertEqual(parse_spend_budgets(SPEND).approval_above, {})
+
+    def test_bad_thresholds_are_refused(self):
+        for bad in ({"EUR": 50}, {"USD": True}, {"USD": -1}, {"USD": 50.001}, [50], {}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                parse_spend_budgets({**SPEND, "approval_above": bad})
+
+
+class HostAmountApprovalTests(unittest.TestCase):
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.policy_path = Path(self._dir.name) / "policy.json"
+        self.authority = ApprovalAuthority.generate()
+        self.write_policy(GATED)
+        self.store = SQLiteRuntimeStore(Path(self._dir.name) / "store.sqlite3")
+        self.recorder = _Recorder()
+
+    def write_policy(self, spend: dict) -> None:
+        value = _policy(spend)
+        value["approval_authorities"] = [
+            {"key_id": self.authority.key_id, "approver": self.authority.approver, "public_key_b64": self.authority.public_key_b64()}
+        ]
+        self.policy_path.write_text(json.dumps(value), encoding="utf-8")
+
+    def start(self, payment: dict):
+        """(host, envelope, outcome) for one payment; outcome is the RunResult or the SecurityError."""
+        tools = ToolRegistry()
+        tools.register(PAY, self.recorder)
+        with portmark_env():
+            host = make_host(
+                host_id=HOST, signer=host_signer(), policy_path=str(self.policy_path),
+                store=self.store, tools=tools, providers={"p": _PayOnce(payment)},
+            )
+        envelope = HostSpendBudgetTests.envelope(host)
+        try:
+            return host, envelope, host.run(envelope)
+        except SecurityError as error:
+            return host, envelope, error
+
+    def resume_with_approval(self, host, envelope, first, approved_arguments: dict):
+        token = self.authority.issue(
+            PAY, envelope.permit.subject, envelope.permit.audience, envelope.state.task_id, envelope.permit.nonce,
+            approved_arguments, host.policy.policy_hash, trusted_now() + 60,
+            checkpoint_generation=first.checkpoint["checkpoint_generation"],
+        )
+        envelope.state.memory["approvals"] = {PAY: asdict(token)}
+        host.signer.seal(envelope)
+        return host.run(envelope)
+
+    def total(self, host) -> int:
+        return self.store.spend_total(host.signer.issuer, "USD", period_key(trusted_now(), "day"))
+
+    def test_a_payment_at_the_threshold_runs_without_approval(self):
+        host, _, result = self.start(_pay(50))
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(len(self.recorder.calls), 1)
+        self.assertEqual(self.total(host), 50 * U)
+
+    def test_a_payment_over_the_threshold_waits_for_approval_and_nothing_runs(self):
+        host, _, result = self.start(_pay(50.01))
+        self.assertEqual(result.status, "awaiting_input")
+        self.assertIs(result.result["approval_required"], True)
+        self.assertEqual(result.result["approval_reason"], "amount")
+        self.assertEqual(self.recorder.calls, [])
+        self.assertEqual(self.total(host), 0)
+
+    def test_a_signed_approval_lets_the_large_payment_run_and_it_is_charged(self):
+        host, envelope, first = self.start(_pay(60))
+        self.assertEqual(first.status, "awaiting_input")
+        second = self.resume_with_approval(host, envelope, first, _pay(60))
+        self.assertEqual(second.status, "completed")
+        self.assertEqual(self.recorder.calls, [_pay(60)])
+        self.assertEqual(self.total(host), 60 * U)
+
+    def test_an_approval_for_a_smaller_amount_cannot_pay_a_larger_one(self):
+        host, envelope, first = self.start(_pay(90))
+        second = self.resume_with_approval(host, envelope, first, _pay(60))
+        self.assertNotEqual(second.status, "completed")
+        self.assertEqual(self.recorder.calls, [])
+        self.assertEqual(self.total(host), 0)
+
+    def test_an_unusable_amount_is_refused_before_anything_runs(self):
+        for amount in ("60", True, 60.001):
+            with self.subTest(amount=amount):
+                _, _, outcome = self.start(_pay(amount))
+                self.assertIsInstance(outcome, SecurityError)
+        self.assertEqual(self.recorder.calls, [])
+
+    def test_without_a_threshold_a_large_payment_needs_no_approval(self):
+        # Control: the medium-impact tool needs no approval by itself, so the rule above is what gates it.
+        self.write_policy(SPEND)
+        _, _, result = self.start(_pay(60))
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(len(self.recorder.calls), 1)
+
+    def test_a_reload_in_flight_cannot_drop_or_raise_a_threshold(self):
+        from portmark.host import _ReloadedPolicy
+
+        previous = policy_from_dict(_policy(GATED), HOST)
+        for label, spend in {"drops it": SPEND, "raises it": {**SPEND, "approval_above": {"USD": 80}}}.items():
+            with self.subTest(label):
+                fresh = policy_from_dict(_policy(spend), HOST)
+                self.assertIs(_ReloadedPolicy(previous, fresh).spend_budgets, previous.spend_budgets)
+        lower = policy_from_dict(_policy({**SPEND, "approval_above": {"USD": 20}}), HOST)
+        self.assertEqual(_ReloadedPolicy(previous, lower).spend_budgets.approval_above, {"USD": 20 * U})
+
+    def test_calibration_the_over_threshold_test_bites_when_the_rule_is_off(self):
+        # Neutralize the rule: the 60 USD payment must then run with no approval. If it still waits, the
+        # over-threshold tests above are not exercising the amount rule.
+        with mock.patch("portmark.host.needs_amount_approval", return_value=False):
+            _, _, result = self.start(_pay(60))
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(len(self.recorder.calls), 1)
 
 
 if __name__ == "__main__":

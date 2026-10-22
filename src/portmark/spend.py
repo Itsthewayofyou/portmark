@@ -8,6 +8,11 @@ signer (`permit.issuer`), per calendar period (UTC day or month), and refuses a 
 The host policy owns the budget; a permit cannot raise or remove it. Amounts are converted to integer
 minor units from their canonical JSON text with `Decimal`, never with float arithmetic, and an amount
 with more decimals than the policy's `scale` is refused rather than rounded.
+
+Optional `approval_above` adds an amount-based approval rule: a call of a budgeted tool whose amount is
+over the threshold for its currency needs a signed approval, whatever the tool's impact. The rule is per
+call. Splitting one large payment into calls under the threshold is caught by the cumulative limit, not
+by this rule.
 """
 
 from __future__ import annotations
@@ -31,7 +36,7 @@ STORAGE_SCALE = 6
 # 10**15 millionths = 10**9 currency units; far below 2**63 (BIGINT / SQLite INTEGER), so no overflow.
 MAX_MINOR_UNITS = 10**15
 _MAX_CURRENCY_LENGTH = 16
-_POLICY_KEYS = frozenset({"period", "scale", "limits", "tools"})
+_POLICY_KEYS = frozenset({"period", "scale", "limits", "tools", "approval_above"})
 _TOOL_KEYS = frozenset({"amount", "currency"})
 
 
@@ -47,6 +52,7 @@ class SpendBudgetPolicy:
     scale: int
     limits: dict[str, int] = field(default_factory=dict)  # currency -> limit in minor units
     tools: dict[str, SpendTool] = field(default_factory=dict)
+    approval_above: dict[str, int] = field(default_factory=dict)  # currency -> threshold in minor units
 
 
 @dataclass(frozen=True)
@@ -95,7 +101,25 @@ def parse_spend_budgets(value: Any) -> SpendBudgetPolicy | None:
         if not (isinstance(amount, str) and amount and isinstance(currency, str) and currency) or amount == currency:
             raise ValueError(f"policy spend_budgets tool {name!r} must name two different argument names")
         tools[name] = SpendTool(amount=amount, currency=currency)
-    return SpendBudgetPolicy(period=period, scale=scale, limits=limits, tools=tools)
+    approval_above = _parse_approval_above(value.get("approval_above"), scale, limits)
+    return SpendBudgetPolicy(period=period, scale=scale, limits=limits, tools=tools, approval_above=approval_above)
+
+
+def _parse_approval_above(value: Any, scale: int, limits: dict[str, int]) -> dict[str, int]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict) or not value:
+        raise ValueError("policy spend_budgets approval_above must be a non-empty object")
+    thresholds: dict[str, int] = {}
+    for currency, threshold in value.items():
+        _check_currency(currency)
+        if currency not in limits:
+            raise ValueError(f"policy spend_budgets approval_above names {currency!r}, which has no limit")
+        try:
+            thresholds[currency] = to_minor_units(threshold, scale, allow_zero=True)
+        except SecurityError as error:
+            raise ValueError(f"policy spend_budgets approval_above for {currency!r}: {error}") from None
+    return thresholds
 
 
 def _check_currency(currency: Any) -> None:
@@ -146,12 +170,26 @@ def charge_for(policy: SpendBudgetPolicy | None, tool: str, arguments: dict[str,
     )
 
 
+def needs_amount_approval(policy: SpendBudgetPolicy | None, tool: str, arguments: dict[str, Any] | None) -> bool:
+    """Whether this call is over the amount-approval threshold for its currency. False when the policy sets
+    no threshold, so a budget without the rule never reads the amount here (the budget check reads it at
+    launch, as before). Raises SecurityError for an unusable amount or currency, so the rule fails closed."""
+    if policy is None or not policy.approval_above or tool not in policy.tools:
+        return False
+    charge = charge_for(policy, tool, arguments)
+    if charge is None:  # unreachable: the tool is budgeted (checked above)
+        return False
+    threshold = policy.approval_above.get(charge.currency)
+    return threshold is not None and charge.amount_minor > threshold
+
+
 def no_looser(previous: SpendBudgetPolicy | None, fresh: SpendBudgetPolicy | None) -> bool:
     """Whether `fresh` restricts at least as much as `previous`, for a run already in flight (U1: a reload
     in flight can only narrow). Same period (another period would start a different total); every
     previously budgeted tool still budgeted, with the same amount and currency arguments; every previous
     currency still listed, with a limit no higher. `scale` cannot loosen anything: totals are stored in
-    a fixed unit, and a smaller scale only refuses more amounts."""
+    a fixed unit, and a smaller scale only refuses more amounts. Every previous approval threshold still
+    set, no higher."""
     if previous is None:
         return True
     if fresh is None or fresh.period != previous.period:
@@ -161,6 +199,11 @@ def no_looser(previous: SpendBudgetPolicy | None, fresh: SpendBudgetPolicy | Non
             return False
     for currency, limit in previous.limits.items():
         if currency not in fresh.limits or fresh.limits[currency] > limit:
+            return False
+    # An approval threshold cannot be dropped or raised either. A mixed reload (one threshold lower, one
+    # limit higher) is not no-looser as a whole, so the caller keeps the whole previous budget: safe.
+    for currency, threshold in previous.approval_above.items():
+        if currency not in fresh.approval_above or fresh.approval_above[currency] > threshold:
             return False
     return True
 

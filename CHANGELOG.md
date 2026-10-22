@@ -17,6 +17,11 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
   `spend.released`. Schema: SQLite v17, PostgreSQL v15 (two new tables, applied on start). See POLICY.md
   "Cumulative spend budgets" for the limits (per signer, per store, migrated tasks refused).
   Tests: `tests/test_spend_budget.py`.
+- **Amount-based approval (`spend_budgets.approval_above`).** A call of a budgeted tool over a set amount
+  per currency now needs a signed approval, whatever the tool's impact; it waits at `awaiting_input` with
+  `"approval_reason": "amount"`. The approval is bound to the exact arguments, a reload cannot drop or raise
+  a threshold for a run in flight, and an unusable amount is refused. The rule is per call; the cumulative
+  limit is what stops a split payment. Tests: `tests/test_spend_budget.py` (amount-approval classes).
 
 ### Security
 

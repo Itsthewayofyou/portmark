@@ -15,7 +15,7 @@ from .metrics import RuntimeMetrics
 from .models import AgentEnvelope, AgentManifest, AgentState, ApprovalToken, AttestationEvidence, Permit, ProviderDecision, ResourceBudget, RunResult, ToolGrant
 from .projection import project_state_for_migration, provider_view
 from .providers import ModelProvider
-from .spend import charge_for, no_looser, period_key
+from .spend import charge_for, needs_amount_approval, no_looser, period_key
 from .security import _MIGRATION_RECEIPT_FIELDS, _OPTIONAL_MIGRATION_RECEIPT_FIELDS, AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, MigrationAttesterProtocol, MigrationPreflightProtocol, PermitExpiredError, SecurityError, TaskCancelledError, arguments_hash, audit_head_payload, canonical_json, detached_json, effect_id, intersect_grants, migration_envelope_digest, migration_receipt_payload, require_unexpired, verified_approval_token
 from .storage import InMemoryRuntimeStore, RuntimeStore
 from .tools import ToolExecutionError, ToolKilledError, ToolRegistry, tool_error_code
@@ -955,7 +955,7 @@ class AgentHost:
             # reconciliation pass (Section 7, tool boundary), not available here. So cancellation of an
             # already-redeemed approval is best-effort-before-launch, not a guarantee that the effect is
             # prevented. Fires only for approval-gated tools; the approval is already consumed.
-            if self._requires_approval(active_policy, decision.tool) and self.store.is_task_cancelled(state.task_id):
+            if self._requires_approval(active_policy, decision.tool, decision.arguments) and self.store.is_task_cancelled(state.task_id):
                 return self._approval_failure(state, audit, "approval.denied", "cancelled")
             # Section 7 PR 2: a side-effecting tool runs under the durable effect ledger. The host
             # derives an idempotency key (effect_id) from the DURABLE admission generation and a
@@ -1309,13 +1309,26 @@ class AgentHost:
             self.policy = loaded
         return self.policy
 
-    def _requires_approval(self, policy: "HostPolicy | _ReloadedPolicy", tool: str) -> bool:
-        """The ONE approval decision, for the gate and for the pre-launch cancel re-check alike: the
-        policy's impact plus the registry's side-effecting flag (Fix 3, 3B)."""
-        return policy.requires_approval_for(tool, side_effecting=self.tools.is_side_effecting(tool))
+    def _requires_approval(self, policy: "HostPolicy | _ReloadedPolicy", tool: str, arguments: dict[str, Any] | None) -> bool:
+        """The ONE approval decision, for the gate and for the pre-launch cancel re-check alike."""
+        return self._approval_reason(policy, tool, arguments) is not None
+
+    def _approval_reason(self, policy: "HostPolicy | _ReloadedPolicy", tool: str, arguments: dict[str, Any] | None) -> str | None:
+        """Why this call needs a signed approval, or None. "impact": the policy's impact plus the registry's
+        side-effecting flag (Fix 3, 3B). "amount": the call is over the spend budget's approval threshold
+        for its currency. `arguments` is the detached canonical copy, the same one charged and invoked.
+        The impact rule is checked first, so an impact-gated call never has its amount read here."""
+        if policy.requires_approval_for(tool, side_effecting=self.tools.is_side_effecting(tool)):
+            return "impact"
+        if needs_amount_approval(getattr(policy, "spend_budgets", None), tool, arguments):
+            return "amount"
+        return None
 
     def _approval_gate(self, policy: HostPolicy, permit, state, decision: ProviderDecision, audit: AuditLog, admission_generation: int) -> tuple[bool, None] | None:
-        if decision.tool is None or not self._requires_approval(policy, decision.tool):
+        if decision.tool is None:
+            return None
+        reason = self._approval_reason(policy, decision.tool, decision.arguments)
+        if reason is None:
             return None
         # Section 5 #4: the token is loaded from untrusted mutable memory. Any malformation
         # (missing/extra keys, wrong types) is turned into a controlled approval.denied here,
@@ -1334,6 +1347,8 @@ class AgentHost:
                 "policy_version": policy.policy_version,
                 "policy_hash": policy.policy_hash,
             }
+            if reason == "amount":
+                state.result["approval_reason"] = "amount"
             audit.append("approval.requested", state.result)
             return True, None
         # Section 5 #4: used_approval_ids also comes from untrusted memory. A non-list (or a

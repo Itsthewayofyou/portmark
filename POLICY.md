@@ -151,8 +151,31 @@ host's store: hosts with separate databases have separate budgets (point them at
 share it). A task that arrived by migration is refused for a budgeted tool, because the permit was re-minted
 by the source host and the original signer is not known here. A policy reload reaches a run in flight only
 if the new budget is no looser: the same period, every budgeted tool still budgeted with the same arguments,
-every currency still listed with a limit no higher. Otherwise the run keeps the budget it started under,
-and the next run uses the new one. Approval is still decided by tool impact, not by amount.
+every currency still listed with a limit no higher, every approval threshold still set and no higher.
+Otherwise the run keeps the budget it started under, and the next run uses the new one.
+
+**Amount-based approval.** Add `approval_above` to require a signed approval for any call over a set amount,
+whatever the tool's impact:
+
+```json
+"spend_budgets": {
+  "limits": {"USD": 100},
+  "approval_above": {"USD": 50},
+  "tools": {"payments.reserve": {"amount": "amount", "currency": "currency"}}
+}
+```
+
+A call of a budgeted tool whose amount is **over** the threshold for its currency (50.01 here; exactly 50 is
+not over) stops at `awaiting_input` with `approval_required` and `"approval_reason": "amount"`, and nothing
+runs until a trusted approver signs an approval for that exact call. The approval is bound to the call's
+arguments, so an approval for 60 USD cannot pay 90 USD. Each currency in `approval_above` must have a limit.
+The rule applies only to tools listed under `spend_budgets.tools`, and a call with an unusable amount or
+currency is refused, never let through. The rule is **per call**: splitting one large payment into calls
+under the threshold is stopped by the cumulative limit, not by this rule. A tool whose impact already
+requires approval still requires it at every amount. Like impact-based approval, the rule is read from the
+policy each run uses: a reload in flight cannot drop or raise a threshold, but a call that is waiting for
+approval is checked again under the policy in force when it resumes, so an operator who removes the rule
+also removes it for calls already waiting.
 
 ## Loading And Reloading
 
