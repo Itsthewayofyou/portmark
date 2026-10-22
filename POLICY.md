@@ -111,6 +111,46 @@ or the host will reject them.
 
 `migration` is the host-side ceiling on where an agent may move. It defaults to deny-all: omit it, or set `"allowed": false`, and the host refuses every migration regardless of what the incoming permit delegates. To permit migration, set `"allowed": true` and list the exact destination host ids under `"destinations"`; a migration proceeds only when the incoming permit delegates it, the host allows it, and the destination is on this list. `"allowed": true` with an empty `"destinations"` is rejected at load, since it would allow migration to nowhere.
 
+### Cumulative spend budgets
+
+A per-call limit such as `max_amount` cannot stop an agent from splitting one large payment into many small
+ones: two 99 USD payments under a 100 USD cap are each allowed. `spend_budgets` closes that gap. It keeps a
+running total per **permit signer** (the permit's `issuer`), per currency, per calendar **period** (UTC day
+or month), across every task and every permit of that signer, and refuses a call that would take the total
+over the limit:
+
+```json
+"spend_budgets": {
+  "period": "day",
+  "scale": 2,
+  "limits": {"USD": 100},
+  "tools": {"payments.reserve": {"amount": "amount", "currency": "currency"}}
+}
+```
+
+- `tools` names, per budgeted tool, the argument that holds the amount and the one that holds the currency.
+  Every budgeted tool must also be granted in `tools` above; a budget on an ungranted name is refused at load.
+- `limits` is per currency. A call in a currency with no limit is refused. There is no currency conversion.
+- `scale` is the number of decimal places (default 2). Amounts are counted exactly in minor units
+  (99.99 → 9999), from the argument's canonical JSON with decimal arithmetic. An amount with more decimals
+  than `scale`, a boolean, a string, a non-finite number, zero or a negative number is refused.
+- `period` is `day` (default) or `month`, on the calendar in UTC, from the host's trusted clock.
+- Unknown keys anywhere in the block are refused at load.
+
+**When a call is charged.** The host reserves the amount right before it launches the tool, after every other
+check. If the tool provably never started (a permit, constraint or launch check refused it), the amount is
+given back (`spend.released`). If the tool started and then failed, timed out or was killed, the amount stays
+counted: the payment may have gone through, and the host cannot prove it did not. A refused call ends the task
+with `decision.refused`.
+
+**Limits of this control.** The budget is per signer, so give each user who signs permits their own key in
+the host's trust registry; users who share a signing key share one budget. The running total lives in the
+host's store: hosts with separate databases have separate budgets (point them at one PostgreSQL store to
+share it). A task that arrived by migration is refused for a budgeted tool, because the permit was re-minted
+by the source host and the original signer is not known here. A policy reload in flight can change the
+limits but cannot remove the budget from a run that started under one. Approval is still decided by tool
+impact, not by amount.
+
 ## Loading And Reloading
 
 Use a policy file:
@@ -160,6 +200,10 @@ The host emits these approval events:
 - `approval.denied`
 - `approval.expired`
 - `approval.used`
+
+With `spend_budgets`, the host also emits `spend.reserved` (tool, reservation id, currency, amount and
+running total in minor units, period, limit) and `spend.released` (a reservation given back because the tool
+never started). A call over the budget ends the task with `decision.refused`.
 
 The `agent.accepted` event includes `policy_version` and `policy_hash` so every run can be tied back to the policy that authorized it.
 

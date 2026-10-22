@@ -15,6 +15,7 @@ from .metrics import RuntimeMetrics
 from .models import AgentEnvelope, AgentManifest, AgentState, ApprovalToken, AttestationEvidence, Permit, ProviderDecision, ResourceBudget, RunResult, ToolGrant
 from .projection import project_state_for_migration, provider_view
 from .providers import ModelProvider
+from .spend import charge_for, period_key
 from .security import _MIGRATION_RECEIPT_FIELDS, _OPTIONAL_MIGRATION_RECEIPT_FIELDS, AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, MigrationAttesterProtocol, MigrationPreflightProtocol, PermitExpiredError, SecurityError, TaskCancelledError, arguments_hash, audit_head_payload, canonical_json, detached_json, effect_id, intersect_grants, migration_envelope_digest, migration_receipt_payload, require_unexpired, verified_approval_token
 from .storage import InMemoryRuntimeStore, RuntimeStore
 from .tools import ToolExecutionError, ToolKilledError, ToolRegistry, tool_error_code
@@ -157,6 +158,14 @@ class _ReloadedPolicy:
     def authorize_migration(self, permit: Permit, destination: str) -> None:
         self._previous.authorize_migration(permit, destination)
         self._fresh.authorize_migration(permit, destination)
+
+    @property
+    def spend_budgets(self) -> Any:
+        # PM-AUTH-015: the fresh policy's budgets apply at once (the running total is shared by every run
+        # of the signer, so its limit is a property of the signer, not of this run). But a reload in flight
+        # can never REMOVE the budget from a run that started under one: that would loosen it (U1).
+        fresh = getattr(self._fresh, "spend_budgets", None)
+        return fresh if fresh is not None else getattr(self._previous, "spend_budgets", None)
 
 
 def _narrow_permit(effective: Permit, fresh: Permit) -> Permit:
@@ -874,6 +883,46 @@ class AgentHost:
         self._record_run_status(result.status)
         return result
 
+    def _reserve_spend(self, active_policy, effective, state, decision, audit, eid) -> str | None:
+        """PM-AUTH-015: reserve this call's amount against the permit signer's running total for the
+        current UTC period, or refuse the call. None when the tool is not budgeted.
+
+        Called after the last expiry check and immediately before invoke, so a refusal here means the
+        tool never ran: a side-effecting tool's ledger row (already `started`) is settled back to
+        `prepared`, as the expiry refusal above does. The owner is the permit issuer, which
+        require_identity bound to a trusted signing key. A migrated task is refused: its permit was
+        re-minted by the source host, so the original signer is not known here."""
+        budgets = getattr(active_policy, "spend_budgets", None)
+        try:
+            charge = charge_for(budgets, decision.tool, decision.arguments)
+            if charge is None:
+                return None
+            if state.task_id.startswith(_MIGRATION_TASK_NAMESPACE):
+                raise SecurityError("a budgeted tool refuses a migrated task: the original permit signer is not known on this host")
+            period = period_key(trusted_now(), budgets.period)
+            reservation_id = "spend-" + secrets.token_hex(16)
+            if not self.store.reserve_spend(
+                reservation_id, state.task_id, effective.issuer, charge.currency, period, charge.amount_minor, charge.limit_minor
+            ):
+                raise SecurityError(f"spend budget exceeded: this call would take {charge.currency} over this {budgets.period}'s limit")
+        except BaseException:
+            if eid is not None:
+                self.store.settle_effect(eid, "prepared", None, "spend budget refused the call; nothing ran")
+            raise
+        audit.append(
+            "spend.reserved",
+            {
+                "tool": decision.tool,
+                "reservation": reservation_id,
+                "currency": charge.currency,
+                "amount_minor": charge.amount_minor,
+                "period": period,
+                "total_minor": self.store.spend_total(effective.issuer, charge.currency, period),
+                "limit_minor": charge.limit_minor,
+            },
+        )
+        return reservation_id
+
     def _apply_decision(self, decision, state, effective, audit, envelope, active_policy, admission_generation=0):
         # PM-003: the permit's lifetime is re-read here, on the trusted clock, before ANY action of
         # this step. Admission checked it once; a provider that answered slowly (or a long previous
@@ -973,9 +1022,24 @@ class AgentHost:
                                     eid, "prepared", None, "permit expired before the launch; nothing ran"
                                 )
                             raise
-                        result = self.tools.invoke(
-                            effective, decision.tool, decision.arguments, effective.budget.max_output_bytes, launch_capability=launch_cap
-                        )
+                        # PM-AUTH-015: charge the cumulative spend budget, durably, right before the launch.
+                        spend_reservation = self._reserve_spend(active_policy, effective, state, decision, audit, eid)
+                        try:
+                            result = self.tools.invoke(
+                                effective, decision.tool, decision.arguments, effective.budget.max_output_bytes, launch_capability=launch_cap
+                            )
+                        except ToolExecutionError:
+                            # The tool STARTED and then failed (an error, a kill, a timeout; ToolKilledError
+                            # is a subclass). The effect may have landed and the host cannot prove it did
+                            # not, so the reservation stays counted (owner decision 3). This clause must stay
+                            # BEFORE the SecurityError one: ToolExecutionError subclasses SecurityError.
+                            raise
+                        except SecurityError:
+                            # Any other SecurityError from invoke is raised BEFORE the tool starts (permit,
+                            # constraint, launch-capability checks), so nothing was spent: give it back.
+                            if spend_reservation is not None and self.store.release_spend(spend_reservation):
+                                audit.append("spend.released", {"tool": decision.tool, "reservation": spend_reservation})
+                            raise
                     finally:
                         _run_progress.note(phase="tool_returned")
                         self.metrics.observe_duration("tool_invocation_duration_seconds", time.monotonic() - tool_started)

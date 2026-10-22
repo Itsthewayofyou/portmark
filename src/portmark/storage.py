@@ -30,8 +30,8 @@ from .security import (
 )
 
 
-SQLITE_SCHEMA_VERSION = 16
-POSTGRES_SCHEMA_VERSION = 14
+SQLITE_SCHEMA_VERSION = 17
+POSTGRES_SCHEMA_VERSION = 15
 
 # Section 4 #3: a migration lease is bounded. Zero/negative would defeat exclusivity (two workers
 # could claim the same row at the same instant); an unbounded lease would let a dead worker hold a
@@ -658,6 +658,22 @@ class RuntimeStore(Protocol):
         """Durably record that a task is cancelled (section 5 #3). Idempotent."""
         ...
 
+    def reserve_spend(
+        self, reservation_id: str, task_id: str, owner: str, currency: str, period: str, amount_minor: int, limit_minor: int
+    ) -> bool:
+        """PM-AUTH-015: atomically add `amount_minor` to the (owner, currency, period) running total if the
+        new total stays within `limit_minor`, and record the reservation. True = reserved, False = it would
+        go over (nothing written). Two racing reservations can never both pass the limit."""
+        ...
+
+    def release_spend(self, reservation_id: str) -> bool:
+        """Give a reservation back (the tool provably never started). Idempotent: True only the first time."""
+        ...
+
+    def spend_total(self, owner: str, currency: str, period: str) -> int:
+        """The (owner, currency, period) running total, in minor units; 0 when nothing was reserved."""
+        ...
+
     def is_task_cancelled(self, task_id: str) -> bool:
         """Whether a task is durably cancelled (non-transactional read for the pre-launch re-check)."""
         ...
@@ -910,6 +926,9 @@ class InMemoryRuntimeStore:
         # approval transaction (which holds self._lock for its whole duration, so a concurrent
         # cancel cannot interleave with a redeem) and again before the tool launches.
         self._cancelled: set[str] = set()
+        # PM-AUTH-015: running spend totals per (owner, currency, period), and the reservations behind them.
+        self._spend_totals: dict[tuple[str, str, str], int] = {}
+        self._spend_reservations: dict[str, dict[str, Any]] = {}
         self._effects: dict[str, dict[str, Any]] = {}
         self._floor_markers: dict[str, tuple[int, bool]] = {}
         # EV-013: the newest remote-witness receipt per host (restored with the rest on a rolled-back save).
@@ -928,6 +947,35 @@ class InMemoryRuntimeStore:
 
     def transaction(self) -> AbstractContextManager[RuntimeTransaction]:
         return _InMemoryTransaction(self)
+
+    def reserve_spend(
+        self, reservation_id: str, task_id: str, owner: str, currency: str, period: str, amount_minor: int, limit_minor: int
+    ) -> bool:
+        with self._lock:
+            if reservation_id in self._spend_reservations:
+                raise SecurityError("spend reservation id already used")
+            key = (owner, currency, period)
+            spent = self._spend_totals.get(key, 0)
+            if spent + amount_minor > limit_minor:
+                return False
+            self._spend_totals[key] = spent + amount_minor
+            self._spend_reservations[reservation_id] = {
+                "task_id": task_id, "key": key, "amount_minor": amount_minor, "state": "reserved",
+            }
+            return True
+
+    def release_spend(self, reservation_id: str) -> bool:
+        with self._lock:
+            row = self._spend_reservations.get(reservation_id)
+            if row is None or row["state"] != "reserved":
+                return False
+            row["state"] = "released"
+            self._spend_totals[row["key"]] -= row["amount_minor"]
+            return True
+
+    def spend_total(self, owner: str, currency: str, period: str) -> int:
+        with self._lock:
+            return self._spend_totals.get((owner, currency, period), 0)
 
     def _page(self, status: str, limit: int, after: str | None) -> list[dict[str, Any]]:
         _validate_page(limit, after)
@@ -1683,6 +1731,63 @@ class _SQLRuntimeStore:
     def _session(self) -> AbstractContextManager[Any]:  # pragma: no cover - each backend defines it
         raise NotImplementedError
 
+    # PM-AUTH-015: the cumulative spend budget. The SQL is shared; each backend runs it inside ONE
+    # transaction (SQLite: BEGIN IMMEDIATE; PostgreSQL: the session's transaction). The conditional
+    # UPDATE is the gate: it adds the amount only while the new total stays within the limit, so two
+    # racing reservations cannot both pass it (SQLite serializes writers; PostgreSQL re-checks the WHERE
+    # on the row version it waited for).
+    @staticmethod
+    def _reserve_spend_sql(
+        connection: Any, reservation_id: str, task_id: str, owner: str, currency: str, period: str, amount_minor: int, limit_minor: int
+    ) -> bool:
+        now = int(time.time())
+        connection.execute(
+            "INSERT INTO spend_totals (owner, currency, period, spent_minor) VALUES (?, ?, ?, 0) ON CONFLICT DO NOTHING",
+            (owner, currency, period),
+        )
+        cursor = connection.execute(
+            "UPDATE spend_totals SET spent_minor = spent_minor + ? "
+            "WHERE owner = ? AND currency = ? AND period = ? AND spent_minor + ? <= ?",
+            (amount_minor, owner, currency, period, amount_minor, limit_minor),
+        )
+        if cursor.rowcount != 1:
+            return False
+        connection.execute(
+            "INSERT INTO spend_reservations "
+            "(reservation_id, task_id, owner, currency, period, amount_minor, state, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'reserved', ?, ?)",
+            (reservation_id, task_id, owner, currency, period, amount_minor, now, now),
+        )
+        return True
+
+    @staticmethod
+    def _release_spend_sql(connection: Any, reservation_id: str) -> bool:
+        row = connection.execute(
+            "SELECT owner, currency, period, amount_minor FROM spend_reservations WHERE reservation_id = ? AND state = 'reserved'",
+            (reservation_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        cursor = connection.execute(
+            "UPDATE spend_reservations SET state = 'released', updated_at = ? WHERE reservation_id = ? AND state = 'reserved'",
+            (int(time.time()), reservation_id),
+        )
+        if cursor.rowcount != 1:
+            return False
+        connection.execute(
+            "UPDATE spend_totals SET spent_minor = spent_minor - ? WHERE owner = ? AND currency = ? AND period = ?",
+            (row["amount_minor"], row["owner"], row["currency"], row["period"]),
+        )
+        return True
+
+    def spend_total(self, owner: str, currency: str, period: str) -> int:
+        with self._session() as connection:
+            row = connection.execute(
+                "SELECT spent_minor FROM spend_totals WHERE owner = ? AND currency = ? AND period = ?",
+                (owner, currency, period),
+            ).fetchone()
+        return 0 if row is None else int(row["spent_minor"])
+
     def set_audit_head_verifier(self, verifier: AuditHeadVerifier) -> None:
         self._audit_head_verifier = verifier
 
@@ -1931,6 +2036,7 @@ class SQLiteRuntimeStore(_SQLRuntimeStore):
             13: self._migrate_to_v14,
             14: self._migrate_to_v15,
             15: self._migrate_to_v16,
+            16: self._migrate_to_v17,
         }
 
     @staticmethod
@@ -2169,6 +2275,36 @@ class SQLiteRuntimeStore(_SQLRuntimeStore):
         self._add_column(connection, "checkpoints", "owner_issuer", "TEXT")
         self._add_column(connection, "checkpoints", "owner_subject", "TEXT")
 
+    def _migrate_to_v17(self, connection: sqlite3.Connection) -> None:
+        # PM-AUTH-015: cumulative spend budgets. One running total per (permit signer, currency, UTC
+        # period), and the reservations that make it up, so a provably-unlaunched call can be given back.
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS spend_totals (
+                owner TEXT NOT NULL,
+                currency TEXT NOT NULL,
+                period TEXT NOT NULL,
+                spent_minor INTEGER NOT NULL CHECK (spent_minor >= 0),
+                PRIMARY KEY (owner, currency, period)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS spend_reservations (
+                reservation_id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                owner TEXT NOT NULL,
+                currency TEXT NOT NULL,
+                period TEXT NOT NULL,
+                amount_minor INTEGER NOT NULL CHECK (amount_minor > 0),
+                state TEXT NOT NULL CHECK (state IN ('reserved', 'released')),
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+
     def _migrate_to_v16(self, connection: sqlite3.Connection) -> None:
         # U7: the authority a MIGRATED task arrived with (its effective grants, budget, expiry and
         # component, as canonical JSON), recorded on the CREATE of a migration admission and never
@@ -2235,6 +2371,32 @@ class SQLiteRuntimeStore(_SQLRuntimeStore):
                 "UPDATE migration_outbox SET status = 'delivered', receipt_json = ?, delivered_at = ? WHERE task_id = ?",
                 (receipt_json, int(time.time()), task_id),
             )
+
+    def _spend_write(self, body: Callable[[sqlite3.Connection], bool]) -> bool:
+        # One BEGIN IMMEDIATE transaction (the connection is in autocommit mode otherwise), under the
+        # process lock: the read-check-write of a spend reservation is serialized against every writer.
+        with self._lock, self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                result = body(connection)
+                connection.execute("COMMIT")
+                return result
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+
+    def reserve_spend(
+        self, reservation_id: str, task_id: str, owner: str, currency: str, period: str, amount_minor: int, limit_minor: int
+    ) -> bool:
+        return self._spend_write(
+            lambda connection: self._reserve_spend_sql(
+                connection, reservation_id, task_id, owner, currency, period, amount_minor, limit_minor
+            )
+        )
+
+    def release_spend(self, reservation_id: str) -> bool:
+        return self._spend_write(lambda connection: self._release_spend_sql(connection, reservation_id))
 
     def cancel_task(self, task_id: str) -> None:
         # Idempotent: a repeat cancel keeps the first cancelled_at. Presence = cancelled.
@@ -2844,6 +3006,33 @@ class PostgresRuntimeStore(_SQLRuntimeStore):
             f"SELECT TRUE, COALESCE(GREATEST({seed_terms}), 0), COALESCE(GREATEST({seed_terms}), 0) "
             f"ON CONFLICT (singleton) DO NOTHING"
         )
+        # v15 (PM-AUTH-015): cumulative spend budgets; see SQLiteRuntimeStore._migrate_to_v17.
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS spend_totals (
+                owner TEXT NOT NULL,
+                currency TEXT NOT NULL,
+                period TEXT NOT NULL,
+                spent_minor BIGINT NOT NULL CHECK (spent_minor >= 0),
+                PRIMARY KEY (owner, currency, period)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS spend_reservations (
+                reservation_id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                owner TEXT NOT NULL,
+                currency TEXT NOT NULL,
+                period TEXT NOT NULL,
+                amount_minor BIGINT NOT NULL CHECK (amount_minor > 0),
+                state TEXT NOT NULL CHECK (state IN ('reserved', 'released')),
+                created_at BIGINT NOT NULL,
+                updated_at BIGINT NOT NULL
+            )
+            """
+        )
         connection.execute(
             """
             INSERT INTO portmark_schema (singleton, version)
@@ -2862,6 +3051,17 @@ class PostgresRuntimeStore(_SQLRuntimeStore):
                 "UPDATE migration_outbox SET status = 'delivered', receipt_json = %s, delivered_at = EXTRACT(EPOCH FROM clock_timestamp())::bigint WHERE task_id = %s",
                 (receipt_json, task_id),
             )
+
+    def reserve_spend(
+        self, reservation_id: str, task_id: str, owner: str, currency: str, period: str, amount_minor: int, limit_minor: int
+    ) -> bool:
+        # One transaction (psycopg commits on a clean exit of the session, rolls back on an exception).
+        with self._session() as connection:
+            return self._reserve_spend_sql(connection, reservation_id, task_id, owner, currency, period, amount_minor, limit_minor)
+
+    def release_spend(self, reservation_id: str) -> bool:
+        with self._session() as connection:
+            return self._release_spend_sql(connection, reservation_id)
 
     def cancel_task(self, task_id: str) -> None:
         # Idempotent: a repeat cancel keeps the first cancelled_at. Presence = cancelled. Takes the
