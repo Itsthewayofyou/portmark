@@ -4,6 +4,15 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 ## Unreleased
 
+### Security
+
+- **A per-tool output cap now binds on the AgentHost path.** `register_isolated(..., max_output_bytes=N)`
+  was ignored whenever a caller passed its own budget, and AgentHost always passes the run budget, so on the
+  host path an isolated tool registered with a 1 KiB cap could return up to the run budget (64 KiB by
+  default). The effective cap is now the smaller of the two. A tool without a per-tool cap keeps the
+  caller's budget, and a smaller caller budget still wins. Plain `register()` tools have no per-tool cap and
+  are unchanged. Tests: `tests/test_fix_per_tool_output_cap.py`.
+
 ## 0.11.0 — 2026-10-20
 
 **A security release.** It ships the twelve security fixes made since 0.10.0: argument detachment (U2),

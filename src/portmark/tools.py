@@ -645,6 +645,12 @@ class ToolRegistry:
         check_constraints(grant.constraints, arguments)
         timeout = self._timeouts.get(name, self.default_timeout)
         cap = max_output_bytes if max_output_bytes is not None else self._max_output.get(name, self.max_output_bytes)
+        # A per-tool cap (register_isolated(max_output_bytes=...)) binds even when the caller passes a
+        # larger budget: AgentHost always passes the run budget, which used to replace the tool's own cap.
+        # Only an explicit override counts (_set_override drops a None), so a tool without one keeps the
+        # caller's budget rather than shrinking to the registry default.
+        if max_output_bytes is not None and name in self._max_output:
+            cap = min(cap, self._max_output[name])
 
         effect_id: str | None = None
         if name in self._side_effecting:
