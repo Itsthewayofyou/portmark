@@ -24,6 +24,12 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
   default). The effective cap is now the smaller of the two. A tool without a per-tool cap keeps the
   caller's budget, and a smaller caller budget still wins. Plain `register()` tools have no per-tool cap and
   are unchanged. Tests: `tests/test_fix_per_tool_output_cap.py`.
+- **Explicit resource caps are refused on Windows instead of silently skipped.** Windows has no POSIX
+  `setrlimit`, so the worker could not apply `resource_limits` and did not refuse, and the Job Object got
+  no memory limit: `ToolRegistry(resource_limits={...})` enforced nothing. That broke the fail-closed rule
+  in TOOLS.md. The registry now raises at construction on a platform without `setrlimit`. **Migration:** a
+  Windows deployment that sets `resource_limits` must remove it or pass `disable_resource_limits=True`. A
+  registry with no `resource_limits` builds as before.
 
 ## 0.11.0 — 2026-10-20
 

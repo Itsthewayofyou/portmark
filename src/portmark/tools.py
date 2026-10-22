@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from . import _windows_job, safe_paths
+from . import _windows_job, safe_paths, tool_subprocess_runner
 from .models import Permit, validate_tool_name
 from .security import SecurityError, canonical_json, check_constraints, detached_json
 
@@ -307,6 +307,16 @@ class ToolRegistry:
             self.resource_limits: dict[str, int] = {}
         else:
             self.resource_limits = _merged_resource_limits(resource_limits)
+            # An EXPLICIT cap request must be enforceable (fail-closed). Without POSIX setrlimit
+            # (Windows) the worker cannot apply any of these caps, and the Job Object's committed-
+            # memory limit is not RLIMIT_AS, so refuse here rather than run uncapped. The default
+            # caps are not an explicit request. Same sentinel the worker checks, read at call time.
+            if resource_limits and tool_subprocess_runner._resource is None:
+                requested = ", ".join(sorted(resource_limits))
+                raise RuntimeError(
+                    f"resource_limits ({requested}) cannot be enforced on this platform: it has no "
+                    "POSIX setrlimit; pass disable_resource_limits=True to run the tools without these caps"
+                )
         # Finding #5: the thread-timeout path cannot cancel a tool once it starts, so a
         # tool that exceeds its deadline leaves its daemon thread running. This bounded
         # semaphore caps how many such executions can be in flight at once. A slot is held
