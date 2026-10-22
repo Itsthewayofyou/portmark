@@ -9,7 +9,9 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 - **Cumulative spend budgets (`spend_budgets` in host policy).** Per-call limits could not stop an agent
   from splitting a payment: two 99 USD payments under a 100 USD cap were each allowed. The host now keeps a
   running total per permit signer, per currency, per UTC day or month, across tasks and permits, and refuses
-  a call that would go over. Amounts are counted exactly in minor units. The reservation is made atomically
+  a call that would go over. Amounts are counted exactly and stored in millionths, so a `scale` change
+  never reinterprets a stored total; a policy reload reaches a run in flight only if it is no looser. The
+  reservation is made atomically
   right before launch (two racing calls cannot both pass), given back only when the tool provably never
   started, and kept when the tool started and then failed. New audit events `spend.reserved` and
   `spend.released`. Schema: SQLite v17, PostgreSQL v15 (two new tables, applied on start). See POLICY.md

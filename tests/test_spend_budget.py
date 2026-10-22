@@ -33,6 +33,7 @@ from test_audit_floor import HOST, host_signer
 from test_boundary_production_profile import portmark_env
 
 PAY = "payments.reserve"
+U = 1_000_000  # storage units per currency unit (amounts are stored in millionths)
 CONSTRAINTS = {"max_amount": 100, "allowed_currency": ["USD"], "allowed_vendor": ["acme"]}
 SPEND = {"period": "day", "scale": 2, "limits": {"USD": 100}, "tools": {PAY: {"amount": "amount", "currency": "currency"}}}
 
@@ -86,7 +87,7 @@ class _Recorder:
 class SpendPolicyParsingTests(unittest.TestCase):
     def test_a_valid_block_parses_to_minor_units(self):
         parsed = parse_spend_budgets(SPEND)
-        self.assertEqual(parsed.limits, {"USD": 10000})
+        self.assertEqual(parsed.limits, {"USD": 100 * U})
         self.assertEqual(parsed.period, "day")
 
     def test_unknown_keys_and_bad_values_are_refused(self):
@@ -112,15 +113,15 @@ class SpendPolicyParsingTests(unittest.TestCase):
             policy_from_dict(_policy(spend), HOST)
 
     def test_the_policy_carries_the_budget(self):
-        self.assertEqual(policy_from_dict(_policy(), HOST).spend_budgets.limits, {"USD": 10000})
+        self.assertEqual(policy_from_dict(_policy(), HOST).spend_budgets.limits, {"USD": 100 * U})
         self.assertIsNone(policy_from_dict(_policy(None), HOST).spend_budgets)
 
 
 class AmountTests(unittest.TestCase):
     def test_exact_decimal_conversion(self):
-        self.assertEqual(to_minor_units(99.99, 2), 9999)  # float arithmetic would give 9998.999...
-        self.assertEqual(to_minor_units(100, 2), 10000)
-        self.assertEqual(to_minor_units(0.29, 2), 29)
+        self.assertEqual(to_minor_units(99.99, 2), 99_990_000)  # float arithmetic would give 99.989999...
+        self.assertEqual(to_minor_units(100, 2), 100 * U)
+        self.assertEqual(to_minor_units(0.29, 2), 290_000)
 
     def test_unusable_amounts_are_refused(self):
         for bad in (True, False, "99", None, [1], float("nan"), float("inf"), -1, 0, 0.1 + 0.2, 1.005, 10**20):
@@ -261,7 +262,7 @@ class HostSpendBudgetTests(unittest.TestCase):
         self.assertIsInstance(outcome, SecurityError)
         self.assertIn("spend budget exceeded", str(outcome))
         self.assertEqual(len(self.recorder.calls), 1)
-        self.assertEqual(self.total(host), 9900)
+        self.assertEqual(self.total(host), 99 * U)
 
     def test_a_split_payment_is_refused_across_permits(self):
         # Per-permit limits already existed (max_tool_calls); the budget spans permits of one signer.
@@ -271,18 +272,18 @@ class HostSpendBudgetTests(unittest.TestCase):
         self.assertIn("spend.reserved", self.events(first))
         self.assertIsInstance(second, SecurityError)
         self.assertEqual(len(self.recorder.calls), 1)
-        self.assertEqual(self.total(host), 9900)
+        self.assertEqual(self.total(host), 99 * U)
 
     def test_control_payments_within_the_budget_all_run(self):
         host, result = self.run_payments([_pay(60), _pay(30), _pay(10)])
         self.assertEqual(result.status, "completed")
         self.assertEqual(len(self.recorder.calls), 3)
-        self.assertEqual(self.total(host), 10000)
+        self.assertEqual(self.total(host), 100 * U)
 
     def test_cents_are_exact(self):
         host, result = self.run_payments([_pay(33.33), _pay(33.33), _pay(33.34)])
         self.assertEqual(result.status, "completed")
-        self.assertEqual(self.total(host), 10000)
+        self.assertEqual(self.total(host), 100 * U)
 
     def test_a_call_refused_before_launch_gives_the_money_back(self):
         # Constraint failure inside invoke (vendor not allowed): the tool never started.
@@ -297,7 +298,7 @@ class HostSpendBudgetTests(unittest.TestCase):
         failing = _Recorder(fail=True)
         host, result = self.run_payments([_pay(50)], failing)
         self.assertEqual(len(failing.calls), 1)
-        self.assertEqual(self.total(host), 5000)
+        self.assertEqual(self.total(host), 50 * U)
         self.assertIn("tool.failed", self.events(result))
 
     def test_unusable_amounts_and_currencies_are_refused_before_anything_runs(self):
@@ -336,9 +337,34 @@ class HostSpendBudgetTests(unittest.TestCase):
         with_budget = policy_from_dict(_policy(), HOST)
         without = policy_from_dict(_policy(None), HOST)
         self.assertIs(_ReloadedPolicy(with_budget, without).spend_budgets, with_budget.spend_budgets)
-        # A reload that changes the budget applies the fresh one.
+        # A reload that only tightens applies the fresh budget at once.
         tighter = policy_from_dict(_policy({**SPEND, "limits": {"USD": 50}}), HOST)
-        self.assertEqual(_ReloadedPolicy(with_budget, tighter).spend_budgets.limits, {"USD": 5000})
+        self.assertEqual(_ReloadedPolicy(with_budget, tighter).spend_budgets.limits, {"USD": 50 * U})
+
+    def test_a_reload_in_flight_cannot_loosen_the_budget_in_any_way(self):
+        # Codex review: a NON-empty fresh block can loosen too. Each of these keeps the previous budget.
+        from portmark.host import _ReloadedPolicy
+
+        previous = policy_from_dict(_policy(), HOST)
+        other_tool = {"other.tool": {"impact": "medium", "constraints": {"max_amount": 5}}}
+        looser = {
+            "drops the tool": {**SPEND, "tools": {"other.tool": {"amount": "amount", "currency": "currency"}}},
+            "changes the period": {**SPEND, "period": "month"},
+            "raises the limit": {**SPEND, "limits": {"USD": 1000}},
+            "drops the currency": {**SPEND, "limits": {"EUR": 100}},
+            "remaps the amount argument": {**SPEND, "tools": {PAY: {"amount": "total", "currency": "currency"}}},
+        }
+        for label, spend in looser.items():
+            with self.subTest(label):
+                fresh_value = _policy(spend)
+                fresh_value["tools"].update(other_tool)
+                fresh = policy_from_dict(fresh_value, HOST)
+                self.assertIs(_ReloadedPolicy(previous, fresh).spend_budgets, previous.spend_budgets)
+
+    def test_a_scale_change_does_not_reinterpret_stored_totals(self):
+        # Totals are stored in a fixed unit, so 50 USD is the same number at any policy scale.
+        self.assertEqual(to_minor_units(50, 0), to_minor_units(50, 2))
+        self.assertEqual(to_minor_units(50, 0), 50 * U)
 
     def test_calibration_the_split_test_bites_when_the_gate_is_off(self):
         # Neutralize the gate (always "reserved"): the split payment must then run twice. If this ever

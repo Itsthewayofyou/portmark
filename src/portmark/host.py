@@ -15,7 +15,7 @@ from .metrics import RuntimeMetrics
 from .models import AgentEnvelope, AgentManifest, AgentState, ApprovalToken, AttestationEvidence, Permit, ProviderDecision, ResourceBudget, RunResult, ToolGrant
 from .projection import project_state_for_migration, provider_view
 from .providers import ModelProvider
-from .spend import charge_for, period_key
+from .spend import charge_for, no_looser, period_key
 from .security import _MIGRATION_RECEIPT_FIELDS, _OPTIONAL_MIGRATION_RECEIPT_FIELDS, AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, MigrationAttesterProtocol, MigrationPreflightProtocol, PermitExpiredError, SecurityError, TaskCancelledError, arguments_hash, audit_head_payload, canonical_json, detached_json, effect_id, intersect_grants, migration_envelope_digest, migration_receipt_payload, require_unexpired, verified_approval_token
 from .storage import InMemoryRuntimeStore, RuntimeStore
 from .tools import ToolExecutionError, ToolKilledError, ToolRegistry, tool_error_code
@@ -161,11 +161,14 @@ class _ReloadedPolicy:
 
     @property
     def spend_budgets(self) -> Any:
-        # PM-AUTH-015: the fresh policy's budgets apply at once (the running total is shared by every run
-        # of the signer, so its limit is a property of the signer, not of this run). But a reload in flight
-        # can never REMOVE the budget from a run that started under one: that would loosen it (U1).
+        # PM-AUTH-015 + U1: a reload in flight can only narrow. The fresh budgets apply to this run only if
+        # they are no looser than the ones it ran under (same period, same budgeted tools and arguments,
+        # same currencies, limits no higher); otherwise the run keeps its previous budgets. Removing the
+        # block, dropping a tool or currency, raising a limit or changing the period does not reach a run
+        # in flight; the next run is admitted under the fresh policy as usual.
+        previous = getattr(self._previous, "spend_budgets", None)
         fresh = getattr(self._fresh, "spend_budgets", None)
-        return fresh if fresh is not None else getattr(self._previous, "spend_budgets", None)
+        return fresh if no_looser(previous, fresh) else previous
 
 
 def _narrow_permit(effective: Permit, fresh: Permit) -> Permit:

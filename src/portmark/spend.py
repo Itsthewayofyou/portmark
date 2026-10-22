@@ -24,7 +24,11 @@ PERIODS = ("day", "month")
 DEFAULT_PERIOD = "day"
 DEFAULT_SCALE = 2
 MAX_SCALE = 6
-# Far below 2**63 (BIGINT / SQLite INTEGER), so a running total can never overflow the column.
+# Every amount and total is STORED in millionths of the currency unit, whatever the policy's `scale`.
+# `scale` only limits how many decimals an amount may have. A fixed storage unit means a policy edit
+# that changes `scale` can never reinterpret the running totals already in the store.
+STORAGE_SCALE = 6
+# 10**15 millionths = 10**9 currency units; far below 2**63 (BIGINT / SQLite INTEGER), so no overflow.
 MAX_MINOR_UNITS = 10**15
 _MAX_CURRENCY_LENGTH = 16
 _POLICY_KEYS = frozenset({"period", "scale", "limits", "tools"})
@@ -100,10 +104,10 @@ def _check_currency(currency: Any) -> None:
 
 
 def to_minor_units(value: Any, scale: int, *, allow_zero: bool = False) -> int:
-    """An amount as an integer count of minor units (scale 2: 99.99 -> 9999), or SecurityError.
+    """An amount as an integer count of storage units (millionths: 99.99 -> 99_990_000), or SecurityError.
 
-    Read from the value's canonical JSON text with Decimal, so 99.99 is exactly 9999 (float arithmetic
-    would give 9998.999...). More decimals than `scale` is refused, never rounded."""
+    Read from the value's canonical JSON text with Decimal, so 99.99 is exact (float arithmetic would
+    give 99.989999...). More decimals than `scale` is refused, never rounded."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise SecurityError("spend amount must be a number")
     if isinstance(value, float) and not math.isfinite(value):
@@ -117,7 +121,7 @@ def to_minor_units(value: Any, scale: int, *, allow_zero: bool = False) -> int:
     scaled = amount.scaleb(scale)
     if scaled != scaled.to_integral_value():
         raise SecurityError(f"spend amount has more than {scale} decimal places")
-    minor = int(scaled)
+    minor = int(amount.scaleb(STORAGE_SCALE))
     if minor > MAX_MINOR_UNITS:
         raise SecurityError("spend amount is too large")
     return minor
@@ -140,6 +144,25 @@ def charge_for(policy: SpendBudgetPolicy | None, tool: str, arguments: dict[str,
         amount_minor=to_minor_units(arguments[spec.amount], policy.scale),
         limit_minor=policy.limits[currency],
     )
+
+
+def no_looser(previous: SpendBudgetPolicy | None, fresh: SpendBudgetPolicy | None) -> bool:
+    """Whether `fresh` restricts at least as much as `previous`, for a run already in flight (U1: a reload
+    in flight can only narrow). Same period (another period would start a different total); every
+    previously budgeted tool still budgeted, with the same amount and currency arguments; every previous
+    currency still listed, with a limit no higher. `scale` cannot loosen anything: totals are stored in
+    a fixed unit, and a smaller scale only refuses more amounts."""
+    if previous is None:
+        return True
+    if fresh is None or fresh.period != previous.period:
+        return False
+    for tool, spec in previous.tools.items():
+        if fresh.tools.get(tool) != spec:
+            return False
+    for currency, limit in previous.limits.items():
+        if currency not in fresh.limits or fresh.limits[currency] > limit:
+            return False
+    return True
 
 
 def period_key(now: int, period: str) -> str:

@@ -131,9 +131,11 @@ over the limit:
 - `tools` names, per budgeted tool, the argument that holds the amount and the one that holds the currency.
   Every budgeted tool must also be granted in `tools` above; a budget on an ungranted name is refused at load.
 - `limits` is per currency. A call in a currency with no limit is refused. There is no currency conversion.
-- `scale` is the number of decimal places (default 2). Amounts are counted exactly in minor units
-  (99.99 → 9999), from the argument's canonical JSON with decimal arithmetic. An amount with more decimals
-  than `scale`, a boolean, a string, a non-finite number, zero or a negative number is refused.
+- `scale` is the number of decimal places an amount may have (default 2, at most 6). Amounts are counted
+  exactly, from the argument's canonical JSON with decimal arithmetic, and stored in millionths of the
+  currency unit whatever `scale` is, so changing `scale` never changes the meaning of a stored total. An
+  amount with more decimals than `scale`, a boolean, a string, a non-finite number, zero or a negative
+  number is refused.
 - `period` is `day` (default) or `month`, on the calendar in UTC, from the host's trusted clock.
 - Unknown keys anywhere in the block are refused at load.
 
@@ -147,9 +149,10 @@ with `decision.refused`.
 the host's trust registry; users who share a signing key share one budget. The running total lives in the
 host's store: hosts with separate databases have separate budgets (point them at one PostgreSQL store to
 share it). A task that arrived by migration is refused for a budgeted tool, because the permit was re-minted
-by the source host and the original signer is not known here. A policy reload in flight can change the
-limits but cannot remove the budget from a run that started under one. Approval is still decided by tool
-impact, not by amount.
+by the source host and the original signer is not known here. A policy reload reaches a run in flight only
+if the new budget is no looser: the same period, every budgeted tool still budgeted with the same arguments,
+every currency still listed with a limit no higher. Otherwise the run keeps the budget it started under,
+and the next run uses the new one. Approval is still decided by tool impact, not by amount.
 
 ## Loading And Reloading
 
@@ -201,8 +204,8 @@ The host emits these approval events:
 - `approval.expired`
 - `approval.used`
 
-With `spend_budgets`, the host also emits `spend.reserved` (tool, reservation id, currency, amount and
-running total in minor units, period, limit) and `spend.released` (a reservation given back because the tool
+With `spend_budgets`, the host also emits `spend.reserved` (tool, reservation id, currency, period, and the
+amount, running total and limit in millionths of the currency unit) and `spend.released` (a reservation given back because the tool
 never started). A call over the budget ends the task with `decision.refused`.
 
 The `agent.accepted` event includes `policy_version` and `policy_hash` so every run can be tied back to the policy that authorized it.
