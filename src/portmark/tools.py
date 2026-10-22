@@ -311,8 +311,10 @@ class ToolRegistry:
             # (Windows) the worker cannot apply any of these caps, and the Job Object's committed-
             # memory limit is not RLIMIT_AS, so refuse here rather than run uncapped. The default
             # caps are not an explicit request. Same sentinel the worker checks, read at call time.
-            if resource_limits and tool_subprocess_runner._resource is None:
-                requested = ", ".join(sorted(resource_limits))
+            # dict() first: a caller's dict subclass must not decide "explicit" through its own __bool__.
+            requested_keys = dict(resource_limits) if resource_limits is not None else {}
+            if requested_keys and tool_subprocess_runner._resource is None:
+                requested = ", ".join(sorted(requested_keys))
                 raise RuntimeError(
                     f"resource_limits ({requested}) cannot be enforced on this platform: it has no "
                     "POSIX setrlimit; pass disable_resource_limits=True to run the tools without these caps"
@@ -768,6 +770,13 @@ class ToolRegistry:
         # wall-clock deadline (a CPU-bound tool that ignores the clock still dies), set a little
         # above the timeout so it never fires before the host's own deadline does.
         rlimits = dict(self.resource_limits)
+        # The construction check covers the constructor only; resource_limits is a public attribute,
+        # so re-check at launch. Without setrlimit only the documented defaults (or none) may pass.
+        if tool_subprocess_runner._resource is None and rlimits and rlimits != _DEFAULT_TOOL_RLIMITS:
+            raise ToolExecutionError(
+                "resource_limits cannot be enforced on this platform: it has no POSIX setrlimit; "
+                "use disable_resource_limits=True"
+            )
         if "cpu_seconds" not in rlimits:
             rlimits["cpu_seconds"] = int(timeout) + 2
         payload: dict[str, Any] = {
