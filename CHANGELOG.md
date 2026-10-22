@@ -22,6 +22,11 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
   `"approval_reason": "amount"`. The approval is bound to the exact arguments, a reload cannot drop or raise
   a threshold for a run in flight, and an unusable amount is refused. The rule is per call; the cumulative
   limit is what stops a split payment. Tests: `tests/test_spend_budget.py` (amount-approval classes).
+- **`portmark policy check <file> [--json]`.** Loads a host policy with the host's own loader and says in
+  plain words what it allows: each tool's impact and when it needs approval, the spend budget, the trusted
+  approvers, and the `policy_hash` approvals are bound to. Warns about valid-but-wrong settings (approval no
+  one can give, a threshold that can never take effect, a zero limit, a missing impact). Exit 1 when the host
+  would refuse the file. New example: `examples/purchasing-policy.json`. Tests: `tests/test_policy_check.py`.
 
 ### Changed
 

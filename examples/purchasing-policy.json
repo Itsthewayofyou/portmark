@@ -1,0 +1,19 @@
+{
+  "version": "purchasing-pilot-v1",
+  "budget": {"max_steps": 6, "max_tool_calls": 3, "max_output_bytes": 32768},
+  "tools": {
+    "catalog.search": {"impact": "low", "constraints": {"max_limit": 5}, "output_projection": ["id", "title", "price"]},
+    "payments.reserve": {
+      "impact": "medium",
+      "constraints": {"max_amount": 100, "allowed_currency": ["USD"], "allowed_vendor": ["acme"]},
+      "output_projection": ["reserved"]
+    }
+  },
+  "spend_budgets": {
+    "period": "day",
+    "scale": 2,
+    "limits": {"USD": 100},
+    "approval_above": {"USD": 50},
+    "tools": {"payments.reserve": {"amount": "amount", "currency": "currency"}}
+  }
+}

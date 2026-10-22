@@ -190,6 +190,22 @@ python -m portmark.cli --policy-path host-policy.json demo "research mobile agen
 
 Or set `PORTMARK_POLICY_PATH`.
 
+### Checking a policy file before you deploy it
+
+```bash
+python -m portmark.cli policy check examples/purchasing-policy.json          # plain words
+python -m portmark.cli policy check --json examples/purchasing-policy.json   # for automation
+```
+
+The check loads the file with the host's own loader, so it accepts exactly the files the host accepts, and it
+prints the `policy_hash` the host will put in its approval requests. It then lists every tool with its impact
+and when it needs approval (`never`, `always (impact ...)`, or `over 50 USD`), the spend budget, and how many
+approvers are trusted. It warns about settings that are valid but almost certainly a mistake: approval that no
+trusted approver can give, an `approval_above` on a tool that already needs approval at every amount, a
+threshold at or above its limit, a limit of 0, and a tool with no `impact`. Exit code 0 means the host would
+load the file (warnings included); 1 means it would refuse it, and the reason is printed. The check is a
+reading aid: the host's decisions still come from the host.
+
 By default the policy is loaded at startup and changes require restart. Pass `--reload-policy` to reload the file before each run, and twice in each step of a run in flight: before the provider's view is built, and after the provider answers but before the host acts (and once more after a migration preflight, before anything is sealed). Replace the policy file atomically (write a temporary file, then rename it over the old one): a reload that cannot read a valid policy fails every run in flight, not only new ones. A change that lands mid-run can only narrow that run: its grants, output projections and budget become what both policies allow (a step budget that drops below the current step stops the run), its expiry takes the earlier, a tool needs approval if either policy requires it, and a migration must pass both. Which approvers are trusted, and the policy hash an approval is bound to, come from the current policy. The change is recorded as a `policy.reloaded` audit event, and a reload that fails ends the task as failed. A reload is honored at the next of those two checks; it is not synchronized with them, so a reload that lands in the gap after a check does not stop the view or action that check already cleared. That gap includes the host's own store writes before a tool launches (approval redemption, the effect ledger), which can wait on a database lock. If a reload shrinks the output budget below the checkpoint as it stands, the task fails and its closing record is stored under the last budget that admitted it. The narrowing lasts for one `run()` call: a task that pauses (for example for approval) and is resumed later is admitted under the policy current at that time, like any other run. Approval tokens are bound to the policy hash, so a token issued for an older policy is rejected after reload.
 
 ## Approval Tokens
