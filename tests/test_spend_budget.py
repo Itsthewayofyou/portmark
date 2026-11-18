@@ -288,10 +288,30 @@ class HostSpendBudgetTests(unittest.TestCase):
         self.assertEqual(self.total(host), 100 * U)
 
     def test_a_call_refused_before_launch_gives_the_money_back(self):
-        # Constraint failure inside invoke (vendor not allowed): the tool never started.
-        host, outcome = self.run_payments([_pay(50, vendor="evil")])
+        # The refusal must come AFTER the reservation, or this proves nothing: a bad argument (a wrong
+        # vendor) is now refused by the early check before any money is reserved, so the total is 0
+        # whether or not the give-back works. Here invoke refuses (as a launch-capability or permit
+        # check inside it would) after the reservation, and the tool never starts.
+        host = self.host([_pay(50)])
+        reserve = mock.patch.object(self.store, "reserve_spend", wraps=self.store.reserve_spend)
+        release = mock.patch.object(self.store, "release_spend", wraps=self.store.release_spend)
+        refuse = mock.patch.object(host.tools, "invoke", side_effect=SecurityError("launch refused"))
+        with reserve as reserved, release as released, refuse:
+            with self.assertRaisesRegex(SecurityError, "launch refused"):
+                host.run(self.envelope(host))
+        self.assertEqual(reserved.call_count, 1, "the call must be charged before the refusal")
+        self.assertEqual(released.call_count, 1, "the refused call must be given back")
+        self.assertEqual(self.recorder.calls, [])
+        self.assertEqual(self.total(host), 0)
+
+    def test_a_bad_argument_is_refused_before_any_money_is_reserved(self):
+        # The early argument check (before the approval gate) refuses a wrong vendor first, so the
+        # budget is never touched.
+        with mock.patch.object(self.store, "reserve_spend", wraps=self.store.reserve_spend) as reserved:
+            host, outcome = self.run_payments([_pay(50, vendor="evil")])
         self.assertIsInstance(outcome, SecurityError)
         self.assertIn("vendor", str(outcome))
+        self.assertEqual(reserved.call_count, 0)
         self.assertEqual(self.recorder.calls, [])
         self.assertEqual(self.total(host), 0)
 
