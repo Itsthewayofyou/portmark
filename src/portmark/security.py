@@ -1786,8 +1786,12 @@ class HostPolicy:
         approval_required_impacts: tuple[str, ...] = DEFAULT_APPROVAL_REQUIRED_IMPACTS,
         migration: "MigrationPolicy | None" = None,
         implicit_impacts: tuple[str, ...] = (),
+        spend_budgets: Any = None,
     ) -> None:
         self.audience = audience
+        # PM-AUTH-015: the host's cumulative spend budgets (a portmark.spend.SpendBudgetPolicy, or None
+        # for none). Host policy only: no permit field can raise or remove it.
+        self.spend_budgets = spend_budgets
         # B-lite: normalize each policy grant so a bare one denies unnamed arguments
         # by default. Done once here, so every reader of self.grants -- effective_permit
         # and explain_missing_grant alike -- sees the same explicit shape.

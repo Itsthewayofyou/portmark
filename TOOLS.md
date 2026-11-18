@@ -465,6 +465,16 @@ empty dict; the CPU-time backstop still applies.
 > under weaker caps than you configured. On Linux (the supported POSIX target) all of
 > these limits apply, so this refusal only fires on a genuinely unsupported platform
 > or an impossible value.
+>
+> **Windows:** there is no POSIX `setrlimit`, so none of these caps can apply (the Job
+> Object's committed-memory limit is not `RLIMIT_AS`). `ToolRegistry(resource_limits={...})`
+> therefore **raises at construction** on Windows. Pass `disable_resource_limits=True`
+> to run the tools without the caps. A registry with no `resource_limits` still builds;
+> the default caps are not applied there, and the kill-on-close Job Object is the
+> containment. The `cpu_seconds` backstop is POSIX-only too: on Windows only the host's
+> wall-clock deadline and the Job Object's whole-tree termination stop a runaway tool.
+> Setting `registry.resource_limits` to non-default caps after construction is refused
+> at launch on Windows for the same reason.
 
 ## Side-Effecting Tools And The Effect Ledger
 

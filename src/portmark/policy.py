@@ -8,6 +8,7 @@ from typing import Any
 from .models import ResourceBudget, ToolGrant
 from ._encoding import decode_raw_key, required_string
 from .security import HostPolicy, MigrationPolicy, TrustedApprover, canonical_json, normalize_output_projection, validate_constraints
+from .spend import parse_spend_budgets
 
 
 VALID_IMPACTS = {"low", "medium", "high", "destructive", "external-payment", "credentialed", "data-exfiltration"}
@@ -47,6 +48,13 @@ def policy_from_dict(value: dict[str, Any], audience: str) -> HostPolicy:
     if not grants:
         raise ValueError("policy must grant at least one tool")
     approval_required_impacts = _approval_required_impacts(value.get("approval_required_impacts", HostPolicy.DEFAULT_APPROVAL_REQUIRED_IMPACTS))
+    spend_budgets = parse_spend_budgets(value.get("spend_budgets"))
+    if spend_budgets is not None:
+        # A budget on a tool this policy does not grant would guard nothing, which almost always means
+        # a typo in the tool name. Fail closed at load.
+        ungranted = sorted(set(spend_budgets.tools) - set(impacts))
+        if ungranted:
+            raise ValueError(f"policy spend_budgets names tools the policy does not grant: {ungranted}")
     return HostPolicy(
         audience=audience,
         grants=tuple(grants),
@@ -58,6 +66,7 @@ def policy_from_dict(value: dict[str, Any], audience: str) -> HostPolicy:
         approval_required_impacts=approval_required_impacts,
         migration=_migration_policy(value.get("migration")),
         implicit_impacts=tuple(implicit),
+        spend_budgets=spend_budgets,
     )
 
 
