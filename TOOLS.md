@@ -224,7 +224,16 @@ full stored result:
 
 - omit `output_projection`, or set it to `[]`, to share no tool output
 - use field names such as `["id", "title"]` for dict outputs or lists of dicts
+- use a JSON Pointer path such as `["/user/name"]` to share one nested field:
+  `{"user": {"name": "a", "ssn": "x"}}` becomes `{"user": {"name": "a"}}`. Lists
+  are mapped at every level, so `/items/id` keeps `id` in each item. Inside a key,
+  write `~1` for `/` and `~0` for `~`. An entry without a leading `/` is still one
+  top-level key, so `"a.b"` means the key `a.b`, as before.
 - use `["*"]` only when the full output is acceptable provider input
+
+When two grants are merged, a path inside another (`/user/name` inside `user`)
+becomes the shared result, and sibling paths (`/user/name`, `/user/ssn`) share
+nothing.
 
 Projection is configured in host policy because the operator, not the agent,
 owns the data-sharing decision. Host policy is the ceiling: a policy grant that

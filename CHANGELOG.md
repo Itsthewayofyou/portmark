@@ -13,6 +13,12 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
   empty segment, a backslash, an encoded slash or backslash, a path still encoded after one decode, or
   a repeated query key. Merging keeps the narrower path prefix, so host policy stays the ceiling.
   Grants without the new keys behave exactly as before.
+- **Nested output projection.** An `output_projection` entry that starts with `/` is a JSON Pointer
+  path (RFC 6901): `/user/name` shares only `user.name`, so other fields under `user` no longer reach
+  the provider or a migration destination. Lists are mapped at every level. Merging keeps the deeper
+  of two nested paths; sibling paths share nothing. An entry without a leading `/` is still one
+  top-level key, so every existing projection keeps its meaning. A malformed path (empty segment,
+  bad `~` escape) is refused when the policy, permit or A2A grant is loaded.
 
 ## 0.11.0 — 2026-10-20
 

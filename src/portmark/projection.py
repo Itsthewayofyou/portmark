@@ -159,11 +159,72 @@ def project_tool_messages(messages: list[dict[str, Any]], grants: tuple[ToolGran
     return projected
 
 
+def projection_path(entry: str) -> tuple[str, ...]:
+    """S4: the key path an `output_projection` entry names.
+
+    An entry starting with "/" is a JSON Pointer (RFC 6901): "/user/name" is ("user", "name"), with
+    "~1" for "/" and "~0" for "~" inside a key. Any other entry is ONE top-level key, exactly as before
+    paths existed, so "a.b" stays the key "a.b". Raises ValueError for an empty segment or a bad escape.
+    """
+    if not entry.startswith("/"):
+        return (entry,)
+    path = []
+    for segment in entry[1:].split("/"):
+        if not segment:
+            raise ValueError(f"output_projection path {entry!r} has an empty segment")
+        if "~" in segment.replace("~0", "").replace("~1", ""):
+            raise ValueError(f"output_projection path {entry!r} has an invalid '~' escape")
+        path.append(segment.replace("~1", "/").replace("~0", "~"))
+    return tuple(path)
+
+
+_WHOLE = None  # a projection tree leaf: share the whole value at this key
+
+
+def _projection_tree(output_projection: tuple[str, ...]) -> dict[str, Any]:
+    """Merge the entries into one tree of keys. A shallower entry wins over a deeper one under it,
+    because it already shares the whole subtree. An entry that is not a valid path is skipped:
+    sharing less is the safe direction."""
+    tree: dict[str, Any] = {}
+    for entry in output_projection:
+        try:
+            path = projection_path(entry)
+        except ValueError:
+            continue
+        node = tree
+        covered = False
+        for segment in path[:-1]:
+            if segment in node and node[segment] is _WHOLE:
+                covered = True
+                break
+            node = node.setdefault(segment, {})
+        if not covered:
+            node[path[-1]] = _WHOLE
+    return tree
+
+
+def _project_dict(content: dict[str, Any], tree: dict[str, Any]) -> dict[str, Any]:
+    projected: dict[str, Any] = {}
+    for key, subtree in tree.items():
+        if key not in content:
+            continue
+        value = content[key]
+        if subtree is _WHOLE:
+            projected[key] = value
+        elif isinstance(value, dict):
+            projected[key] = _project_dict(value, subtree)
+        elif isinstance(value, list):
+            projected[key] = [_project_dict(item, subtree) for item in value if isinstance(item, dict)]
+        # A scalar where the path goes deeper shares nothing at this key.
+    return projected
+
+
 def project_tool_output(content: Any, output_projection: tuple[str, ...]) -> Any:
     if "*" in output_projection:
         return content
+    tree = _projection_tree(output_projection)
     if isinstance(content, dict):
-        return {key: content[key] for key in output_projection if key in content}
+        return _project_dict(content, tree)
     if isinstance(content, list):
-        return [project_tool_output(item, output_projection) for item in content if isinstance(item, dict)]
+        return [_project_dict(item, tree) for item in content if isinstance(item, dict)]
     return None

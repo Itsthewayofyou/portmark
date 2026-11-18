@@ -20,6 +20,7 @@ from ._encoding import b64url_encode as _b64url_encode
 from ._encoding import decode_raw_key as _decode_raw_key
 from ._encoding import required_string as _required_string
 from .models import AgentEnvelope, AgentManifest, ApprovalToken, AttestationEvidence, Permit, ResourceBudget, ToolGrant
+from .projection import projection_path
 
 
 class SecurityError(RuntimeError):
@@ -1714,7 +1715,19 @@ def _projection_intersection(left: tuple[str, ...] | None, right: tuple[str, ...
         return right
     if "*" in right:
         return left
-    return tuple(item for item in left if item in set(right))
+    # S4: entries are key paths. For each pair where one path lies inside the other, the deeper one is
+    # what both sides share. A path that does not parse shares nothing, so it is skipped.
+    shared: list[str] = []
+    for a in left:
+        for b in right:
+            try:
+                path_a, path_b = projection_path(a), projection_path(b)
+            except ValueError:
+                continue
+            inner = a if path_a[: len(path_b)] == path_b else b if path_b[: len(path_a)] == path_a else None
+            if inner is not None and inner not in shared:
+                shared.append(inner)
+    return tuple(shared)
 
 
 @dataclass(frozen=True)
@@ -2153,6 +2166,11 @@ def normalize_output_projection(value: Any, where: str) -> tuple[str, ...] | Non
         raise ValueError(f"{where} output_projection entries must be non-empty strings")
     if "*" in value and len(value) > 1:
         raise ValueError(f"{where} output_projection cannot mix '*' with field names")
+    for item in value:
+        try:
+            projection_path(item)
+        except ValueError as error:
+            raise ValueError(f"{where} {error}") from None
     return tuple(value)
 
 
