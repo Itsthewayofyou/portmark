@@ -4,12 +4,56 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 ## Unreleased
 
+### Added
+
+- **Cumulative spend budgets (`spend_budgets` in host policy).** Per-call limits could not stop an agent
+  from splitting a payment: two 99 USD payments under a 100 USD cap were each allowed. The host now keeps a
+  running total per permit signer, per currency, per UTC day or month, across tasks and permits, and refuses
+  a call that would go over. Amounts are counted exactly and stored in millionths, so a `scale` change
+  never reinterprets a stored total; a policy reload reaches a run in flight only if it is no looser. The
+  reservation is made atomically
+  right before launch (two racing calls cannot both pass), given back only when the tool provably never
+  started, and kept when the tool started and then failed. New audit events `spend.reserved` and
+  `spend.released`. Schema: SQLite v17, PostgreSQL v15 (two new tables, applied on start). See POLICY.md
+  "Cumulative spend budgets" for the limits (per signer, per store, migrated tasks refused).
+  Tests: `tests/test_spend_budget.py`.
+- **Amount-based approval (`spend_budgets.approval_above`).** A call of a budgeted tool over a set amount
+  per currency now needs a signed approval, whatever the tool's impact; it waits at `awaiting_input` with
+  `"approval_reason": "amount"`. The approval is bound to the exact arguments, a reload cannot drop or raise
+  a threshold for a run in flight, and an unusable amount is refused. The rule is per call; the cumulative
+  limit is what stops a split payment. Tests: `tests/test_spend_budget.py` (amount-approval classes).
+- **`portmark policy check <file> [--json]`.** Loads a host policy with the host's own loader and says in
+  plain words what it allows: each tool's impact and when it needs approval, the spend budget, the trusted
+  approvers, and the `policy_hash` approvals are bound to. Warns about valid-but-wrong settings (approval no
+  one can give, a threshold that can never take effect, a zero limit, a missing impact). Exit 1 when the host
+  would refuse the file. New example: `examples/purchasing-policy.json`. Tests: `tests/test_policy_check.py`.
+
+### Changed
+
+- **The argument check now runs before the approval gate.** A call that breaks its grant's constraints
+  (an extra field, a disallowed value, an amount over the cap) used to reach the approval gate first, so a
+  human could be asked to approve a call that would then be refused at launch. It is now refused before
+  any approval is requested, for impact-based and amount-based approval alike. The launch-time check in
+  `ToolRegistry.invoke` still runs as the last line.
+
 ### Security
 
 - **Dependency updates for new advisories.** certifi 2026.7.22 → 2026.10.23 (PYSEC-2026-4320), filelock
   4.0.7 → 4.2.12 (a group of 2026 CVEs), setuptools 84.0.0 → 84.2.1 (GHSA-xmj3-9gf7-h52w, fixed in
   84.1.0; the build-system and bootstrap pins move together). The CI dependency audit failed on main
   for these.
+- **A per-tool output cap now binds on the AgentHost path.** `register_isolated(..., max_output_bytes=N)`
+  was ignored whenever a caller passed its own budget, and AgentHost always passes the run budget, so on the
+  host path an isolated tool registered with a 1 KiB cap could return up to the run budget (64 KiB by
+  default). The effective cap is now the smaller of the two. A tool without a per-tool cap keeps the
+  caller's budget, and a smaller caller budget still wins. Plain `register()` tools have no per-tool cap and
+  are unchanged. Tests: `tests/test_fix_per_tool_output_cap.py`.
+- **Explicit resource caps are refused on Windows instead of silently skipped.** Windows has no POSIX
+  `setrlimit`, so the worker could not apply `resource_limits` and did not refuse, and the Job Object got
+  no memory limit: `ToolRegistry(resource_limits={...})` enforced nothing. That broke the fail-closed rule
+  in TOOLS.md. The registry now raises at construction on a platform without `setrlimit`. **Migration:** a
+  Windows deployment that sets `resource_limits` must remove it or pass `disable_resource_limits=True`. A
+  registry with no `resource_limits` builds as before.
 
 ## 0.11.0 — 2026-10-20
 

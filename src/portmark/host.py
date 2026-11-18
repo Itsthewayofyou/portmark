@@ -15,7 +15,8 @@ from .metrics import RuntimeMetrics
 from .models import AgentEnvelope, AgentManifest, AgentState, ApprovalToken, AttestationEvidence, Permit, ProviderDecision, ResourceBudget, RunResult, ToolGrant
 from .projection import project_state_for_migration, provider_view
 from .providers import ModelProvider
-from .security import _MIGRATION_RECEIPT_FIELDS, _OPTIONAL_MIGRATION_RECEIPT_FIELDS, AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, MigrationAttesterProtocol, MigrationPreflightProtocol, PermitExpiredError, SecurityError, TaskCancelledError, arguments_hash, audit_head_payload, canonical_json, detached_json, effect_id, intersect_grants, migration_envelope_digest, migration_receipt_payload, require_unexpired, verified_approval_token
+from .spend import charge_for, needs_amount_approval, no_looser, period_key
+from .security import _MIGRATION_RECEIPT_FIELDS, _OPTIONAL_MIGRATION_RECEIPT_FIELDS, AttestationPolicy, AuditLog, EnvelopeSigningIdentity, HostPolicy, MigrationAttesterProtocol, MigrationPreflightProtocol, PermitExpiredError, SecurityError, TaskCancelledError, arguments_hash, audit_head_payload, canonical_json, check_constraints, detached_json, effect_id, intersect_grants, migration_envelope_digest, migration_receipt_payload, require_unexpired, verified_approval_token
 from .storage import InMemoryRuntimeStore, RuntimeStore
 from .tools import ToolExecutionError, ToolKilledError, ToolRegistry, tool_error_code
 
@@ -157,6 +158,17 @@ class _ReloadedPolicy:
     def authorize_migration(self, permit: Permit, destination: str) -> None:
         self._previous.authorize_migration(permit, destination)
         self._fresh.authorize_migration(permit, destination)
+
+    @property
+    def spend_budgets(self) -> Any:
+        # PM-AUTH-015 + U1: a reload in flight can only narrow. The fresh budgets apply to this run only if
+        # they are no looser than the ones it ran under (same period, same budgeted tools and arguments,
+        # same currencies, limits no higher); otherwise the run keeps its previous budgets. Removing the
+        # block, dropping a tool or currency, raising a limit or changing the period does not reach a run
+        # in flight; the next run is admitted under the fresh policy as usual.
+        previous = getattr(self._previous, "spend_budgets", None)
+        fresh = getattr(self._fresh, "spend_budgets", None)
+        return fresh if no_looser(previous, fresh) else previous
 
 
 def _narrow_permit(effective: Permit, fresh: Permit) -> Permit:
@@ -874,6 +886,46 @@ class AgentHost:
         self._record_run_status(result.status)
         return result
 
+    def _reserve_spend(self, active_policy, effective, state, decision, audit, eid) -> str | None:
+        """PM-AUTH-015: reserve this call's amount against the permit signer's running total for the
+        current UTC period, or refuse the call. None when the tool is not budgeted.
+
+        Called after the last expiry check and immediately before invoke, so a refusal here means the
+        tool never ran: a side-effecting tool's ledger row (already `started`) is settled back to
+        `prepared`, as the expiry refusal above does. The owner is the permit issuer, which
+        require_identity bound to a trusted signing key. A migrated task is refused: its permit was
+        re-minted by the source host, so the original signer is not known here."""
+        budgets = getattr(active_policy, "spend_budgets", None)
+        try:
+            charge = charge_for(budgets, decision.tool, decision.arguments)
+            if charge is None:
+                return None
+            if state.task_id.startswith(_MIGRATION_TASK_NAMESPACE):
+                raise SecurityError("a budgeted tool refuses a migrated task: the original permit signer is not known on this host")
+            period = period_key(trusted_now(), budgets.period)
+            reservation_id = "spend-" + secrets.token_hex(16)
+            if not self.store.reserve_spend(
+                reservation_id, state.task_id, effective.issuer, charge.currency, period, charge.amount_minor, charge.limit_minor
+            ):
+                raise SecurityError(f"spend budget exceeded: this call would take {charge.currency} over this {budgets.period}'s limit")
+        except BaseException:
+            if eid is not None:
+                self.store.settle_effect(eid, "prepared", None, "spend budget refused the call; nothing ran")
+            raise
+        audit.append(
+            "spend.reserved",
+            {
+                "tool": decision.tool,
+                "reservation": reservation_id,
+                "currency": charge.currency,
+                "amount_minor": charge.amount_minor,
+                "period": period,
+                "total_minor": self.store.spend_total(effective.issuer, charge.currency, period),
+                "limit_minor": charge.limit_minor,
+            },
+        )
+        return reservation_id
+
     def _apply_decision(self, decision, state, effective, audit, envelope, active_policy, admission_generation=0):
         # PM-003: the permit's lifetime is re-read here, on the trusted clock, before ANY action of
         # this step. Admission checked it once; a provider that answered slowly (or a long previous
@@ -888,6 +940,11 @@ class AgentHost:
                 raise SecurityError(
                     active_policy.explain_missing_grant(envelope.manifest, envelope.permit, decision.tool)
                 )
+            # The argument check, BEFORE the approval gate: a call that breaks its grant's constraints can
+            # never run, so no human is asked to approve it (a queue of doomed requests trains approvers to
+            # click through). Same grant and same detached arguments as the launch-time check in
+            # tools.invoke, which still runs as the last line.
+            check_constraints(next(grant for grant in effective.grants if grant.name == decision.tool).constraints, decision.arguments)
             approval_result = self._approval_gate(active_policy, effective, state, decision, audit, admission_generation)
             if approval_result is not None:
                 return approval_result
@@ -903,7 +960,7 @@ class AgentHost:
             # reconciliation pass (Section 7, tool boundary), not available here. So cancellation of an
             # already-redeemed approval is best-effort-before-launch, not a guarantee that the effect is
             # prevented. Fires only for approval-gated tools; the approval is already consumed.
-            if self._requires_approval(active_policy, decision.tool) and self.store.is_task_cancelled(state.task_id):
+            if self._requires_approval(active_policy, decision.tool, decision.arguments) and self.store.is_task_cancelled(state.task_id):
                 return self._approval_failure(state, audit, "approval.denied", "cancelled")
             # Section 7 PR 2: a side-effecting tool runs under the durable effect ledger. The host
             # derives an idempotency key (effect_id) from the DURABLE admission generation and a
@@ -973,9 +1030,24 @@ class AgentHost:
                                     eid, "prepared", None, "permit expired before the launch; nothing ran"
                                 )
                             raise
-                        result = self.tools.invoke(
-                            effective, decision.tool, decision.arguments, effective.budget.max_output_bytes, launch_capability=launch_cap
-                        )
+                        # PM-AUTH-015: charge the cumulative spend budget, durably, right before the launch.
+                        spend_reservation = self._reserve_spend(active_policy, effective, state, decision, audit, eid)
+                        try:
+                            result = self.tools.invoke(
+                                effective, decision.tool, decision.arguments, effective.budget.max_output_bytes, launch_capability=launch_cap
+                            )
+                        except ToolExecutionError:
+                            # The tool STARTED and then failed (an error, a kill, a timeout; ToolKilledError
+                            # is a subclass). The effect may have landed and the host cannot prove it did
+                            # not, so the reservation stays counted (owner decision 3). This clause must stay
+                            # BEFORE the SecurityError one: ToolExecutionError subclasses SecurityError.
+                            raise
+                        except SecurityError:
+                            # Any other SecurityError from invoke is raised BEFORE the tool starts (permit,
+                            # constraint, launch-capability checks), so nothing was spent: give it back.
+                            if spend_reservation is not None and self.store.release_spend(spend_reservation):
+                                audit.append("spend.released", {"tool": decision.tool, "reservation": spend_reservation})
+                            raise
                     finally:
                         _run_progress.note(phase="tool_returned")
                         self.metrics.observe_duration("tool_invocation_duration_seconds", time.monotonic() - tool_started)
@@ -1242,13 +1314,26 @@ class AgentHost:
             self.policy = loaded
         return self.policy
 
-    def _requires_approval(self, policy: "HostPolicy | _ReloadedPolicy", tool: str) -> bool:
-        """The ONE approval decision, for the gate and for the pre-launch cancel re-check alike: the
-        policy's impact plus the registry's side-effecting flag (Fix 3, 3B)."""
-        return policy.requires_approval_for(tool, side_effecting=self.tools.is_side_effecting(tool))
+    def _requires_approval(self, policy: "HostPolicy | _ReloadedPolicy", tool: str, arguments: dict[str, Any] | None) -> bool:
+        """The ONE approval decision, for the gate and for the pre-launch cancel re-check alike."""
+        return self._approval_reason(policy, tool, arguments) is not None
+
+    def _approval_reason(self, policy: "HostPolicy | _ReloadedPolicy", tool: str, arguments: dict[str, Any] | None) -> str | None:
+        """Why this call needs a signed approval, or None. "impact": the policy's impact plus the registry's
+        side-effecting flag (Fix 3, 3B). "amount": the call is over the spend budget's approval threshold
+        for its currency. `arguments` is the detached canonical copy, the same one charged and invoked.
+        The impact rule is checked first, so an impact-gated call never has its amount read here."""
+        if policy.requires_approval_for(tool, side_effecting=self.tools.is_side_effecting(tool)):
+            return "impact"
+        if needs_amount_approval(getattr(policy, "spend_budgets", None), tool, arguments):
+            return "amount"
+        return None
 
     def _approval_gate(self, policy: HostPolicy, permit, state, decision: ProviderDecision, audit: AuditLog, admission_generation: int) -> tuple[bool, None] | None:
-        if decision.tool is None or not self._requires_approval(policy, decision.tool):
+        if decision.tool is None:
+            return None
+        reason = self._approval_reason(policy, decision.tool, decision.arguments)
+        if reason is None:
             return None
         # Section 5 #4: the token is loaded from untrusted mutable memory. Any malformation
         # (missing/extra keys, wrong types) is turned into a controlled approval.denied here,
@@ -1267,6 +1352,8 @@ class AgentHost:
                 "policy_version": policy.policy_version,
                 "policy_hash": policy.policy_hash,
             }
+            if reason == "amount":
+                state.result["approval_reason"] = "amount"
             audit.append("approval.requested", state.result)
             return True, None
         # Section 5 #4: used_approval_ids also comes from untrusted memory. A non-list (or a

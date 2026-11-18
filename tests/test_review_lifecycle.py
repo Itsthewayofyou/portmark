@@ -189,7 +189,7 @@ class ReviewLifecycleTests(unittest.TestCase):
         store = self._store()
         launched = []
         with patch.object(_clock, "_default_clock", fake.clock()):
-            host = self._host(ScriptedProvider(ProviderDecision("tool", "catalog.search", {"query": "t"})), store)
+            host = self._host(ScriptedProvider(ProviderDecision("tool", "catalog.search", {"query": "t", "limit": 1})), store)
             host.tools.is_side_effecting = lambda name: True
             host.tools.is_isolated = lambda name: True
             envelope, probe = self._envelope(host, "expiry during the started transition")
@@ -284,7 +284,7 @@ class ReviewLifecycleTests(unittest.TestCase):
         store = self._store()
         launched = []
         with patch.object(_clock, "_default_clock", fake.clock()):
-            host = self._host(ScriptedProvider(ProviderDecision("tool", "catalog.search", {"query": "t"})), store)
+            host = self._host(ScriptedProvider(ProviderDecision("tool", "catalog.search", {"query": "t", "limit": 1})), store)
             envelope, probe = self._envelope(host, "expiry before a plain launch")
 
             def slow_lookup(name):
@@ -397,7 +397,7 @@ class ReviewLifecycleTests(unittest.TestCase):
         store = self._store()
         launched = []
         with patch.object(_clock, "_default_clock", fake.clock()):
-            host = self._host(ScriptedProvider(ProviderDecision("tool", "catalog.search", {"query": "t"})), store)
+            host = self._host(ScriptedProvider(ProviderDecision("tool", "catalog.search", {"query": "t", "limit": 1})), store)
             host.tools.is_side_effecting = lambda name: True
             host.tools.is_isolated = lambda name: True
             envelope, probe = self._envelope(host, "expiry during the ledger write")
@@ -548,7 +548,9 @@ class ReviewLifecycleTests(unittest.TestCase):
         # The dangerous case: an effect may already be in flight. The task must close, and the EFFECT
         # ledger must stay the authority -- the row is not settled `confirmed` by this closure.
         store = self._store()
-        provider = ScriptedProvider(ProviderDecision("tool", "catalog.search", {"query": "t"}))
+        # A VALID call (the demo grant caps `limit`, so it must be present): the host's argument check runs
+        # before the ledger write, and this test is about what happens AFTER a launch.
+        provider = ScriptedProvider(ProviderDecision("tool", "catalog.search", {"query": "t", "limit": 1}))
         host = self._host(provider, store)
         envelope, probe = self._envelope(host, "tool explodes")
         host.tools.is_side_effecting = lambda name: True

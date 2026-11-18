@@ -176,7 +176,7 @@ class TaskOwnershipTests(unittest.TestCase):
                 transaction.save_checkpoint("old-task", AgentState("old-task", "goal"), 1, owner=("user:alice", "agent:demo"))
         with contextlib.closing(sqlite3.connect(str(path))) as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-        self.assertEqual(version, 16)
+        self.assertEqual(version, 17)
 
 
 class OwnershipStoreContractTests(unittest.TestCase):

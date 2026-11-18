@@ -837,6 +837,14 @@ def main() -> None:
         help="check that PORTMARK_MIGRATION_PREFLIGHT_COMMAND attests a destination the way migration verifies it",
     )
     preflight_kit.add_argument("--destination", required=True, help="the destination host id to attest (a real one)")
+    policy_parser = subparsers.add_parser("policy", help="work with a host policy file")
+    policy_commands = policy_parser.add_subparsers(dest="policy_command", required=True)
+    policy_check = policy_commands.add_parser(
+        "check",
+        help="load a host policy file with the host's own loader and say in plain words what it allows (exit 1 if invalid)",
+    )
+    policy_check.add_argument("path", help="the host policy JSON file")
+    policy_check.add_argument("--json", action="store_true", help="print the report as JSON")
     witness_parser = subparsers.add_parser("witness", help="EV-013: run or check a remote witness (the reference server)")
     witness_commands = witness_parser.add_subparsers(dest="witness_command", required=True)
     witness_keygen = witness_commands.add_parser("keygen", help="write a new Ed25519 private key (mode 600) and print its public key")
@@ -943,6 +951,15 @@ def main() -> None:
         return
     if args.command == "preflight-conformance":
         _run_preflight_conformance(parser, args, config)
+        return
+    if args.command == "policy":
+        # Reads one file; needs no host, store or key.
+        from .policy_check import check_policy_file, render_json, render_text
+
+        report = check_policy_file(args.path)
+        print(render_json(report) if args.json else render_text(report))
+        if report["status"] != "ok":
+            raise SystemExit(1)
         return
     audit_verifier = load_trust_registry(config.trust_registry_path) if config.trust_registry_path else None
     try:

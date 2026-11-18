@@ -44,6 +44,7 @@ from portmark.models import AgentManifest, AgentState, AttestationEvidence, Perm
 from portmark.projection import project_state_for_migration, provider_state, provider_view
 from portmark.providers import GenericHttpProvider, ModelProvider, NativeWasmtimeComponentProvider, ProviderError
 from portmark.policy import load_host_policy
+from portmark import tool_subprocess_runner
 from portmark.security import (
     AUDIT_HASH_VERSION,
     AttestationPolicy,
@@ -1409,6 +1410,10 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unknown resource_limits key 'cpu_seconds'"):
             ToolRegistry(resource_limits={"cpu_seconds": 5})
 
+    @unittest.skipIf(
+        tool_subprocess_runner._resource is None,
+        "explicit resource_limits are refused without POSIX setrlimit (test_fix_windows_resource_caps)",
+    )
     def test_resource_limits_merge_keeps_other_defaults(self):
         # Section 7 #3: supplying one key MERGES over the defaults -- it must not silently drop the
         # memory / fd caps (the old replace-everything behavior).

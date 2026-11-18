@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from . import _windows_job, safe_paths
+from . import _windows_job, safe_paths, tool_subprocess_runner
 from .models import Permit, validate_tool_name
 from .security import SecurityError, canonical_json, check_constraints, detached_json
 
@@ -307,6 +307,18 @@ class ToolRegistry:
             self.resource_limits: dict[str, int] = {}
         else:
             self.resource_limits = _merged_resource_limits(resource_limits)
+            # An EXPLICIT cap request must be enforceable (fail-closed). Without POSIX setrlimit
+            # (Windows) the worker cannot apply any of these caps, and the Job Object's committed-
+            # memory limit is not RLIMIT_AS, so refuse here rather than run uncapped. The default
+            # caps are not an explicit request. Same sentinel the worker checks, read at call time.
+            # dict() first: a caller's dict subclass must not decide "explicit" through its own __bool__.
+            requested_keys = dict(resource_limits) if resource_limits is not None else {}
+            if requested_keys and tool_subprocess_runner._resource is None:
+                requested = ", ".join(sorted(requested_keys))
+                raise RuntimeError(
+                    f"resource_limits ({requested}) cannot be enforced on this platform: it has no "
+                    "POSIX setrlimit; pass disable_resource_limits=True to run the tools without these caps"
+                )
         # Finding #5: the thread-timeout path cannot cancel a tool once it starts, so a
         # tool that exceeds its deadline leaves its daemon thread running. This bounded
         # semaphore caps how many such executions can be in flight at once. A slot is held
@@ -645,6 +657,12 @@ class ToolRegistry:
         check_constraints(grant.constraints, arguments)
         timeout = self._timeouts.get(name, self.default_timeout)
         cap = max_output_bytes if max_output_bytes is not None else self._max_output.get(name, self.max_output_bytes)
+        # A per-tool cap (register_isolated(max_output_bytes=...)) binds even when the caller passes a
+        # larger budget: AgentHost always passes the run budget, which used to replace the tool's own cap.
+        # Only an explicit override counts (_set_override drops a None), so a tool without one keeps the
+        # caller's budget rather than shrinking to the registry default.
+        if max_output_bytes is not None and name in self._max_output:
+            cap = min(cap, self._max_output[name])
 
         effect_id: str | None = None
         if name in self._side_effecting:
@@ -752,6 +770,13 @@ class ToolRegistry:
         # wall-clock deadline (a CPU-bound tool that ignores the clock still dies), set a little
         # above the timeout so it never fires before the host's own deadline does.
         rlimits = dict(self.resource_limits)
+        # The construction check covers the constructor only; resource_limits is a public attribute,
+        # so re-check at launch. Without setrlimit only the documented defaults (or none) may pass.
+        if tool_subprocess_runner._resource is None and rlimits and rlimits != _DEFAULT_TOOL_RLIMITS:
+            raise ToolExecutionError(
+                "resource_limits cannot be enforced on this platform: it has no POSIX setrlimit; "
+                "use disable_resource_limits=True"
+            )
         if "cpu_seconds" not in rlimits:
             rlimits["cpu_seconds"] = int(timeout) + 2
         payload: dict[str, Any] = {
