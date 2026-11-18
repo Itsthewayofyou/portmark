@@ -291,7 +291,8 @@ Start the CLI with `--provider-endpoint URL`. The runtime sends:
 `state.messages` contains only host-policy-projected tool output from prior steps. The host never
 sends raw checkpoint `memory` or `result` fields to remote providers. Configure per-tool sharing
 with `output_projection` in host policy; omit it or set `[]` to share no output, use top-level
-field names such as `["id", "title"]` for dict outputs or lists of dicts, and use `["*"]` only
+field names such as `["id", "title"]` for dict outputs or lists of dicts, JSON Pointer paths
+such as `["/user/name"]` for nested fields, and use `["*"]` only
 for tools whose full output may be sent to the provider.
 
 The provider responds with one decision:

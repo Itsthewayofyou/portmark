@@ -27,6 +27,19 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
   approvers, and the `policy_hash` approvals are bound to. Warns about valid-but-wrong settings (approval no
   one can give, a threshold that can never take effect, a zero limit, a missing impact). Exit 1 when the host
   would refuse the file. New example: `examples/purchasing-policy.json`. Tests: `tests/test_policy_check.py`.
+- **URL port, path and query constraints.** Three new keys for a URL argument: `allowed_ports` (an
+  omitted port counts as the scheme's default, 80 or 443), `path_prefixes` (matched by whole segments:
+  `/v1` admits `/v1/items` but not `/v10`), and `allowed_query_keys` (every query key must be listed).
+  With `path_prefixes` or `allowed_query_keys` set, a URL is refused if it has a fragment, a dot or
+  empty segment, a backslash, an encoded slash or backslash, a path still encoded after one decode, or
+  a repeated query key. Merging keeps the narrower path prefix, so host policy stays the ceiling.
+  Grants without the new keys behave exactly as before.
+- **Nested output projection.** An `output_projection` entry that starts with `/` is a JSON Pointer
+  path (RFC 6901): `/user/name` shares only `user.name`, so other fields under `user` no longer reach
+  the provider or a migration destination. Lists are mapped at every level. Merging keeps the deeper
+  of two nested paths; sibling paths share nothing. An entry without a leading `/` is still one
+  top-level key, so every existing projection keeps its meaning. A malformed path (empty segment,
+  bad `~` escape) is refused when the policy, permit or A2A grant is loaded.
 
 ### Changed
 

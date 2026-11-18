@@ -56,6 +56,10 @@ VALUE_POOL: tuple[Any, ...] = (
     "https://api.example.com/v1",
     "https://other.example.com/v1",
     "http://evil.test/path",
+    "https://api.example.com:8443/v1/items?q=red",
+    "https://api.example.com/v10?page=2&token=x",
+    "https://api.example.com/v1/../path",
+    "https://other.example.com/?q=a&q=b",
     True,
     None,
 )
@@ -136,6 +140,9 @@ def random_argument_spec(rng: random.Random) -> dict[str, Any]:
         ("allowed_schemes", lambda: rng.sample(["https", "http", "ftp"], rng.randint(1, 2))),
         ("allowed_hosts", lambda: rng.sample(["api.example.com", "other.example.com", "evil.test"], rng.randint(1, 2))),
         ("allowed_domains", lambda: rng.sample(["example.com", "evil.test"], rng.randint(1, 2))),
+        ("allowed_ports", lambda: rng.sample([443, 80, 8443], rng.randint(1, 2))),
+        ("path_prefixes", lambda: rng.sample(["/", "/v1", "/v1/items", "/v10", "/path"], rng.randint(1, 2))),
+        ("allowed_query_keys", lambda: rng.sample(["q", "page", "token"], rng.randint(1, 2))),
     ]
     rng.shuffle(generators)
     spec: dict[str, Any] = {}
@@ -195,6 +202,13 @@ def candidate_arguments(rng: random.Random, left: dict[str, Any], right: dict[st
                 interesting.setdefault(name, []).append(spec["const"])
             if isinstance(spec.get("enum"), list):
                 interesting.setdefault(name, []).extend(spec["enum"])
+            # S3: a URL on each named path prefix (and one segment below it) is the boundary a
+            # widened prefix merge would cross; random pool URLs almost never land on it.
+            if isinstance(spec.get("path_prefixes"), list):
+                for prefix in spec["path_prefixes"]:
+                    if isinstance(prefix, str):
+                        base = "https://api.example.com" + prefix.rstrip("/")
+                        interesting.setdefault(name, []).extend([base or "https://api.example.com/", base + "/x"])
         for key, value in side.items():
             if key.startswith("allowed_") and isinstance(value, list):
                 interesting.setdefault(key[8:], []).extend(value)
@@ -391,6 +405,19 @@ class GeneratorDiscriminationTest(unittest.TestCase):
             msg="the generator found no widening in a deliberately naive union merge, "
             "so NoWideningPropertyTest is decorative and proves nothing",
         )
+
+    def test_union_of_path_prefixes_is_caught(self) -> None:
+        """S3 control: a prefix merge that unions instead of narrowing must be found by the generator."""
+        from unittest import mock
+
+        import portmark.security as security
+
+        def union(left, right):
+            return list(dict.fromkeys(list(left) + list(right)))
+
+        with mock.patch.object(security, "_prefix_intersection", union):
+            violation = find_widening(merge_real)
+        self.assertIsNotNone(violation, msg="the generator cannot see a widened path_prefixes merge")
 
     def test_naive_union_widens_the_hand_derived_case(self) -> None:
         left = {"arguments": {"a": {"type": "string"}}, "additional_arguments": False}

@@ -100,6 +100,21 @@ allowlist belongs in host policy with URL constraints such as `scheme`,
 `allowed_hosts`, or `allowed_domains`; provider-supplied arguments cannot expand
 that allowlist.
 
+`allowed_hosts` matches a host exactly; `allowed_domains` also admits subdomains.
+Three more keys narrow the rest of the URL:
+
+- `allowed_ports`: a list of ports. A URL with no port uses its scheme's default
+  (80 for `http`, 443 for `https`); any other scheme must name its port.
+- `path_prefixes`: a list of paths, matched by whole segments. `/v1` admits `/v1`
+  and `/v1/items`, not `/v10`; `/v1/` means the same as `/v1`; `/` admits every path.
+- `allowed_query_keys`: every query key in the URL must be listed. A repeated key
+  is refused, because two parsers can pick different copies.
+
+When `path_prefixes` or `allowed_query_keys` is set, a URL is refused rather than
+interpreted if it has a fragment, a `.` or `..` segment, an empty segment (`//`),
+a backslash, an encoded `/` or `\`, or a path that is still encoded after one
+decode. The tool behind the URL might resolve such a path differently.
+
 ## Grant Tools In Policy
 
 Installing a tool does not grant it. The host still intersects the agent
@@ -146,7 +161,8 @@ Per key:
 | --- | --- |
 | `minimum`, `min_length` | the larger of the two |
 | `maximum`, `max_length` | the smaller of the two |
-| `enum`, `allowed_schemes`, `allowed_hosts`, `allowed_domains` | set intersection; empty drops the grant |
+| `enum`, `allowed_schemes`, `allowed_hosts`, `allowed_domains`, `allowed_ports`, `allowed_query_keys` | set intersection; empty drops the grant |
+| `path_prefixes` | for each pair where one prefix lies inside the other, the inner one; none drops the grant |
 | `const`, `pattern`, `scheme` | must be identical, or the grant is dropped |
 | `type` | set intersection of the type lists; empty drops the grant |
 | `required` | required if either side requires it |
@@ -208,7 +224,16 @@ full stored result:
 
 - omit `output_projection`, or set it to `[]`, to share no tool output
 - use field names such as `["id", "title"]` for dict outputs or lists of dicts
+- use a JSON Pointer path such as `["/user/name"]` to share one nested field:
+  `{"user": {"name": "a", "ssn": "x"}}` becomes `{"user": {"name": "a"}}`. Lists
+  are mapped at every level, so `/items/id` keeps `id` in each item. Inside a key,
+  write `~1` for `/` and `~0` for `~`. An entry without a leading `/` is still one
+  top-level key, so `"a.b"` means the key `a.b`, as before.
 - use `["*"]` only when the full output is acceptable provider input
+
+When two grants are merged, a path inside another (`/user/name` inside `user`)
+becomes the shared result, and sibling paths (`/user/name`, `/user/ssn`) share
+nothing.
 
 Projection is configured in host policy because the operator, not the agent,
 owns the data-sharing decision. Host policy is the ceiling: a policy grant that
