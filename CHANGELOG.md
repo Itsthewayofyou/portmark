@@ -4,6 +4,16 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 ## Unreleased
 
+## 0.12.0 — 2026-11-18
+
+**Spend control and finer grants.** Hosts can now cap what agents spend across tasks and permits, and
+require a human above a set amount. URL arguments can be limited by port, path and query key, and tool
+output can be shared field by field with nested paths. Two security fixes make declared output and
+resource caps bind where they were silently ignored. **Migration:** on Windows, a `ToolRegistry` built with
+`resource_limits` now refuses to start instead of enforcing nothing; remove `resource_limits` or pass
+`disable_resource_limits=True`. The store schema upgrades on start (SQLite v17, PostgreSQL v15). Existing policies,
+URL constraints and output projections keep their meaning.
+
 ### Added
 
 - **Cumulative spend budgets (`spend_budgets` in host policy).** Per-call limits could not stop an agent
