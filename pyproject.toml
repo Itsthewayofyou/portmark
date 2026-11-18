@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools==84.0.0"]
+requires = ["setuptools==84.2.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -44,7 +44,7 @@ wasmtime = ["wasmtime==49.0.0"]
 # Section 11 #4: build and CI tooling is hash-locked in uv.lock like the runtime dependencies.
 # requirements/*.txt are hash-pinned exports of uv.lock (scripts/lock_requirements.py); Docker, CI, and
 # release install them with `pip install --require-hashes --no-deps`. Not part of the package metadata.
-bootstrap = ["pip==26.2.1", "setuptools==84.0.0"]
+bootstrap = ["pip==26.2.1", "setuptools==84.2.1"]
 ci = ["bandit==1.9.4", "coverage==7.16.1", "pip-audit==2.10.1"]
 release = ["build==1.6.1", "twine==7.0.0", "uv==0.12.19"]
 

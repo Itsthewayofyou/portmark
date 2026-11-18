@@ -38,6 +38,10 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 ### Security
 
+- **Dependency updates for new advisories.** certifi 2026.7.22 → 2026.10.23 (PYSEC-2026-4320), filelock
+  4.0.7 → 4.2.12 (a group of 2026 CVEs), setuptools 84.0.0 → 84.2.1 (GHSA-xmj3-9gf7-h52w, fixed in
+  84.1.0; the build-system and bootstrap pins move together). The CI dependency audit failed on main
+  for these.
 - **A per-tool output cap now binds on the AgentHost path.** `register_isolated(..., max_output_bytes=N)`
   was ignored whenever a caller passed its own budget, and AgentHost always passes the run budget, so on the
   host path an isolated tool registered with a 1 KiB cap could return up to the run budget (64 KiB by
