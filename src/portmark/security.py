@@ -9,7 +9,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, unquote, urlparse
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
@@ -1357,6 +1357,11 @@ _SPEC_NARROWERS: dict[str, str] = {
     "allowed_schemes": "list-intersection",
     "allowed_hosts": "list-intersection",
     "allowed_domains": "list-intersection",
+    # S3: port, path and query. A port list and a query-key list narrow like any list. Path prefixes
+    # cannot: "/v1" and "/v1/items" share no entry, yet "/v1/items" is the honest intersection.
+    "allowed_ports": "list-intersection",
+    "allowed_query_keys": "list-intersection",
+    "path_prefixes": "prefix-intersection",
 }
 
 
@@ -1468,6 +1473,12 @@ def _narrow_argument_spec(left: dict[str, Any], right: dict[str, Any]) -> tuple[
                 return None, key
             result[key] = shared
             continue
+        if rule == "prefix-intersection":
+            narrowed = _prefix_intersection(left[key], right[key])
+            if not narrowed:
+                return None, key
+            result[key] = narrowed
+            continue
         if rule == "type-intersection":
             # `type` accepts a bare string or a list of them, and a value passes
             # if it matches ANY entry, so intersecting the lists narrows. The
@@ -1480,6 +1491,24 @@ def _narrow_argument_spec(left: dict[str, Any], right: dict[str, Any]) -> tuple[
             continue
         return None, key
     return result, None
+
+
+def _prefix_intersection(left: Any, right: Any) -> list[str]:
+    """S3: the path prefixes both sides admit. For each pair where one prefix lies inside the other,
+    the inner (narrower) one survives. Malformed input on either side gives an empty result, which
+    drops the grant."""
+    try:
+        left_prefixes = _path_prefix_list(left, "path_prefixes")
+        right_prefixes = _path_prefix_list(right, "path_prefixes")
+    except SecurityError:
+        return []
+    narrowed: list[str] = []
+    for a in left_prefixes:
+        for b in right_prefixes:
+            inner = a if _path_within_prefix(a, b) else b if _path_within_prefix(b, a) else None
+            if inner is not None and inner not in narrowed:
+                narrowed.append(inner)
+    return narrowed
 
 
 def _as_type_list(value: Any) -> list[Any]:
@@ -2241,7 +2270,7 @@ def _matches_type(value: Any, expected_type: Any) -> bool:
 
 
 def _check_url_constraints(name: str, value: Any, spec: dict[str, Any]) -> None:
-    has_url_constraint = any(key in spec for key in ("scheme", "allowed_schemes", "allowed_hosts", "allowed_domains"))
+    has_url_constraint = any(key in spec for key in _URL_CONSTRAINT_KEYS)
     if not has_url_constraint:
         return
     if not isinstance(value, str):
@@ -2273,6 +2302,93 @@ def _check_url_constraints(name: str, value: Any, spec: dict[str, Any]) -> None:
         domains = _normalized_hosts(allowed_domains, f"argument {name!r} allowed_domains")
         if not any(host == domain or host.endswith(f".{domain}") for domain in domains):
             raise SecurityError(f"argument {name!r} domain is outside its allowed set")
+    _check_url_port_path_query(name, value, parsed, spec)
+
+
+_URL_CONSTRAINT_KEYS = (
+    "scheme", "allowed_schemes", "allowed_hosts", "allowed_domains", "allowed_ports", "path_prefixes", "allowed_query_keys",
+)
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _check_url_port_path_query(name: str, value: str, parsed: Any, spec: dict[str, Any]) -> None:
+    """S3: port, path and query checks. Each refuses what it cannot read without guessing, because the
+    tool behind the URL may resolve an ambiguous path or a repeated query key differently than we do."""
+    if "allowed_ports" in spec:
+        ports = spec["allowed_ports"]
+        if (
+            not isinstance(ports, list)
+            or not ports
+            or not all(isinstance(port, int) and not isinstance(port, bool) and 1 <= port <= 65535 for port in ports)
+        ):
+            raise SecurityError(f"argument {name!r} allowed_ports must be a non-empty list of ports 1-65535")
+        try:
+            port = parsed.port
+        except ValueError as error:
+            raise SecurityError(f"argument {name!r} URL port is invalid") from error
+        if port is None:
+            port = _DEFAULT_PORTS.get(parsed.scheme.lower())
+        if port is None or port not in ports:
+            raise SecurityError(f"argument {name!r} URL port is outside its allowed set")
+    if "path_prefixes" not in spec and "allowed_query_keys" not in spec:
+        return
+    if "#" in value:
+        raise SecurityError(f"argument {name!r} URL must not contain a fragment")
+    if "path_prefixes" in spec:
+        prefixes = _path_prefix_list(spec["path_prefixes"], f"argument {name!r} path_prefixes")
+        path = _clean_url_path(parsed.path or "/", f"argument {name!r} URL path")
+        if not any(_path_within_prefix(path, prefix) for prefix in prefixes):
+            raise SecurityError(f"argument {name!r} URL path is outside its allowed prefixes")
+    if "allowed_query_keys" in spec:
+        allowed = set(_non_empty_string_tuple(spec["allowed_query_keys"], f"argument {name!r} allowed_query_keys"))
+        keys = [key for key, _ in parse_qsl(parsed.query, keep_blank_values=True)]
+        if len(keys) != len(set(keys)):
+            raise SecurityError(f"argument {name!r} URL repeats a query key")
+        if not set(keys) <= allowed:
+            raise SecurityError(f"argument {name!r} URL query key is outside its allowed set")
+
+
+def _clean_url_path(raw: str, label: str) -> str:
+    """The decoded path, or refuse. Refused: backslashes, encoded slashes or backslashes (they change
+    where segments split), dot segments (an escape upward), and empty segments (`//`), except one
+    trailing slash."""
+    lowered = raw.lower()
+    if "\\" in raw or "%2f" in lowered or "%5c" in lowered:
+        raise SecurityError(f"{label} contains a backslash or an encoded separator")
+    path = unquote(raw)
+    if "%" in path:
+        # Still encoded after one decode: a tool that decodes twice would see a different path.
+        raise SecurityError(f"{label} is encoded more than once")
+    if not path.startswith("/"):
+        raise SecurityError(f"{label} must start with '/'")
+    segments = path.split("/")[1:]
+    for index, segment in enumerate(segments):
+        if segment in {".", ".."} or (segment == "" and index != len(segments) - 1):
+            raise SecurityError(f"{label} contains a dot or empty segment")
+    return path
+
+
+def _path_prefix_list(value: Any, label: str) -> list[str]:
+    prefixes = list(_non_empty_string_tuple(value, label))
+    for prefix in prefixes:
+        if unquote(prefix) != prefix:
+            raise SecurityError(f"{label} entries must not be percent-encoded")
+        _clean_url_path(prefix, label)
+    return prefixes
+
+
+def _path_within_prefix(path: str, prefix: str) -> bool:
+    """S3: whether a clean decoded `path` lies at or under `prefix`, by whole segments.
+
+    Both inputs already passed _clean_url_path, so neither has dot segments, `//`, or backslashes.
+    Required behaviour (tests/test_url_path_constraints.py):
+      "/v1"     admits "/v1" and "/v1/items", but not "/v10"
+      "/v1/"    means the same as "/v1"
+      "/"       admits every path
+    Also used by _prefix_intersection to compare two prefixes, so it must work prefix-vs-prefix too.
+    """
+    base = prefix.rstrip("/")
+    return not base or path == base or path.startswith(base + "/")
 
 
 def _non_empty_string_tuple(value: Any, label: str) -> tuple[str, ...]:

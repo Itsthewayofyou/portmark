@@ -4,6 +4,16 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 ## Unreleased
 
+### Added
+
+- **URL port, path and query constraints.** Three new keys for a URL argument: `allowed_ports` (an
+  omitted port counts as the scheme's default, 80 or 443), `path_prefixes` (matched by whole segments:
+  `/v1` admits `/v1/items` but not `/v10`), and `allowed_query_keys` (every query key must be listed).
+  With `path_prefixes` or `allowed_query_keys` set, a URL is refused if it has a fragment, a dot or
+  empty segment, a backslash, an encoded slash or backslash, a path still encoded after one decode, or
+  a repeated query key. Merging keeps the narrower path prefix, so host policy stays the ceiling.
+  Grants without the new keys behave exactly as before.
+
 ## 0.11.0 — 2026-10-20
 
 **A security release.** It ships the twelve security fixes made since 0.10.0: argument detachment (U2),
