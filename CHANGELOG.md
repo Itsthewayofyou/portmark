@@ -4,6 +4,13 @@ All notable changes to Portmark are recorded here. Versions follow [semantic ver
 
 ## Unreleased
 
+### Security
+
+- **Dependency updates for new advisories.** certifi 2026.7.22 → 2026.10.23 (PYSEC-2026-4320), filelock
+  4.0.7 → 4.2.12 (a group of 2026 CVEs), setuptools 84.0.0 → 84.2.1 (GHSA-xmj3-9gf7-h52w, fixed in
+  84.1.0; the build-system and bootstrap pins move together). The CI dependency audit failed on main
+  for these.
+
 ## 0.11.0 — 2026-10-20
 
 **A security release.** It ships the twelve security fixes made since 0.10.0: argument detachment (U2),
